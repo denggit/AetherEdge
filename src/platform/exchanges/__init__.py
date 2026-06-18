@@ -1,4 +1,5 @@
 from src.platform.exchanges.factory import create_exchange_client
+from src.platform.exchanges.errors import ExchangeConfigError
 from src.platform.exchanges.models import (
     AmendOrderRequest,
     Balance,
@@ -41,6 +42,7 @@ __all__ = [
     "CancelStopOrderRequest",
     "ExchangeAccountClient",
     "ExchangeClient",
+    "ExchangeConfigError",
     "ExchangeExecutionClient",
     "ExchangeMarketDataClient",
     "ExchangeConfig",

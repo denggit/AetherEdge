@@ -383,6 +383,9 @@ class BinanceExchangeClient:
     def _require_credentials(self) -> None:
         if not self._config.api_key or not self._config.api_secret:
             raise ExchangeConfigError("Binance private API requires api_key and api_secret")
+        _require_header_safe(self._config.api_key, "BINANCE_API_KEY")
+        for name, value in self._config.extra_headers.items():
+            _require_header_safe(value, f"extra_headers[{name!r}]")
 
 
 def _map_binance_kline(row: list[Any], *, symbol: str, raw_symbol: str, interval: str) -> Kline:
@@ -404,6 +407,16 @@ def _map_binance_kline(row: list[Any], *, symbol: str, raw_symbol: str, interval
         is_closed=True,
         raw={"row": row},
     )
+
+
+def _require_header_safe(value: str, field: str) -> None:
+    try:
+        value.encode("latin-1")
+    except UnicodeEncodeError as exc:
+        raise ExchangeConfigError(
+            f"{field} contains characters that cannot be sent in an HTTP header. "
+            "Check your .env file and replace any placeholder text with the real credential value."
+        ) from exc
 
 
 def _map_binance_position(row: Mapping[str, Any], *, fallback_symbol: str | None = None) -> Position:

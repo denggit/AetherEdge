@@ -9,8 +9,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from src.platform import create_account_client, create_execution_client, fetch_platform_snapshot
+from src.platform.exchanges import ExchangeConfigError
 
 
 async def main() -> None:
@@ -38,4 +45,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except ExchangeConfigError as exc:
+        raise SystemExit(f"Configuration error: {exc}") from exc

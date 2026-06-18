@@ -1,9 +1,12 @@
 import asyncio
 from decimal import Decimal
 
+import pytest
+
 from src.platform.exchanges import (
     CancelOrderRequest,
     ExchangeConfig,
+    ExchangeConfigError,
     ExchangeName,
     OrderRequest,
     OrderSide,
@@ -112,3 +115,14 @@ def test_okx_place_and_cancel_order_use_same_business_request_model():
     assert http.calls[0]["headers"]["x-simulated-trading"] == "1"
     assert order.status is OrderStatus.NEW
     assert canceled.status is OrderStatus.CANCELED
+
+
+def test_okx_rejects_non_header_safe_private_credentials():
+    http = FakeHttpClient([])
+    cfg = ExchangeConfig(api_key="你的OKX_API_KEY", api_secret="secret", passphrase="pass")
+    client = create_exchange_client("okx", cfg, http_client=http)
+
+    with pytest.raises(ExchangeConfigError, match="OKX_API_KEY"):
+        asyncio.run(client.fetch_balance("USDT"))
+
+    assert http.calls == []

@@ -481,10 +481,24 @@ class OkxExchangeClient:
     def _require_credentials(self) -> None:
         if not self._config.api_key or not self._config.api_secret or not self._config.passphrase:
             raise ExchangeConfigError("OKX private API requires api_key, api_secret and passphrase")
+        _require_header_safe(self._config.api_key, "OKX_API_KEY")
+        _require_header_safe(self._config.passphrase, "OKX_PASSPHRASE")
+        for name, value in self._config.extra_headers.items():
+            _require_header_safe(value, f"extra_headers[{name!r}]")
 
 
 def _okx_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _require_header_safe(value: str, field: str) -> None:
+    try:
+        value.encode("latin-1")
+    except UnicodeEncodeError as exc:
+        raise ExchangeConfigError(
+            f"{field} contains characters that cannot be sent in an HTTP header. "
+            "Check your .env file and replace any placeholder text with the real credential value."
+        ) from exc
 
 
 def _map_okx_kline(row: list[Any], *, symbol: str, raw_symbol: str, interval: str) -> Kline:
