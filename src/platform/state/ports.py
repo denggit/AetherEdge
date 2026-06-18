@@ -11,7 +11,7 @@ from src.platform.state.models import StoredEvent, StoredOrder
 class StateStore(Protocol):
     """Local state persistence interface.
 
-    This is storage only. It must not place orders, cancel orders, or run recovery
+    This is storage only. It must not place orders, cancel orders, or run startup repair
     decisions.
     """
 

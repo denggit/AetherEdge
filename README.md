@@ -626,3 +626,112 @@ account_snapshots   账户启动快照
 ```
 
 边界：State Store 不会调用交易所 API，不会下单，不会撤单，不会恢复订单；恢复逻辑后面放 runtime/state reconciler 单独做。
+
+## Runtime Skeleton v1
+
+Runtime Skeleton 是框架编排层，不包含策略逻辑。
+
+它只负责：
+
+```text
+1. 组装 data / execution / account / event_stream / state_store
+2. 启动时读取 snapshot
+3. 把 snapshot 写入 State Store
+4. 消费 Private Event Stream
+5. 把私有事件写入 State Store
+6. 通过 RuntimeEventHandler 给未来策略/插件预留观察接口
+```
+
+它不做：
+
+```text
+不开仓
+不平仓
+不撤单
+不补止损
+不做 TP/SL 业务判断
+不做订单恢复动作
+```
+
+代码结构：
+
+```text
+src/platform/runtime/
+  config.py      # RuntimeConfig
+  context.py     # RuntimeContext，依赖注入容器
+  factory.py     # build_runtime_context()
+  handlers.py    # RuntimeEventHandler / NoopRuntimeEventHandler
+  service.py     # PlatformRuntime 生命周期服务
+
+src/platform/strategy/
+  ports.py       # StrategyPort，未来策略接入协议
+```
+
+设计模式：
+
+```text
+Port / Adapter：runtime 只依赖 data / execution / account / state 的协议
+Factory：build_runtime_context 负责组装默认实现
+Dependency Injection：测试和未来实盘都可以注入自己的 client/store/handler
+Observer：RuntimeEventHandler 只观察 snapshot/event，不直接触碰交易所 adapter
+Strategy Port：给未来策略留接口，但现在不实现策略
+```
+
+空跑方式：
+
+```bash
+PYTHONPATH=. python tools/run_runtime_skeleton.py okx --no-event-stream
+PYTHONPATH=. python tools/run_runtime_skeleton.py binance --max-events 10
+```
+
+`--no-event-stream` 只做启动 snapshot；`--max-events` 用于测试私有事件流，避免进程一直运行。
+
+## Module Placement Rules
+
+这次边界重新审视后，模块归属定为：
+
+```text
+src/platform/
+  data/        平台行情接口
+  execution/   平台执行接口
+  account/     平台账户/私有事件接口
+  exchanges/   交易所 adapter
+  markets/     品种配置
+  state/       本地状态存储，不是状态机
+  runtime/     平台生命周期编排，只负责启动、snapshot、事件落库
+  snapshot.py  只读状态快照
+  config.py    env/config 读取
+
+src/strategy/
+  ports.py     策略接入协议，未来策略放这里，不放 platform
+```
+
+`platform/state` 仍然保留在 platform，因为它是交易平台底座的本地状态存储，服务于订单、成交、事件和账户快照的落库。
+
+但有一条硬边界：
+
+```text
+State Store 只存储，不做状态机，不做恢复，不做对账，不做策略，不调用交易所 API。
+```
+
+以后这些模块不要放进 `platform/state`：
+
+```text
+reconciler
+startup recovery
+order repair
+tp/sl manager
+strategy scheduler
+signal processor
+```
+
+这些属于更上层的 live/app/runtime 扩展，后续应该单独建模块，不能污染平台接口层。
+
+本次调整：
+
+```text
+已移动：src/platform/strategy/ -> src/strategy/
+已删除：src/platform/strategy/
+已新增 boundary test，确保 strategy 不 import 交易所 adapter / REST endpoint
+已新增 module placement test，限制 platform 顶层模块继续膨胀
+```

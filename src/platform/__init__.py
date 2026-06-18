@@ -4,6 +4,7 @@ from src.platform.execution import ExecutionClient, ExchangeExecutionService, Ex
 from src.platform.markets import MarketProfile, get_market_profile, list_market_profiles, register_market_profile
 from src.platform.snapshot import PlatformSnapshot, fetch_platform_snapshot
 from src.platform.state import SqliteStateStore, StateStore, StoredAccountSnapshot, StoredEvent, StoredFill, StoredOrder
+from src.platform.runtime import PlatformRuntime, RuntimeConfig, RuntimeContext, RuntimeEventHandler, RuntimeRunResult, RuntimeStats, build_runtime_context
 from src.platform.exchanges import (
     AmendOrderRequest,
     Balance,
@@ -65,6 +66,12 @@ __all__ = [
     "StoredEvent",
     "StoredAccountSnapshot",
     "StateStore",
+    "RuntimeStats",
+    "RuntimeRunResult",
+    "RuntimeEventHandler",
+    "RuntimeContext",
+    "RuntimeConfig",
+    "PlatformRuntime",
     "SqliteStateStore",
     "Order",
     "OrderQuery",
@@ -87,6 +94,7 @@ __all__ = [
     "create_execution_client",
     "create_market_data_feed",
     "fetch_platform_snapshot",
+    "build_runtime_context",
     "get_market_profile",
     "list_market_profiles",
     "register_market_profile",
