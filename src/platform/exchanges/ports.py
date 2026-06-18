@@ -10,6 +10,7 @@ from src.platform.exchanges.models import (
     InstrumentRule,
     Kline,
     Order,
+    OrderQuery,
     OrderRequest,
     Position,
     Ticker,
@@ -69,6 +70,12 @@ class ExchangeExecutionClient(ExchangeIdentity, Protocol):
         ...
 
     async def amend_order(self, request: AmendOrderRequest) -> Order:
+        ...
+
+    async def fetch_order_status(self, query: OrderQuery) -> Order:
+        ...
+
+    async def fetch_open_orders(self, symbol: str) -> list[Order]:
         ...
 
 

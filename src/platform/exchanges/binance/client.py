@@ -18,6 +18,7 @@ from src.platform.exchanges.models import (
     Kline,
     MarginMode,
     Order,
+    OrderQuery,
     OrderRequest,
     OrderSide,
     OrderStatus,
@@ -184,6 +185,21 @@ class BinanceExchangeClient:
             params["origClientOrderId"] = request.client_order_id
         payload = await self._request_signed("PUT", "/fapi/v1/order", params=params)
         return _map_binance_order(payload, symbol=request.symbol, raw_symbol=raw_symbol)
+
+    async def fetch_order_status(self, query: OrderQuery) -> Order:
+        raw_symbol = to_exchange_symbol(self.exchange, query.symbol)
+        params: dict[str, Any] = {"symbol": raw_symbol}
+        if query.order_id:
+            params["orderId"] = query.order_id
+        if query.client_order_id:
+            params["origClientOrderId"] = query.client_order_id
+        payload = await self._request_signed("GET", "/fapi/v1/order", params=params)
+        return _map_binance_order(payload, symbol=query.symbol, raw_symbol=raw_symbol)
+
+    async def fetch_open_orders(self, symbol: str) -> list[Order]:
+        raw_symbol = to_exchange_symbol(self.exchange, symbol)
+        payload = await self._request_signed("GET", "/fapi/v1/openOrders", params={"symbol": raw_symbol})
+        return [_map_binance_order(row, symbol=symbol, raw_symbol=raw_symbol) for row in payload]
 
     async def _request_public(
         self,

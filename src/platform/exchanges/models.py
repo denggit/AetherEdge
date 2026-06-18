@@ -66,6 +66,7 @@ class ExchangeConfig:
     sandbox: bool = False
     timeout_seconds: float = 10.0
     recv_window_ms: int = 5000  # Binance signed request window.
+    live_trading_enabled: bool = False
     default_margin_mode: MarginMode = MarginMode.CROSS
     extra_headers: Mapping[str, str] = field(default_factory=dict)
 
@@ -83,6 +84,7 @@ class ExchangeConfig:
             sandbox=_bool_env(values.get(f"{exchange_name.value.upper()}_SANDBOX", values.get("SANDBOX", "false"))),
             timeout_seconds=float(values.get("API_TIMEOUT_SECONDS", "10.0") or 10.0),
             recv_window_ms=int(values.get("BINANCE_RECV_WINDOW_MS", "5000") or 5000),
+            live_trading_enabled=_bool_env(values.get("AETHER_LIVE_TRADING", "false")),
             default_margin_mode=MarginMode(str(values.get("MARGIN_MODE", "cross")).strip().lower()),
         )
         if exchange_name == ExchangeName.OKX:
@@ -96,6 +98,7 @@ class ExchangeConfig:
                 sandbox=base.sandbox,
                 timeout_seconds=base.timeout_seconds,
                 recv_window_ms=base.recv_window_ms,
+                live_trading_enabled=base.live_trading_enabled,
                 default_margin_mode=base.default_margin_mode,
             )
         if exchange_name == ExchangeName.BINANCE:
@@ -109,6 +112,7 @@ class ExchangeConfig:
                 sandbox=base.sandbox,
                 timeout_seconds=base.timeout_seconds,
                 recv_window_ms=base.recv_window_ms,
+                live_trading_enabled=base.live_trading_enabled,
                 default_margin_mode=base.default_margin_mode,
             )
         return base
@@ -216,6 +220,17 @@ class AmendOrderRequest:
             raise ValueError("order_id or client_order_id is required")
         if self.new_quantity is None and self.new_price is None:
             raise ValueError("new_quantity or new_price is required")
+
+
+@dataclass(frozen=True)
+class OrderQuery:
+    symbol: str
+    order_id: str | None = None
+    client_order_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.order_id and not self.client_order_id:
+            raise ValueError("order_id or client_order_id is required")
 
 
 @dataclass(frozen=True)

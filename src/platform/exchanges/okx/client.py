@@ -20,6 +20,7 @@ from src.platform.exchanges.models import (
     Kline,
     MarginMode,
     Order,
+    OrderQuery,
     OrderRequest,
     OrderSide,
     OrderStatus,
@@ -219,6 +220,27 @@ class OkxExchangeClient:
             raw=data,
         )
 
+    async def fetch_order_status(self, query: OrderQuery) -> Order:
+        raw_symbol = to_exchange_symbol(self.exchange, query.symbol)
+        params: dict[str, Any] = {"instId": raw_symbol}
+        if query.order_id:
+            params["ordId"] = query.order_id
+        if query.client_order_id:
+            params["clOrdId"] = query.client_order_id
+        payload = await self._request_private("GET", "/api/v5/trade/order", params=params)
+        data = _first_data(payload, "OKX order status")
+        return _map_okx_order_row(data, symbol=query.symbol, raw_symbol=raw_symbol)
+
+    async def fetch_open_orders(self, symbol: str) -> list[Order]:
+        raw_symbol = to_exchange_symbol(self.exchange, symbol)
+        payload = await self._request_private("GET", "/api/v5/trade/orders-pending", params={"instId": raw_symbol})
+        rows = payload.get("data", [])
+        return [
+            _map_okx_order_row(row, symbol=symbol, raw_symbol=raw_symbol)
+            for row in rows
+            if isinstance(row, Mapping)
+        ]
+
     async def _request_public(
         self,
         method: str,
@@ -305,6 +327,23 @@ def _map_okx_kline(row: list[Any], *, symbol: str, raw_symbol: str, interval: st
     )
 
 
+def _map_okx_order_row(row: Mapping[str, Any], *, symbol: str, raw_symbol: str) -> Order:
+    return Order(
+        exchange=ExchangeName.OKX,
+        symbol=symbol,
+        raw_symbol=str(row.get("instId") or raw_symbol),
+        order_id=_optional_str(row.get("ordId")),
+        client_order_id=_optional_str(row.get("clOrdId")),
+        status=_OKX_ORDER_STATUS.get(str(row.get("state", "")).lower(), OrderStatus.UNKNOWN),
+        side=_optional_order_side(row.get("side")),
+        order_type=_optional_order_type(row.get("ordType")),
+        price=_optional_decimal(row.get("px")),
+        quantity=_optional_decimal(row.get("sz")),
+        filled_quantity=_optional_decimal(row.get("accFillSz")),
+        raw=row,
+    )
+
+
 def _map_okx_position(row: Mapping[str, Any], *, fallback_symbol: str | None = None) -> Position:
     raw_symbol = str(row.get("instId") or "")
     symbol = fallback_symbol or "ETH-USDT-PERP"
@@ -365,6 +404,24 @@ def _decimal(value: Any, *, field: str) -> Decimal:
         return Decimal(str(value))
     except Exception as exc:
         raise ExchangeMappingError(f"Invalid decimal for {field}: {value!r}") from exc
+
+
+def _optional_order_side(value: Any) -> OrderSide | None:
+    text = str(value or "").lower()
+    if text == "buy":
+        return OrderSide.BUY
+    if text == "sell":
+        return OrderSide.SELL
+    return None
+
+
+def _optional_order_type(value: Any) -> OrderType | None:
+    text = str(value or "").lower()
+    if text == "market":
+        return OrderType.MARKET
+    if text in {"limit", "post_only", "fok", "ioc"}:
+        return OrderType.LIMIT
+    return None
 
 
 def _optional_decimal(value: Any) -> Decimal | None:

@@ -23,4 +23,12 @@ def create_execution_client(
     profile = market_profile or get_market_profile(symbol)
     cfg = config or ExchangeConfig.from_env(exchange)
     client = exchange_client or create_exchange_client(exchange, cfg, http_client=http_client)
-    return ExchangeExecutionService(client, symbol=profile.symbol, market_profile=profile, risk_limits=risk_limits, validate_orders=validate_orders)
+    return ExchangeExecutionService(
+        client,
+        symbol=profile.symbol,
+        market_profile=profile,
+        risk_limits=risk_limits,
+        validate_orders=validate_orders,
+        sandbox=cfg.sandbox,
+        live_trading_enabled=cfg.live_trading_enabled,
+    )

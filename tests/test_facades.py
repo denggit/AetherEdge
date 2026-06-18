@@ -6,6 +6,7 @@ from src.platform.execution import create_execution_client
 from src.platform.exchanges.models import (
     Balance,
     CancelOrderRequest,
+    ExchangeConfig,
     ExchangeName,
     Order,
     OrderRequest,
@@ -63,7 +64,7 @@ class FakeExchangeClient:
 
 def test_execution_facade_places_cancels_and_replaces_orders():
     exchange_client = FakeExchangeClient()
-    execution = create_execution_client("okx", exchange_client=exchange_client)
+    execution = create_execution_client("okx", config=ExchangeConfig(sandbox=True), exchange_client=exchange_client)
 
     order = asyncio.run(
         execution.replace_order(

@@ -3,7 +3,7 @@ from decimal import Decimal
 
 import pytest
 
-from src.platform import AmendOrderRequest, ExchangeName, Order, OrderRequest, OrderSide, OrderStatus, OrderType
+from src.platform import AmendOrderRequest, ExchangeConfig, ExchangeName, Order, OrderRequest, OrderSide, OrderStatus, OrderType
 from src.platform.execution import ExecutionRiskLimits, MultiExchangeExecutionClient, RiskCheckError, create_execution_client
 from src.platform.exchanges.models import InstrumentRule
 
@@ -48,7 +48,7 @@ class FakeExchangeClient:
 
 def test_execution_normalizes_quantity_price_before_place_order():
     fake = FakeExchangeClient()
-    execution = create_execution_client("okx", exchange_client=fake)
+    execution = create_execution_client("okx", config=ExchangeConfig(sandbox=True), exchange_client=fake)
 
     order = asyncio.run(
         execution.place_order(
@@ -68,7 +68,7 @@ def test_execution_normalizes_quantity_price_before_place_order():
 
 
 def test_execution_risk_gate_rejects_too_small_quantity():
-    execution = create_execution_client("okx", exchange_client=FakeExchangeClient())
+    execution = create_execution_client("okx", config=ExchangeConfig(sandbox=True), exchange_client=FakeExchangeClient())
 
     with pytest.raises(RiskCheckError):
         asyncio.run(
@@ -86,7 +86,7 @@ def test_execution_risk_gate_rejects_too_small_quantity():
 
 def test_execution_amend_uses_native_adapter_method():
     fake = FakeExchangeClient()
-    execution = create_execution_client("okx", exchange_client=fake)
+    execution = create_execution_client("okx", config=ExchangeConfig(sandbox=True), exchange_client=fake)
 
     asyncio.run(execution.amend_order(AmendOrderRequest(symbol="ETH-USDT-PERP", order_id="1", new_quantity=Decimal("0.029"))))
 
@@ -94,13 +94,13 @@ def test_execution_amend_uses_native_adapter_method():
 
 
 def test_multi_exchange_execution_collects_partial_failures():
-    okx = create_execution_client("okx", exchange_client=FakeExchangeClient(ExchangeName.OKX))
+    okx = create_execution_client("okx", config=ExchangeConfig(sandbox=True), exchange_client=FakeExchangeClient(ExchangeName.OKX))
 
     class BrokenClient(FakeExchangeClient):
         async def place_order(self, request):
             raise RuntimeError("boom")
 
-    binance = create_execution_client("binance", exchange_client=BrokenClient(ExchangeName.BINANCE))
+    binance = create_execution_client("binance", config=ExchangeConfig(sandbox=True), exchange_client=BrokenClient(ExchangeName.BINANCE))
     multi = MultiExchangeExecutionClient([okx, binance])
 
     results = asyncio.run(

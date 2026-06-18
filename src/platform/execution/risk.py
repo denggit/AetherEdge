@@ -10,6 +10,10 @@ class RiskCheckError(ValueError):
     pass
 
 
+class LiveTradingBlocked(PermissionError):
+    pass
+
+
 @dataclass(frozen=True)
 class ExecutionRiskLimits:
     max_order_notional: Decimal | None = None

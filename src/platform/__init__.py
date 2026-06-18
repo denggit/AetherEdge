@@ -1,6 +1,6 @@
 from src.platform.account import AccountClient, ExchangeAccountService, create_account_client
 from src.platform.data import MarketDataFeed, create_market_data_feed
-from src.platform.execution import ExecutionClient, ExchangeExecutionService, ExecutionRiskLimits, MultiExchangeExecutionClient, RiskCheckError, create_execution_client
+from src.platform.execution import ExecutionClient, ExchangeExecutionService, ExecutionRiskLimits, LiveTradingBlocked, MultiExchangeExecutionClient, RiskCheckError, create_execution_client
 from src.platform.markets import MarketProfile, get_market_profile, list_market_profiles, register_market_profile
 from src.platform.exchanges import (
     AmendOrderRequest,
@@ -12,6 +12,7 @@ from src.platform.exchanges import (
     InstrumentRule,
     Kline,
     Order,
+    OrderQuery,
     OrderRequest,
     OrderSide,
     OrderStatus,
@@ -39,9 +40,11 @@ __all__ = [
     "Kline",
     "MarketDataFeed",
     "MarketProfile",
+    "LiveTradingBlocked",
     "MultiExchangeExecutionClient",
     "RiskCheckError",
     "Order",
+    "OrderQuery",
     "OrderRequest",
     "OrderSide",
     "OrderStatus",
