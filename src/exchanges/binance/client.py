@@ -1,257 +1,322 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-@Author     : Zijun Deng
-@Date       : 2026/06/13
-@File       : client.py
-@Description: Binance broker adapter.
-
-No-arg construction produces a shell that raises UNSUPPORTED_OPERATION on
-every method — compatible with the contract established in earlier commits.
-
-When api_key, api_secret, and an injected transport are supplied the client
-builds signed REST requests, sends them through the transport, and maps the
-responses back into the exchange-agnostic Broker* DTOs.
-"""
-
 from __future__ import annotations
 
-from typing import Sequence
+import hashlib
+import hmac
+import time
+from decimal import Decimal
+from typing import Any, Mapping
+from urllib.parse import urlencode
 
-from src.exchanges.base import BrokerClient
-from src.exchanges.binance.errors import binance_unsupported
-from src.exchanges.binance.mapper import (
-    BINANCE_ETH_USDT_SYMBOL,
-    assert_binance_ethusdt_symbol,
-    map_binance_error,
-    map_binance_order,
-    map_binance_position,
-)
-from src.exchanges.binance.request_mapper import broker_order_request_to_binance_params
-from src.exchanges.binance.signing import (
-    BINANCE_USDM_BASE_URL,
-    BINANCE_USDM_OPEN_ORDERS_PATH,
-    BINANCE_USDM_ORDER_PATH,
-    BINANCE_USDM_POSITION_RISK_PATH,
-    build_signed_request,
-)
-from src.exchanges.binance.transport import BinanceHttpTransport, BinanceTransportResponse
-from src.exchanges.errors import ExchangeError, ExchangeErrorKind
+from src.exchanges.errors import ExchangeConfigError, ExchangeMappingError
 from src.exchanges.models import (
-    BrokerCancelResult,
-    BrokerOrder,
-    BrokerOrderRequest,
-    BrokerOrderResult,
-    BrokerPosition,
+    Balance,
+    CancelOrderRequest,
+    ExchangeConfig,
     ExchangeName,
+    Kline,
+    MarginMode,
+    Order,
+    OrderRequest,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    Position,
+    PositionSide,
+    Ticker,
+    TimeInForce,
 )
+from src.exchanges.ports import HttpClient
+from src.exchanges.symbols import to_exchange_symbol
+
+BINANCE_PROD_REST_URL = "https://fapi.binance.com"
+BINANCE_TESTNET_REST_URL = "https://testnet.binancefuture.com"
+
+_BINANCE_ORDER_STATUS = {
+    "NEW": OrderStatus.NEW,
+    "PARTIALLY_FILLED": OrderStatus.PARTIALLY_FILLED,
+    "FILLED": OrderStatus.FILLED,
+    "CANCELED": OrderStatus.CANCELED,
+    "REJECTED": OrderStatus.REJECTED,
+    "EXPIRED": OrderStatus.CANCELED,
+}
 
 
-class BinanceBrokerClient(BrokerClient):
-    """Binance broker adapter.
+class BinanceExchangeClient:
+    """Binance USD-M futures adapter behind the unified ExchangeClient port."""
 
-    No-arg construction produces a shell that raises UNSUPPORTED_OPERATION on
-    every method.  Pass ``api_key``, ``api_secret``, and ``transport`` to
-    enable real (or fake) request dispatching.
-    """
-
-    def __init__(
-        self,
-        *,
-        api_key: str | None = None,
-        api_secret: str | None = None,
-        transport: BinanceHttpTransport | None = None,
-        base_url: str = BINANCE_USDM_BASE_URL,
-        recv_window: int = 5000,
-        position_mode: str = "net",
-    ) -> None:
-        self._api_key = api_key
-        self._api_secret = api_secret
-        self._transport = transport
-        self._base_url = base_url
-        self._recv_window = recv_window
-        self._position_mode = position_mode
-
-    # ------------------------------------------------------------------
-    # BrokerClient port
-    # ------------------------------------------------------------------
+    def __init__(self, *, config: ExchangeConfig, http_client: HttpClient) -> None:
+        self._config = config
+        self._http = http_client
+        self._base_url = BINANCE_TESTNET_REST_URL if config.sandbox else BINANCE_PROD_REST_URL
 
     @property
     def exchange(self) -> ExchangeName:
         return ExchangeName.BINANCE
 
-    async def place_order(self, request: BrokerOrderRequest) -> BrokerOrderResult:
-        self._ensure_transport("place_order")
+    async def get_server_time_ms(self) -> int:
+        payload = await self._request_public("GET", "/fapi/v1/time")
+        return int(payload["serverTime"])
 
-        params = broker_order_request_to_binance_params(
-            request,
-            position_mode=self._position_mode,
-        )
-
-        signed_request = build_signed_request(
-            method="POST",
-            path=BINANCE_USDM_ORDER_PATH,
-            params=params,
-            api_key=self._api_key or "",
-            api_secret=self._api_secret or "",
-            base_url=self._base_url,
-            recv_window=self._recv_window,
-        )
-
-        response = await self._transport.send(signed_request)  # type: ignore[union-attr]
-        self._raise_for_transport_response(response, operation="place_order")
-
-        if not isinstance(response.payload, dict):
-            raise map_binance_error(
-                status_code=response.status_code,
-                payload={"message": "Binance place_order payload is not a dict"},
-            )
-
-        order = map_binance_order(response.payload)
-
-        return BrokerOrderResult(
-            exchange=ExchangeName.BINANCE,
-            symbol=order.symbol,
-            ok=True,
-            order_id=order.order_id,
-            client_order_id=order.client_order_id,
-            order=order,
-            raw=response.payload,
-        )
-
-    async def cancel_order(self, symbol: str, order_id: str) -> BrokerCancelResult:
-        self._ensure_transport("cancel_order")
-        assert_binance_ethusdt_symbol(symbol)
-
-        if not order_id:
-            raise ValueError("order_id must not be empty")
-
-        signed_request = build_signed_request(
-            method="DELETE",
-            path=BINANCE_USDM_ORDER_PATH,
-            params={"symbol": symbol, "orderId": order_id},
-            api_key=self._api_key or "",
-            api_secret=self._api_secret or "",
-            base_url=self._base_url,
-            recv_window=self._recv_window,
-        )
-
-        response = await self._transport.send(signed_request)  # type: ignore[union-attr]
-        self._raise_for_transport_response(response, operation="cancel_order")
-
-        if not isinstance(response.payload, dict):
-            raise map_binance_error(
-                status_code=response.status_code,
-                payload={"message": "Binance cancel_order payload is not a dict"},
-            )
-
-        return BrokerCancelResult(
-            exchange=ExchangeName.BINANCE,
-            symbol=symbol,
-            ok=True,
-            order_id=str(response.payload.get("orderId")) if response.payload.get("orderId") is not None else order_id,
-            client_order_id=str(response.payload.get("clientOrderId")) if response.payload.get("clientOrderId") is not None else None,
-            raw=response.payload,
-        )
-
-    async def fetch_open_orders(self, symbol: str) -> Sequence[BrokerOrder]:
-        self._ensure_transport("fetch_open_orders")
-        assert_binance_ethusdt_symbol(symbol)
-
-        signed_request = build_signed_request(
-            method="GET",
-            path=BINANCE_USDM_OPEN_ORDERS_PATH,
-            params={"symbol": symbol},
-            api_key=self._api_key or "",
-            api_secret=self._api_secret or "",
-            base_url=self._base_url,
-            recv_window=self._recv_window,
-        )
-
-        response = await self._transport.send(signed_request)  # type: ignore[union-attr]
-        self._raise_for_transport_response(response, operation="fetch_open_orders")
-
-        if not isinstance(response.payload, list):
-            raise map_binance_error(
-                status_code=response.status_code,
-                payload={"message": "Binance fetch_open_orders payload is not a list"},
-            )
-
-        return [map_binance_order(item) for item in response.payload]
-
-    async def fetch_position(self, symbol: str) -> BrokerPosition | None:
-        self._ensure_transport("fetch_position")
-        assert_binance_ethusdt_symbol(symbol)
-
-        signed_request = build_signed_request(
-            method="GET",
-            path=BINANCE_USDM_POSITION_RISK_PATH,
-            params={"symbol": symbol},
-            api_key=self._api_key or "",
-            api_secret=self._api_secret or "",
-            base_url=self._base_url,
-            recv_window=self._recv_window,
-        )
-
-        response = await self._transport.send(signed_request)  # type: ignore[union-attr]
-        self._raise_for_transport_response(response, operation="fetch_position")
-
-        if not isinstance(response.payload, list):
-            raise map_binance_error(
-                status_code=response.status_code,
-                payload={"message": "Binance fetch_position payload is not a list"},
-            )
-
-        positions = [map_binance_position(item) for item in response.payload]
-        active_positions = [pos for pos in positions if pos is not None]
-
-        if not active_positions:
-            return None
-
-        if len(active_positions) > 1:
-            raise ExchangeError(
-                exchange=ExchangeName.BINANCE,
-                kind=ExchangeErrorKind.UNSUPPORTED_OPERATION,
-                message="fetch_position does not support simultaneous LONG and SHORT Binance hedge positions yet",
-                raw={"positions": response.payload},
-            )
-
-        return active_positions[0]
-
-    # ------------------------------------------------------------------
-    # Transport readiness helpers
-    # ------------------------------------------------------------------
-
-    def _has_transport(self) -> bool:
-        """Return True when all three transport ingredients are present."""
-        return bool(self._api_key and self._api_secret and self._transport)
-
-    def _ensure_transport(self, operation: str) -> None:
-        """Raise UNSUPPORTED_OPERATION if the transport is not wired."""
-        if not self._has_transport():
-            raise binance_unsupported(operation)
-
-    # ------------------------------------------------------------------
-    # Error handling
-    # ------------------------------------------------------------------
-
-    def _raise_for_transport_response(
+    async def fetch_klines(
         self,
-        response: BinanceTransportResponse,
+        symbol: str,
         *,
-        operation: str,
-    ) -> None:
-        """Inspect transport response and raise a mapped ExchangeError on failure."""
-        if response.status_code >= 400:
-            payload = (
-                response.payload
-                if isinstance(response.payload, dict)
-                else {"message": str(response.payload)}
-            )
-            raise map_binance_error(status_code=response.status_code, payload=payload)
+        interval: str,
+        limit: int = 100,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> list[Kline]:
+        raw_symbol = to_exchange_symbol(self.exchange, symbol)
+        params = {
+            "symbol": raw_symbol,
+            "interval": interval,
+            "limit": limit,
+            "startTime": start_time_ms,
+            "endTime": end_time_ms,
+        }
+        payload = await self._request_public("GET", "/fapi/v1/klines", params=params)
+        return [_map_binance_kline(row, symbol=symbol, raw_symbol=raw_symbol, interval=interval) for row in payload]
 
-        if isinstance(response.payload, dict) and "code" in response.payload and "msg" in response.payload:
-            raise map_binance_error(status_code=response.status_code, payload=response.payload)
+    async def fetch_ticker(self, symbol: str) -> Ticker:
+        raw_symbol = to_exchange_symbol(self.exchange, symbol)
+        payload = await self._request_public("GET", "/fapi/v1/ticker/price", params={"symbol": raw_symbol})
+        return Ticker(
+            exchange=self.exchange,
+            symbol=symbol,
+            raw_symbol=raw_symbol,
+            price=_decimal(payload.get("price"), field="price"),
+            time_ms=_optional_int(payload.get("time")),
+            raw=payload,
+        )
+
+    async def fetch_balance(self, asset: str = "USDT") -> Balance:
+        payload = await self._request_signed("GET", "/fapi/v3/balance")
+        selected = next((item for item in payload if item.get("asset") == asset), None)
+        if selected is None:
+            return Balance(exchange=self.exchange, asset=asset, total=Decimal("0"), available=Decimal("0"), raw={})
+        return Balance(
+            exchange=self.exchange,
+            asset=asset,
+            total=_decimal(selected.get("balance", "0"), field="balance"),
+            available=_decimal(selected.get("availableBalance", "0"), field="availableBalance"),
+            raw=selected,
+        )
+
+    async def fetch_positions(self, symbol: str | None = None) -> list[Position]:
+        params: dict[str, Any] = {}
+        if symbol is not None:
+            params["symbol"] = to_exchange_symbol(self.exchange, symbol)
+        payload = await self._request_signed("GET", "/fapi/v3/positionRisk", params=params)
+        return [_map_binance_position(row, fallback_symbol=symbol) for row in payload]
+
+    async def place_order(self, request: OrderRequest) -> Order:
+        raw_symbol = to_exchange_symbol(self.exchange, request.symbol)
+        params: dict[str, Any] = {
+            "symbol": raw_symbol,
+            "side": _map_binance_side(request.side),
+            "type": _map_binance_order_type(request.order_type),
+            "quantity": _decimal_to_str(request.quantity),
+        }
+        if request.price is not None:
+            params["price"] = _decimal_to_str(request.price)
+        if request.client_order_id:
+            params["newClientOrderId"] = request.client_order_id
+        if request.reduce_only:
+            params["reduceOnly"] = "true"
+        if request.position_side is not None and request.position_side != PositionSide.BOTH:
+            params["positionSide"] = request.position_side.value.upper()
+        if request.time_in_force is not None:
+            params["timeInForce"] = _map_binance_time_in_force(request.time_in_force)
+        elif request.order_type == OrderType.LIMIT:
+            params["timeInForce"] = "GTC"
+
+        payload = await self._request_signed("POST", "/fapi/v1/order", params=params)
+        return _map_binance_order(payload, symbol=request.symbol, raw_symbol=raw_symbol)
+
+    async def cancel_order(self, request: CancelOrderRequest) -> Order:
+        raw_symbol = to_exchange_symbol(self.exchange, request.symbol)
+        params: dict[str, Any] = {"symbol": raw_symbol}
+        if request.order_id:
+            params["orderId"] = request.order_id
+        if request.client_order_id:
+            params["origClientOrderId"] = request.client_order_id
+        payload = await self._request_signed("DELETE", "/fapi/v1/order", params=params)
+        return _map_binance_order(payload, symbol=request.symbol, raw_symbol=raw_symbol, fallback_status=OrderStatus.CANCELED)
+
+    async def _request_public(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+    ) -> Any:
+        return await self._http.request(
+            method,
+            f"{self._base_url}{path}",
+            params=_clean_params(params),
+            timeout_seconds=self._config.timeout_seconds,
+        )
+
+    async def _request_signed(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+    ) -> Any:
+        self._require_credentials()
+        signed_params: dict[str, Any] = dict(_clean_params(params))
+        signed_params["recvWindow"] = self._config.recv_window_ms
+        signed_params["timestamp"] = int(time.time() * 1000)
+        query = urlencode(signed_params)
+        signed_params["signature"] = hmac.new(
+            self._config.api_secret.encode("utf-8"),
+            query.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        headers = {"X-MBX-APIKEY": self._config.api_key, **dict(self._config.extra_headers)}
+        return await self._http.request(
+            method,
+            f"{self._base_url}{path}",
+            params=signed_params,
+            headers=headers,
+            timeout_seconds=self._config.timeout_seconds,
+        )
+
+    def _require_credentials(self) -> None:
+        if not self._config.api_key or not self._config.api_secret:
+            raise ExchangeConfigError("Binance private API requires api_key and api_secret")
 
 
-__all__ = ["BinanceBrokerClient"]
+def _map_binance_kline(row: list[Any], *, symbol: str, raw_symbol: str, interval: str) -> Kline:
+    if len(row) < 8:
+        raise ExchangeMappingError("Binance kline row is too short", payload=row)
+    return Kline(
+        exchange=ExchangeName.BINANCE,
+        symbol=symbol,
+        raw_symbol=raw_symbol,
+        interval=interval,
+        open_time_ms=int(row[0]),
+        close_time_ms=int(row[6]),
+        open=_decimal(row[1], field="open"),
+        high=_decimal(row[2], field="high"),
+        low=_decimal(row[3], field="low"),
+        close=_decimal(row[4], field="close"),
+        volume=_decimal(row[5], field="volume"),
+        quote_volume=_decimal(row[7], field="quote_volume"),
+        raw={"row": row},
+    )
+
+
+def _map_binance_position(row: Mapping[str, Any], *, fallback_symbol: str | None = None) -> Position:
+    raw_symbol = str(row.get("symbol") or "")
+    raw_side = str(row.get("positionSide") or "BOTH").upper()
+    side = {
+        "LONG": PositionSide.LONG,
+        "SHORT": PositionSide.SHORT,
+        "BOTH": PositionSide.BOTH,
+    }.get(raw_side, PositionSide.BOTH)
+    return Position(
+        exchange=ExchangeName.BINANCE,
+        symbol=fallback_symbol or "ETH-USDT-PERP",
+        raw_symbol=raw_symbol,
+        side=side,
+        quantity=_decimal(row.get("positionAmt", "0"), field="positionAmt"),
+        entry_price=_optional_decimal(row.get("entryPrice")),
+        unrealized_pnl=_optional_decimal(row.get("unRealizedProfit")),
+        leverage=_optional_decimal(row.get("leverage")),
+        raw=row,
+    )
+
+
+def _map_binance_order(
+    payload: Mapping[str, Any],
+    *,
+    symbol: str,
+    raw_symbol: str,
+    fallback_status: OrderStatus = OrderStatus.NEW,
+) -> Order:
+    return Order(
+        exchange=ExchangeName.BINANCE,
+        symbol=symbol,
+        raw_symbol=raw_symbol,
+        order_id=_optional_str(payload.get("orderId")),
+        client_order_id=_optional_str(payload.get("clientOrderId")),
+        status=_BINANCE_ORDER_STATUS.get(str(payload.get("status", "")).upper(), fallback_status),
+        side=_optional_order_side(payload.get("side")),
+        order_type=_optional_order_type(payload.get("type")),
+        price=_optional_decimal(payload.get("price")),
+        quantity=_optional_decimal(payload.get("origQty")),
+        filled_quantity=_optional_decimal(payload.get("executedQty")),
+        raw=payload,
+    )
+
+
+def _map_binance_side(side: OrderSide) -> str:
+    return "BUY" if side == OrderSide.BUY else "SELL"
+
+
+def _map_binance_order_type(order_type: OrderType) -> str:
+    return "MARKET" if order_type == OrderType.MARKET else "LIMIT"
+
+
+def _map_binance_time_in_force(tif: TimeInForce) -> str:
+    return {
+        TimeInForce.GTC: "GTC",
+        TimeInForce.IOC: "IOC",
+        TimeInForce.FOK: "FOK",
+        TimeInForce.POST_ONLY: "GTX",
+    }[tif]
+
+
+def _clean_params(params: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not params:
+        return {}
+    return {key: value for key, value in params.items() if value is not None}
+
+
+def _decimal(value: Any, *, field: str) -> Decimal:
+    try:
+        return Decimal(str(value))
+    except Exception as exc:
+        raise ExchangeMappingError(f"Invalid decimal for {field}: {value!r}") from exc
+
+
+def _optional_decimal(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    return Decimal(str(value))
+
+
+def _optional_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    return int(value)
+
+
+def _optional_str(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    return str(value)
+
+
+def _optional_order_side(value: Any) -> OrderSide | None:
+    text = str(value or "").upper()
+    if text == "BUY":
+        return OrderSide.BUY
+    if text == "SELL":
+        return OrderSide.SELL
+    return None
+
+
+def _optional_order_type(value: Any) -> OrderType | None:
+    text = str(value or "").upper()
+    if text == "MARKET":
+        return OrderType.MARKET
+    if text == "LIMIT":
+        return OrderType.LIMIT
+    return None
+
+
+def _decimal_to_str(value: Decimal) -> str:
+    return format(value.normalize(), "f")

@@ -1,16 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-@Author     : Zijun Deng
-@Date       : 2026/06/12
-@File       : models.py
-@Description: Generic broker DTOs and enums.
-
-These models are exchange-agnostic.  No OKX / Binance / Bybit private fields
-are allowed as first-class attributes.  Exchange-specific raw data is stored in
-``raw`` or ``metadata`` (both ``Mapping[str, Any]``).
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -19,165 +6,151 @@ from enum import Enum
 from typing import Any, Mapping
 
 
-# ---------------------------------------------------------------------------
-# Enums
-# ---------------------------------------------------------------------------
-
-
 class ExchangeName(str, Enum):
     OKX = "okx"
     BINANCE = "binance"
-    BYBIT = "bybit"
+
+
+class OrderSide(str, Enum):
+    BUY = "buy"
+    SELL = "sell"
+
+
+class OrderType(str, Enum):
+    MARKET = "market"
+    LIMIT = "limit"
+
+
+class OrderStatus(str, Enum):
+    NEW = "new"
+    PARTIALLY_FILLED = "partially_filled"
+    FILLED = "filled"
+    CANCELED = "canceled"
+    REJECTED = "rejected"
     UNKNOWN = "unknown"
 
 
-class BrokerMarketType(str, Enum):
-    SPOT = "SPOT"
-    MARGIN = "MARGIN"
-    SWAP = "SWAP"
-    FUTURES = "FUTURES"
+class PositionSide(str, Enum):
+    LONG = "long"
+    SHORT = "short"
+    BOTH = "both"
 
 
-class BrokerPositionMode(str, Enum):
-    NET = "NET"
-    HEDGE = "HEDGE"
+class TimeInForce(str, Enum):
+    GTC = "gtc"
+    IOC = "ioc"
+    FOK = "fok"
+    POST_ONLY = "post_only"
 
 
-class BrokerPositionSide(str, Enum):
-    LONG = "LONG"
-    SHORT = "SHORT"
-    NET = "NET"
-    UNKNOWN = "UNKNOWN"
-
-
-class BrokerOrderSide(str, Enum):
-    BUY = "BUY"
-    SELL = "SELL"
-    UNKNOWN = "UNKNOWN"
-
-
-class BrokerOrderType(str, Enum):
-    MARKET = "MARKET"
-    LIMIT = "LIMIT"
-    STOP_MARKET = "STOP_MARKET"
-    TAKE_PROFIT_MARKET = "TAKE_PROFIT_MARKET"
-    UNKNOWN = "UNKNOWN"
-
-
-class BrokerOrderStatus(str, Enum):
-    OPEN = "OPEN"
-    PARTIALLY_FILLED = "PARTIALLY_FILLED"
-    FILLED = "FILLED"
-    CANCELED = "CANCELED"
-    REJECTED = "REJECTED"
-    EXPIRED = "EXPIRED"
-    UNKNOWN = "UNKNOWN"
-
-
-class BrokerQuantityUnit(str, Enum):
-    CONTRACTS = "CONTRACTS"
-    BASE_ASSET = "BASE_ASSET"
-    QUOTE_ASSET = "QUOTE_ASSET"
-
-
-# ---------------------------------------------------------------------------
-# Dataclass DTOs
-# ---------------------------------------------------------------------------
+class MarginMode(str, Enum):
+    CROSS = "cross"
+    ISOLATED = "isolated"
 
 
 @dataclass(frozen=True)
-class BrokerSymbol:
+class ExchangeConfig:
+    """Runtime config passed into exchange adapters.
+
+    Keep secrets here instead of letting business modules read env variables.
+    The adapter decides how to sign and map requests.
+    """
+
+    api_key: str = ""
+    api_secret: str = ""
+    passphrase: str = ""  # OKX only.
+    sandbox: bool = False
+    timeout_seconds: float = 10.0
+    recv_window_ms: int = 5000  # Binance signed request window.
+    default_margin_mode: MarginMode = MarginMode.CROSS
+    extra_headers: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Kline:
     exchange: ExchangeName
+    symbol: str
     raw_symbol: str
-    base_asset: str
-    quote_asset: str
-    market_type: BrokerMarketType
-    contract_type: str | None = None
-    metadata: Mapping[str, Any] = field(default_factory=dict)
+    interval: str
+    open_time_ms: int
+    close_time_ms: int
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
+    quote_volume: Decimal | None = None
+    raw: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
-class BrokerOrder:
+class Ticker:
     exchange: ExchangeName
     symbol: str
-    order_id: str | None
-    client_order_id: str | None
-    side: BrokerOrderSide
-    position_side: BrokerPositionSide
-    order_type: BrokerOrderType
-    status: BrokerOrderStatus
-    price: Decimal | None
-    quantity: Decimal | None
-    quantity_unit: BrokerQuantityUnit | None
-    filled_quantity: Decimal | None = None
-    average_price: Decimal | None = None
-    reduce_only: bool = False
-    trigger_price: Decimal | None = None
+    raw_symbol: str
+    price: Decimal
+    time_ms: int | None = None
     raw: Mapping[str, Any] = field(default_factory=dict)
-    metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
-class BrokerPosition:
-    exchange: ExchangeName
-    symbol: str
-    position_side: BrokerPositionSide
-    quantity: Decimal
-    quantity_unit: BrokerQuantityUnit
-    average_entry_price: Decimal | None = None
-    mark_price: Decimal | None = None
-    unrealized_pnl: Decimal | None = None
-    leverage: Decimal | None = None
-    raw: Mapping[str, Any] = field(default_factory=dict)
-    metadata: Mapping[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class BrokerBalance:
+class Balance:
     exchange: ExchangeName
     asset: str
     total: Decimal
-    available: Decimal | None = None
-    frozen: Decimal | None = None
+    available: Decimal
     raw: Mapping[str, Any] = field(default_factory=dict)
-    metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
-class BrokerOrderRequest:
+class Position:
     exchange: ExchangeName
     symbol: str
-    side: BrokerOrderSide
-    position_side: BrokerPositionSide
-    order_type: BrokerOrderType
+    raw_symbol: str
+    side: PositionSide
     quantity: Decimal
-    quantity_unit: BrokerQuantityUnit
-    price: Decimal | None = None
-    trigger_price: Decimal | None = None
-    reduce_only: bool = False
-    close_position: bool = False
-    client_order_id: str | None = None
-    metadata: Mapping[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class BrokerOrderResult:
-    exchange: ExchangeName
-    symbol: str
-    ok: bool
-    order_id: str | None = None
-    client_order_id: str | None = None
-    order: BrokerOrder | None = None
-    message: str = ""
+    entry_price: Decimal | None = None
+    unrealized_pnl: Decimal | None = None
+    leverage: Decimal | None = None
     raw: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
-class BrokerCancelResult:
-    exchange: ExchangeName
+class OrderRequest:
     symbol: str
-    ok: bool
+    side: OrderSide
+    order_type: OrderType
+    quantity: Decimal
+    price: Decimal | None = None
+    client_order_id: str | None = None
+    reduce_only: bool = False
+    position_side: PositionSide | None = None
+    margin_mode: MarginMode | None = None
+    time_in_force: TimeInForce | None = None
+
+
+@dataclass(frozen=True)
+class CancelOrderRequest:
+    symbol: str
     order_id: str | None = None
     client_order_id: str | None = None
-    message: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.order_id and not self.client_order_id:
+            raise ValueError("order_id or client_order_id is required")
+
+
+@dataclass(frozen=True)
+class Order:
+    exchange: ExchangeName
+    symbol: str
+    raw_symbol: str
+    order_id: str | None
+    client_order_id: str | None
+    status: OrderStatus
+    side: OrderSide | None = None
+    order_type: OrderType | None = None
+    price: Decimal | None = None
+    quantity: Decimal | None = None
+    filled_quantity: Decimal | None = None
     raw: Mapping[str, Any] = field(default_factory=dict)

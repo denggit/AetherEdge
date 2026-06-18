@@ -1,432 +1,336 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-@Author     : Zijun Deng
-@Date       : 2026/06/12
-@File       : client.py
-@Description: OKX BrokerClient adapter.
-
-This module wraps a trader-like object behind the generic BrokerClient port.
-It does not instantiate Trader and is not wired into the live execution path.
-"""
-
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
+from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
+from urllib.parse import urlencode
 
-from src.execution import order_specs
-from src.exchanges.base import BrokerClient
-from src.exchanges.errors import ExchangeError, ExchangeErrorKind
+from src.exchanges.errors import ExchangeApiError, ExchangeConfigError, ExchangeMappingError
 from src.exchanges.models import (
-    BrokerCancelResult,
-    BrokerOrder,
-    BrokerOrderRequest,
-    BrokerOrderResult,
-    BrokerOrderSide,
-    BrokerOrderType,
-    BrokerPosition,
-    BrokerPositionSide,
-    BrokerQuantityUnit,
+    Balance,
+    CancelOrderRequest,
+    ExchangeConfig,
     ExchangeName,
+    Kline,
+    MarginMode,
+    Order,
+    OrderRequest,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    Position,
+    PositionSide,
+    Ticker,
+    TimeInForce,
 )
-from src.exchanges.okx.mapper import (
-    broker_order_from_okx_pending_algo_order,
-    broker_order_from_okx_pending_order,
-)
+from src.exchanges.ports import HttpClient
+from src.exchanges.symbols import to_exchange_symbol
+
+OKX_PROD_REST_URL = "https://www.okx.com"
+OKX_DEMO_REST_URL = "https://www.okx.com"
+
+_OKX_ORDER_STATUS = {
+    "live": OrderStatus.NEW,
+    "partially_filled": OrderStatus.PARTIALLY_FILLED,
+    "filled": OrderStatus.FILLED,
+    "canceled": OrderStatus.CANCELED,
+}
 
 
-class OkxBrokerClient(BrokerClient):
-    """OKX adapter for the generic broker port.
+class OkxExchangeClient:
+    """OKX USDⓈ perpetual adapter behind the unified ExchangeClient port."""
 
-    The injected trader provides exchange-agnostic config fields
-    (symbol, td_mode, pos_side_mode) and formatting helpers
-    (decimal_to_str, price_to_str, extract_order_id, extract_algo_id).
-
-    REST calls are issued through *private_client* directly — the
-    broker client no longer tunnels them through Trader.request().
-    """
-
-    def __init__(
-        self,
-        trader: Any,
-        *,
-        private_client: Any,
-        rate_limiter: Any | None = None,
-    ) -> None:
-        self._trader = trader
-        self._client = private_client
-        self._rate_limiter = rate_limiter
-
-    async def _request(
-        self,
-        method: str,
-        endpoint: str,
-        payload: Any | None = None,
-    ) -> dict[str, Any]:
-        """Rate-limited REST call through the injected private client."""
-        if method.upper() == "POST" and self._rate_limiter is not None:
-            await self._rate_limiter.acquire()
-        return await self._client.request(method, endpoint, payload)
+    def __init__(self, *, config: ExchangeConfig, http_client: HttpClient) -> None:
+        self._config = config
+        self._http = http_client
+        self._base_url = OKX_DEMO_REST_URL if config.sandbox else OKX_PROD_REST_URL
 
     @property
     def exchange(self) -> ExchangeName:
         return ExchangeName.OKX
 
-    async def place_order(self, request: BrokerOrderRequest) -> BrokerOrderResult:
-        self._validate_request_basics(request)
+    async def get_server_time_ms(self) -> int:
+        payload = await self._request_public("GET", "/api/v5/public/time")
+        data = _first_data(payload, "OKX server time")
+        return int(data["ts"])
 
-        if request.order_type == BrokerOrderType.STOP_MARKET:
-            return await self.place_protective_stop_order(request)
-
-        side = _to_legacy_position_side(request.position_side)
-        contracts_text = self._format_decimal(request.quantity)
-
-        if request.order_type == BrokerOrderType.MARKET and not request.reduce_only:
-            body = order_specs.build_market_entry_order_body(
-                inst_id=request.symbol,
-                td_mode=self._td_mode(),
-                side=side,
-                contracts_text=contracts_text,
-                pos_side_mode=self._pos_side_mode(),
-            )
-            res = await self._request("POST", "/api/v5/trade/order", body)
-            return self._order_result(request, res, order_id=self._extract_order_id(res))
-
-        if request.order_type == BrokerOrderType.MARKET and request.reduce_only:
-            body = order_specs.build_reduce_only_market_order_body(
-                inst_id=request.symbol,
-                td_mode=self._td_mode(),
-                side=side,
-                contracts_text=contracts_text,
-                pos_side_mode=self._pos_side_mode(),
-            )
-            res = await self._request("POST", "/api/v5/trade/order", body)
-            return self._order_result(request, res, order_id=self._extract_order_id(res))
-
-        if request.order_type == BrokerOrderType.LIMIT and request.reduce_only:
-            if request.price is None:
-                raise _exchange_error(
-                    ExchangeErrorKind.INVALID_PRICE,
-                    "LIMIT reduce-only order requires price",
-                )
-            body = order_specs.build_reduce_only_tp_order_body(
-                inst_id=request.symbol,
-                td_mode=self._td_mode(),
-                side=side,
-                contracts_text=contracts_text,
-                price_text=self._format_price(request.price),
-                pos_side_mode=self._pos_side_mode(),
-                client_order_id=request.client_order_id,
-            )
-            res = await self._request("POST", "/api/v5/trade/order", body)
-            return self._order_result(request, res, order_id=self._extract_order_id(res))
-
-        raise _exchange_error(
-            ExchangeErrorKind.UNSUPPORTED_OPERATION,
-            f"Unsupported OKX order mapping: {request.order_type.value}",
-        )
-
-    async def place_protective_stop_order(
-        self,
-        request: BrokerOrderRequest,
-    ) -> BrokerOrderResult:
-        self._validate_request_basics(request)
-        if request.trigger_price is None:
-            raise _exchange_error(
-                ExchangeErrorKind.INVALID_PRICE,
-                "STOP_MARKET order requires trigger_price",
-            )
-        if request.order_type != BrokerOrderType.STOP_MARKET:
-            raise _exchange_error(
-                ExchangeErrorKind.UNSUPPORTED_OPERATION,
-                "protective stop requires STOP_MARKET order type",
-            )
-
-        body = order_specs.build_conditional_protective_sl_algo_body(
-            inst_id=request.symbol,
-            td_mode=self._td_mode(),
-            side=_to_legacy_position_side(request.position_side),
-            contracts_text=self._format_decimal(request.quantity),
-            stop_price_text=self._format_price(request.trigger_price),
-            pos_side_mode=self._pos_side_mode(),
-        )
-        res = await self._request("POST", "/api/v5/trade/order-algo", body)
-        return self._order_result(request, res, order_id=self._extract_algo_id(res))
-
-    async def cancel_order(self, symbol: str, order_id: str) -> BrokerCancelResult:
-        res = await self._request(
-            "POST",
-            "/api/v5/trade/cancel-order",
-            order_specs.build_cancel_order_body(inst_id=symbol, order_id=order_id),
-        )
-        return BrokerCancelResult(
-            exchange=ExchangeName.OKX,
-            symbol=symbol,
-            ok=True,
-            order_id=order_id,
-            raw=res,
-        )
-
-    async def cancel_algo_order(
+    async def fetch_klines(
         self,
         symbol: str,
-        algo_id: str,
-    ) -> BrokerCancelResult:
-        res = await self._request(
-            "POST",
-            "/api/v5/trade/cancel-algos",
-            order_specs.build_cancel_algo_body(inst_id=symbol, algo_id=algo_id),
-        )
-        return BrokerCancelResult(
-            exchange=ExchangeName.OKX,
-            symbol=symbol,
-            ok=True,
-            order_id=algo_id,
-            raw=res,
-        )
-
-    async def fetch_open_orders(self, symbol: str) -> Sequence[BrokerOrder]:
-        raw = await self._request(
-            "GET",
-            f"/api/v5/trade/orders-pending?instId={symbol}",
-        )
-        raw_orders = _response_data(raw)
-
-        return tuple(
-            broker_order_from_okx_pending_order(item)
-            for item in raw_orders
-            if item.get("instId") == symbol
-        )
-
-    async def fetch_algo_orders(self, symbol: str) -> Sequence[BrokerOrder]:
-        raw = await self._request(
-            "GET",
-            f"/api/v5/trade/orders-algo-pending?instId={symbol}&ordType=conditional",
-        )
-        raw_orders = _response_data(raw)
-
-        return tuple(
-            broker_order_from_okx_pending_algo_order(item)
-            for item in raw_orders
-            if item.get("instId") == symbol
-        )
-
-    async def fetch_position(self, symbol: str) -> BrokerPosition | None:
-        fetch_position_snapshot = getattr(self._trader, "fetch_position_snapshot", None)
-        if not callable(fetch_position_snapshot):
-            raise _exchange_error(
-                ExchangeErrorKind.UNSUPPORTED_OPERATION,
-                "trader does not support fetch_position_snapshot",
-            )
-
-        snapshot = await fetch_position_snapshot()
-        if snapshot is None:
-            return None
-
-        contracts = getattr(snapshot, "contracts", Decimal("0"))
-        if not isinstance(contracts, Decimal):
-            contracts = Decimal(str(contracts))
-
-        side = getattr(snapshot, "side", None)
-        if side is None or contracts <= 0:
-            return None
-
-        position_side = _broker_position_side_from_legacy(side)
-        avg_entry = getattr(snapshot, "avg_entry_price", None)
-        average_entry_price = (
-            Decimal(str(avg_entry))
-            if avg_entry is not None and str(avg_entry) != ""
-            else None
-        )
-
-        return BrokerPosition(
-            exchange=ExchangeName.OKX,
-            symbol=symbol,
-            position_side=position_side,
-            quantity=contracts,
-            quantity_unit=BrokerQuantityUnit.CONTRACTS,
-            average_entry_price=average_entry_price,
-            raw={"source": "legacy_position_snapshot"},
-            metadata={"source": "legacy_position_snapshot"},
-        )
-
-    def _validate_request_basics(self, request: BrokerOrderRequest) -> None:
-        if request.exchange != ExchangeName.OKX:
-            raise _exchange_error(
-                ExchangeErrorKind.UNSUPPORTED_OPERATION,
-                f"OkxBrokerClient cannot place {request.exchange.value} orders",
-            )
-        if request.quantity_unit != BrokerQuantityUnit.CONTRACTS:
-            raise _exchange_error(
-                ExchangeErrorKind.UNSUPPORTED_OPERATION,
-                "OkxBrokerClient expects quantity in contracts",
-            )
-        if request.quantity <= 0:
-            raise _exchange_error(
-                ExchangeErrorKind.INVALID_ORDER_SIZE,
-                "Order quantity must be positive",
-            )
-        if request.side not in {
-            BrokerOrderSide.BUY,
-            BrokerOrderSide.SELL,
-        }:
-            raise _exchange_error(
-                ExchangeErrorKind.UNSUPPORTED_OPERATION,
-                f"Unsupported order side: {request.side.value}",
-            )
-
-    def _order_result(
-        self,
-        request: BrokerOrderRequest,
-        raw: Mapping[str, Any],
         *,
-        order_id: str,
-    ) -> BrokerOrderResult:
-        return BrokerOrderResult(
-            exchange=ExchangeName.OKX,
+        interval: str,
+        limit: int = 100,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+    ) -> list[Kline]:
+        raw_symbol = to_exchange_symbol(self.exchange, symbol)
+        params: dict[str, Any] = {"instId": raw_symbol, "bar": interval, "limit": limit}
+        if start_time_ms is not None:
+            params["after"] = start_time_ms
+        if end_time_ms is not None:
+            params["before"] = end_time_ms
+        payload = await self._request_public("GET", "/api/v5/market/candles", params=params)
+        return [_map_okx_kline(row, symbol=symbol, raw_symbol=raw_symbol, interval=interval) for row in payload.get("data", [])]
+
+    async def fetch_ticker(self, symbol: str) -> Ticker:
+        raw_symbol = to_exchange_symbol(self.exchange, symbol)
+        payload = await self._request_public("GET", "/api/v5/market/ticker", params={"instId": raw_symbol})
+        data = _first_data(payload, "OKX ticker")
+        return Ticker(
+            exchange=self.exchange,
+            symbol=symbol,
+            raw_symbol=raw_symbol,
+            price=_decimal(data.get("last"), field="last"),
+            time_ms=_optional_int(data.get("ts")),
+            raw=data,
+        )
+
+    async def fetch_balance(self, asset: str = "USDT") -> Balance:
+        payload = await self._request_private("GET", "/api/v5/account/balance", params={"ccy": asset})
+        account = _first_data(payload, "OKX balance")
+        details = account.get("details") or []
+        selected = next((item for item in details if item.get("ccy") == asset), None)
+        if selected is None:
+            return Balance(exchange=self.exchange, asset=asset, total=Decimal("0"), available=Decimal("0"), raw=account)
+        return Balance(
+            exchange=self.exchange,
+            asset=asset,
+            total=_decimal(selected.get("cashBal", "0"), field="cashBal"),
+            available=_decimal(selected.get("availBal", "0"), field="availBal"),
+            raw=selected,
+        )
+
+    async def fetch_positions(self, symbol: str | None = None) -> list[Position]:
+        params: dict[str, Any] = {}
+        if symbol is not None:
+            params["instId"] = to_exchange_symbol(self.exchange, symbol)
+        payload = await self._request_private("GET", "/api/v5/account/positions", params=params)
+        rows = payload.get("data", [])
+        return [_map_okx_position(row, fallback_symbol=symbol) for row in rows]
+
+    async def place_order(self, request: OrderRequest) -> Order:
+        raw_symbol = to_exchange_symbol(self.exchange, request.symbol)
+        body: dict[str, Any] = {
+            "instId": raw_symbol,
+            "tdMode": _map_okx_margin_mode(request.margin_mode or self._config.default_margin_mode),
+            "side": _map_okx_side(request.side),
+            "ordType": _map_okx_order_type(request.order_type, request.time_in_force),
+            "sz": _decimal_to_str(request.quantity),
+        }
+        if request.price is not None:
+            body["px"] = _decimal_to_str(request.price)
+        if request.client_order_id:
+            body["clOrdId"] = request.client_order_id
+        if request.reduce_only:
+            body["reduceOnly"] = "true"
+        if request.position_side is not None and request.position_side != PositionSide.BOTH:
+            body["posSide"] = request.position_side.value
+
+        payload = await self._request_private("POST", "/api/v5/trade/order", json_body=body)
+        data = _first_data(payload, "OKX place order")
+        status = OrderStatus.REJECTED if str(data.get("sCode", "0")) != "0" else OrderStatus.NEW
+        return Order(
+            exchange=self.exchange,
             symbol=request.symbol,
-            ok=True,
-            order_id=order_id,
-            client_order_id=request.client_order_id,
-            raw=raw,
+            raw_symbol=raw_symbol,
+            order_id=_optional_str(data.get("ordId")),
+            client_order_id=_optional_str(data.get("clOrdId")) or request.client_order_id,
+            status=status,
+            side=request.side,
+            order_type=request.order_type,
+            price=request.price,
+            quantity=request.quantity,
+            raw=data,
         )
 
-    def _extract_order_id(self, res: Mapping[str, Any]) -> str:
-        extractor = getattr(self._trader, "extract_order_id", None)
-        if callable(extractor):
-            try:
-                order_id = extractor(res)
-                if order_id:
-                    return str(order_id)
-            except Exception:
-                pass
-        return _extract_order_id(res)
-
-    def _extract_algo_id(self, res: Mapping[str, Any]) -> str:
-        extractor = getattr(self._trader, "extract_algo_id", None)
-        if callable(extractor):
-            try:
-                algo_id = extractor(res)
-                if algo_id:
-                    return str(algo_id)
-            except Exception:
-                pass
-        return _extract_algo_id(res)
-
-    def _format_decimal(self, value: Decimal) -> str:
-        formatter = getattr(self._trader, "decimal_to_str", None)
-        if callable(formatter):
-            return str(formatter(value))
-        return _format_decimal(value)
-
-    def _format_price(self, value: Decimal) -> str:
-        formatter = getattr(self._trader, "price_to_str", None)
-        if callable(formatter):
-            return str(formatter(float(value)))
-        return _format_decimal(value)
-
-    def _td_mode(self) -> str:
-        return str(getattr(self._trader, "td_mode"))
-
-    def _pos_side_mode(self) -> str:
-        return str(getattr(self._trader, "pos_side_mode"))
-
-
-class OkxBrokerClientNotWired:
-    """Compatibility placeholder retained for older skeleton-step imports."""
-
-    @property
-    def exchange(self) -> ExchangeName:
-        return ExchangeName.OKX
-
-    def _not_wired(self) -> None:
-        raise _exchange_error(
-            ExchangeErrorKind.UNSUPPORTED_OPERATION,
-            "OKX broker client is not wired into the live path.",
+    async def cancel_order(self, request: CancelOrderRequest) -> Order:
+        raw_symbol = to_exchange_symbol(self.exchange, request.symbol)
+        body: dict[str, Any] = {"instId": raw_symbol}
+        if request.order_id:
+            body["ordId"] = request.order_id
+        if request.client_order_id:
+            body["clOrdId"] = request.client_order_id
+        payload = await self._request_private("POST", "/api/v5/trade/cancel-order", json_body=body)
+        data = _first_data(payload, "OKX cancel order")
+        status = OrderStatus.REJECTED if str(data.get("sCode", "0")) != "0" else OrderStatus.CANCELED
+        return Order(
+            exchange=self.exchange,
+            symbol=request.symbol,
+            raw_symbol=raw_symbol,
+            order_id=_optional_str(data.get("ordId")) or request.order_id,
+            client_order_id=_optional_str(data.get("clOrdId")) or request.client_order_id,
+            status=status,
+            raw=data,
         )
 
+    async def _request_public(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+    ) -> Any:
+        return await self._http.request(
+            method,
+            f"{self._base_url}{path}",
+            params=params,
+            timeout_seconds=self._config.timeout_seconds,
+        )
 
-def _to_legacy_position_side(side: BrokerPositionSide) -> str:
-    if side == BrokerPositionSide.LONG:
-        return "LONG"
-    if side == BrokerPositionSide.SHORT:
-        return "SHORT"
-    raise _exchange_error(
-        ExchangeErrorKind.UNSUPPORTED_OPERATION,
-        f"Unsupported position side: {side.value}",
+    async def _request_private(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        json_body: Mapping[str, Any] | None = None,
+    ) -> Any:
+        self._require_credentials()
+        method = method.upper()
+        timestamp = _okx_timestamp()
+        request_path = path
+        if params:
+            request_path = f"{path}?{urlencode({k: v for k, v in params.items() if v is not None})}"
+        body_text = "" if json_body is None else json.dumps(json_body, separators=(",", ":"))
+        sign_payload = f"{timestamp}{method}{request_path}{body_text}"
+        signature = base64.b64encode(
+            hmac.new(
+                self._config.api_secret.encode("utf-8"),
+                sign_payload.encode("utf-8"),
+                hashlib.sha256,
+            ).digest()
+        ).decode("utf-8")
+        headers = {
+            "OK-ACCESS-KEY": self._config.api_key,
+            "OK-ACCESS-SIGN": signature,
+            "OK-ACCESS-TIMESTAMP": timestamp,
+            "OK-ACCESS-PASSPHRASE": self._config.passphrase,
+            **dict(self._config.extra_headers),
+        }
+        if self._config.sandbox:
+            headers["x-simulated-trading"] = "1"
+        return await self._http.request(
+            method,
+            f"{self._base_url}{path}",
+            params=params,
+            json_body=json_body,
+            headers=headers,
+            timeout_seconds=self._config.timeout_seconds,
+        )
+
+    def _require_credentials(self) -> None:
+        if not self._config.api_key or not self._config.api_secret or not self._config.passphrase:
+            raise ExchangeConfigError("OKX private API requires api_key, api_secret and passphrase")
+
+
+def _okx_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _map_okx_kline(row: list[Any], *, symbol: str, raw_symbol: str, interval: str) -> Kline:
+    if len(row) < 6:
+        raise ExchangeMappingError("OKX kline row is too short", payload=row)
+    open_time_ms = int(row[0])
+    return Kline(
+        exchange=ExchangeName.OKX,
+        symbol=symbol,
+        raw_symbol=raw_symbol,
+        interval=interval,
+        open_time_ms=open_time_ms,
+        close_time_ms=open_time_ms,
+        open=_decimal(row[1], field="open"),
+        high=_decimal(row[2], field="high"),
+        low=_decimal(row[3], field="low"),
+        close=_decimal(row[4], field="close"),
+        volume=_decimal(row[5], field="volume"),
+        quote_volume=_decimal(row[7], field="quote_volume") if len(row) > 7 else None,
+        raw={"row": row},
     )
 
 
-def _broker_position_side_from_legacy(side: Any) -> BrokerPositionSide:
-    if side == "LONG" or side == BrokerPositionSide.LONG:
-        return BrokerPositionSide.LONG
-    if side == "SHORT" or side == BrokerPositionSide.SHORT:
-        return BrokerPositionSide.SHORT
-    if side == "NET" or side == BrokerPositionSide.NET:
-        return BrokerPositionSide.NET
-    return BrokerPositionSide.UNKNOWN
+def _map_okx_position(row: Mapping[str, Any], *, fallback_symbol: str | None = None) -> Position:
+    raw_symbol = str(row.get("instId") or "")
+    symbol = fallback_symbol or "ETH-USDT-PERP"
+    raw_side = str(row.get("posSide") or "both").lower()
+    side = {
+        "long": PositionSide.LONG,
+        "short": PositionSide.SHORT,
+        "net": PositionSide.BOTH,
+        "both": PositionSide.BOTH,
+    }.get(raw_side, PositionSide.BOTH)
+    return Position(
+        exchange=ExchangeName.OKX,
+        symbol=symbol,
+        raw_symbol=raw_symbol,
+        side=side,
+        quantity=_decimal(row.get("pos", "0"), field="pos"),
+        entry_price=_optional_decimal(row.get("avgPx")),
+        unrealized_pnl=_optional_decimal(row.get("upl")),
+        leverage=_optional_decimal(row.get("lever")),
+        raw=row,
+    )
 
 
-def _format_decimal(value: Decimal) -> str:
+def _first_data(payload: Mapping[str, Any], context: str) -> Mapping[str, Any]:
+    if str(payload.get("code", "0")) != "0":
+        raise ExchangeApiError(f"{context} failed: {payload}", payload=payload)
+    data = payload.get("data")
+    if not isinstance(data, list) or not data:
+        raise ExchangeMappingError(f"{context} response has no data", payload=payload)
+    first = data[0]
+    if not isinstance(first, Mapping):
+        raise ExchangeMappingError(f"{context} first data item is invalid", payload=payload)
+    return first
+
+
+def _map_okx_side(side: OrderSide) -> str:
+    return "buy" if side == OrderSide.BUY else "sell"
+
+
+def _map_okx_order_type(order_type: OrderType, tif: TimeInForce | None) -> str:
+    if tif == TimeInForce.POST_ONLY:
+        return "post_only"
+    if tif == TimeInForce.FOK:
+        return "fok"
+    if tif == TimeInForce.IOC:
+        return "ioc"
+    if order_type == OrderType.MARKET:
+        return "market"
+    return "limit"
+
+
+def _map_okx_margin_mode(mode: MarginMode) -> str:
+    return "cross" if mode == MarginMode.CROSS else "isolated"
+
+
+def _decimal(value: Any, *, field: str) -> Decimal:
+    try:
+        return Decimal(str(value))
+    except Exception as exc:
+        raise ExchangeMappingError(f"Invalid decimal for {field}: {value!r}") from exc
+
+
+def _optional_decimal(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    return Decimal(str(value))
+
+
+def _optional_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    return int(value)
+
+
+def _optional_str(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    return str(value)
+
+
+def _decimal_to_str(value: Decimal) -> str:
     return format(value.normalize(), "f")
-
-
-def _extract_order_id(res: Mapping[str, Any]) -> str:
-    data = res.get("data")
-    if isinstance(data, Sequence) and data:
-        item = data[0]
-        if isinstance(item, Mapping) and item.get("ordId"):
-            return str(item["ordId"])
-    raise ExchangeError(
-        exchange=ExchangeName.OKX,
-        kind=ExchangeErrorKind.EXCHANGE_REJECTED,
-        message="Missing OKX order id in response",
-        raw=res,
-    )
-
-
-def _extract_algo_id(res: Mapping[str, Any]) -> str:
-    data = res.get("data")
-    if isinstance(data, Sequence) and data:
-        item = data[0]
-        if isinstance(item, Mapping):
-            algo_id = item.get("algoId") or item.get("ordId")
-            if algo_id:
-                return str(algo_id)
-    raise ExchangeError(
-        exchange=ExchangeName.OKX,
-        kind=ExchangeErrorKind.EXCHANGE_REJECTED,
-        message="Missing OKX order id in response",
-        raw=res,
-    )
-
-
-def _response_data(raw: Any) -> Sequence[Mapping[str, Any]]:
-    if isinstance(raw, Mapping):
-        data = raw.get("data")
-        if isinstance(data, Sequence) and not isinstance(data, (str, bytes)):
-            return tuple(item for item in data if isinstance(item, Mapping))
-        return ()
-    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
-        return tuple(item for item in raw if isinstance(item, Mapping))
-    return ()
-
-
-def _exchange_error(
-    kind: ExchangeErrorKind,
-    message: str,
-    raw: Mapping[str, Any] | None = None,
-) -> ExchangeError:
-    return ExchangeError(
-        exchange=ExchangeName.OKX,
-        kind=kind,
-        message=message,
-        raw=raw,
-    )
-
-
-__all__ = [
-    "OkxBrokerClient",
-    "OkxBrokerClientNotWired",
-]

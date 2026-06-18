@@ -1,50 +1,35 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-@Author     : Zijun Deng
-@Date       : 2026/06/13
-@File       : symbols.py
-@Description: Canonical symbol mapper – maps ETH-USDT-PERP to exchange-specific
-              raw symbols (OKX / Binance).
-
-This module is exchange-agnostic at the interface level.  It does NOT import
-any live, execution, strategy, or adapter code, and it does NOT read os.environ
-or any configuration file.
-"""
-
 from __future__ import annotations
 
 from src.exchanges.models import ExchangeName
-from src.exchanges.runtime_config import ExchangeRuntimeConfig
+
+CANONICAL_ETH_USDT_PERP = "ETH-USDT-PERP"
+OKX_ETH_USDT_SWAP = "ETH-USDT-SWAP"
+BINANCE_ETH_USDT_PERP = "ETHUSDT"
+
+_RAW_SYMBOL_BY_EXCHANGE = {
+    ExchangeName.OKX: {CANONICAL_ETH_USDT_PERP: OKX_ETH_USDT_SWAP},
+    ExchangeName.BINANCE: {CANONICAL_ETH_USDT_PERP: BINANCE_ETH_USDT_PERP},
+}
+
+_CANONICAL_SYMBOL_BY_EXCHANGE = {
+    exchange: {raw: canonical for canonical, raw in mapping.items()}
+    for exchange, mapping in _RAW_SYMBOL_BY_EXCHANGE.items()
+}
 
 
-SUPPORTED_CANONICAL_SYMBOL = "ETH-USDT-PERP"
-OKX_ETH_USDT_PERPETUAL_SYMBOL = "ETH-USDT-SWAP"
-BINANCE_ETH_USDT_PERPETUAL_SYMBOL = "ETHUSDT"
+def to_exchange_symbol(exchange: ExchangeName, canonical_symbol: str) -> str:
+    try:
+        return _RAW_SYMBOL_BY_EXCHANGE[exchange][canonical_symbol]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported symbol mapping: exchange={exchange.value}, symbol={canonical_symbol!r}"
+        ) from exc
 
 
-def assert_supported_canonical_symbol(canonical_symbol: str) -> None:
-    if canonical_symbol != SUPPORTED_CANONICAL_SYMBOL:
-        raise ValueError(f"Unsupported canonical symbol: {canonical_symbol}")
-
-
-def raw_symbol_for_exchange(
-    *,
-    exchange: ExchangeName,
-    canonical_symbol: str,
-) -> str:
-    assert_supported_canonical_symbol(canonical_symbol)
-
-    if exchange == ExchangeName.OKX:
-        return OKX_ETH_USDT_PERPETUAL_SYMBOL
-    if exchange == ExchangeName.BINANCE:
-        return BINANCE_ETH_USDT_PERPETUAL_SYMBOL
-
-    raise ValueError(f"Unsupported exchange for canonical symbol mapping: {exchange.value}")
-
-
-def raw_symbol_from_runtime_config(rt_cfg: ExchangeRuntimeConfig) -> str:
-    return raw_symbol_for_exchange(
-        exchange=rt_cfg.exchange,
-        canonical_symbol=rt_cfg.canonical_symbol,
-    )
+def to_canonical_symbol(exchange: ExchangeName, raw_symbol: str) -> str:
+    try:
+        return _CANONICAL_SYMBOL_BY_EXCHANGE[exchange][raw_symbol]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported raw symbol mapping: exchange={exchange.value}, raw_symbol={raw_symbol!r}"
+        ) from exc

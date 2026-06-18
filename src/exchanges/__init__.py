@@ -1,11 +1,40 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""
-@Author     : Zijun Deng
-@Date       : 2026/06/12
-@File       : __init__.py
-@Description: Exchange abstraction layer – ports and adapters.
+from src.exchanges.factory import create_exchange_client
+from src.exchanges.models import (
+    Balance,
+    CancelOrderRequest,
+    ExchangeConfig,
+    ExchangeName,
+    Kline,
+    MarginMode,
+    Order,
+    OrderRequest,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    Position,
+    PositionSide,
+    Ticker,
+    TimeInForce,
+)
+from src.exchanges.ports import ExchangeClient, HttpClient
 
-This package defines exchange adapters and low-level client primitives.
-Concrete adapters live in sub‑packages (okx/, binance/, …).
-"""
+__all__ = [
+    "Balance",
+    "CancelOrderRequest",
+    "ExchangeClient",
+    "ExchangeConfig",
+    "ExchangeName",
+    "HttpClient",
+    "Kline",
+    "MarginMode",
+    "Order",
+    "OrderRequest",
+    "OrderSide",
+    "OrderStatus",
+    "OrderType",
+    "Position",
+    "PositionSide",
+    "Ticker",
+    "TimeInForce",
+    "create_exchange_client",
+]
