@@ -25,8 +25,10 @@ from src.platform.exchanges.models import (
     OrderType,
     Position,
     PositionSide,
+    StopMarketOrderRequest,
     Ticker,
     TimeInForce,
+    TriggerPriceType,
 )
 from src.platform.exchanges.ports import HttpClient
 from src.platform.exchanges.symbols import to_exchange_symbol
@@ -159,6 +161,31 @@ class BinanceExchangeClient:
 
         payload = await self._request_signed("POST", "/fapi/v1/order", params=params)
         return _map_binance_order(payload, symbol=request.symbol, raw_symbol=raw_symbol)
+
+
+    async def place_stop_market_order(self, request: StopMarketOrderRequest) -> Order:
+        raw_symbol = to_exchange_symbol(self.exchange, request.symbol)
+        params: dict[str, Any] = {
+            "algoType": "CONDITIONAL",
+            "symbol": raw_symbol,
+            "side": _map_binance_side(request.side),
+            "type": "STOP_MARKET",
+            "triggerPrice": _decimal_to_str(request.trigger_price),
+            "workingType": _map_binance_trigger_price_type(request.trigger_price_type),
+        }
+        if request.client_order_id:
+            params["clientAlgoId"] = request.client_order_id
+        if request.position_side is not None and request.position_side != PositionSide.BOTH:
+            params["positionSide"] = request.position_side.value.upper()
+        if request.close_position:
+            params["closePosition"] = "true"
+        else:
+            params["quantity"] = _decimal_to_str(request.quantity)
+            if request.reduce_only:
+                params["reduceOnly"] = "true"
+
+        payload = await self._request_signed("POST", "/fapi/v1/algoOrder", params=params)
+        return _map_binance_algo_order(payload, symbol=request.symbol, raw_symbol=raw_symbol)
 
     async def cancel_order(self, request: CancelOrderRequest) -> Order:
         raw_symbol = to_exchange_symbol(self.exchange, request.symbol)
@@ -311,6 +338,22 @@ def _map_binance_order(
     )
 
 
+def _map_binance_algo_order(payload: Mapping[str, Any], *, symbol: str, raw_symbol: str) -> Order:
+    return Order(
+        exchange=ExchangeName.BINANCE,
+        symbol=symbol,
+        raw_symbol=raw_symbol,
+        order_id=_optional_str(payload.get("algoId")),
+        client_order_id=_optional_str(payload.get("clientAlgoId")),
+        status=_BINANCE_ORDER_STATUS.get(str(payload.get("algoStatus", "")).upper(), OrderStatus.UNKNOWN),
+        side=_optional_order_side(payload.get("side")),
+        order_type=OrderType.MARKET,
+        price=_optional_decimal(payload.get("triggerPrice")),
+        quantity=_optional_decimal(payload.get("quantity")),
+        raw=payload,
+    )
+
+
 def _map_binance_side(side: OrderSide) -> str:
     return "BUY" if side == OrderSide.BUY else "SELL"
 
@@ -326,6 +369,12 @@ def _map_binance_time_in_force(tif: TimeInForce) -> str:
         TimeInForce.FOK: "FOK",
         TimeInForce.POST_ONLY: "GTX",
     }[tif]
+
+
+def _map_binance_trigger_price_type(value: TriggerPriceType) -> str:
+    if value == TriggerPriceType.INDEX:
+        raise ExchangeConfigError("Binance stop market order does not support INDEX trigger price type")
+    return "MARK_PRICE" if value == TriggerPriceType.MARK else "CONTRACT_PRICE"
 
 
 def _clean_params(params: Mapping[str, Any] | None) -> dict[str, Any]:

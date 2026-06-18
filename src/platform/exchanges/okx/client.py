@@ -27,8 +27,10 @@ from src.platform.exchanges.models import (
     OrderType,
     Position,
     PositionSide,
+    StopMarketOrderRequest,
     Ticker,
     TimeInForce,
+    TriggerPriceType,
 )
 from src.platform.exchanges.ports import HttpClient
 from src.platform.exchanges.symbols import to_exchange_symbol
@@ -170,6 +172,45 @@ class OkxExchangeClient:
             side=request.side,
             order_type=request.order_type,
             price=request.price,
+            quantity=request.quantity,
+            raw=data,
+        )
+
+
+    async def place_stop_market_order(self, request: StopMarketOrderRequest) -> Order:
+        if request.close_position:
+            raise ExchangeConfigError("OKX stop market order requires explicit quantity; close_position is not supported")
+        raw_symbol = to_exchange_symbol(self.exchange, request.symbol)
+        body: dict[str, Any] = {
+            "instId": raw_symbol,
+            "tdMode": _map_okx_margin_mode(request.margin_mode or self._config.default_margin_mode),
+            "side": _map_okx_side(request.side),
+            "ordType": "conditional",
+            "sz": _decimal_to_str(request.quantity),
+            "slTriggerPx": _decimal_to_str(request.trigger_price),
+            "slOrdPx": "-1",
+            "slTriggerPxType": _map_okx_trigger_price_type(request.trigger_price_type),
+        }
+        if request.client_order_id:
+            body["algoClOrdId"] = request.client_order_id
+        if request.reduce_only:
+            body["reduceOnly"] = "true"
+        if request.position_side is not None and request.position_side != PositionSide.BOTH:
+            body["posSide"] = request.position_side.value
+
+        payload = await self._request_private("POST", "/api/v5/trade/order-algo", json_body=body)
+        data = _first_data(payload, "OKX place stop market order")
+        status = OrderStatus.REJECTED if str(data.get("sCode", "0")) != "0" else OrderStatus.NEW
+        return Order(
+            exchange=self.exchange,
+            symbol=request.symbol,
+            raw_symbol=raw_symbol,
+            order_id=_optional_str(data.get("algoId")),
+            client_order_id=_optional_str(data.get("algoClOrdId")) or request.client_order_id,
+            status=status,
+            side=request.side,
+            order_type=OrderType.MARKET,
+            price=request.trigger_price,
             quantity=request.quantity,
             raw=data,
         )
@@ -397,6 +438,14 @@ def _map_okx_order_type(order_type: OrderType, tif: TimeInForce | None) -> str:
 
 def _map_okx_margin_mode(mode: MarginMode) -> str:
     return "cross" if mode == MarginMode.CROSS else "isolated"
+
+
+def _map_okx_trigger_price_type(value: TriggerPriceType) -> str:
+    return {
+        TriggerPriceType.LAST: "last",
+        TriggerPriceType.MARK: "mark",
+        TriggerPriceType.INDEX: "index",
+    }[value]
 
 
 def _decimal(value: Any, *, field: str) -> Decimal:

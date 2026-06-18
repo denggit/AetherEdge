@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass
 
 from src.platform.execution.ports import ExecutionClient
-from src.platform.exchanges.models import CancelOrderRequest, ExchangeName, Order, OrderRequest
+from src.platform.exchanges.models import CancelOrderRequest, ExchangeName, Order, OrderRequest, StopMarketOrderRequest
 
 
 @dataclass(frozen=True)
@@ -32,6 +32,9 @@ class MultiExchangeExecutionClient:
 
     async def cancel_order_all(self, request: CancelOrderRequest) -> list[ExecutionResult]:
         return await self._run_all(lambda client: client.cancel_order(request))
+
+    async def place_stop_market_order_all(self, request: StopMarketOrderRequest) -> list[ExecutionResult]:
+        return await self._run_all(lambda client: client.place_stop_market_order(request))
 
     async def _run_all(self, call):
         if self._fail_fast:

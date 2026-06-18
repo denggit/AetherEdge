@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from src.platform.execution.risk import ExecutionRiskGate, ExecutionRiskLimits, LiveTradingBlocked
-from src.platform.execution.rules import normalize_amend_order_request, normalize_order_request
-from src.platform.exchanges.models import AmendOrderRequest, CancelOrderRequest, ExchangeName, InstrumentRule, Order, OrderQuery, OrderRequest
+from src.platform.execution.rules import normalize_amend_order_request, normalize_order_request, normalize_stop_market_order_request
+from decimal import Decimal
+
+from src.platform.exchanges.models import AmendOrderRequest, CancelOrderRequest, ExchangeName, InstrumentRule, Order, OrderQuery, OrderRequest, OrderSide, Position, PositionSide, StopMarketOrderRequest, TriggerPriceType
 from src.platform.exchanges.ports import ExchangeExecutionClient
 from src.platform.markets import MarketProfile
 
@@ -49,6 +51,45 @@ class ExchangeExecutionService:
         if self._validate_orders:
             self._risk_gate.validate_order(normalized, rule)
         return await self._exchange_client.place_order(normalized)
+
+
+    async def place_stop_market_order(self, request: StopMarketOrderRequest) -> Order:
+        self._ensure_live_write_allowed("place_stop_market_order")
+        self._ensure_bound_symbol(request.symbol)
+        rule = await self._fetch_rule_if_available(request.symbol)
+        normalized = normalize_stop_market_order_request(request, rule)
+        if self._validate_orders:
+            self._risk_gate.validate_stop_market(normalized, rule)
+        return await self._exchange_client.place_stop_market_order(normalized)
+
+    async def place_stop_loss_for_position(
+        self,
+        position: Position,
+        *,
+        trigger_price: Decimal,
+        client_order_id: str | None = None,
+        trigger_price_type: TriggerPriceType = TriggerPriceType.LAST,
+    ) -> Order:
+        self._ensure_bound_symbol(position.symbol)
+        quantity = abs(position.quantity)
+        if quantity <= 0:
+            raise ValueError("position quantity is zero; cannot place stop loss")
+        close_side = _close_side_for_position(position)
+        position_side = None if position.side == PositionSide.BOTH else position.side
+        close_position = self.exchange == ExchangeName.BINANCE
+        return await self.place_stop_market_order(
+            StopMarketOrderRequest(
+                symbol=position.symbol,
+                side=close_side,
+                trigger_price=trigger_price,
+                quantity=None if close_position else quantity,
+                client_order_id=client_order_id,
+                reduce_only=not close_position,
+                position_side=position_side,
+                trigger_price_type=trigger_price_type,
+                close_position=close_position,
+            )
+        )
 
     async def cancel_order(self, request: CancelOrderRequest) -> Order:
         self._ensure_bound_symbol(request.symbol)
@@ -107,3 +148,15 @@ class ExchangeExecutionService:
             raise LiveTradingBlocked(
                 f"{action} blocked: live trading requires AETHER_LIVE_TRADING=true or sandbox=true"
             )
+
+
+def _close_side_for_position(position: Position) -> OrderSide:
+    if position.side == PositionSide.LONG:
+        return OrderSide.SELL
+    if position.side == PositionSide.SHORT:
+        return OrderSide.BUY
+    if position.quantity > 0:
+        return OrderSide.SELL
+    if position.quantity < 0:
+        return OrderSide.BUY
+    raise ValueError("position quantity is zero; cannot infer close side")

@@ -13,6 +13,9 @@ class FakeExecutionClient:
     async def place_order(self, request):
         return Order(exchange=self.exchange, symbol=request.symbol, raw_symbol="raw", order_id="1", client_order_id=None, status=OrderStatus.NEW)
 
+    async def place_stop_market_order(self, request):
+        return Order(exchange=self.exchange, symbol=request.symbol, raw_symbol="raw", order_id="sl", client_order_id=request.client_order_id, status=OrderStatus.NEW)
+
     async def cancel_order(self, request):
         return Order(exchange=self.exchange, symbol=request.symbol, raw_symbol="raw", order_id=request.order_id, client_order_id=None, status=OrderStatus.CANCELED)
 

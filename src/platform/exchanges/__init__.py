@@ -16,7 +16,9 @@ from src.platform.exchanges.models import (
     OrderType,
     Position,
     PositionSide,
+    StopMarketOrderRequest,
     Ticker,
+    TriggerPriceType,
     TimeInForce,
 )
 from src.platform.exchanges.ports import (
@@ -49,7 +51,9 @@ __all__ = [
     "OrderType",
     "Position",
     "PositionSide",
+    "StopMarketOrderRequest",
     "Ticker",
+    "TriggerPriceType",
     "TimeInForce",
     "create_exchange_client",
 ]

@@ -13,6 +13,7 @@ from src.platform.exchanges.models import (
     OrderQuery,
     OrderRequest,
     Position,
+    StopMarketOrderRequest,
     Ticker,
 )
 
@@ -64,6 +65,9 @@ class ExchangeMarketDataClient(ExchangeIdentity, Protocol):
 
 class ExchangeExecutionClient(ExchangeIdentity, Protocol):
     async def place_order(self, request: OrderRequest) -> Order:
+        ...
+
+    async def place_stop_market_order(self, request: StopMarketOrderRequest) -> Order:
         ...
 
     async def cancel_order(self, request: CancelOrderRequest) -> Order:

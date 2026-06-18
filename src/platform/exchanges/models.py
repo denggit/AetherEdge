@@ -48,6 +48,12 @@ class MarginMode(str, Enum):
     ISOLATED = "isolated"
 
 
+class TriggerPriceType(str, Enum):
+    LAST = "last"
+    MARK = "mark"
+    INDEX = "index"
+
+
 @dataclass(frozen=True)
 class ExchangeConfig:
     """Runtime config passed into exchange adapters.
@@ -194,6 +200,29 @@ class OrderRequest:
     position_side: PositionSide | None = None
     margin_mode: MarginMode | None = None
     time_in_force: TimeInForce | None = None
+
+
+@dataclass(frozen=True)
+class StopMarketOrderRequest:
+    symbol: str
+    side: OrderSide
+    trigger_price: Decimal
+    quantity: Decimal | None = None
+    client_order_id: str | None = None
+    reduce_only: bool = True
+    position_side: PositionSide | None = None
+    margin_mode: MarginMode | None = None
+    trigger_price_type: TriggerPriceType = TriggerPriceType.LAST
+    close_position: bool = False
+
+    def __post_init__(self) -> None:
+        if self.trigger_price <= 0:
+            raise ValueError("trigger_price must be positive")
+        if not self.close_position:
+            if self.quantity is None:
+                raise ValueError("quantity is required unless close_position=True")
+            if self.quantity <= 0:
+                raise ValueError("quantity must be positive")
 
 
 @dataclass(frozen=True)
