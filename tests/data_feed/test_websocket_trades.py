@@ -149,3 +149,30 @@ def test_market_data_feed_can_disable_trade_stream_for_rest_only_mode():
         assert "No trade stream" in str(exc)
     else:  # pragma: no cover
         raise AssertionError("REST-only feed should not stream trades")
+
+
+def test_binance_trade_stream_reconnects_after_disconnect():
+    class SequencedConnector:
+        def __init__(self):
+            self.urls = []
+            self.messages = [[], [json.dumps({"e": "aggTrade", "E": 2, "s": "ETHUSDT", "a": 2, "p": "3001", "q": "0.1", "T": 2, "m": False})]]
+
+        async def connect(self, url: str):
+            self.urls.append(url)
+            return FakeWebSocketConnection(self.messages.pop(0))
+
+    connector = SequencedConnector()
+    feed = create_market_data_feed(
+        "binance",
+        symbol="ETH-USDT-PERP",
+        config=ExchangeConfig(),
+        exchange_client=FakeExchangeClient(),
+        websocket_connector=connector,
+        reconnect_delay_seconds=0,
+        max_reconnects=1,
+    )
+
+    trade = asyncio.run(_first_trade(feed))
+
+    assert len(connector.urls) == 2
+    assert trade.price == Decimal("3001")

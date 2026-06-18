@@ -15,6 +15,7 @@ from src.platform.data.storage import MarketDataStore
 from src.platform.data.websocket.ports import OrderBookStream, TradeStream
 from src.platform.exchanges.models import ExchangeName
 from src.platform.exchanges.ports import ExchangeMarketDataClient
+from src.platform.markets import MarketProfile
 
 
 class RestMarketDataFeed:
@@ -25,12 +26,14 @@ class RestMarketDataFeed:
         *,
         exchange_client: ExchangeMarketDataClient,
         symbol: str,
+        market_profile: MarketProfile,
         trade_stream: TradeStream | None = None,
         order_book_stream: OrderBookStream | None = None,
         store: MarketDataStore | None = None,
     ) -> None:
         self._exchange_client = exchange_client
         self._symbol = symbol
+        self._market_profile = market_profile
         self._trade_stream = trade_stream
         self._order_book_stream = order_book_stream
         self._store = store
@@ -42,6 +45,10 @@ class RestMarketDataFeed:
     @property
     def symbol(self) -> str:
         return self._symbol
+
+    @property
+    def market_profile(self) -> MarketProfile:
+        return self._market_profile
 
     async def fetch_klines(
         self,

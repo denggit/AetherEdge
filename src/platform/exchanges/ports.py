@@ -3,9 +3,11 @@ from __future__ import annotations
 from typing import Any, Mapping, Protocol
 
 from src.platform.exchanges.models import (
+    AmendOrderRequest,
     Balance,
     CancelOrderRequest,
     ExchangeName,
+    InstrumentRule,
     Kline,
     Order,
     OrderRequest,
@@ -55,12 +57,18 @@ class ExchangeMarketDataClient(ExchangeIdentity, Protocol):
     async def fetch_ticker(self, symbol: str) -> Ticker:
         ...
 
+    async def fetch_instrument_rule(self, symbol: str) -> InstrumentRule:
+        ...
+
 
 class ExchangeExecutionClient(ExchangeIdentity, Protocol):
     async def place_order(self, request: OrderRequest) -> Order:
         ...
 
     async def cancel_order(self, request: CancelOrderRequest) -> Order:
+        ...
+
+    async def amend_order(self, request: AmendOrderRequest) -> Order:
         ...
 
 

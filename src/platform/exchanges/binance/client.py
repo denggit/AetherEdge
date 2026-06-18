@@ -9,10 +9,12 @@ from urllib.parse import urlencode
 
 from src.platform.exchanges.errors import ExchangeConfigError, ExchangeMappingError
 from src.platform.exchanges.models import (
+    AmendOrderRequest,
     Balance,
     CancelOrderRequest,
     ExchangeConfig,
     ExchangeName,
+    InstrumentRule,
     Kline,
     MarginMode,
     Order,
@@ -90,6 +92,29 @@ class BinanceExchangeClient:
             raw=payload,
         )
 
+    async def fetch_instrument_rule(self, symbol: str) -> InstrumentRule:
+        raw_symbol = to_exchange_symbol(self.exchange, symbol)
+        payload = await self._request_public("GET", "/fapi/v1/exchangeInfo")
+        symbols = payload.get("symbols") or []
+        selected = next((row for row in symbols if row.get("symbol") == raw_symbol), None)
+        if selected is None:
+            raise ExchangeMappingError(f"Binance instrument not found: {raw_symbol}", payload=payload)
+        filters = {str(row.get("filterType")): row for row in selected.get("filters", []) if isinstance(row, Mapping)}
+        price_filter = filters.get("PRICE_FILTER", {})
+        lot_size = filters.get("LOT_SIZE", {})
+        min_notional = filters.get("MIN_NOTIONAL", {})
+        return InstrumentRule(
+            exchange=self.exchange,
+            symbol=symbol,
+            raw_symbol=raw_symbol,
+            price_tick=_optional_decimal(price_filter.get("tickSize")),
+            quantity_step=_optional_decimal(lot_size.get("stepSize")),
+            min_quantity=_optional_decimal(lot_size.get("minQty")),
+            max_quantity=_optional_decimal(lot_size.get("maxQty")),
+            min_notional=_optional_decimal(min_notional.get("notional") or min_notional.get("minNotional")),
+            raw=selected,
+        )
+
     async def fetch_balance(self, asset: str = "USDT") -> Balance:
         payload = await self._request_signed("GET", "/fapi/v3/balance")
         selected = next((item for item in payload if item.get("asset") == asset), None)
@@ -143,6 +168,22 @@ class BinanceExchangeClient:
             params["origClientOrderId"] = request.client_order_id
         payload = await self._request_signed("DELETE", "/fapi/v1/order", params=params)
         return _map_binance_order(payload, symbol=request.symbol, raw_symbol=raw_symbol, fallback_status=OrderStatus.CANCELED)
+
+    async def amend_order(self, request: AmendOrderRequest) -> Order:
+        raw_symbol = to_exchange_symbol(self.exchange, request.symbol)
+        if request.new_quantity is None or request.new_price is None:
+            raise ExchangeConfigError("Binance modify order requires both new_quantity and new_price")
+        params: dict[str, Any] = {
+            "symbol": raw_symbol,
+            "quantity": _decimal_to_str(request.new_quantity),
+            "price": _decimal_to_str(request.new_price),
+        }
+        if request.order_id:
+            params["orderId"] = request.order_id
+        if request.client_order_id:
+            params["origClientOrderId"] = request.client_order_id
+        payload = await self._request_signed("PUT", "/fapi/v1/order", params=params)
+        return _map_binance_order(payload, symbol=request.symbol, raw_symbol=raw_symbol)
 
     async def _request_public(
         self,

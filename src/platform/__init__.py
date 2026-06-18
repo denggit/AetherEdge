@@ -1,12 +1,15 @@
 from src.platform.account import AccountClient, ExchangeAccountService, create_account_client
 from src.platform.data import MarketDataFeed, create_market_data_feed
-from src.platform.execution import ExecutionClient, ExchangeExecutionService, create_execution_client
+from src.platform.execution import ExecutionClient, ExchangeExecutionService, ExecutionRiskLimits, MultiExchangeExecutionClient, RiskCheckError, create_execution_client
+from src.platform.markets import MarketProfile, get_market_profile, list_market_profiles, register_market_profile
 from src.platform.exchanges import (
+    AmendOrderRequest,
     Balance,
     CancelOrderRequest,
     ExchangeClient,
     ExchangeConfig,
     ExchangeName,
+    InstrumentRule,
     Kline,
     Order,
     OrderRequest,
@@ -22,16 +25,22 @@ from src.platform.exchanges import (
 
 __all__ = [
     "AccountClient",
+    "AmendOrderRequest",
     "ExchangeAccountService",
     "Balance",
     "CancelOrderRequest",
     "ExchangeClient",
     "ExchangeConfig",
     "ExchangeName",
+    "InstrumentRule",
     "ExecutionClient",
+    "ExecutionRiskLimits",
     "ExchangeExecutionService",
     "Kline",
     "MarketDataFeed",
+    "MarketProfile",
+    "MultiExchangeExecutionClient",
+    "RiskCheckError",
     "Order",
     "OrderRequest",
     "OrderSide",
@@ -45,4 +54,7 @@ __all__ = [
     "create_exchange_client",
     "create_execution_client",
     "create_market_data_feed",
+    "get_market_profile",
+    "list_market_profiles",
+    "register_market_profile",
 ]

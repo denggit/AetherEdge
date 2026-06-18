@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from decimal import Decimal
 from typing import Any, AsyncIterator, Mapping
@@ -20,22 +21,34 @@ class BinanceTradeWebSocketFeed:
         symbol: str,
         connector: WebSocketConnector,
         sandbox: bool = False,
+        reconnect: bool = True,
+        reconnect_delay_seconds: float = 1.0,
+        max_reconnects: int | None = None,
     ) -> None:
         self._symbol = symbol
         self._raw_symbol = to_exchange_symbol(ExchangeName.BINANCE, symbol)
         self._connector = connector
+        self._reconnect = reconnect
+        self._reconnect_delay_seconds = reconnect_delay_seconds
+        self._max_reconnects = max_reconnects
         base_url = BINANCE_USDM_TESTNET_WS_URL if sandbox else BINANCE_USDM_WS_URL
         self._url = f"{base_url}/{self._raw_symbol.lower()}@aggTrade"
 
     async def stream_trades(self) -> AsyncIterator[MarketTrade]:
-        connection = await self._connector.connect(self._url)
-        try:
-            async for message in connection:
-                trade = self._map_message(message)
-                if trade is not None:
-                    yield trade
-        finally:
-            await connection.close()
+        reconnects = 0
+        while True:
+            connection = await self._connector.connect(self._url)
+            try:
+                async for message in connection:
+                    trade = self._map_message(message)
+                    if trade is not None:
+                        yield trade
+            finally:
+                await connection.close()
+            if not self._reconnect or (self._max_reconnects is not None and reconnects >= self._max_reconnects):
+                break
+            reconnects += 1
+            await asyncio.sleep(self._reconnect_delay_seconds)
 
     def _map_message(self, message: str | bytes) -> MarketTrade | None:
         payload = _decode_json(message)
@@ -53,22 +66,34 @@ class BinanceOrderBookWebSocketFeed:
         sandbox: bool = False,
         depth: int = 5,
         update_ms: int = 100,
+        reconnect: bool = True,
+        reconnect_delay_seconds: float = 1.0,
+        max_reconnects: int | None = None,
     ) -> None:
         self._symbol = symbol
         self._raw_symbol = to_exchange_symbol(ExchangeName.BINANCE, symbol)
         self._connector = connector
+        self._reconnect = reconnect
+        self._reconnect_delay_seconds = reconnect_delay_seconds
+        self._max_reconnects = max_reconnects
         base_url = BINANCE_USDM_TESTNET_WS_URL if sandbox else BINANCE_USDM_WS_URL
         self._url = f"{base_url}/{self._raw_symbol.lower()}@depth{depth}@{update_ms}ms"
 
     async def stream_order_book(self) -> AsyncIterator[MarketOrderBook]:
-        connection = await self._connector.connect(self._url)
-        try:
-            async for message in connection:
-                order_book = self._map_message(message)
-                if order_book is not None:
-                    yield order_book
-        finally:
-            await connection.close()
+        reconnects = 0
+        while True:
+            connection = await self._connector.connect(self._url)
+            try:
+                async for message in connection:
+                    order_book = self._map_message(message)
+                    if order_book is not None:
+                        yield order_book
+            finally:
+                await connection.close()
+            if not self._reconnect or (self._max_reconnects is not None and reconnects >= self._max_reconnects):
+                break
+            reconnects += 1
+            await asyncio.sleep(self._reconnect_delay_seconds)
 
     def _map_message(self, message: str | bytes) -> MarketOrderBook | None:
         payload = _decode_json(message)

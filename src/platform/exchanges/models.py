@@ -165,6 +165,20 @@ class Position:
 
 
 @dataclass(frozen=True)
+class InstrumentRule:
+    exchange: ExchangeName
+    symbol: str
+    raw_symbol: str
+    price_tick: Decimal | None = None
+    quantity_step: Decimal | None = None
+    min_quantity: Decimal | None = None
+    min_notional: Decimal | None = None
+    max_quantity: Decimal | None = None
+    contract_value: Decimal | None = None
+    raw: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class OrderRequest:
     symbol: str
     side: OrderSide
@@ -187,6 +201,21 @@ class CancelOrderRequest:
     def __post_init__(self) -> None:
         if not self.order_id and not self.client_order_id:
             raise ValueError("order_id or client_order_id is required")
+
+
+@dataclass(frozen=True)
+class AmendOrderRequest:
+    symbol: str
+    order_id: str | None = None
+    client_order_id: str | None = None
+    new_quantity: Decimal | None = None
+    new_price: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        if not self.order_id and not self.client_order_id:
+            raise ValueError("order_id or client_order_id is required")
+        if self.new_quantity is None and self.new_price is None:
+            raise ValueError("new_quantity or new_price is required")
 
 
 @dataclass(frozen=True)

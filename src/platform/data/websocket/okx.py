@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from decimal import Decimal
 from typing import Any, AsyncIterator, Mapping
@@ -20,21 +21,33 @@ class OkxTradeWebSocketFeed:
         symbol: str,
         connector: WebSocketConnector,
         sandbox: bool = False,
+        reconnect: bool = True,
+        reconnect_delay_seconds: float = 1.0,
+        max_reconnects: int | None = None,
     ) -> None:
         self._symbol = symbol
         self._raw_symbol = to_exchange_symbol(ExchangeName.OKX, symbol)
         self._connector = connector
+        self._reconnect = reconnect
+        self._reconnect_delay_seconds = reconnect_delay_seconds
+        self._max_reconnects = max_reconnects
         self._url = OKX_DEMO_PUBLIC_WS_URL if sandbox else OKX_PUBLIC_WS_URL
 
     async def stream_trades(self) -> AsyncIterator[MarketTrade]:
-        connection = await self._connector.connect(self._url)
-        try:
-            await connection.send(_okx_subscribe_message(channel="trades", inst_id=self._raw_symbol))
-            async for message in connection:
-                for trade in self._map_message(message):
-                    yield trade
-        finally:
-            await connection.close()
+        reconnects = 0
+        while True:
+            connection = await self._connector.connect(self._url)
+            try:
+                await connection.send(_okx_subscribe_message(channel="trades", inst_id=self._raw_symbol))
+                async for message in connection:
+                    for trade in self._map_message(message):
+                        yield trade
+            finally:
+                await connection.close()
+            if not self._reconnect or (self._max_reconnects is not None and reconnects >= self._max_reconnects):
+                break
+            reconnects += 1
+            await asyncio.sleep(self._reconnect_delay_seconds)
 
     def _map_message(self, message: str | bytes) -> list[MarketTrade]:
         payload = _decode_json(message)
@@ -56,22 +69,34 @@ class OkxOrderBookWebSocketFeed:
         connector: WebSocketConnector,
         sandbox: bool = False,
         depth_channel: str = "books5",
+        reconnect: bool = True,
+        reconnect_delay_seconds: float = 1.0,
+        max_reconnects: int | None = None,
     ) -> None:
         self._symbol = symbol
         self._raw_symbol = to_exchange_symbol(ExchangeName.OKX, symbol)
         self._connector = connector
+        self._reconnect = reconnect
+        self._reconnect_delay_seconds = reconnect_delay_seconds
+        self._max_reconnects = max_reconnects
         self._url = OKX_DEMO_PUBLIC_WS_URL if sandbox else OKX_PUBLIC_WS_URL
         self._depth_channel = depth_channel
 
     async def stream_order_book(self) -> AsyncIterator[MarketOrderBook]:
-        connection = await self._connector.connect(self._url)
-        try:
-            await connection.send(_okx_subscribe_message(channel=self._depth_channel, inst_id=self._raw_symbol))
-            async for message in connection:
-                for order_book in self._map_message(message):
-                    yield order_book
-        finally:
-            await connection.close()
+        reconnects = 0
+        while True:
+            connection = await self._connector.connect(self._url)
+            try:
+                await connection.send(_okx_subscribe_message(channel=self._depth_channel, inst_id=self._raw_symbol))
+                async for message in connection:
+                    for order_book in self._map_message(message):
+                        yield order_book
+            finally:
+                await connection.close()
+            if not self._reconnect or (self._max_reconnects is not None and reconnects >= self._max_reconnects):
+                break
+            reconnects += 1
+            await asyncio.sleep(self._reconnect_delay_seconds)
 
     def _map_message(self, message: str | bytes) -> list[MarketOrderBook]:
         payload = _decode_json(message)

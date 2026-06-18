@@ -11,10 +11,12 @@ from urllib.parse import urlencode
 
 from src.platform.exchanges.errors import ExchangeApiError, ExchangeConfigError, ExchangeMappingError
 from src.platform.exchanges.models import (
+    AmendOrderRequest,
     Balance,
     CancelOrderRequest,
     ExchangeConfig,
     ExchangeName,
+    InstrumentRule,
     Kline,
     MarginMode,
     Order,
@@ -93,6 +95,26 @@ class OkxExchangeClient:
             raw=data,
         )
 
+    async def fetch_instrument_rule(self, symbol: str) -> InstrumentRule:
+        raw_symbol = to_exchange_symbol(self.exchange, symbol)
+        payload = await self._request_public(
+            "GET",
+            "/api/v5/public/instruments",
+            params={"instType": "SWAP", "instId": raw_symbol},
+        )
+        data = _first_data(payload, "OKX instruments")
+        return InstrumentRule(
+            exchange=self.exchange,
+            symbol=symbol,
+            raw_symbol=raw_symbol,
+            price_tick=_optional_decimal(data.get("tickSz")),
+            quantity_step=_optional_decimal(data.get("lotSz")),
+            min_quantity=_optional_decimal(data.get("minSz")),
+            max_quantity=_optional_decimal(data.get("maxLmtSz") or data.get("maxMktSz")),
+            contract_value=_optional_decimal(data.get("ctVal")),
+            raw=data,
+        )
+
     async def fetch_balance(self, asset: str = "USDT") -> Balance:
         payload = await self._request_private("GET", "/api/v5/account/balance", params={"ccy": asset})
         account = _first_data(payload, "OKX balance")
@@ -168,6 +190,32 @@ class OkxExchangeClient:
             order_id=_optional_str(data.get("ordId")) or request.order_id,
             client_order_id=_optional_str(data.get("clOrdId")) or request.client_order_id,
             status=status,
+            raw=data,
+        )
+
+    async def amend_order(self, request: AmendOrderRequest) -> Order:
+        raw_symbol = to_exchange_symbol(self.exchange, request.symbol)
+        body: dict[str, Any] = {"instId": raw_symbol}
+        if request.order_id:
+            body["ordId"] = request.order_id
+        if request.client_order_id:
+            body["clOrdId"] = request.client_order_id
+        if request.new_quantity is not None:
+            body["newSz"] = _decimal_to_str(request.new_quantity)
+        if request.new_price is not None:
+            body["newPx"] = _decimal_to_str(request.new_price)
+        payload = await self._request_private("POST", "/api/v5/trade/amend-order", json_body=body)
+        data = _first_data(payload, "OKX amend order")
+        status = OrderStatus.REJECTED if str(data.get("sCode", "0")) != "0" else OrderStatus.NEW
+        return Order(
+            exchange=self.exchange,
+            symbol=request.symbol,
+            raw_symbol=raw_symbol,
+            order_id=_optional_str(data.get("ordId")) or request.order_id,
+            client_order_id=_optional_str(data.get("clOrdId")) or request.client_order_id,
+            status=status,
+            price=request.new_price,
+            quantity=request.new_quantity,
             raw=data,
         )
 

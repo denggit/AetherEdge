@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import AsyncIterator, Protocol
 
 from src.platform.exchanges.models import ExchangeName
+from src.platform.markets import MarketProfile
 from src.platform.data.models import MarketEvent, MarketKline, MarketOrderBook, MarketTicker, MarketTrade
 
 
@@ -15,6 +16,10 @@ class MarketDataFeed(Protocol):
 
     @property
     def symbol(self) -> str:
+        ...
+
+    @property
+    def market_profile(self) -> MarketProfile:
         ...
 
     async def fetch_klines(

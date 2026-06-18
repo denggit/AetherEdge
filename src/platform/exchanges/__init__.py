@@ -1,9 +1,11 @@
 from src.platform.exchanges.factory import create_exchange_client
 from src.platform.exchanges.models import (
+    AmendOrderRequest,
     Balance,
     CancelOrderRequest,
     ExchangeConfig,
     ExchangeName,
+    InstrumentRule,
     Kline,
     MarginMode,
     Order,
@@ -25,6 +27,7 @@ from src.platform.exchanges.ports import (
 )
 
 __all__ = [
+    "AmendOrderRequest",
     "Balance",
     "CancelOrderRequest",
     "ExchangeAccountClient",
@@ -34,6 +37,7 @@ __all__ = [
     "ExchangeConfig",
     "ExchangeName",
     "HttpClient",
+    "InstrumentRule",
     "Kline",
     "MarginMode",
     "Order",

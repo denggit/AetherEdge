@@ -1,0 +1,23 @@
+{
+  "symbol": "ETH-USDT-PERP",
+  "base_asset": "ETH",
+  "quote_asset": "USDT",
+  "contract_type": "perp",
+  "default": true,
+  "exchange_symbols": {
+    "okx": "ETH-USDT-SWAP",
+    "binance": "ETHUSDT"
+  },
+  "contract_value_by_exchange": {
+    "okx": "0.01",
+    "binance": "1"
+  },
+  "min_quantity_by_exchange": {
+    "okx": "0.01",
+    "binance": "0.001"
+  },
+  "quantity_unit_by_exchange": {
+    "okx": "contract",
+    "binance": "base_asset"
+  }
+}
