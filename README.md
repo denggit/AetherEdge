@@ -90,6 +90,129 @@ balance = await account.fetch_balance("USDT")
 positions = await account.fetch_positions("ETH-USDT-PERP")
 ```
 
+
+## Stop Market Order Interface
+
+止损单属于执行接口层，不包含策略判断。
+
+手动传数量挂 reduce-only 止损：
+
+```python
+from decimal import Decimal
+from src.platform import OrderSide, StopMarketOrderRequest
+
+await execution.place_stop_market_order(
+    StopMarketOrderRequest(
+        symbol="ETH-USDT-PERP",
+        side=OrderSide.SELL,
+        quantity=Decimal("0.01"),
+        trigger_price=Decimal("2800"),
+        reduce_only=True,
+    )
+)
+```
+
+根据当前持仓直接挂对应方向止损：
+
+```python
+positions = await account.fetch_positions("ETH-USDT-PERP")
+position = next(p for p in positions if p.quantity != 0)
+
+await execution.place_stop_loss_for_position(
+    position,
+    trigger_price=Decimal("2800"),
+)
+```
+
+方向规则只做接口级映射：
+
+```text
+long  position -> SELL stop
+short position -> BUY stop
+net   position -> 根据 quantity 正负判断平仓方向
+```
+
+底层 adapter：
+
+```text
+OKX:     POST /api/v5/trade/order-algo
+Binance: POST /fapi/v1/algoOrder
+```
+
+Binance 对“按当前持仓直接挂止损”默认使用 `closePosition=true`，不传 `quantity` 和 `reduceOnly`，避免数量和持仓变化不一致。OKX 使用当前持仓数量，并带 `reduceOnly=true`。
+
+
+## Order State + Live Safety Gate
+
+执行层现在补齐了订单状态闭环，但仍然只属于接口层，不包含策略、TP/SL、runtime 主循环。
+
+查询单个订单：
+
+```python
+from src.platform import OrderQuery
+
+order = await execution.fetch_order_status(
+    OrderQuery(symbol="ETH-USDT-PERP", order_id="123")
+)
+```
+
+查询当前挂单：
+
+```python
+open_orders = await execution.fetch_open_orders()
+```
+
+底层 adapter：
+
+```text
+OKX:     GET /api/v5/trade/order
+OKX:     GET /api/v5/trade/orders-pending
+Binance: GET /fapi/v1/order
+Binance: GET /fapi/v1/openOrders
+```
+
+真实盘写操作有硬保护。默认 `.env` 里应该显式写：
+
+```text
+AETHER_LIVE_TRADING=false
+```
+
+当 `OKX_SANDBOX=false` 或 `BINANCE_SANDBOX=false` 时，除非同时设置：
+
+```text
+AETHER_LIVE_TRADING=true
+```
+
+否则这些写操作会被挡住：
+
+```text
+place_order
+amend_order
+replace_order
+```
+
+`cancel_order` 不挡，因为误连真实盘时撤单是降风险动作，不应该被安全开关拦住。
+
+完整 `.env` 示例：
+
+```text
+AETHER_MARKET=ETH-USDT-PERP
+AETHER_LIVE_TRADING=false
+
+API_TIMEOUT_SECONDS=10
+BINANCE_RECV_WINDOW_MS=5000
+MARGIN_MODE=cross
+
+OKX_API_KEY=
+OKX_SECRET_KEY=
+OKX_PASSPHRASE=
+OKX_SANDBOX=true
+
+BINANCE_API_KEY=
+BINANCE_SECRET_KEY=
+BINANCE_SANDBOX=true
+```
+
 ## API KEY
 
 只保留长期维护的 key 名称，旧的错误 fallback 已删除。
@@ -134,3 +257,372 @@ Binance: ETHUSDT
 ```bash
 PYTHONPATH=. pytest -q
 ```
+
+## Execution Safety v1
+
+执行层现在会在下单前尽量读取交易规则：
+
+```text
+OKX:     GET /api/v5/public/instruments
+Binance: GET /fapi/v1/exchangeInfo
+```
+
+会自动处理：
+
+```text
+price_tick      价格精度
+quantity_step   数量步长
+min_quantity    最小下单量
+min_notional    最小名义金额，Binance 支持
+```
+
+默认下单前会做基础校验和精度向下规整：
+
+```python
+from decimal import Decimal
+from src.platform import OrderRequest, OrderSide, OrderType
+
+await execution.place_order(
+    OrderRequest(
+        symbol="ETH-USDT-PERP",
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        quantity=Decimal("0.019"),
+        price=Decimal("3000.19"),
+    )
+)
+```
+
+原生改单：
+
+```python
+from decimal import Decimal
+from src.platform import AmendOrderRequest
+
+await execution.amend_order(
+    AmendOrderRequest(
+        symbol="ETH-USDT-PERP",
+        order_id="123",
+        new_quantity=Decimal("0.02"),
+        new_price=Decimal("3000.1"),
+    )
+)
+```
+
+Binance 原生改单要求 `new_quantity` 和 `new_price` 同时传入；OKX 可以只改数量或只改价格。
+
+## WebSocket reconnect
+
+行情 WebSocket 默认开启自动重连：
+
+```python
+data = create_market_data_feed(
+    "binance",
+    symbol="ETH-USDT-PERP",
+    reconnect_streams=True,
+    reconnect_delay_seconds=1,
+)
+```
+
+测试或一次性消费时可以关闭：
+
+```python
+data = create_market_data_feed("okx", reconnect_streams=False)
+```
+
+## Multi-exchange execution
+
+多交易所并行执行雏形：
+
+```python
+from src.platform.execution import MultiExchangeExecutionClient
+
+multi = MultiExchangeExecutionClient([okx_execution, binance_execution])
+results = await multi.place_order_all(order_request)
+```
+
+单个交易所失败不会把其他交易所的结果吞掉，返回里会保留 `order` 或 `error`。
+
+## Market Profiles
+
+平台默认市场是：
+
+```text
+ETH-USDT-PERP
+```
+
+本地品种参数放在：
+
+```text
+src/platform/markets/profiles/ETH-USDT-PERP.json
+```
+
+当前 ETH 配置示例：
+
+```json
+{
+  "symbol": "ETH-USDT-PERP",
+  "base_asset": "ETH",
+  "quote_asset": "USDT",
+  "contract_type": "perp",
+  "default": true,
+  "exchange_symbols": {
+    "okx": "ETH-USDT-SWAP",
+    "binance": "ETHUSDT"
+  },
+  "contract_value_by_exchange": {
+    "okx": "0.01",
+    "binance": "1"
+  },
+  "min_quantity_by_exchange": {
+    "okx": "0.01",
+    "binance": "0.001"
+  },
+  "quantity_unit_by_exchange": {
+    "okx": "contract",
+    "binance": "base_asset"
+  }
+}
+```
+
+获取配置：
+
+```python
+from src.platform import get_market_profile
+
+profile = get_market_profile()
+print(profile.symbol)
+print(profile.raw_symbol("okx"))
+print(profile.contract_value("okx"))
+```
+
+绑定不同品种：
+
+```python
+symbol = "ETH-USDT-PERP"
+
+data = create_market_data_feed("okx", symbol=symbol)
+execution = create_execution_client("okx", symbol=symbol)
+account = create_account_client("okx", symbol=symbol)
+```
+
+以后加其他币种，不改业务代码，新增一个 profile JSON 即可，例如：
+
+```text
+src/platform/markets/profiles/SOL-USDT-PERP.json
+```
+
+然后业务层只改：
+
+```python
+symbol = "SOL-USDT-PERP"
+```
+
+## Interface Freeze v1
+
+这一版开始，平台接口层先封口。接口层只负责“能不能稳定调用交易平台”，不包含策略判断、自动开平仓、TP/SL 编排、runtime 主循环。
+
+执行接口现在包括：
+
+```python
+await execution.place_order(order_request)
+await execution.place_stop_market_order(stop_request)
+await execution.place_stop_loss_for_position(position, trigger_price=...)
+
+await execution.cancel_order(cancel_request)
+await execution.cancel_all_orders()
+await execution.cancel_stop_order(cancel_stop_request)
+await execution.cancel_all_stop_orders()
+
+await execution.amend_order(amend_request)
+await execution.replace_order(cancel_request, new_order_request)
+
+await execution.fetch_order_status(order_query)
+await execution.fetch_open_orders()
+await execution.fetch_stop_order_status(stop_order_query)
+await execution.fetch_open_stop_orders()
+```
+
+账户 / 配置接口现在包括：
+
+```python
+await account.fetch_balance("USDT")
+await account.fetch_positions()
+
+await account.fetch_leverage()
+await account.set_leverage(Decimal("3"))
+await account.set_margin_mode(MarginMode.CROSS)
+await account.fetch_position_mode()
+await account.set_position_mode(PositionMode.ONE_WAY)
+```
+
+止损 / 条件单管理底层映射：
+
+```text
+OKX:
+  POST /api/v5/trade/order-algo
+  GET  /api/v5/trade/order-algo
+  GET  /api/v5/trade/orders-algo-pending
+  POST /api/v5/trade/cancel-algos
+
+Binance USD-M:
+  POST   /fapi/v1/algoOrder
+  GET    /fapi/v1/algoOrder
+  GET    /fapi/v1/openAlgoOrders
+  DELETE /fapi/v1/algoOrder
+  DELETE /fapi/v1/algoOpenOrders
+```
+
+普通订单批量撤单：
+
+```text
+OKX:     当前实现为 fetch_open_orders 后逐个 cancel_order
+Binance: DELETE /fapi/v1/allOpenOrders
+```
+
+杠杆 / 仓位模式：
+
+```text
+OKX:
+  GET  /api/v5/account/leverage-info
+  POST /api/v5/account/set-leverage
+  GET  /api/v5/account/config
+  POST /api/v5/account/set-position-mode
+
+Binance USD-M:
+  GET  /fapi/v3/positionRisk        # 读取当前 leverage
+  POST /fapi/v1/leverage
+  POST /fapi/v1/marginType
+  GET  /fapi/v1/positionSide/dual
+  POST /fapi/v1/positionSide/dual
+```
+
+注意：OKX 的 `tdMode` 是下单参数，所以 `account.set_margin_mode()` 在 OKX adapter 中是无网络请求的接口级 no-op；真正下单时仍然由 `OrderRequest.margin_mode` 或 `.env` 的 `MARGIN_MODE` 控制。
+
+## Startup Snapshot / Smoke
+
+接口层提供只读启动快照，不做恢复、不撤单、不补单，只把当前交易所状态一次性读出来：
+
+```python
+from src.platform import fetch_platform_snapshot
+
+snapshot = await fetch_platform_snapshot(account=account, execution=execution)
+```
+
+包含：
+
+```text
+balance
+positions
+open_orders
+open_stop_orders
+leverage
+position_mode
+```
+
+只读 smoke 脚本：
+
+```bash
+PYTHONPATH=. python tools/smoke_public.py okx
+PYTHONPATH=. python tools/smoke_public.py binance
+
+PYTHONPATH=. python tools/smoke_private_readonly.py okx
+PYTHONPATH=. python tools/smoke_private_readonly.py binance
+```
+
+`smoke_private_readonly.py` 不会下单、改单或撤单；它只验证私有读接口和当前状态读取是否可用。
+
+## Private Event Stream v1
+
+私有事件流是单独接口模块，只负责把交易所私有 WebSocket 事件统一成 `AccountEvent`，不做策略判断、不做自动恢复、不维护本地订单状态机。
+
+```python
+from src.platform import create_account_event_stream, AccountEventType
+
+stream = create_account_event_stream("okx")
+
+async for event in stream.stream_events():
+    if event.event_type is AccountEventType.ORDER:
+        print(event.order_id, event.order_status, event.filled_quantity)
+```
+
+统一事件类型：
+
+```text
+AccountEventType.ORDER
+AccountEventType.BALANCE
+AccountEventType.POSITION
+AccountEventType.SYSTEM
+AccountEventType.UNKNOWN
+```
+
+OKX：
+
+```text
+wss://ws.okx.com:8443/ws/v5/private
+wss://wspap.okx.com:8443/ws/v5/private?brokerId=9999  # demo
+
+login 后订阅：
+orders
+account
+positions
+```
+
+Binance USD-M：
+
+```text
+POST /fapi/v1/listenKey
+wss://fstream.binance.com/ws/<listenKey>
+wss://stream.binancefuture.com/ws/<listenKey>  # testnet
+```
+
+Binance listenKey 辅助接口：
+
+```python
+listen_key = await exchange.create_user_stream_listen_key()
+await exchange.keepalive_user_stream_listen_key(listen_key)
+await exchange.close_user_stream_listen_key(listen_key)
+```
+
+当前 v1 只做事件映射和连接。listenKey 定时续期、断线状态追赶、本地订单状态机、启动恢复动作，后续放 runtime/state 模块，不放进接口层。
+
+## State Store v1
+
+本地状态库只负责留存证据和支持重启读取，不做交易决策。
+
+主要用途：
+
+```text
+1. 程序重启后知道之前有什么普通挂单 / 止损挂单
+2. 保存私有事件流里的订单、余额、仓位事件
+3. 保存成交 fills，方便复盘滑点、手续费、成交质量
+4. 保存账户启动快照，方便对账和事故排查
+5. 把交易所状态和本地 runtime 状态分开，避免策略层直接依赖交易所 raw payload
+```
+
+使用方式：
+
+```python
+from src.platform import SqliteStateStore
+
+store = SqliteStateStore("data/state/aether_state.sqlite3")
+
+store.save_order(order)
+store.save_account_event(event)
+store.save_snapshot(snapshot)
+
+open_orders = store.list_open_orders(exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP")
+recent_events = store.load_recent_events(exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP")
+recent_fills = store.load_recent_fills(exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP")
+```
+
+SQLite 表：
+
+```text
+orders              当前订单状态快照
+fills               成交记录
+events              私有事件原始记录
+account_snapshots   账户启动快照
+```
+
+边界：State Store 不会调用交易所 API，不会下单，不会撤单，不会恢复订单；恢复逻辑后面放 runtime/state reconciler 单独做。

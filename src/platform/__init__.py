@@ -1,8 +1,9 @@
-from src.platform.account import AccountClient, ExchangeAccountService, create_account_client
+from src.platform.account import AccountClient, AccountEvent, AccountEventStream, AccountEventType, ExchangeAccountService, create_account_client, create_account_event_stream
 from src.platform.data import MarketDataFeed, create_market_data_feed
 from src.platform.execution import ExecutionClient, ExchangeExecutionService, ExecutionRiskLimits, LiveTradingBlocked, MultiExchangeExecutionClient, RiskCheckError, create_execution_client
 from src.platform.markets import MarketProfile, get_market_profile, list_market_profiles, register_market_profile
 from src.platform.snapshot import PlatformSnapshot, fetch_platform_snapshot
+from src.platform.state import SqliteStateStore, StateStore, StoredAccountSnapshot, StoredEvent, StoredFill, StoredOrder
 from src.platform.exchanges import (
     AmendOrderRequest,
     Balance,
@@ -35,6 +36,9 @@ from src.platform.exchanges import (
 
 __all__ = [
     "AccountClient",
+    "AccountEventType",
+    "AccountEventStream",
+    "AccountEvent",
     "AmendOrderRequest",
     "ExchangeAccountService",
     "Balance",
@@ -56,6 +60,12 @@ __all__ = [
     "LiveTradingBlocked",
     "MultiExchangeExecutionClient",
     "RiskCheckError",
+    "StoredOrder",
+    "StoredFill",
+    "StoredEvent",
+    "StoredAccountSnapshot",
+    "StateStore",
+    "SqliteStateStore",
     "Order",
     "OrderQuery",
     "OrderRequest",
@@ -72,6 +82,7 @@ __all__ = [
     "TriggerPriceType",
     "TimeInForce",
     "create_account_client",
+    "create_account_event_stream",
     "create_exchange_client",
     "create_execution_client",
     "create_market_data_feed",

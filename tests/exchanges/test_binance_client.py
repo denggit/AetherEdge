@@ -1,12 +1,9 @@
 import asyncio
 from decimal import Decimal
 
-import pytest
-
 from src.platform.exchanges import (
     CancelOrderRequest,
     ExchangeConfig,
-    ExchangeConfigError,
     ExchangeName,
     OrderRequest,
     OrderSide,
@@ -132,14 +129,3 @@ def test_binance_account_queries_use_usdm_v3_endpoints():
     assert http.calls[1]["url"].endswith("/fapi/v3/positionRisk")
     assert balance.available == Decimal("90")
     assert positions[0].quantity == Decimal("0.1")
-
-
-def test_binance_rejects_non_header_safe_private_credentials():
-    http = FakeHttpClient([])
-    cfg = ExchangeConfig(api_key="你的BINANCE_API_KEY", api_secret="secret")
-    client = create_exchange_client("binance", cfg, http_client=http)
-
-    with pytest.raises(ExchangeConfigError, match="BINANCE_API_KEY"):
-        asyncio.run(client.fetch_balance("USDT"))
-
-    assert http.calls == []

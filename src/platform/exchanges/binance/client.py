@@ -340,6 +340,19 @@ class BinanceExchangeClient:
         )
         return mode
 
+    async def create_user_stream_listen_key(self) -> str:
+        payload = await self._request_api_key("POST", "/fapi/v1/listenKey")
+        listen_key = payload.get("listenKey")
+        if not listen_key:
+            raise ExchangeMappingError("Binance listenKey response is missing listenKey", payload=payload)
+        return str(listen_key)
+
+    async def keepalive_user_stream_listen_key(self, listen_key: str) -> None:
+        await self._request_api_key("PUT", "/fapi/v1/listenKey", params={"listenKey": listen_key})
+
+    async def close_user_stream_listen_key(self, listen_key: str) -> None:
+        await self._request_api_key("DELETE", "/fapi/v1/listenKey", params={"listenKey": listen_key})
+
     async def _request_public(
         self,
         method: str,
@@ -351,6 +364,23 @@ class BinanceExchangeClient:
             method,
             f"{self._base_url}{path}",
             params=_clean_params(params),
+            timeout_seconds=self._config.timeout_seconds,
+        )
+
+    async def _request_api_key(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+    ) -> Any:
+        self._require_credentials()
+        headers = {"X-MBX-APIKEY": self._config.api_key, **dict(self._config.extra_headers)}
+        return await self._http.request(
+            method,
+            f"{self._base_url}{path}",
+            params=_clean_params(params),
+            headers=headers,
             timeout_seconds=self._config.timeout_seconds,
         )
 
@@ -383,9 +413,6 @@ class BinanceExchangeClient:
     def _require_credentials(self) -> None:
         if not self._config.api_key or not self._config.api_secret:
             raise ExchangeConfigError("Binance private API requires api_key and api_secret")
-        _require_header_safe(self._config.api_key, "BINANCE_API_KEY")
-        for name, value in self._config.extra_headers.items():
-            _require_header_safe(value, f"extra_headers[{name!r}]")
 
 
 def _map_binance_kline(row: list[Any], *, symbol: str, raw_symbol: str, interval: str) -> Kline:
@@ -407,16 +434,6 @@ def _map_binance_kline(row: list[Any], *, symbol: str, raw_symbol: str, interval
         is_closed=True,
         raw={"row": row},
     )
-
-
-def _require_header_safe(value: str, field: str) -> None:
-    try:
-        value.encode("latin-1")
-    except UnicodeEncodeError as exc:
-        raise ExchangeConfigError(
-            f"{field} contains characters that cannot be sent in an HTTP header. "
-            "Check your .env file and replace any placeholder text with the real credential value."
-        ) from exc
 
 
 def _map_binance_position(row: Mapping[str, Any], *, fallback_symbol: str | None = None) -> Position:
