@@ -36,6 +36,11 @@ class PositionSide(str, Enum):
     BOTH = "both"
 
 
+class PositionMode(str, Enum):
+    ONE_WAY = "one_way"
+    HEDGE = "hedge"
+
+
 class TimeInForce(str, Enum):
     GTC = "gtc"
     IOC = "ioc"
@@ -261,6 +266,52 @@ class OrderQuery:
         if not self.order_id and not self.client_order_id:
             raise ValueError("order_id or client_order_id is required")
 
+
+
+
+@dataclass(frozen=True)
+class StopOrderQuery:
+    symbol: str
+    stop_order_id: str | None = None
+    client_order_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.stop_order_id and not self.client_order_id:
+            raise ValueError("stop_order_id or client_order_id is required")
+
+
+@dataclass(frozen=True)
+class CancelStopOrderRequest:
+    symbol: str
+    stop_order_id: str | None = None
+    client_order_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.stop_order_id and not self.client_order_id:
+            raise ValueError("stop_order_id or client_order_id is required")
+
+
+@dataclass(frozen=True)
+class LeverageRequest:
+    symbol: str
+    leverage: Decimal
+    margin_mode: MarginMode = MarginMode.CROSS
+    position_side: PositionSide | None = None
+
+    def __post_init__(self) -> None:
+        if self.leverage <= 0:
+            raise ValueError("leverage must be positive")
+
+
+@dataclass(frozen=True)
+class LeverageInfo:
+    exchange: ExchangeName
+    symbol: str
+    raw_symbol: str
+    leverage: Decimal | None
+    margin_mode: MarginMode | None = None
+    position_side: PositionSide | None = None
+    raw: Mapping[str, Any] = field(default_factory=dict)
 
 @dataclass(frozen=True)
 class Order:

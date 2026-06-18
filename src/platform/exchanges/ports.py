@@ -6,14 +6,20 @@ from src.platform.exchanges.models import (
     AmendOrderRequest,
     Balance,
     CancelOrderRequest,
+    CancelStopOrderRequest,
     ExchangeName,
     InstrumentRule,
     Kline,
+    LeverageInfo,
+    LeverageRequest,
+    MarginMode,
     Order,
     OrderQuery,
     OrderRequest,
     Position,
+    PositionMode,
     StopMarketOrderRequest,
+    StopOrderQuery,
     Ticker,
 )
 
@@ -73,6 +79,9 @@ class ExchangeExecutionClient(ExchangeIdentity, Protocol):
     async def cancel_order(self, request: CancelOrderRequest) -> Order:
         ...
 
+    async def cancel_all_orders(self, symbol: str) -> list[Order]:
+        ...
+
     async def amend_order(self, request: AmendOrderRequest) -> Order:
         ...
 
@@ -80,6 +89,18 @@ class ExchangeExecutionClient(ExchangeIdentity, Protocol):
         ...
 
     async def fetch_open_orders(self, symbol: str) -> list[Order]:
+        ...
+
+    async def fetch_stop_order_status(self, query: StopOrderQuery) -> Order:
+        ...
+
+    async def fetch_open_stop_orders(self, symbol: str) -> list[Order]:
+        ...
+
+    async def cancel_stop_order(self, request: CancelStopOrderRequest) -> Order:
+        ...
+
+    async def cancel_all_stop_orders(self, symbol: str) -> list[Order]:
         ...
 
 
@@ -90,10 +111,25 @@ class ExchangeAccountClient(ExchangeIdentity, Protocol):
     async def fetch_positions(self, symbol: str | None = None) -> list[Position]:
         ...
 
+    async def fetch_leverage(self, symbol: str, *, margin_mode: MarginMode = MarginMode.CROSS) -> LeverageInfo:
+        ...
+
+    async def set_leverage(self, request: LeverageRequest) -> LeverageInfo:
+        ...
+
+    async def set_margin_mode(self, symbol: str, margin_mode: MarginMode) -> Mapping[str, Any]:
+        ...
+
+    async def fetch_position_mode(self) -> PositionMode:
+        ...
+
+    async def set_position_mode(self, mode: PositionMode) -> PositionMode:
+        ...
+
 
 class ExchangeClient(ExchangeMarketDataClient, ExchangeExecutionClient, ExchangeAccountClient, Protocol):
     """Full exchange adapter port.
 
     Application code should usually depend on one of the narrower facades:
-    data_feed.MarketDataFeed, execution.ExecutionClient, or account.AccountClient.
+    data.MarketDataFeed, execution.ExecutionClient, or account.AccountClient.
     """

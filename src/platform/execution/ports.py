@@ -2,7 +2,19 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from src.platform.exchanges.models import AmendOrderRequest, CancelOrderRequest, ExchangeName, Order, OrderQuery, OrderRequest, Position, StopMarketOrderRequest, TriggerPriceType
+from src.platform.exchanges.models import (
+    AmendOrderRequest,
+    CancelOrderRequest,
+    CancelStopOrderRequest,
+    ExchangeName,
+    Order,
+    OrderQuery,
+    OrderRequest,
+    Position,
+    StopMarketOrderRequest,
+    StopOrderQuery,
+    TriggerPriceType,
+)
 from src.platform.markets import MarketProfile
 
 
@@ -40,6 +52,15 @@ class ExecutionClient(Protocol):
     async def cancel_order(self, request: CancelOrderRequest) -> Order:
         ...
 
+    async def cancel_all_orders(self) -> list[Order]:
+        ...
+
+    async def cancel_stop_order(self, request: CancelStopOrderRequest) -> Order:
+        ...
+
+    async def cancel_all_stop_orders(self) -> list[Order]:
+        ...
+
     async def amend_order(self, request: AmendOrderRequest) -> Order:
         ...
 
@@ -47,6 +68,12 @@ class ExecutionClient(Protocol):
         ...
 
     async def fetch_open_orders(self) -> list[Order]:
+        ...
+
+    async def fetch_stop_order_status(self, query: StopOrderQuery) -> Order:
+        ...
+
+    async def fetch_open_stop_orders(self) -> list[Order]:
         ...
 
     async def replace_order(self, cancel_request: CancelOrderRequest, new_order: OrderRequest) -> Order:

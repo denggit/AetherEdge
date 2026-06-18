@@ -1,10 +1,29 @@
 from __future__ import annotations
 
-from src.platform.execution.risk import ExecutionRiskGate, ExecutionRiskLimits, LiveTradingBlocked
-from src.platform.execution.rules import normalize_amend_order_request, normalize_order_request, normalize_stop_market_order_request
 from decimal import Decimal
 
-from src.platform.exchanges.models import AmendOrderRequest, CancelOrderRequest, ExchangeName, InstrumentRule, Order, OrderQuery, OrderRequest, OrderSide, Position, PositionSide, StopMarketOrderRequest, TriggerPriceType
+from src.platform.execution.risk import ExecutionRiskGate, ExecutionRiskLimits, LiveTradingBlocked
+from src.platform.execution.rules import (
+    normalize_amend_order_request,
+    normalize_order_request,
+    normalize_stop_market_order_request,
+)
+from src.platform.exchanges.models import (
+    AmendOrderRequest,
+    CancelOrderRequest,
+    CancelStopOrderRequest,
+    ExchangeName,
+    InstrumentRule,
+    Order,
+    OrderQuery,
+    OrderRequest,
+    OrderSide,
+    Position,
+    PositionSide,
+    StopMarketOrderRequest,
+    StopOrderQuery,
+    TriggerPriceType,
+)
 from src.platform.exchanges.ports import ExchangeExecutionClient
 from src.platform.markets import MarketProfile
 
@@ -52,7 +71,6 @@ class ExchangeExecutionService:
             self._risk_gate.validate_order(normalized, rule)
         return await self._exchange_client.place_order(normalized)
 
-
     async def place_stop_market_order(self, request: StopMarketOrderRequest) -> Order:
         self._ensure_live_write_allowed("place_stop_market_order")
         self._ensure_bound_symbol(request.symbol)
@@ -95,6 +113,16 @@ class ExchangeExecutionService:
         self._ensure_bound_symbol(request.symbol)
         return await self._exchange_client.cancel_order(request)
 
+    async def cancel_all_orders(self) -> list[Order]:
+        return await self._exchange_client.cancel_all_orders(self._symbol)
+
+    async def cancel_stop_order(self, request: CancelStopOrderRequest) -> Order:
+        self._ensure_bound_symbol(request.symbol)
+        return await self._exchange_client.cancel_stop_order(request)
+
+    async def cancel_all_stop_orders(self) -> list[Order]:
+        return await self._exchange_client.cancel_all_stop_orders(self._symbol)
+
     async def amend_order(self, request: AmendOrderRequest) -> Order:
         self._ensure_live_write_allowed("amend_order")
         self._ensure_bound_symbol(request.symbol)
@@ -104,13 +132,19 @@ class ExchangeExecutionService:
             self._risk_gate.validate_amend(normalized, rule)
         return await self._exchange_client.amend_order(normalized)
 
-
     async def fetch_order_status(self, query: OrderQuery) -> Order:
         self._ensure_bound_symbol(query.symbol)
         return await self._exchange_client.fetch_order_status(query)
 
     async def fetch_open_orders(self) -> list[Order]:
         return await self._exchange_client.fetch_open_orders(self._symbol)
+
+    async def fetch_stop_order_status(self, query: StopOrderQuery) -> Order:
+        self._ensure_bound_symbol(query.symbol)
+        return await self._exchange_client.fetch_stop_order_status(query)
+
+    async def fetch_open_stop_orders(self) -> list[Order]:
+        return await self._exchange_client.fetch_open_stop_orders(self._symbol)
 
     async def replace_order(self, cancel_request: CancelOrderRequest, new_order: OrderRequest) -> Order:
         self._ensure_live_write_allowed("replace_order")

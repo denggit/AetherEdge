@@ -12,10 +12,13 @@ from src.platform.exchanges.models import (
     AmendOrderRequest,
     Balance,
     CancelOrderRequest,
+    CancelStopOrderRequest,
     ExchangeConfig,
     ExchangeName,
     InstrumentRule,
     Kline,
+    LeverageInfo,
+    LeverageRequest,
     MarginMode,
     Order,
     OrderQuery,
@@ -24,8 +27,10 @@ from src.platform.exchanges.models import (
     OrderStatus,
     OrderType,
     Position,
+    PositionMode,
     PositionSide,
     StopMarketOrderRequest,
+    StopOrderQuery,
     Ticker,
     TimeInForce,
     TriggerPriceType,
@@ -228,6 +233,113 @@ class BinanceExchangeClient:
         payload = await self._request_signed("GET", "/fapi/v1/openOrders", params={"symbol": raw_symbol})
         return [_map_binance_order(row, symbol=symbol, raw_symbol=raw_symbol) for row in payload]
 
+    async def cancel_all_orders(self, symbol: str) -> list[Order]:
+        raw_symbol = to_exchange_symbol(self.exchange, symbol)
+        payload = await self._request_signed("DELETE", "/fapi/v1/allOpenOrders", params={"symbol": raw_symbol})
+        status = OrderStatus.CANCELED if int(payload.get("code", 200)) in {200, 0} else OrderStatus.UNKNOWN
+        return [
+            Order(
+                exchange=self.exchange,
+                symbol=symbol,
+                raw_symbol=raw_symbol,
+                order_id=None,
+                client_order_id=None,
+                status=status,
+                raw=payload,
+            )
+        ]
+
+    async def fetch_stop_order_status(self, query: StopOrderQuery) -> Order:
+        raw_symbol = to_exchange_symbol(self.exchange, query.symbol)
+        params: dict[str, Any] = {"symbol": raw_symbol}
+        if query.stop_order_id:
+            params["algoId"] = query.stop_order_id
+        if query.client_order_id:
+            params["clientAlgoId"] = query.client_order_id
+        payload = await self._request_signed("GET", "/fapi/v1/algoOrder", params=params)
+        return _map_binance_algo_order(payload, symbol=query.symbol, raw_symbol=raw_symbol)
+
+    async def fetch_open_stop_orders(self, symbol: str) -> list[Order]:
+        raw_symbol = to_exchange_symbol(self.exchange, symbol)
+        payload = await self._request_signed("GET", "/fapi/v1/openAlgoOrders", params={"symbol": raw_symbol})
+        return [_map_binance_algo_order(row, symbol=symbol, raw_symbol=raw_symbol) for row in payload]
+
+    async def cancel_stop_order(self, request: CancelStopOrderRequest) -> Order:
+        raw_symbol = to_exchange_symbol(self.exchange, request.symbol)
+        params: dict[str, Any] = {"symbol": raw_symbol}
+        if request.stop_order_id:
+            params["algoId"] = request.stop_order_id
+        if request.client_order_id:
+            params["clientAlgoId"] = request.client_order_id
+        payload = await self._request_signed("DELETE", "/fapi/v1/algoOrder", params=params)
+        return _map_binance_algo_order(payload, symbol=request.symbol, raw_symbol=raw_symbol)
+
+    async def cancel_all_stop_orders(self, symbol: str) -> list[Order]:
+        raw_symbol = to_exchange_symbol(self.exchange, symbol)
+        payload = await self._request_signed("DELETE", "/fapi/v1/algoOpenOrders", params={"symbol": raw_symbol})
+        status = OrderStatus.CANCELED if int(payload.get("code", 200)) in {200, 0} else OrderStatus.UNKNOWN
+        return [
+            Order(
+                exchange=self.exchange,
+                symbol=symbol,
+                raw_symbol=raw_symbol,
+                order_id=None,
+                client_order_id=None,
+                status=status,
+                raw=payload,
+            )
+        ]
+
+    async def fetch_leverage(self, symbol: str, *, margin_mode: MarginMode = MarginMode.CROSS) -> LeverageInfo:
+        positions = await self.fetch_positions(symbol)
+        selected = next((position for position in positions if position.raw_symbol == to_exchange_symbol(self.exchange, symbol)), None)
+        return LeverageInfo(
+            exchange=self.exchange,
+            symbol=symbol,
+            raw_symbol=to_exchange_symbol(self.exchange, symbol),
+            leverage=selected.leverage if selected is not None else None,
+            margin_mode=margin_mode,
+            position_side=selected.side if selected is not None else None,
+            raw=selected.raw if selected is not None else {},
+        )
+
+    async def set_leverage(self, request: LeverageRequest) -> LeverageInfo:
+        raw_symbol = to_exchange_symbol(self.exchange, request.symbol)
+        payload = await self._request_signed(
+            "POST",
+            "/fapi/v1/leverage",
+            params={"symbol": raw_symbol, "leverage": _decimal_to_str(request.leverage)},
+        )
+        return LeverageInfo(
+            exchange=self.exchange,
+            symbol=request.symbol,
+            raw_symbol=raw_symbol,
+            leverage=_optional_decimal(payload.get("leverage")) or request.leverage,
+            margin_mode=request.margin_mode,
+            position_side=request.position_side,
+            raw=payload,
+        )
+
+    async def set_margin_mode(self, symbol: str, margin_mode: MarginMode) -> Mapping[str, Any]:
+        raw_symbol = to_exchange_symbol(self.exchange, symbol)
+        return await self._request_signed(
+            "POST",
+            "/fapi/v1/marginType",
+            params={"symbol": raw_symbol, "marginType": _map_binance_margin_type(margin_mode)},
+        )
+
+    async def fetch_position_mode(self) -> PositionMode:
+        payload = await self._request_signed("GET", "/fapi/v1/positionSide/dual")
+        return PositionMode.HEDGE if str(payload.get("dualSidePosition", "false")).lower() == "true" else PositionMode.ONE_WAY
+
+    async def set_position_mode(self, mode: PositionMode) -> PositionMode:
+        await self._request_signed(
+            "POST",
+            "/fapi/v1/positionSide/dual",
+            params={"dualSidePosition": "true" if mode == PositionMode.HEDGE else "false"},
+        )
+        return mode
+
     async def _request_public(
         self,
         method: str,
@@ -375,6 +487,11 @@ def _map_binance_trigger_price_type(value: TriggerPriceType) -> str:
     if value == TriggerPriceType.INDEX:
         raise ExchangeConfigError("Binance stop market order does not support INDEX trigger price type")
     return "MARK_PRICE" if value == TriggerPriceType.MARK else "CONTRACT_PRICE"
+
+
+
+def _map_binance_margin_type(mode: MarginMode) -> str:
+    return "CROSSED" if mode == MarginMode.CROSS else "ISOLATED"
 
 
 def _clean_params(params: Mapping[str, Any] | None) -> dict[str, Any]:

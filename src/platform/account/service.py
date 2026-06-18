@@ -1,7 +1,17 @@
 from __future__ import annotations
 
-from src.platform.account.ports import AccountClient
-from src.platform.exchanges.models import Balance, ExchangeName, Position
+from decimal import Decimal
+from typing import Any, Mapping
+
+from src.platform.exchanges.models import (
+    Balance,
+    ExchangeName,
+    LeverageInfo,
+    LeverageRequest,
+    MarginMode,
+    Position,
+    PositionMode,
+)
 from src.platform.exchanges.ports import ExchangeAccountClient
 from src.platform.markets import MarketProfile
 
@@ -31,6 +41,26 @@ class ExchangeAccountService:
 
     async def fetch_positions(self, symbol: str | None = None) -> list[Position]:
         resolved_symbol = symbol or self._symbol
-        if resolved_symbol != self._symbol:
-            raise ValueError(f"account client is bound to {self._symbol}, got {resolved_symbol}")
+        self._ensure_bound_symbol(resolved_symbol)
         return await self._exchange_client.fetch_positions(resolved_symbol)
+
+    async def fetch_leverage(self, *, margin_mode: MarginMode = MarginMode.CROSS) -> LeverageInfo:
+        return await self._exchange_client.fetch_leverage(self._symbol, margin_mode=margin_mode)
+
+    async def set_leverage(self, leverage: Decimal, *, margin_mode: MarginMode = MarginMode.CROSS) -> LeverageInfo:
+        return await self._exchange_client.set_leverage(
+            LeverageRequest(symbol=self._symbol, leverage=leverage, margin_mode=margin_mode)
+        )
+
+    async def set_margin_mode(self, margin_mode: MarginMode) -> Mapping[str, Any]:
+        return await self._exchange_client.set_margin_mode(self._symbol, margin_mode)
+
+    async def fetch_position_mode(self) -> PositionMode:
+        return await self._exchange_client.fetch_position_mode()
+
+    async def set_position_mode(self, mode: PositionMode) -> PositionMode:
+        return await self._exchange_client.set_position_mode(mode)
+
+    def _ensure_bound_symbol(self, symbol: str) -> None:
+        if symbol != self._symbol:
+            raise ValueError(f"account client is bound to {self._symbol}, got {symbol}")

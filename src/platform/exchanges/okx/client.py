@@ -14,10 +14,13 @@ from src.platform.exchanges.models import (
     AmendOrderRequest,
     Balance,
     CancelOrderRequest,
+    CancelStopOrderRequest,
     ExchangeConfig,
     ExchangeName,
     InstrumentRule,
     Kline,
+    LeverageInfo,
+    LeverageRequest,
     MarginMode,
     Order,
     OrderQuery,
@@ -26,8 +29,10 @@ from src.platform.exchanges.models import (
     OrderStatus,
     OrderType,
     Position,
+    PositionMode,
     PositionSide,
     StopMarketOrderRequest,
+    StopOrderQuery,
     Ticker,
     TimeInForce,
     TriggerPriceType,
@@ -282,6 +287,142 @@ class OkxExchangeClient:
             if isinstance(row, Mapping)
         ]
 
+    async def cancel_all_orders(self, symbol: str) -> list[Order]:
+        orders = await self.fetch_open_orders(symbol)
+        canceled: list[Order] = []
+        for order in orders:
+            if order.order_id or order.client_order_id:
+                canceled.append(
+                    await self.cancel_order(
+                        CancelOrderRequest(
+                            symbol=symbol,
+                            order_id=order.order_id,
+                            client_order_id=order.client_order_id,
+                        )
+                    )
+                )
+        return canceled
+
+    async def fetch_stop_order_status(self, query: StopOrderQuery) -> Order:
+        raw_symbol = to_exchange_symbol(self.exchange, query.symbol)
+        params: dict[str, Any] = {"instId": raw_symbol, "ordType": "conditional"}
+        if query.stop_order_id:
+            params["algoId"] = query.stop_order_id
+        if query.client_order_id:
+            params["algoClOrdId"] = query.client_order_id
+        payload = await self._request_private("GET", "/api/v5/trade/order-algo", params=params)
+        data = _first_data(payload, "OKX stop order status")
+        return _map_okx_algo_order_row(data, symbol=query.symbol, raw_symbol=raw_symbol)
+
+    async def fetch_open_stop_orders(self, symbol: str) -> list[Order]:
+        raw_symbol = to_exchange_symbol(self.exchange, symbol)
+        payload = await self._request_private(
+            "GET",
+            "/api/v5/trade/orders-algo-pending",
+            params={"instType": "SWAP", "instId": raw_symbol, "ordType": "conditional"},
+        )
+        rows = payload.get("data", [])
+        return [
+            _map_okx_algo_order_row(row, symbol=symbol, raw_symbol=raw_symbol)
+            for row in rows
+            if isinstance(row, Mapping)
+        ]
+
+    async def cancel_stop_order(self, request: CancelStopOrderRequest) -> Order:
+        raw_symbol = to_exchange_symbol(self.exchange, request.symbol)
+        item: dict[str, Any] = {"instId": raw_symbol}
+        if request.stop_order_id:
+            item["algoId"] = request.stop_order_id
+        if request.client_order_id:
+            item["algoClOrdId"] = request.client_order_id
+        payload = await self._request_private("POST", "/api/v5/trade/cancel-algos", json_body=[item])
+        data = _first_data(payload, "OKX cancel stop order")
+        status = OrderStatus.REJECTED if str(data.get("sCode", "0")) != "0" else OrderStatus.CANCELED
+        return Order(
+            exchange=self.exchange,
+            symbol=request.symbol,
+            raw_symbol=raw_symbol,
+            order_id=_optional_str(data.get("algoId")) or request.stop_order_id,
+            client_order_id=_optional_str(data.get("algoClOrdId")) or request.client_order_id,
+            status=status,
+            raw=data,
+        )
+
+    async def cancel_all_stop_orders(self, symbol: str) -> list[Order]:
+        orders = await self.fetch_open_stop_orders(symbol)
+        canceled: list[Order] = []
+        for order in orders:
+            if order.order_id or order.client_order_id:
+                canceled.append(
+                    await self.cancel_stop_order(
+                        CancelStopOrderRequest(
+                            symbol=symbol,
+                            stop_order_id=order.order_id,
+                            client_order_id=order.client_order_id,
+                        )
+                    )
+                )
+        return canceled
+
+    async def fetch_leverage(self, symbol: str, *, margin_mode: MarginMode = MarginMode.CROSS) -> LeverageInfo:
+        raw_symbol = to_exchange_symbol(self.exchange, symbol)
+        payload = await self._request_private(
+            "GET",
+            "/api/v5/account/leverage-info",
+            params={"instId": raw_symbol, "mgnMode": _map_okx_margin_mode(margin_mode)},
+        )
+        data = _first_data(payload, "OKX leverage info")
+        return LeverageInfo(
+            exchange=self.exchange,
+            symbol=symbol,
+            raw_symbol=raw_symbol,
+            leverage=_optional_decimal(data.get("lever")),
+            margin_mode=margin_mode,
+            position_side=_optional_position_side(data.get("posSide")),
+            raw=data,
+        )
+
+    async def set_leverage(self, request: LeverageRequest) -> LeverageInfo:
+        raw_symbol = to_exchange_symbol(self.exchange, request.symbol)
+        body: dict[str, Any] = {
+            "instId": raw_symbol,
+            "lever": _decimal_to_str(request.leverage),
+            "mgnMode": _map_okx_margin_mode(request.margin_mode),
+        }
+        if request.position_side is not None and request.position_side != PositionSide.BOTH:
+            body["posSide"] = request.position_side.value
+        payload = await self._request_private("POST", "/api/v5/account/set-leverage", json_body=body)
+        data = _first_data(payload, "OKX set leverage")
+        return LeverageInfo(
+            exchange=self.exchange,
+            symbol=request.symbol,
+            raw_symbol=raw_symbol,
+            leverage=_optional_decimal(data.get("lever")) or request.leverage,
+            margin_mode=request.margin_mode,
+            position_side=request.position_side,
+            raw=data,
+        )
+
+    async def set_margin_mode(self, symbol: str, margin_mode: MarginMode) -> Mapping[str, Any]:
+        raw_symbol = to_exchange_symbol(self.exchange, symbol)
+        return {
+            "exchange": self.exchange.value,
+            "symbol": symbol,
+            "raw_symbol": raw_symbol,
+            "margin_mode": margin_mode.value,
+            "note": "OKX margin mode is supplied per order as tdMode; no global symbol margin-mode call is needed.",
+        }
+
+    async def fetch_position_mode(self) -> PositionMode:
+        payload = await self._request_private("GET", "/api/v5/account/config")
+        data = _first_data(payload, "OKX account config")
+        return PositionMode.HEDGE if str(data.get("posMode", "")).lower() == "long_short_mode" else PositionMode.ONE_WAY
+
+    async def set_position_mode(self, mode: PositionMode) -> PositionMode:
+        pos_mode = "long_short_mode" if mode == PositionMode.HEDGE else "net_mode"
+        await self._request_private("POST", "/api/v5/account/set-position-mode", json_body={"posMode": pos_mode})
+        return mode
+
     async def _request_public(
         self,
         method: str,
@@ -383,6 +524,35 @@ def _map_okx_order_row(row: Mapping[str, Any], *, symbol: str, raw_symbol: str) 
         filled_quantity=_optional_decimal(row.get("accFillSz")),
         raw=row,
     )
+
+
+
+def _map_okx_algo_order_row(row: Mapping[str, Any], *, symbol: str, raw_symbol: str) -> Order:
+    return Order(
+        exchange=ExchangeName.OKX,
+        symbol=symbol,
+        raw_symbol=str(row.get("instId") or raw_symbol),
+        order_id=_optional_str(row.get("algoId")),
+        client_order_id=_optional_str(row.get("algoClOrdId")),
+        status=_OKX_ORDER_STATUS.get(str(row.get("state", "")).lower(), OrderStatus.UNKNOWN),
+        side=_optional_order_side(row.get("side")),
+        order_type=OrderType.MARKET,
+        price=_optional_decimal(row.get("slTriggerPx") or row.get("triggerPx")),
+        quantity=_optional_decimal(row.get("sz")),
+        filled_quantity=_optional_decimal(row.get("actualSz")),
+        raw=row,
+    )
+
+
+def _optional_position_side(value: Any) -> PositionSide | None:
+    text = str(value or "").lower()
+    if text == "long":
+        return PositionSide.LONG
+    if text == "short":
+        return PositionSide.SHORT
+    if text in {"both", "net"}:
+        return PositionSide.BOTH
+    return None
 
 
 def _map_okx_position(row: Mapping[str, Any], *, fallback_symbol: str | None = None) -> Position:
