@@ -883,3 +883,17 @@ planner 只生成请求对象，不产生交易副作用
 ```text
 不同策略 -> 同一种 TradeSignal -> 同一个 Planner -> 同一个 execution 接口
 ```
+
+
+## Project Hygiene Notes
+
+轻量框架收口阶段新增了几个工程约束：
+
+```text
+1. 所有 tools/*.py 必须带 REPO_ROOT bootstrap，保证直接运行时能 import src。
+2. requirements.txt 至少声明运行 WebSocket 所需的 websockets 依赖。
+3. config/env_loader.py 和 src/utils/email_sender.py 视为稳定用户工具，外围模块只能适配它们，不要重写。
+4. .gitignore 需要排除 .env、缓存、IDE 文件、本地 DB、日志和 zip 包。
+```
+
+注意：这些都是工程收口，不涉及具体策略逻辑。

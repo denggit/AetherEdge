@@ -1,0 +1,13 @@
+{
+  "symbol": "ETH-USDT-PERP",
+  "exchanges": ["okx"],
+  "data_exchange": "okx",
+  "strategy": "strategies.empty_strategy:Strategy",
+  "data_streams": ["trades", "order_book"],
+  "state_db_path": "data/state/aether_state.sqlite3",
+  "market_queue_maxsize": 1000,
+  "signal_queue_maxsize": 200,
+  "alert_queue_maxsize": 100,
+  "dry_run": true,
+  "enable_email_alerts": false
+}
