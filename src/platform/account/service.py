@@ -42,7 +42,8 @@ class ExchangeAccountService:
     async def fetch_positions(self, symbol: str | None = None) -> list[Position]:
         resolved_symbol = symbol or self._symbol
         self._ensure_bound_symbol(resolved_symbol)
-        return await self._exchange_client.fetch_positions(resolved_symbol)
+        positions = await self._exchange_client.fetch_positions(resolved_symbol)
+        return [position for position in positions if position.quantity != Decimal("0")]
 
     async def fetch_leverage(self, *, margin_mode: MarginMode = MarginMode.CROSS) -> LeverageInfo:
         return await self._exchange_client.fetch_leverage(self._symbol, margin_mode=margin_mode)
