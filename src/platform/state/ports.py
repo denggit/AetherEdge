@@ -5,7 +5,7 @@ from typing import Protocol
 from src.platform.account.events import AccountEvent
 from src.platform.exchanges.models import ExchangeName, Order
 from src.platform.snapshot import PlatformSnapshot
-from src.platform.state.models import StoredEvent, StoredOrder
+from src.platform.state.models import StoredAccountSnapshot, StoredEvent, StoredFill, StoredOrder
 
 
 class StateStore(Protocol):
@@ -38,4 +38,10 @@ class StateStore(Protocol):
         ...
 
     def load_recent_events(self, *, exchange: ExchangeName, symbol: str | None = None, limit: int = 100) -> list[StoredEvent]:
+        ...
+
+    def load_recent_fills(self, *, exchange: ExchangeName, symbol: str, limit: int = 100) -> list[StoredFill]:
+        ...
+
+    def load_latest_account_snapshot(self, *, exchange: ExchangeName, symbol: str) -> StoredAccountSnapshot | None:
         ...

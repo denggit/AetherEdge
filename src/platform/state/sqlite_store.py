@@ -152,6 +152,21 @@ class SqliteStateStore:
             ).fetchall()
         return list(reversed([_row_to_fill(row) for row in rows]))
 
+    def load_latest_account_snapshot(self, *, exchange: ExchangeName, symbol: str) -> StoredAccountSnapshot | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT exchange, symbol, asset, total, available, positions_json,
+                       leverage, position_mode, created_time_ms, raw_json
+                FROM account_snapshots
+                WHERE exchange = ? AND symbol = ?
+                ORDER BY created_time_ms DESC, id DESC
+                LIMIT 1
+                """,
+                (exchange.value, symbol),
+            ).fetchone()
+        return _row_to_account_snapshot(row) if row is not None else None
+
     def _upsert_order(self, order: StoredOrder) -> None:
         key_order_id = order.order_id or ""
         key_client_order_id = order.client_order_id or ""
@@ -434,6 +449,21 @@ def _row_to_event(row) -> StoredEvent:
         symbol=row[3],
         event_time_ms=row[4],
         raw=json.loads(row[5]),
+    )
+
+
+def _row_to_account_snapshot(row) -> StoredAccountSnapshot:
+    return StoredAccountSnapshot(
+        exchange=ExchangeName(row[0]),
+        symbol=row[1],
+        asset=row[2],
+        total=Decimal(str(row[3])),
+        available=Decimal(str(row[4])),
+        positions_json=row[5],
+        leverage=_optional_decimal(row[6]),
+        position_mode=PositionMode(row[7]),
+        created_time_ms=int(row[8]),
+        raw=json.loads(row[9]),
     )
 
 

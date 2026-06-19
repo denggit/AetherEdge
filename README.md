@@ -735,3 +735,151 @@ signal processor
 已新增 boundary test，确保 strategy 不 import 交易所 adapter / REST endpoint
 已新增 module placement test，限制 platform 顶层模块继续膨胀
 ```
+
+## Reconciler v1
+
+`src/reconcile/` 是只读对账模块，位置刻意放在 `src/platform/` 外面。
+
+原因：
+
+```text
+platform/state 只负责本地存储
+reconcile 负责比较本地状态和交易所真实状态
+```
+
+它检查：
+
+```text
+1. 本地有普通挂单，但交易所没有
+2. 交易所有普通挂单，但本地没有
+3. 本地有止损 / 条件单，但交易所没有
+4. 交易所有止损 / 条件单，但本地没有
+5. 本地订单状态和交易所订单状态不一致
+6. 最近本地仓位快照和交易所当前仓位不一致
+```
+
+它不做：
+
+```text
+不下单
+不撤单
+不改单
+不自动恢复
+不自动补止损
+不做策略判断
+```
+
+用法：
+
+```python
+from src.reconcile import Reconciler
+
+reconciler = Reconciler(
+    account=account,
+    execution=execution,
+    state_store=store,
+)
+
+report = await reconciler.check()
+
+if not report.ok:
+    for issue in report.issues:
+        print(issue.severity, issue.category, issue.message)
+```
+
+### 邮件警告
+
+邮件是 notifier 插件，不耦合在 checker 里面。默认不发邮件；只有显式传入 `EmailReconcileNotifier`，并且发现 warning 以上问题时才会调用 `src.utils.email_sender`。
+
+```python
+from src.reconcile import EmailReconcileNotifier, Reconciler
+
+reconciler = Reconciler(
+    account=account,
+    execution=execution,
+    state_store=store,
+    notifier=EmailReconcileNotifier(),
+)
+
+report = await reconciler.check_and_notify()
+```
+
+Reconciler 的 notifier 会适配现有 `src.utils.email_sender.send_email` 形式：
+
+```python
+async def send_email(subject: str, content: str, content_type: str = "plain") -> bool:
+    ...
+```
+
+也就是说，它会传 `subject`、`content`、`content_type="plain"`，并且会正确 `await` 异步发送函数。
+
+你原来的 `email_sender.py` 通过 `config.env_loader.EMAIL_CONFIG` 读取：
+
+```text
+EMAIL_SENDER=
+EMAIL_PASSWORD=
+EMAIL_RECEIVER=
+```
+
+这次只提醒状态不一致，比如你手动平仓、手动撤止损、交易所事件丢失等情况。它不会自动修复任何东西。
+
+## Signal Model + Execution Planner v1
+
+具体策略最后再做。当前只定义策略和执行之间的标准边界：
+
+```text
+strategy -> TradeSignal -> ExecutionPlanner -> OrderRequest / StopMarketOrderRequest -> execution
+```
+
+新增：
+
+```text
+src/signals/
+  models.py      # TradeSignal / SignalAction / SignalOrderType
+  ports.py       # SignalHandler
+
+src/planner/
+  models.py      # ExecutionPlan / PlannedExecution
+  service.py     # ExecutionPlanner
+  ports.py       # PlannerPort
+```
+
+策略以后只输出标准信号：
+
+```python
+from decimal import Decimal
+from src.signals import SignalAction, TradeSignal
+
+signal = TradeSignal(
+    symbol="ETH-USDT-PERP",
+    action=SignalAction.OPEN_LONG,
+    quantity=Decimal("0.1"),
+    reason="example only",
+)
+```
+
+Planner 只负责把信号转成执行请求，不负责真正下单：
+
+```python
+from src.planner import ExecutionPlanner
+
+plan = ExecutionPlanner().plan(signal)
+
+for item in plan.items:
+    print(item.action, item.order_request, item.stop_market_request)
+```
+
+边界规则：
+
+```text
+signals 不 import OKX / Binance adapter
+planner 不 import OKX / Binance adapter
+planner 不调用 execution.place_order / cancel_order / amend_order
+planner 只生成请求对象，不产生交易副作用
+```
+
+这样以后策略可以随便换，框架仍然复用：
+
+```text
+不同策略 -> 同一种 TradeSignal -> 同一个 Planner -> 同一个 execution 接口
+```
