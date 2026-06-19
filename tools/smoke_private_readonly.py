@@ -17,21 +17,38 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.platform import create_account_client, create_execution_client, fetch_platform_snapshot
+from src.platform.config import load_env_config
+from src.platform.exchanges.errors import ExchangeApiError
 
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("exchange", choices=["okx", "binance"])
+    parser.add_argument("exchange", nargs="?", choices=["okx", "binance"], help="default: first AETHER_EXCHANGES item or okx")
     parser.add_argument("--symbol", default="ETH-USDT-PERP")
     parser.add_argument("--asset", default="USDT")
     args = parser.parse_args()
+    env = load_env_config()
+    exchange = args.exchange or (env.get("AETHER_EXCHANGES", "okx").split(",")[0].strip() or "okx")
 
-    account = create_account_client(args.exchange, symbol=args.symbol)
-    execution = create_execution_client(args.exchange, symbol=args.symbol, validate_orders=False)
-    snapshot = await fetch_platform_snapshot(account=account, execution=execution, asset=args.asset)
+    account = create_account_client(exchange, symbol=args.symbol)
+    execution = create_execution_client(exchange, symbol=args.symbol, validate_orders=False)
+    try:
+        snapshot = await fetch_platform_snapshot(account=account, execution=execution, asset=args.asset)
+    except ExchangeApiError as exc:
+        print(
+            {
+                "exchange": exchange,
+                "symbol": args.symbol,
+                "error": str(exc),
+                "status_code": exc.status_code,
+                "payload": exc.payload,
+                "hint": "If this is OKX HTTP 403, first check API key environment mismatch, IP whitelist, and whether your server IP/User-Agent is blocked.",
+            }
+        )
+        raise SystemExit(1) from exc
     print(
         {
-            "exchange": args.exchange,
+            "exchange": exchange,
             "symbol": snapshot.symbol,
             "available": str(snapshot.balance.available),
             "positions": len(snapshot.positions),

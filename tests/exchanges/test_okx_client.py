@@ -112,3 +112,17 @@ def test_okx_place_and_cancel_order_use_same_business_request_model():
     assert http.calls[0]["headers"]["x-simulated-trading"] == "1"
     assert order.status is OrderStatus.NEW
     assert canceled.status is OrderStatus.CANCELED
+
+
+def test_okx_private_requests_include_content_type_header():
+    http = FakeHttpClient([{"code": "0", "data": [{"details": [{"ccy": "USDT", "cashBal": "1", "availBal": "1"}]}]}])
+    cfg = ExchangeConfig(api_key="k", api_secret="s", passphrase="p")
+    client = create_exchange_client("okx", cfg, http_client=http)
+
+    import asyncio
+
+    asyncio.run(client.fetch_balance("USDT"))
+
+    headers = http.calls[0]["headers"]
+    assert headers["Content-Type"] == "application/json"
+    assert "OK-ACCESS-KEY" in headers

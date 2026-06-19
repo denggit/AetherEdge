@@ -465,6 +465,7 @@ class OkxExchangeClient:
             "OK-ACCESS-SIGN": signature,
             "OK-ACCESS-TIMESTAMP": timestamp,
             "OK-ACCESS-PASSPHRASE": self._config.passphrase,
+            "Content-Type": "application/json",
             **dict(self._config.extra_headers),
         }
         if self._config.sandbox:

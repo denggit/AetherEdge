@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from src.platform.exchanges.errors import UnsupportedExchangeError
-from src.platform.exchanges.http import StdlibHttpClient
+from src.platform.exchanges.http import RequestsHttpClient
 from src.platform.exchanges.models import ExchangeConfig, ExchangeName
 from src.platform.exchanges.ports import ExchangeClient, HttpClient
 
@@ -29,7 +29,7 @@ def create_exchange_client(
 
     exchange_name = normalize_exchange_name(exchange)
     cfg = config or ExchangeConfig.from_env(exchange_name)
-    http = http_client or StdlibHttpClient()
+    http = http_client or RequestsHttpClient()
 
     if exchange_name == ExchangeName.OKX:
         from src.platform.exchanges.okx.client import OkxExchangeClient
