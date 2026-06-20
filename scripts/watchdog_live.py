@@ -1,127 +1,170 @@
-import argparse
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""Simple watchdog for AetherEdge live runner.
+
+This process starts scripts/run_live.py as a child process. If the live runner
+exits unexpectedly, the watchdog restarts it after a short delay.
+
+Stop behavior:
+- stop the watchdog process with SIGTERM / Ctrl+C
+- watchdog will terminate the live child before exiting
+
+This is intentionally simple. Process control lives in the shell script;
+Python only supervises the live child.
+"""
+from __future__ import annotations
+
 import asyncio
-import json
+import datetime as dt
+import os
+import shlex
+import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
+from typing import Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.app import (
-    EmailAlertSink,
-    NoopAlertSink,
-    PidFileProcessController,
-    ProcessWatchdog,
-    WatchdogConfig,
-    build_live_runner_command,
-)
-from src.platform.config import load_env_config
+DEFAULT_LIVE_SCRIPT = PROJECT_ROOT / "scripts" / "run_live.py"
+DEFAULT_LIVE_LOG = PROJECT_ROOT / "logs" / "aether_live.out"
+DEFAULT_CHILD_PID_FILE = PROJECT_ROOT / "data" / "run" / "aether_live.pid"
+
+_running = True
+_child: Optional[subprocess.Popen] = None
 
 
-def _load_defaults() -> dict:
-    path = PROJECT_ROOT / "config" / "aether_defaults.json"
-    if not path.exists():
-        return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+def ts() -> str:
+    return dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
-def _bool(value) -> bool:
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+def log(message: str) -> None:
+    print(f"{ts()} | WATCHDOG | {message}", flush=True)
 
 
-def _optional_int(value):
-    if value in (None, "", "none", "None"):
-        return None
-    return int(value)
+def _truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _str_path(value, fallback: str) -> str:
-    return str(value) if value not in (None, "") else fallback
+def _resolve_path(raw: str | None, default: Path) -> Path:
+    path = Path(raw).expanduser() if raw else default
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path
 
 
-def _parser(env: dict, defaults: dict) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Watch and restart the AetherEdge live runner if it exits unexpectedly.")
-    parser.add_argument("action", nargs="?", choices=["run", "start", "stop", "restart", "status"], default="start")
-    parser.add_argument("--max-restarts", type=int, default=_optional_int(env.get("AETHER_WATCHDOG_MAX_RESTARTS", defaults.get("watchdog_max_restarts", "10"))))
-    parser.add_argument("--restart-delay", type=float, default=float(env.get("AETHER_WATCHDOG_RESTART_DELAY_SECONDS", defaults.get("watchdog_restart_delay_seconds", "5"))))
-    parser.add_argument("--pid-file", default=_str_path(env.get("AETHER_WATCHDOG_PID_FILE"), defaults.get("watchdog_pid_file", "data/run/aether_watchdog.pid")))
-    parser.add_argument("--log-file", default=_str_path(env.get("AETHER_WATCHDOG_LOG_FILE"), defaults.get("watchdog_log_file", "logs/aether_watchdog.log")))
-    parser.add_argument("--stop-timeout", type=float, default=float(env.get("AETHER_WATCHDOG_STOP_TIMEOUT_SECONDS", defaults.get("watchdog_stop_timeout_seconds", "10"))))
-    parser.add_argument("--no-email", action="store_true", help="Disable watchdog email alerts even if AETHER_ENABLE_EMAIL_ALERT=true.")
-    parser.add_argument("child_args", nargs=argparse.REMAINDER, help="Arguments after -- are passed to scripts/run_live.py")
-    return parser
+def _send_watchdog_alert(subject: str, content: str) -> None:
+    if not _truthy(os.getenv("AETHER_ENABLE_EMAIL_ALERT")):
+        return
+    try:
+        from src.utils.email_sender import send_email
+
+        asyncio.run(send_email(subject=subject, content=content, content_type="plain"))
+    except Exception as exc:  # noqa: BLE001 - watchdog must never crash because alert failed
+        log(f"Failed to send watchdog email alert: {exc}")
 
 
-def _clean_child_args(raw_args: list[str]) -> list[str]:
-    if raw_args and raw_args[0] == "--":
-        return raw_args[1:]
-    return raw_args
+def terminate_child(reason: str) -> None:
+    global _child
+    child = _child
+    if child is None or child.poll() is not None:
+        return
+
+    log(f"Stopping live child pid={child.pid} reason={reason}")
+    try:
+        child.terminate()
+        child.wait(timeout=float(os.getenv("AETHER_WATCHDOG_CHILD_STOP_TIMEOUT_SECONDS", "20")))
+        log(f"Live child stopped pid={child.pid} returncode={child.returncode}")
+    except subprocess.TimeoutExpired:
+        log(f"Live child did not stop in time, killing pid={child.pid}")
+        child.kill()
+        child.wait(timeout=10)
+    finally:
+        _child = None
+        try:
+            DEFAULT_CHILD_PID_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
-def _run_command(args) -> tuple[str, ...]:
-    command = [sys.executable, str(PROJECT_ROOT / "scripts" / "watchdog_live.py"), "run"]
-    if args.max_restarts is not None:
-        command.extend(["--max-restarts", str(args.max_restarts)])
-    command.extend(["--restart-delay", str(args.restart_delay)])
-    if args.no_email:
-        command.append("--no-email")
-    child_args = _clean_child_args(list(args.child_args))
-    if child_args:
-        command.append("--")
-        command.extend(child_args)
-    return tuple(command)
+def handle_stop_signal(signum: int, _frame) -> None:  # type: ignore[no-untyped-def]
+    global _running
+    _running = False
+    log(f"Received signal={signum}. Watchdog is shutting down.")
+    terminate_child(f"watchdog_signal_{signum}")
 
 
-def _controller(args) -> PidFileProcessController:
-    return PidFileProcessController(pid_file=PROJECT_ROOT / args.pid_file, log_file=PROJECT_ROOT / args.log_file, cwd=PROJECT_ROOT)
+def build_command() -> list[str]:
+    python_bin = os.getenv("LIVE_PYTHON_BIN", sys.executable)
+    live_script = _resolve_path(os.getenv("LIVE_SCRIPT"), DEFAULT_LIVE_SCRIPT)
+    extra_args = shlex.split(os.getenv("LIVE_ARGS", ""))
+    return [python_bin, "-u", str(live_script), *extra_args]
 
 
-async def _run_watchdog(args, env: dict) -> int:
-    child_args = _clean_child_args(list(args.child_args))
-    command = build_live_runner_command(project_root=PROJECT_ROOT, child_args=child_args)
-    enable_email = _bool(env.get("AETHER_ENABLE_EMAIL_ALERT", "false")) and not args.no_email
-    alert_sink = EmailAlertSink() if enable_email else NoopAlertSink()
-    config = WatchdogConfig(
-        command=command,
+def start_child() -> subprocess.Popen:
+    command = build_command()
+    live_log_path = _resolve_path(os.getenv("LIVE_LOG_FILE"), DEFAULT_LIVE_LOG)
+    live_pid_file = _resolve_path(os.getenv("LIVE_PID_FILE"), DEFAULT_CHILD_PID_FILE)
+    live_log_path.parent.mkdir(parents=True, exist_ok=True)
+    live_pid_file.parent.mkdir(parents=True, exist_ok=True)
+
+    log(f"Starting live child: {' '.join(command)}")
+    log(f"Live child log file: {live_log_path}")
+    log_file = open(live_log_path, "a", buffering=1, encoding="utf-8")
+    child = subprocess.Popen(
+        command,
         cwd=str(PROJECT_ROOT),
-        restart_delay_seconds=args.restart_delay,
-        max_restarts=args.max_restarts,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        env=os.environ.copy(),
+        text=True,
     )
-    stats = await ProcessWatchdog(config, alert_sink=alert_sink).run()
-    print(stats)
-    if stats.last_return_code not in (None, 0):
-        return int(stats.last_return_code or 1)
-    return 0
+    live_pid_file.write_text(str(child.pid), encoding="utf-8")
+    log(f"Live child started pid={child.pid}")
+    return child
 
 
 def main() -> int:
-    env = load_env_config()
-    defaults = _load_defaults()
-    args = _parser(env, defaults).parse_args()
-    controller = _controller(args)
+    global _child
+    signal.signal(signal.SIGTERM, handle_stop_signal)
+    signal.signal(signal.SIGINT, handle_stop_signal)
 
-    if args.action == "run":
-        return asyncio.run(_run_watchdog(args, env))
-    if args.action == "start":
-        result = controller.start(_run_command(args))
-        print(result)
-        return 0 if result.ok else 1
-    if args.action == "stop":
-        result = controller.stop(timeout_seconds=args.stop_timeout)
-        print(result)
-        return 0 if result.ok else 1
-    if args.action == "restart":
-        stop_result = controller.stop(timeout_seconds=args.stop_timeout)
-        print(stop_result)
-        start_result = controller.start(_run_command(args))
-        print(start_result)
-        return 0 if start_result.ok else 1
-    if args.action == "status":
-        result = controller.status()
-        print(result)
-        return 0 if result.ok else 1
-    raise ValueError(f"unsupported action: {args.action}")
+    restart_seconds = float(os.getenv("AETHER_WATCHDOG_RESTART_DELAY_SECONDS", "5"))
+    max_restarts = int(os.getenv("AETHER_WATCHDOG_MAX_RESTARTS", "0"))  # 0 means unlimited
+    restart_count = 0
+
+    log("Watchdog started")
+    log(f"Project root: {PROJECT_ROOT}")
+    log(f"Restart delay: {restart_seconds}s, max_restarts={max_restarts or 'unlimited'}")
+
+    while _running:
+        _child = start_child()
+        returncode = _child.wait()
+        try:
+            _resolve_path(os.getenv("LIVE_PID_FILE"), DEFAULT_CHILD_PID_FILE).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        if not _running:
+            break
+
+        restart_count += 1
+        message = f"Live child exited unexpectedly returncode={returncode}. restart_count={restart_count}"
+        log(message)
+        _send_watchdog_alert("AetherEdge live runner exited", message)
+        if max_restarts > 0 and restart_count >= max_restarts:
+            log("Max restart count reached. Watchdog exits.")
+            return returncode if returncode != 0 else 1
+
+        time.sleep(restart_seconds)
+
+    log("Watchdog stopped")
+    return 0
 
 
 if __name__ == "__main__":

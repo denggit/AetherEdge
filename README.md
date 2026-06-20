@@ -898,128 +898,54 @@ planner 只生成请求对象，不产生交易副作用
 
 注意：这些都是工程收口，不涉及具体策略逻辑。
 
-## Lightweight App Runner
+## Simple Live Watchdog Scripts
 
-具体策略仍然最后再做。当前 app runner 只负责把框架链路串起来：
-
-```text
-data stream -> strategy plugin -> TradeSignal -> ExecutionPlanner -> execution
-```
-
-启动入口放在 `scripts/`：
+启动脚本放在 `scripts/`，采用简单 shell PID 文件管理，不使用复杂 Python 进程控制类。
 
 ```bash
-python scripts/run_live.py --max-events 10
-# 或
-bash scripts/run_live.sh --max-events 10
+bash scripts/start_live_watchdog.sh start
+bash scripts/start_live_watchdog.sh status
+bash scripts/start_live_watchdog.sh stop
+bash scripts/start_live_watchdog.sh restart
+bash scripts/start_live_watchdog.sh logs
 ```
 
-`--max-events` 只用于测试，表示最多处理 N 条行情事件后退出。真正长时间运行时不要加这个参数。
-
-默认 `.env` 建议先保持：
-
-```text
-AETHER_DRY_RUN=true
-AETHER_LIVE_TRADING=false
-AETHER_STRATEGY=strategies.empty_strategy:Strategy
-```
-
-这样框架能跑通，但不会真实下单。
-
-## Live Watchdog
-
-`watchdog` 是外部进程监督器，不在策略主循环里运行。它只做一件事：启动 `scripts/run_live.py`，如果子进程异常退出，就发邮件提醒并按配置重启。
-
-启动方式：
+也可以用兼容入口：
 
 ```bash
-python scripts/watchdog_live.py
-# 或
-bash scripts/watchdog_live.sh
-```
-
-不带参数时默认等价于 `start`，会后台启动 watchdog。需要前台调试时显式使用：
-
-```bash
-bash scripts/watchdog_live.sh run
-python scripts/watchdog_live.py run
-```
-
-测试时可以把参数传给内部的 `scripts/run_live.py`：
-
-```bash
-python scripts/watchdog_live.py --restart-delay 1 --max-restarts 3 -- --max-events 10
-bash scripts/watchdog_live.sh --restart-delay 1 --max-restarts 3 -- --max-events 10
-```
-
-说明：
-
-```text
---restart-delay    子进程异常退出后的重启等待秒数
---max-restarts     最大重启次数；达到后 watchdog 退出
---no-email         即使 AETHER_ENABLE_EMAIL_ALERT=true，也不发 watchdog 邮件
---                 后面的参数原样传给 scripts/run_live.py
-```
-
-`.env` 可覆盖 watchdog 参数：
-
-```text
-AETHER_WATCHDOG_RESTART_DELAY_SECONDS=5
-AETHER_WATCHDOG_MAX_RESTARTS=10
-AETHER_ENABLE_EMAIL_ALERT=true
-```
-
-长期默认值放在 `config/aether_defaults.json`：
-
-```json
-{
-  "watchdog_restart_delay_seconds": 5,
-  "watchdog_max_restarts": 10
-}
-```
-
-边界：watchdog 不懂策略、不懂订单、不懂交易所 API；它只是进程级守护。邮件发送在 watchdog 进程里完成，不会阻塞主交易进程的数据、分析和下单链路。
-
-### Watchdog start / stop / restart / status
-
-`watchdog_live.py` 支持进程控制命令，方便服务器上管理实盘进程。现在不带参数时默认后台启动：
-
-```bash
-bash scripts/watchdog_live.sh          # 等价于 start
 bash scripts/watchdog_live.sh start
-bash scripts/watchdog_live.sh status
 bash scripts/watchdog_live.sh stop
-bash scripts/watchdog_live.sh restart
 ```
 
-也可以直接用 Python：
+不带参数默认 `start`：
 
 ```bash
-python scripts/watchdog_live.py start
-python scripts/watchdog_live.py status
-python scripts/watchdog_live.py stop
-python scripts/watchdog_live.py restart
+bash scripts/start_live_watchdog.sh
 ```
 
-`start` 会在后台启动 watchdog，watchdog 再启动 `scripts/run_live.py`。PID 和日志默认位置：
+默认文件：
 
 ```text
-PID:  data/run/aether_watchdog.pid
-LOG:  logs/aether_watchdog.log
+watchdog pid: data/run/aether_watchdog.pid
+live pid:     data/run/aether_live.pid
+watchdog log: logs/aether_watchdog.out
+live log:     logs/aether_live.out
 ```
 
-可用 `.env` 覆盖：
+可通过环境变量覆盖：
 
 ```text
-AETHER_WATCHDOG_PID_FILE=data/run/aether_watchdog.pid
-AETHER_WATCHDOG_LOG_FILE=logs/aether_watchdog.log
-AETHER_WATCHDOG_STOP_TIMEOUT_SECONDS=10
+WATCHDOG_PID_FILE=
+WATCHDOG_LOG_FILE=
+LIVE_PID_FILE=
+LIVE_LOG_FILE=
+LIVE_PYTHON_BIN=
+LIVE_SCRIPT=
+LIVE_ARGS=
+AETHER_WATCHDOG_RESTART_DELAY_SECONDS=5
+AETHER_WATCHDOG_MAX_RESTARTS=0   # 0 means unlimited
 ```
 
-如果要把参数传给内部的 `run_live.py`，仍然用 `--` 分隔：
+`watchdog_live.py` 只负责启动并监督 `scripts/run_live.py`。如果 live 子进程异常退出，watchdog 等待一段时间后重启；如果收到 SIGTERM / Ctrl+C，会先终止 live 子进程再退出。
 
-```bash
-bash scripts/watchdog_live.sh start -- --max-events 10
-```
-
-真正实盘长期运行时不要传 `--max-events`。
+这部分不包含策略逻辑，不调用交易所 API，不做订单恢复。

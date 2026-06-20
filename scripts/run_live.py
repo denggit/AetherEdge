@@ -1,3 +1,12 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""AetherEdge live runner entrypoint.
+
+This script only starts the lightweight app runner. Strategy logic is loaded as
+an external plugin from `.env` / defaults config.
+"""
+from __future__ import annotations
+
 import argparse
 import asyncio
 import sys
