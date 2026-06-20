@@ -897,3 +897,78 @@ planner 只生成请求对象，不产生交易副作用
 ```
 
 注意：这些都是工程收口，不涉及具体策略逻辑。
+
+## Lightweight App Runner
+
+具体策略仍然最后再做。当前 app runner 只负责把框架链路串起来：
+
+```text
+data stream -> strategy plugin -> TradeSignal -> ExecutionPlanner -> execution
+```
+
+启动入口放在 `scripts/`：
+
+```bash
+python scripts/run_live.py --max-events 10
+# 或
+bash scripts/run_live.sh --max-events 10
+```
+
+`--max-events` 只用于测试，表示最多处理 N 条行情事件后退出。真正长时间运行时不要加这个参数。
+
+默认 `.env` 建议先保持：
+
+```text
+AETHER_DRY_RUN=true
+AETHER_LIVE_TRADING=false
+AETHER_STRATEGY=strategies.empty_strategy:Strategy
+```
+
+这样框架能跑通，但不会真实下单。
+
+## Live Watchdog
+
+`watchdog` 是外部进程监督器，不在策略主循环里运行。它只做一件事：启动 `scripts/run_live.py`，如果子进程异常退出，就发邮件提醒并按配置重启。
+
+启动方式：
+
+```bash
+python scripts/watchdog_live.py
+# 或
+bash scripts/watchdog_live.sh
+```
+
+测试时可以把参数传给内部的 `scripts/run_live.py`：
+
+```bash
+python scripts/watchdog_live.py --restart-delay 1 --max-restarts 3 -- --max-events 10
+bash scripts/watchdog_live.sh --restart-delay 1 --max-restarts 3 -- --max-events 10
+```
+
+说明：
+
+```text
+--restart-delay    子进程异常退出后的重启等待秒数
+--max-restarts     最大重启次数；达到后 watchdog 退出
+--no-email         即使 AETHER_ENABLE_EMAIL_ALERT=true，也不发 watchdog 邮件
+--                 后面的参数原样传给 scripts/run_live.py
+```
+
+`.env` 可覆盖 watchdog 参数：
+
+```text
+AETHER_WATCHDOG_RESTART_DELAY_SECONDS=5
+AETHER_WATCHDOG_MAX_RESTARTS=10
+AETHER_ENABLE_EMAIL_ALERT=true
+```
+
+长期默认值放在 `config/aether_defaults.json`：
+
+```json
+{
+  "watchdog_restart_delay_seconds": 5,
+  "watchdog_max_restarts": 10
+}
+```
+
+边界：watchdog 不懂策略、不懂订单、不懂交易所 API；它只是进程级守护。邮件发送在 watchdog 进程里完成，不会阻塞主交易进程的数据、分析和下单链路。
