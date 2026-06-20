@@ -92,3 +92,31 @@ def test_account_facade_reads_balance_and_positions_only():
 
     assert balance.available == Decimal("90")
     assert positions[0].quantity == Decimal("0.1")
+
+
+def test_account_facade_filters_zero_quantity_positions():
+    class ZeroPositionExchangeClient(FakeExchangeClient):
+        async def fetch_positions(self, symbol=None):
+            return [
+                Position(
+                    exchange=ExchangeName.OKX,
+                    symbol="ETH-USDT-PERP",
+                    raw_symbol="ETH-USDT-SWAP",
+                    side=PositionSide.LONG,
+                    quantity=Decimal("0"),
+                ),
+                Position(
+                    exchange=ExchangeName.OKX,
+                    symbol="ETH-USDT-PERP",
+                    raw_symbol="ETH-USDT-SWAP",
+                    side=PositionSide.SHORT,
+                    quantity=Decimal("0.2"),
+                ),
+            ]
+
+    account = create_account_client("okx", exchange_client=ZeroPositionExchangeClient())
+
+    positions = asyncio.run(account.fetch_positions("ETH-USDT-PERP"))
+
+    assert len(positions) == 1
+    assert positions[0].quantity == Decimal("0.2")
