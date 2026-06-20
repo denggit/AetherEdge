@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -47,14 +48,21 @@ class ProcessWatchdog:
         self.config = config
         self.alert_sink = alert_sink or NoopAlertSink()
         self.stats = WatchdogStats()
+        self._current_process: asyncio.subprocess.Process | None = None
+        self._stop_requested = False
 
     async def run(self) -> WatchdogStats:
-        while True:
+        self._install_signal_handlers()
+        while not self._stop_requested:
             self.stats.starts += 1
             process = await asyncio.create_subprocess_exec(*self.config.command, cwd=self.config.cwd)
+            self._current_process = process
             return_code = await process.wait()
+            self._current_process = None
             self.stats.last_return_code = return_code
 
+            if self._stop_requested:
+                return self.stats
             if return_code == 0 and self.config.stop_on_success:
                 return self.stats
 
@@ -66,6 +74,24 @@ class ProcessWatchdog:
             self.stats.restarts += 1
             if self.config.restart_delay_seconds > 0:
                 await asyncio.sleep(self.config.restart_delay_seconds)
+        return self.stats
+
+    def _install_signal_handlers(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(signum, self._request_stop)
+        except (NotImplementedError, RuntimeError):
+            return
+
+    def _request_stop(self) -> None:
+        self._stop_requested = True
+        process = self._current_process
+        if process is not None and process.returncode is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
 
     async def _alert_child_exit(self, return_code: int) -> None:
         subject = "AetherEdge live runner exited"

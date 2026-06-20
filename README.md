@@ -938,6 +938,13 @@ python scripts/watchdog_live.py
 bash scripts/watchdog_live.sh
 ```
 
+不带参数时默认等价于 `start`，会后台启动 watchdog。需要前台调试时显式使用：
+
+```bash
+bash scripts/watchdog_live.sh run
+python scripts/watchdog_live.py run
+```
+
 测试时可以把参数传给内部的 `scripts/run_live.py`：
 
 ```bash
@@ -972,3 +979,47 @@ AETHER_ENABLE_EMAIL_ALERT=true
 ```
 
 边界：watchdog 不懂策略、不懂订单、不懂交易所 API；它只是进程级守护。邮件发送在 watchdog 进程里完成，不会阻塞主交易进程的数据、分析和下单链路。
+
+### Watchdog start / stop / restart / status
+
+`watchdog_live.py` 支持进程控制命令，方便服务器上管理实盘进程。现在不带参数时默认后台启动：
+
+```bash
+bash scripts/watchdog_live.sh          # 等价于 start
+bash scripts/watchdog_live.sh start
+bash scripts/watchdog_live.sh status
+bash scripts/watchdog_live.sh stop
+bash scripts/watchdog_live.sh restart
+```
+
+也可以直接用 Python：
+
+```bash
+python scripts/watchdog_live.py start
+python scripts/watchdog_live.py status
+python scripts/watchdog_live.py stop
+python scripts/watchdog_live.py restart
+```
+
+`start` 会在后台启动 watchdog，watchdog 再启动 `scripts/run_live.py`。PID 和日志默认位置：
+
+```text
+PID:  data/run/aether_watchdog.pid
+LOG:  logs/aether_watchdog.log
+```
+
+可用 `.env` 覆盖：
+
+```text
+AETHER_WATCHDOG_PID_FILE=data/run/aether_watchdog.pid
+AETHER_WATCHDOG_LOG_FILE=logs/aether_watchdog.log
+AETHER_WATCHDOG_STOP_TIMEOUT_SECONDS=10
+```
+
+如果要把参数传给内部的 `run_live.py`，仍然用 `--` 分隔：
+
+```bash
+bash scripts/watchdog_live.sh start -- --max-events 10
+```
+
+真正实盘长期运行时不要传 `--max-events`。

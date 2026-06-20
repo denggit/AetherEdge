@@ -23,3 +23,8 @@ def test_all_shell_startup_scripts_define_project_root():
         if "PROJECT_ROOT=" not in text or "cd \"$PROJECT_ROOT\"" not in text:
             missing.append(str(path.relative_to(ROOT)))
     assert missing == []
+
+
+def test_watchdog_script_defaults_to_background_start():
+    text = (ROOT / "scripts" / "watchdog_live.py").read_text(encoding="utf-8")
+    assert 'choices=["run", "start", "stop", "restart", "status"], default="start"' in text
