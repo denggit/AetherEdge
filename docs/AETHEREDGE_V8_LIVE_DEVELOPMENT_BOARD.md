@@ -27,11 +27,11 @@
 
 ## Board 2：Runtime Foundation
 
-- [ ] AE-0201 Runtime Config / Context
-- [ ] AE-0202 Async Task Queues
-- [ ] AE-0203 4H Closed-Bar Scheduler
-- [ ] AE-0204 Startup Lifecycle
-- [ ] AE-0205 `scripts/run_live.py` 接入 `AETHER_RUNTIME_MODE`
+- [x] AE-0201 Runtime Config / Context
+- [x] AE-0202 Async Task Queues
+- [x] AE-0203 4H Closed-Bar Scheduler
+- [x] AE-0204 Startup Lifecycle
+- [x] AE-0205 `scripts/run_live.py` 接入 `AETHER_RUNTIME_MODE`
 
 ## Board 3：Order Management Foundation
 
@@ -72,6 +72,11 @@ AE-0106 Historical Trades Warmup
 AE-0107 RangeBar Builder
 AE-0108 RangeBar Store
 AE-0109 4H Range Aggregate
+AE-0201 Runtime Config / Context
+AE-0202 Async Task Queues
+AE-0203 4H Closed-Bar Scheduler
+AE-0204 Startup Lifecycle
+AE-0205 scripts/run_live.py 接入 AETHER_RUNTIME_MODE
 ```
 
-本包完成 Market Data Foundation 主线，不改变现有 live 启动链路，不改变策略逻辑。
+本包完成 Market Data Foundation 与 Runtime Foundation 主线；`bash scripts/start_live_watchdog.sh` 入口不变，默认仍走 legacy_app，设置 `AETHER_RUNTIME_MODE=live_runtime` 才启用新 runtime。
