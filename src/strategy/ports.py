@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol, Sequence
 
+from src.market_data.events import MarketFeatureEvent
 from src.platform.account.events import AccountEvent
 from src.platform.data.models import MarketKline, MarketOrderBook, MarketTicker, MarketTrade
 from src.platform.snapshot import PlatformSnapshot
@@ -55,4 +56,11 @@ class RecoverableStrategyPort(Protocol):
     """Optional strategy extension used by runtime recovery."""
 
     async def recover(self, context: StrategyRecoveryContext) -> Sequence[TradeSignal]:
+        ...
+
+
+class MarketFeatureStrategyPort(Protocol):
+    """Optional strategy extension for reusable market feature events."""
+
+    async def on_market_feature(self, event: MarketFeatureEvent) -> Sequence[TradeSignal]:
         ...

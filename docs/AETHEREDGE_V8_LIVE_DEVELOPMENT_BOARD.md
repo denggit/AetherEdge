@@ -46,6 +46,24 @@
 - [x] AE-0401 Runtime Recovery Service
 - [x] AE-0402 Strategy Recover Interface
 
+
+## Board 4.6：Direct Live Runtime Requirements Glue
+
+- [x] AE-0461 StrategyRuntimeRequirements 模型
+- [x] AE-0462 策略 config / strategy method -> requirements parser
+- [x] AE-0463 LiveRuntimeRunner 根据 requirements 自动执行 closed-kline warmup，并选择 closed-kline / rangebar 参数
+- [x] AE-0464 LiveRuntimeRunner 根据 requirements 启动 trades / order_book producer
+- [x] AE-0465 private account/order stream requirement 接入 runtime
+- [x] AE-0466 V8 预期 requirements：trades yes、order_book no、4H yes、rangebar yes、private account yes
+
+设计结论：
+
+```text
+warmup / stream / feature pipeline 不由 LiveRuntimeRunner 写死。closed-kline warmup 可根据 requirements 自动创建；历史 trades warmup 必须由对应 adapter/service 显式提供，缺失时 fail fast。
+策略插件通过 runtime_requirements 声明自己需要的数据，runtime 按需启动。
+V8 不订阅 order_book，只订阅 trades + closed 4H + rangebar aggregate + private account/order events。
+```
+
 ## Board 5：V8 Strategy Plugin
 
 - [ ] AE-0501 V8 Plugin Skeleton
@@ -84,6 +102,12 @@ AE-0304 MultiExchangeOrderCoordinator
 AE-0305 Stop Order Sync
 AE-0401 Runtime Recovery Service
 AE-0402 Strategy Recover Interface
+AE-0461 StrategyRuntimeRequirements 模型
+AE-0462 策略 config / strategy method -> requirements parser
+AE-0463 LiveRuntimeRunner 根据 requirements 自动执行 closed-kline warmup，并选择 closed-kline / rangebar 参数
+AE-0464 LiveRuntimeRunner 根据 requirements 启动 trades / order_book producer
+AE-0465 private account/order stream requirement 接入 runtime
+AE-0466 V8 requirements 预案
 ```
 
 本包完成 Market Data Foundation、Runtime Foundation、Order Management Foundation、Recovery / Reconcile 主线；`bash scripts/start_live_watchdog.sh` 入口不变，默认仍走 legacy_app，设置 `AETHER_RUNTIME_MODE=live_runtime` 才启用新 runtime。

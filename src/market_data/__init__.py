@@ -1,3 +1,4 @@
+from src.market_data.events import MarketFeatureEvent, MarketFeatureEventType
 from src.market_data.models import DataGap, MarketDataSet, RangeBar, RangeBarAggregate, TimeRange, WarmupRequest, WarmupResult
 from src.market_data.ports import (
     DataGapDetector,
@@ -19,6 +20,8 @@ __all__ = [
     "TimeRange",
     "WarmupRequest",
     "WarmupResult",
+    "MarketFeatureEvent",
+    "MarketFeatureEventType",
     "DataGapDetector",
     "KlineRepository",
     "RangeBarAggregatorPort",

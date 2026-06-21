@@ -1,2 +1,12 @@
 /.env
 /.pytest_tmp/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+logs/
+data/
+*.db
+*.sqlite
+*.sqlite3
+.env

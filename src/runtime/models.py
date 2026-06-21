@@ -23,7 +23,9 @@ class RuntimePhase(str, Enum):
 @dataclass(frozen=True)
 class RuntimeHealth:
     phase: RuntimePhase
+    healthy: bool = True
     warmup_complete: bool = False
     caught_up: bool = False
     last_market_event_time_ms: int | None = None
+    error: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)

@@ -85,7 +85,7 @@ def terminate_child(reason: str) -> None:
     finally:
         _child = None
         try:
-            DEFAULT_CHILD_PID_FILE.unlink(missing_ok=True)
+            _resolve_path(os.getenv("LIVE_PID_FILE"), DEFAULT_CHILD_PID_FILE).unlink(missing_ok=True)
         except Exception:
             pass
 

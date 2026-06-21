@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -19,6 +20,10 @@ class LiveRuntimeConfig:
     warmup_enabled: bool = True
     background_queue_maxsize: int = 1000
     scheduler_poll_seconds: float = 1.0
+    closed_bar_interval: str = "4h"
+    closed_bar_buffer_ms: int = 60_000
+    range_pct: Decimal = Decimal("0.002")
+    producer_stale_timeout_ms: int = 60_000
 
     @property
     def symbol(self) -> str:
@@ -52,6 +57,10 @@ def live_runtime_config_from_app(
         warmup_enabled=_bool(env.get("AETHER_WARMUP_ENABLED", defaults.get("warmup_enabled", True))),
         background_queue_maxsize=int(env.get("AETHER_BACKGROUND_QUEUE_MAXSIZE", defaults.get("background_queue_maxsize", 1000))),
         scheduler_poll_seconds=float(env.get("AETHER_SCHEDULER_POLL_SECONDS", defaults.get("scheduler_poll_seconds", 1.0))),
+        closed_bar_interval=str(env.get("AETHER_CLOSED_BAR_INTERVAL", defaults.get("closed_bar_interval", "4h"))),
+        closed_bar_buffer_ms=int(env.get("AETHER_CLOSED_BAR_BUFFER_MS", defaults.get("closed_bar_buffer_ms", 60_000))),
+        range_pct=Decimal(str(env.get("AETHER_RANGE_PCT", defaults.get("range_pct", "0.002")))),
+        producer_stale_timeout_ms=int(env.get("AETHER_PRODUCER_STALE_TIMEOUT_MS", defaults.get("producer_stale_timeout_ms", 60_000))),
     )
 
 
