@@ -23,12 +23,7 @@ class OrderIntentStatus(str, Enum):
 
 @dataclass(frozen=True)
 class OrderIntent:
-    """Durable command describing one strategy execution intent.
-
-    OrderIntent is strategy-agnostic. It records what the system intended to do
-    before exchange-specific orders are sent, which makes restart recovery and
-    duplicate protection possible without coupling to a concrete strategy.
-    """
+    """Durable command describing one strategy execution intent."""
 
     intent_id: str
     strategy_id: str
@@ -58,3 +53,13 @@ class ExchangeOrderResult:
     quantity: Decimal | None = None
     error: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class OrderJournalEvent:
+    intent_id: str
+    status: OrderIntentStatus
+    message: str = ""
+    exchange: ExchangeName | None = None
+    created_time_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+    metadata: Mapping[str, Any] = field(default_factory=dict)

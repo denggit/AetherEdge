@@ -35,11 +35,11 @@
 
 ## Board 3：Order Management Foundation
 
-- [ ] AE-0301 OrderIntent Model 扩展
-- [ ] AE-0302 Order Journal
-- [ ] AE-0303 Client Order ID Generator
-- [ ] AE-0304 MultiExchangeOrderCoordinator
-- [ ] AE-0305 Stop Order Sync
+- [x] AE-0301 OrderIntent Model 扩展
+- [x] AE-0302 Order Journal
+- [x] AE-0303 Client Order ID Generator
+- [x] AE-0304 MultiExchangeOrderCoordinator
+- [x] AE-0305 Stop Order Sync
 
 ## Board 4：Recovery / Reconcile
 
@@ -77,6 +77,11 @@ AE-0202 Async Task Queues
 AE-0203 4H Closed-Bar Scheduler
 AE-0204 Startup Lifecycle
 AE-0205 scripts/run_live.py 接入 AETHER_RUNTIME_MODE
+AE-0301 OrderIntent Model 扩展
+AE-0302 Order Journal
+AE-0303 Client Order ID Generator
+AE-0304 MultiExchangeOrderCoordinator
+AE-0305 Stop Order Sync
 ```
 
-本包完成 Market Data Foundation 与 Runtime Foundation 主线；`bash scripts/start_live_watchdog.sh` 入口不变，默认仍走 legacy_app，设置 `AETHER_RUNTIME_MODE=live_runtime` 才启用新 runtime。
+本包完成 Market Data Foundation、Runtime Foundation、Order Management Foundation 主线；`bash scripts/start_live_watchdog.sh` 入口不变，默认仍走 legacy_app，设置 `AETHER_RUNTIME_MODE=live_runtime` 才启用新 runtime。
