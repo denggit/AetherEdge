@@ -15,11 +15,11 @@
 
 ## Board 1：Market Data Foundation
 
-- [ ] AE-0101 Market Data Models 扩展
-- [ ] AE-0102 Kline Local Store
-- [ ] AE-0103 Trade Local Store
-- [ ] AE-0104 Warmup Gap Detector
-- [ ] AE-0105 Warmup Service
+- [x] AE-0101 Market Data Models 扩展
+- [x] AE-0102 Kline Local Store
+- [x] AE-0103 Trade Local Store
+- [x] AE-0104 Warmup Gap Detector
+- [x] AE-0105 Warmup Service
 - [ ] AE-0106 Historical Trades Warmup
 - [ ] AE-0107 RangeBar Builder
 - [ ] AE-0108 RangeBar Store
@@ -63,6 +63,11 @@
 ```text
 AE-0001 架构边界测试
 AE-0002 新常驻功能域骨架
+AE-0101 Market Data Models 扩展
+AE-0102 Kline Local Store
+AE-0103 Trade Local Store
+AE-0104 Warmup Gap Detector
+AE-0105 Warmup Service
 ```
 
-本包不包含业务实现，不改变现有 live 启动链路，不改变策略逻辑。
+本包不包含 range bar，不改变现有 live 启动链路，不改变策略逻辑。
