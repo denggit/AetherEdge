@@ -5,6 +5,8 @@ from src.market_data.ports import (
     RangeBarAggregatorPort,
     RangeBarBuilderPort,
     RangeBarRepository,
+    HistoricalTradeFeed,
+    TradeCoverageRepository,
     TradeRepository,
     WarmupServicePort,
 )
@@ -22,6 +24,8 @@ __all__ = [
     "RangeBarAggregatorPort",
     "RangeBarBuilderPort",
     "RangeBarRepository",
+    "HistoricalTradeFeed",
+    "TradeCoverageRepository",
     "TradeRepository",
     "WarmupServicePort",
 ]

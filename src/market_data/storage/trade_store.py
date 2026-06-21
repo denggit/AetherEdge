@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import sqlite3
 from decimal import Decimal
@@ -64,6 +65,34 @@ class SqliteTradeStore:
             return None
         return int(row[0])
 
+    def mark_coverage(self, *, symbol: str, time_range: TimeRange, source: str = "historical") -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO trade_coverage (symbol, start_time_ms, end_time_ms, source, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (symbol, time_range.start_time_ms, time_range.end_time_ms, source, now),
+            )
+
+    def coverage_ranges(self, *, symbol: str, time_range: TimeRange, source: str = "historical") -> list[TimeRange]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT start_time_ms, end_time_ms
+                FROM trade_coverage
+                WHERE symbol = ? AND source = ? AND end_time_ms >= ? AND start_time_ms <= ?
+                ORDER BY start_time_ms ASC, end_time_ms ASC
+                """,
+                (symbol, source, time_range.start_time_ms, time_range.end_time_ms),
+            ).fetchall()
+        clipped = [
+            TimeRange(max(time_range.start_time_ms, int(row[0])), min(time_range.end_time_ms, int(row[1])))
+            for row in rows
+        ]
+        return _merge_ranges(clipped)
+
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -85,9 +114,26 @@ class SqliteTradeStore:
                 """
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol_time ON trades(symbol, trade_time_ms, event_time_ms)")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trade_coverage (
+                    symbol TEXT NOT NULL,
+                    start_time_ms INTEGER NOT NULL,
+                    end_time_ms INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(symbol, start_time_ms, end_time_ms, source)
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_coverage_lookup ON trade_coverage(symbol, source, start_time_ms, end_time_ms)")
 
     def _connect(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        return conn
 
 
 def _trade_params(row: MarketTrade) -> tuple[object, ...]:
@@ -133,3 +179,17 @@ def _row_to_trade(row: tuple[object, ...]) -> MarketTrade:
 
 def _dec(value: Decimal) -> str:
     return format(value.normalize(), "f")
+
+
+def _merge_ranges(ranges: list[TimeRange]) -> list[TimeRange]:
+    if not ranges:
+        return []
+    ordered = sorted(ranges, key=lambda item: (item.start_time_ms, item.end_time_ms))
+    merged: list[TimeRange] = [ordered[0]]
+    for item in ordered[1:]:
+        last = merged[-1]
+        if item.start_time_ms <= last.end_time_ms + 1:
+            merged[-1] = TimeRange(last.start_time_ms, max(last.end_time_ms, item.end_time_ms))
+        else:
+            merged.append(item)
+    return merged

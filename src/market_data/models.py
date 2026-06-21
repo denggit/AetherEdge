@@ -97,6 +97,20 @@ class RangeBar:
     def delta_notional(self) -> Decimal:
         return self.buy_notional - self.sell_notional
 
+    @property
+    def direction(self) -> int:
+        if self.close > self.open:
+            return 1
+        if self.close < self.open:
+            return -1
+        return 0
+
+    @property
+    def actual_range_pct(self) -> Decimal:
+        if self.open == 0:
+            return Decimal("0")
+        return (self.high - self.low) / self.open
+
     def __post_init__(self) -> None:
         if not self.symbol:
             raise ValueError("symbol is required")
@@ -135,6 +149,12 @@ class RangeBarAggregate:
     notional_sum: Decimal
 
     @property
+    def micro_return_pct(self) -> Decimal:
+        if self.first_open == 0:
+            return Decimal("0")
+        return self.last_close / self.first_open - Decimal("1")
+
+    @property
     def imbalance(self) -> Decimal:
         denom = self.buy_notional_sum + self.sell_notional_sum
         if denom == 0:
@@ -154,3 +174,13 @@ class RangeBarAggregate:
         if span == 0:
             return Decimal("0.5")
         return (self.last_close - self.low) / span
+
+    def __post_init__(self) -> None:
+        if not self.symbol:
+            raise ValueError("symbol is required")
+        if self.range_pct <= 0:
+            raise ValueError("range_pct must be positive")
+        if self.bucket_end_ms < self.bucket_start_ms:
+            raise ValueError("bucket_end_ms must be greater than or equal to bucket_start_ms")
+        if self.bar_count < 0:
+            raise ValueError("bar_count must be non-negative")

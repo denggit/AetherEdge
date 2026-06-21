@@ -20,10 +20,10 @@
 - [x] AE-0103 Trade Local Store
 - [x] AE-0104 Warmup Gap Detector
 - [x] AE-0105 Warmup Service
-- [ ] AE-0106 Historical Trades Warmup
-- [ ] AE-0107 RangeBar Builder
-- [ ] AE-0108 RangeBar Store
-- [ ] AE-0109 4H Range Aggregate
+- [x] AE-0106 Historical Trades Warmup
+- [x] AE-0107 RangeBar Builder
+- [x] AE-0108 RangeBar Store
+- [x] AE-0109 4H Range Aggregate
 
 ## Board 2：Runtime Foundation
 
@@ -68,6 +68,10 @@ AE-0102 Kline Local Store
 AE-0103 Trade Local Store
 AE-0104 Warmup Gap Detector
 AE-0105 Warmup Service
+AE-0106 Historical Trades Warmup
+AE-0107 RangeBar Builder
+AE-0108 RangeBar Store
+AE-0109 4H Range Aggregate
 ```
 
-本包不包含 range bar，不改变现有 live 启动链路，不改变策略逻辑。
+本包完成 Market Data Foundation 主线，不改变现有 live 启动链路，不改变策略逻辑。

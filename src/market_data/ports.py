@@ -32,6 +32,35 @@ class TradeRepository(Protocol):
         ...
 
 
+class TradeCoverageRepository(Protocol):
+    """Optional coverage tracking for historical trade warmup."""
+
+    def mark_coverage(self, *, symbol: str, time_range: TimeRange, source: str = "historical") -> None:
+        ...
+
+    def coverage_ranges(self, *, symbol: str, time_range: TimeRange, source: str = "historical") -> list[TimeRange]:
+        ...
+
+
+class HistoricalTradeFeed(Protocol):
+    """Port for paginated historical trade retrieval.
+
+    Concrete exchange adapters can implement this later. The market-data domain
+    only depends on this protocol and never imports OKX/Binance raw clients.
+    """
+
+    async def fetch_trades(
+        self,
+        *,
+        symbol: str,
+        start_time_ms: int,
+        end_time_ms: int,
+        limit: int = 1000,
+        oldest_first: bool = True,
+    ) -> list[MarketTrade]:
+        ...
+
+
 class RangeBarRepository(Protocol):
     """Persistence port for reusable derived range bars."""
 
