@@ -43,8 +43,8 @@
 
 ## Board 4：Recovery / Reconcile
 
-- [ ] AE-0401 Runtime Recovery Service
-- [ ] AE-0402 Strategy Recover Interface
+- [x] AE-0401 Runtime Recovery Service
+- [x] AE-0402 Strategy Recover Interface
 
 ## Board 5：V8 Strategy Plugin
 
@@ -82,6 +82,8 @@ AE-0302 Order Journal
 AE-0303 Client Order ID Generator
 AE-0304 MultiExchangeOrderCoordinator
 AE-0305 Stop Order Sync
+AE-0401 Runtime Recovery Service
+AE-0402 Strategy Recover Interface
 ```
 
-本包完成 Market Data Foundation、Runtime Foundation、Order Management Foundation 主线；`bash scripts/start_live_watchdog.sh` 入口不变，默认仍走 legacy_app，设置 `AETHER_RUNTIME_MODE=live_runtime` 才启用新 runtime。
+本包完成 Market Data Foundation、Runtime Foundation、Order Management Foundation、Recovery / Reconcile 主线；`bash scripts/start_live_watchdog.sh` 入口不变，默认仍走 legacy_app，设置 `AETHER_RUNTIME_MODE=live_runtime` 才启用新 runtime。

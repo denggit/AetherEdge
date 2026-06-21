@@ -1,11 +1,28 @@
 from __future__ import annotations
 
-from typing import Protocol, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Mapping, Protocol, Sequence
 
 from src.platform.account.events import AccountEvent
 from src.platform.data.models import MarketKline, MarketOrderBook, MarketTicker, MarketTrade
 from src.platform.snapshot import PlatformSnapshot
+from src.reconcile.models import ReconcileReport
 from src.signals import TradeSignal
+
+
+@dataclass(frozen=True)
+class StrategyRecoveryContext:
+    """Strategy-facing recovery input.
+
+    Runtime owns the generic recovery orchestration. Concrete strategies can use
+    this context to rebuild their own internal state without importing runtime
+    or exchange adapters.
+    """
+
+    snapshots: tuple[PlatformSnapshot, ...]
+    reconcile_reports: tuple[ReconcileReport, ...]
+    order_intent_ids: tuple[str, ...] = ()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 class StrategyPort(Protocol):
@@ -31,4 +48,11 @@ class StrategyPort(Protocol):
         ...
 
     async def on_account_event(self, event: AccountEvent) -> Sequence[TradeSignal]:
+        ...
+
+
+class RecoverableStrategyPort(Protocol):
+    """Optional strategy extension used by runtime recovery."""
+
+    async def recover(self, context: StrategyRecoveryContext) -> Sequence[TradeSignal]:
         ...

@@ -1,4 +1,4 @@
 from src.strategy.loader import StrategyLoadError, load_strategy
-from src.strategy.ports import StrategyPort
+from src.strategy.ports import RecoverableStrategyPort, StrategyPort, StrategyRecoveryContext
 
-__all__ = ["StrategyLoadError", "StrategyPort", "load_strategy"]
+__all__ = ["RecoverableStrategyPort", "StrategyLoadError", "StrategyPort", "StrategyRecoveryContext", "load_strategy"]
