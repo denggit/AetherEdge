@@ -156,7 +156,9 @@ class OkxExchangeClient:
     ) -> list[Trade]:
         raw_symbol = to_exchange_symbol(self.exchange, symbol)
         page_limit = min(max(int(limit or 100), 1), 100)
-        max_pages = int(__import__("os").getenv("OKX_HISTORY_TRADES_MAX_PAGES", "200"))
+        max_pages = int(os.getenv("OKX_HISTORY_TRADES_MAX_PAGES", "500"))
+        page_sleep_every = int(os.getenv("OKX_HISTORY_TRADES_PAGE_SLEEP_EVERY", "20"))
+        page_sleep_seconds = max(0.0, float(os.getenv("OKX_HISTORY_TRADES_PAGE_SLEEP_SECONDS", "1")))
         params: dict[str, Any] = {"instId": raw_symbol, "limit": page_limit}
         rows: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -190,6 +192,10 @@ class OkxExchangeClient:
             cursor = str(data[-1].get("tradeId") or "")
             if not cursor:
                 break
+            if page_sleep_every > 0 and page_sleep_seconds > 0 and len(rows) > 0:
+                page_number = len(seen) // page_limit if page_limit else 0
+                if page_number > 0 and page_number % page_sleep_every == 0:
+                    await asyncio.sleep(page_sleep_seconds)
         trades = [_map_okx_trade(row, symbol=symbol, raw_symbol=raw_symbol) for row in rows]
         trades.sort(key=lambda row: ((row.trade_time_ms or row.event_time_ms or 0), row.trade_id or ""), reverse=not oldest_first)
         return trades[:limit]

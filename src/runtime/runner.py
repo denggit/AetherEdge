@@ -312,7 +312,7 @@ class LiveRuntimeRunner:
             historical_trade_feed=historical_feed,
             range_pct=self._range_pct,
             contract_value=contract_value,
-            batch_limit=int(os.getenv("AETHER_TRADE_WARMUP_BATCH_LIMIT", "1000")),
+            batch_limit=int(os.getenv("AETHER_TRADE_WARMUP_BATCH_LIMIT", "50000")),
         )
         result = await service.warmup(symbol=self.app_config.symbol, time_range=time_range)
         self.stats.warmup_runs += 1

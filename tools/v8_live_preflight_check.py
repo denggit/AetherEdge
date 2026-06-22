@@ -316,7 +316,7 @@ async def _check_current_4h_trade_warmup_api_coverage(report: PreflightReport, *
             historical_trade_feed=data_feed,
             range_pct=runtime.range_pct,
             contract_value=contract_value,
-            batch_limit=int(os.getenv("AETHER_TRADE_WARMUP_BATCH_LIMIT", "1000")),
+            batch_limit=int(os.getenv("AETHER_TRADE_WARMUP_BATCH_LIMIT", "50000")),
         )
         result = await service.warmup(symbol=app.symbol, time_range=TimeRange(bucket_start_ms, now_ms))
         if result.caught_up:

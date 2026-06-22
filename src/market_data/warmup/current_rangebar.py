@@ -38,7 +38,7 @@ class CurrentRangeBarWarmupService:
         historical_trade_feed: HistoricalTradeFeed | None,
         range_pct: Decimal,
         contract_value: Decimal,
-        batch_limit: int = 1000,
+        batch_limit: int = 50_000,
         coverage_source: str = "historical_current_bucket",
     ) -> None:
         self.trade_repository = trade_repository
