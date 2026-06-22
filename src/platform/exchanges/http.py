@@ -57,11 +57,21 @@ class RequestsHttpClient:
             raise ExchangeApiError("requests is required for RequestsHttpClient") from exc
 
         headers_dict = _merged_headers(headers)
+        data = None
+        if json_body is not None:
+            # For signed APIs such as OKX, the exact JSON body bytes must match
+            # the body text used in the signature. ``requests`` serializes
+            # ``json=`` with its own spacing, so send the compact JSON string
+            # explicitly. This keeps POST signatures consistent with adapters
+            # that sign ``json.dumps(..., separators=(",", ":"))``.
+            data = json.dumps(json_body, separators=(",", ":"))
+            headers_dict.setdefault("Content-Type", "application/json")
+
         response = requests.request(
             method.upper(),
             url,
             params={k: v for k, v in (params or {}).items() if v is not None} or None,
-            json=json_body,
+            data=data,
             headers=headers_dict,
             timeout=timeout_seconds or 10.0,
         )

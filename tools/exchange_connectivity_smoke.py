@@ -322,11 +322,24 @@ async def _step(report: SmokeReport, name: str, exchange: ExchangeName | None, f
         print(f"[ok] {name}" + (f" {exchange.value}" if exchange else ""))
         return value
     except Exception as exc:
-        report.add(StepResult(name=name, ok=soft, exchange=None if exchange is None else exchange.value, error=str(exc)))
-        print(f"[{'warn' if soft else 'fail'}] {name}" + (f" {exchange.value}" if exchange else "") + f": {exc}")
-        if soft:
-            return None
+        ok = bool(soft and _is_expected_noop_error(exc))
+        report.add(StepResult(name=name, ok=ok, exchange=None if exchange is None else exchange.value, error=str(exc)))
+        label = "warn-ok" if ok else ("warn-fail" if soft else "fail")
+        print(f"[{label}] {name}" + (f" {exchange.value}" if exchange else "") + f": {exc}")
         return None
+
+
+def _is_expected_noop_error(exc: Exception) -> bool:
+    text = str(exc)
+    expected_fragments = (
+        "No need to change position side",
+        "No need to change margin type",
+        "code': -4059",
+        "code': -4046",
+        '"code": -4059',
+        '"code": -4046',
+    )
+    return any(fragment in text for fragment in expected_fragments)
 
 
 def _stop_price(price: Decimal, *, side: str, distance_pct: Decimal) -> Decimal:
