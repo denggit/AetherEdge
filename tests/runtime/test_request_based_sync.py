@@ -1024,49 +1024,52 @@ async def test_callback_known_ids_binance_fake_with_client():
 
 
 @pytest.mark.asyncio
-async def test_order_sync_inactive_skip_logs_once_then_debug_or_suppressed(caplog):
-    """Inactive order sync should log INFO only once, then DEBUG on repeats."""
-    import logging
-
-    caplog.set_level(logging.DEBUG, logger="src.runtime.account_sync.service")
-
+async def test_order_sync_inactive_summary_not_emitted_on_second_tick():
+    """First inactive logs INFO; second tick (20s later) must NOT emit summary.
+    The summary should only fire after the full 600s interval."""
     service = OrderStateSyncService(
         contexts=(SyncExchangeContext(account=FakeAccount(), execution=TrackingExecution(), state_store=MemoryState()),),
         config=OrderStateRequirement(poll_interval_seconds=20),
         active_check=lambda: False,
     )
 
-    # Simulate 3 periodic ticks by calling the skip logic directly
-    # First tick: should emit INFO "inactive"
-    import asyncio
-    stop = asyncio.Event()
-
-    # We can't easily test run_periodic loop, so test the tracking state directly
-    # Tick 1: first inactive
+    # ── Tick 1: first inactive (state transition None → False) ──
     assert not service.active_check()
     service._inactive_skip_summary.record_skip("inactive")
-    # Simulate the first-logic:
-    assert service._last_order_sync_active is None  # Not yet set
+    t1 = 100.0
+    # This is the first-inactive path: state-change INFO + mark_emitted
+    assert service._last_order_sync_active is not False  # None is not False
     service._last_order_sync_active = False
-    # So first tick would emit INFO "Order state sync inactive"
-    assert service._last_order_sync_active is False
+    service._inactive_skip_summary.mark_emitted("inactive", now=t1)
+    assert service._inactive_skip_summary.count("inactive") == 1
 
-    # Tick 2: repeated inactive
+    # ── Tick 2: 20 seconds later — within 600s window ──
     assert not service.active_check()
     service._inactive_skip_summary.record_skip("inactive")
-    # Now _last_order_sync_active is False (already was)
-    assert service._last_order_sync_active is False
-    # Summary should not emit yet (within 600s window)
-    # Count should be 2
+    t2 = 120.0
+    # should NOT emit summary (mark_emitted seeded timer at t1=100)
+    assert service._inactive_skip_summary.should_emit_summary(
+        "inactive", interval_seconds=600.0, now=t2
+    ) is False
     assert service._inactive_skip_summary.count("inactive") == 2
 
-    # Tick 3: repeated inactive
+    # ── Tick 3: another 20s later — still within window ──
     assert not service.active_check()
     service._inactive_skip_summary.record_skip("inactive")
+    t3 = 140.0
+    assert service._inactive_skip_summary.should_emit_summary(
+        "inactive", interval_seconds=600.0, now=t3
+    ) is False
     assert service._inactive_skip_summary.count("inactive") == 3
 
-    # Verify we can distinguish state correctly
-    assert service._last_order_sync_active is not True
+    # ── After 10 minutes + 1s — summary SHOULD fire ──
+    t4 = 701.0
+    assert service._inactive_skip_summary.should_emit_summary(
+        "inactive", interval_seconds=600.0, now=t4
+    ) is True
+
+    # ── State tracker is correct ──
+    assert service._last_order_sync_active is False
 
 
 @pytest.mark.asyncio

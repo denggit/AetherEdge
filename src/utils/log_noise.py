@@ -131,6 +131,18 @@ class PeriodicSkipSummary:
         with self._lock:
             return self._counts.get(key, 0)
 
+    def mark_emitted(self, key: str, *, now: float | None = None) -> None:
+        """Seed the last-emit timestamp for *key* without actually emitting.
+
+        Call this when an external state-change log (e.g. "Order state sync
+        inactive") already serves as the first notification.  Subsequent
+        ``should_emit_summary`` calls will then wait the full *interval_seconds*
+        before returning True.
+        """
+        now = now if now is not None else self._now_fn()
+        with self._lock:
+            self._last_emit[key] = now
+
     def should_emit_summary(self, key: str, *, interval_seconds: float, now: float | None = None) -> bool:
         """Return True if at least *interval_seconds* have passed since the last
         summary emit for *key*. Updates the last-emit timestamp on True.

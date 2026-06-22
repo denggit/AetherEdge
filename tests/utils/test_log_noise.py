@@ -180,6 +180,42 @@ def test_periodic_skip_summary_different_keys():
     assert summary.should_emit_summary("b", interval_seconds=10.0, now=100.0) is True
 
 
+def test_periodic_skip_summary_mark_emitted_blocks_immediate_summary():
+    """mark_emitted seeds the timer so should_emit_summary won't fire
+    until the full interval has elapsed."""
+    summary = PeriodicSkipSummary()
+    summary.record_skip("inactive")
+    # First inactive: state-change log fired; seed the timer.
+    summary.mark_emitted("inactive", now=100.0)
+
+    # 20 seconds later (within the 600s window): should NOT emit.
+    summary.record_skip("inactive")
+    assert summary.should_emit_summary("inactive", interval_seconds=600.0, now=120.0) is False
+
+    # 10 minutes + 1 second later: SHOULD emit.
+    summary.record_skip("inactive")
+    assert summary.should_emit_summary("inactive", interval_seconds=600.0, now=701.0) is True
+
+
+def test_periodic_skip_summary_mark_emitted_does_not_reset_count():
+    """mark_emitted only updates the timer; skip counts are preserved."""
+    summary = PeriodicSkipSummary()
+    summary.record_skip("inactive")
+    summary.record_skip("inactive")
+    summary.record_skip("inactive")
+    summary.mark_emitted("inactive", now=100.0)
+    assert summary.count("inactive") == 3
+
+
+def test_periodic_skip_summary_without_mark_emitted_first_call_still_true():
+    """Without mark_emitted, the very first should_emit_summary call
+    returns True (backward-compatible behaviour for callers that don't
+    use an external state-change log)."""
+    summary = PeriodicSkipSummary()
+    summary.record_skip("x")
+    assert summary.should_emit_summary("x", interval_seconds=600.0, now=100.0) is True
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # build_fingerprint
 # ────────────────────────────────────────────────────────────────────────────

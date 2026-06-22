@@ -229,6 +229,10 @@ class OrderStateSyncService:
                 now_s = _time.monotonic()
                 if self._last_order_sync_active is not False:
                     self._last_order_sync_active = False
+                    # Seed the summary timer so the next "still inactive" is at
+                    # least interval_seconds away — the state-change log above
+                    # already serves as the first notification.
+                    self._inactive_skip_summary.mark_emitted("inactive", now=now_s)
                     logger.info("Order state sync inactive | reason=no_active_position_no_pending_orders")
                 elif self._inactive_skip_summary.should_emit_summary("inactive", interval_seconds=600.0, now=now_s):
                     logger.info(
