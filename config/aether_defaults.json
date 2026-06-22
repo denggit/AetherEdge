@@ -1,13 +1,21 @@
 {
+  "runtime_mode": "live_runtime",
   "symbol": "ETH-USDT-PERP",
-  "exchanges": ["okx"],
+  "exchanges": ["okx", "binance"],
   "data_exchange": "okx",
-  "strategy": "strategies.empty_strategy:Strategy",
-  "data_streams": ["trades", "order_book"],
+  "strategy": "strategies.eth_lf_portfolio_v8:Strategy",
+  "data_streams": ["trades"],
   "state_db_path": "data/state/aether_state.sqlite3",
   "market_queue_maxsize": 1000,
   "signal_queue_maxsize": 200,
   "alert_queue_maxsize": 100,
   "dry_run": true,
-  "enable_email_alerts": false
+  "enable_email_alerts": false,
+  "warmup_enabled": true,
+  "background_queue_maxsize": 1000,
+  "scheduler_poll_seconds": 1.0,
+  "closed_bar_interval": "4h",
+  "closed_bar_buffer_ms": 60000,
+  "range_pct": "0.002",
+  "producer_stale_timeout_ms": 60000
 }

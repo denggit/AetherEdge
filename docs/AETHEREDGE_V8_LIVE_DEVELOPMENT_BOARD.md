@@ -260,3 +260,20 @@ V8 插件现在支持完整持仓周期第一版：
 6. follower account fill 回流 V8 后，只给 follower leg cancel/replace stop，且使用同一个 master canonical stop price。
 7. 策略插件仍不直接调用 OKX/Binance API。
 ```
+
+
+## Board 5 package 7：V8 Live Startup Config
+
+- [x] AE-0511 V8 Live Startup Config
+
+设计结论：
+
+```text
+已把 AetherEdge 默认配置和 .env.example 切到 V8 live_runtime 主线，但仍保持安全开关：
+1. config/aether_defaults.json 默认 AETHER_RUNTIME_MODE=live_runtime 等价配置。
+2. 默认策略为 strategies.eth_lf_portfolio_v8:Strategy。
+3. 默认 data_streams 为 trades，V8 不订阅 order_book。
+4. .env.example 明确 OKX master / Binance follower 是配置，不是代码写死。
+5. dry_run 默认 true，live_trading 默认 false；真实启动前必须显式改成 AETHER_DRY_RUN=false 且 AETHER_LIVE_TRADING=true。
+6. 新增 startup config 测试，确认 live_runtime 能加载 V8 插件、解析 master/follower、读取 V8 runtime_requirements。
+```
