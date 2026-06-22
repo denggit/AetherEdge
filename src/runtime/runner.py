@@ -173,6 +173,9 @@ class LiveRuntimeRunner:
         signals = await handler(event)
         await self._execute_signals(signals or (), source=event.type_value, event_time_ms=event.event_time_ms, metadata={"feature_type": event.type_value})
 
+    async def process_account_event(self, event: AccountEvent) -> None:
+        await self._process_account_event(event)
+
     async def poll_closed_bar_once(self, *, now_ms: int | None = None) -> list[MarketFeatureEvent]:
         now = int(time.time() * 1000) if now_ms is None else now_ms
         open_time_ms = self._closed_bar_scheduler.due_closed_bar(now)

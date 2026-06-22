@@ -72,7 +72,7 @@ V8 不订阅 order_book，只订阅 trades + closed 4H + rangebar aggregate + pr
 - [x] AE-0504 V8 Position State
 - [x] AE-0505 V8 Signal Mapper
 - [x] AE-0506 Live Signal Engine
-- [ ] AE-0510 Live Runtime Integration / Small Order Verification
+- [x] AE-0510 Live Runtime Integration
 - [x] AE-0508 V8 Live Signal Output
 
 ## 当前完成范围
@@ -241,4 +241,22 @@ V8 插件现在支持完整持仓周期第一版：
 5. 支持 entry_engine exit channel、opposite routed signal、max_hold_bars 平仓。
 6. 支持 master exit 后 cooldown_bars 阻止立即重新入场。
 策略插件仍不直接调用 OKX/Binance API，只输出标准 TradeSignal。
+```
+
+
+## Board 5 package 6：V8 Live Runtime Integration
+
+- [x] AE-0510 V8 Live Runtime Integration
+
+设计结论：
+
+```text
+已确认 V8 插件可以接入 live_runtime 主链路：
+1. closed 4H kline + 4H range aggregate 进入 V8 on_market_feature。
+2. V8 输出 OPEN_LONG / OPEN_SHORT 后进入 LiveOrderIntentFactory。
+3. signal.metadata.target_exchanges 现在会被 LiveOrderIntentFactory 尊重，可用于 master/follower leg-specific stop replacement。
+4. entry intent 进入 MultiExchangeOrderCoordinator，并写入 OrderJournal。
+5. master account fill 回流 V8 后，只给 master leg cancel/replace stop。
+6. follower account fill 回流 V8 后，只给 follower leg cancel/replace stop，且使用同一个 master canonical stop price。
+7. 策略插件仍不直接调用 OKX/Binance API。
 ```
