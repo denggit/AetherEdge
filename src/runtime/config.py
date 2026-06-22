@@ -10,6 +10,7 @@ from src.app import AppConfig
 from src.order_management import MasterFollowerPolicyConfig
 from src.platform.config import load_env_config
 from src.runtime.models import RuntimeMode
+from src.runtime.startup_catchup import StartupCatchupConfig
 
 
 MASTER_FOLLOWER_ENV_KEYS = frozenset(
@@ -42,6 +43,7 @@ class LiveRuntimeConfig:
     range_pct: Decimal = Decimal("0.002")
     producer_stale_timeout_ms: int = 60_000
     master_follower_policy: MasterFollowerPolicyConfig | None = None
+    startup_catchup: StartupCatchupConfig = StartupCatchupConfig()
 
     @property
     def symbol(self) -> str:
@@ -85,6 +87,7 @@ def live_runtime_config_from_app(
             data_exchange=app_config.data_exchange,
             env=master_follower_env,
         ),
+        startup_catchup=StartupCatchupConfig.from_mapping(defaults.get("startup_catchup")),
     )
 
 

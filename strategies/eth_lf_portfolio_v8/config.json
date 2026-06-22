@@ -21,7 +21,8 @@
       "enabled": true,
       "interval": "4h",
       "warmup_days": 365,
-      "close_buffer_ms": 60000
+      "close_buffer_ms": 60000,
+      "min_records": 2000
     },
     "trades": {
       "enabled": true,

@@ -29,8 +29,10 @@ from src.platform.snapshot import PlatformSnapshot
 from src.runtime.account_sync import AccountStateSyncService, OrderStateSyncService, RequestThrottle, SyncExchangeContext
 from src.runtime.config import LiveRuntimeConfig, live_runtime_config_from_app
 from src.runtime.features import closed_kline_feature, range_aggregate_feature, range_aggregate_unavailable_feature, range_bar_closed_feature
+from src.runtime.heartbeat import RuntimeHeartbeatService
 from src.runtime.models import RuntimeHealth, RuntimePhase
 from src.runtime.requirements import StrategyRuntimeRequirements, resolve_strategy_runtime_requirements
+from src.runtime.startup_catchup import StartupCatchupDecision, evaluate_startup_catchup_eligibility
 from src.runtime.orders import LiveOrderIntentFactory
 from src.runtime.recovery.service import RecoveryExchangeContext, RuntimeRecoveryService
 from src.runtime.tasks import ClosedBarScheduler, ProducerHealthMonitor, ProducerSupervisor
@@ -154,6 +156,9 @@ class LiveRuntimeRunner:
             caught_up=not self.runtime_config.warmup_enabled,
             metadata={"runtime_mode": self.runtime_config.mode.value, "strategy": self.app_config.strategy},
         )
+        self._heartbeat_service = RuntimeHeartbeatService()
+        self._startup_catchup_decision: StartupCatchupDecision | None = None
+        self._startup_catchup_evaluated = False
 
     async def run(self, *, max_market_events: int | None = None) -> LiveRuntimeStats:
         logger.info(
@@ -200,6 +205,9 @@ class LiveRuntimeRunner:
 
     async def process_market_event(self, event: MarketEvent) -> None:
         self.stats.market_events_seen += 1
+        hb = getattr(self, "_heartbeat_service", None)
+        if hb is not None:
+            hb.note_market_event(_event_time_ms(event))
         self._set_health(
             RuntimePhase.RUNNING,
             healthy=self._health.healthy,
@@ -213,6 +221,12 @@ class LiveRuntimeRunner:
 
     async def process_market_feature(self, event: MarketFeatureEvent) -> None:
         self.stats.feature_events_seen += 1
+        # Track closed bar open times for heartbeat diagnostics.
+        hb = getattr(self, "_heartbeat_service", None)
+        if hb is not None and event.event_type.value == "closed_kline":
+            open_ms = event.data.get("open_time_ms") if isinstance(event.data, dict) else None
+            if isinstance(open_ms, int):
+                hb.note_closed_bar(open_ms)
         handler = getattr(self.context.strategy, "on_market_feature", None)
         if not callable(handler):
             return
@@ -317,6 +331,14 @@ class LiveRuntimeRunner:
         #     close active PositionPlans (master/follower safety violation).
         await self._run_reconciliation(snapshots)
         await self._call_on_start(snapshots[0])
+        # ── Startup catch-up: one-time guarded check for the most recent
+        #     closed 4H bar.  Only eligible inside the fresh-open window
+        #     (first 5 min of a new 4H candle). ──
+        await self._evaluate_startup_catchup_once(snapshots[0])
+        # ── Start heartbeat service ──
+        self._heartbeat_service.start(
+            runtime_id=f"{self.app_config.strategy}::{self.app_config.symbol}",
+        )
         self._set_health(RuntimePhase.RUNNING, healthy=True, warmup_complete=True, caught_up=True)
         logger.info("Live runtime startup phase completed")
 
@@ -593,6 +615,168 @@ class LiveRuntimeRunner:
         logger.info("Strategy on_start completed | signals=%s", len(signals or ()))
         await self._execute_signals(signals or (), source="on_start", event_time_ms=int(time.time() * 1000))
 
+    async def _evaluate_startup_catchup_once(self, snapshot: PlatformSnapshot) -> None:
+        """Evaluate whether the most recent closed 4H bar qualifies for a
+        guarded startup catch-up entry.
+
+        This runs exactly once per startup, after reconciliation and
+        on_start but before producers and sync tasks.  It is the only code
+        path that can produce a startup catch-up signal — the normal
+        :meth:`poll_closed_bar_once` path does NOT retry startup bars.
+        """
+        if self._startup_catchup_evaluated:
+            return
+        self._startup_catchup_evaluated = True
+
+        if not self.requirements.closed_kline.enabled:
+            logger.info("Startup catchup skipped | reason=closed_kline_disabled")
+            return
+
+        config = self.runtime_config.startup_catchup
+        now_ms = int(time.time() * 1000)
+        h4_ms = self._closed_bar_interval_ms
+        current_4h_open = (now_ms // h4_ms) * h4_ms
+        candidate_open = current_4h_open - h4_ms
+        candidate_close = current_4h_open - 1
+
+        # ── Load previous heartbeat ──
+        previous_heartbeat = self._heartbeat_service.read_previous()
+
+        # ── Load candidate closed kline ──
+        repository = self.services.get("kline_store") or SqliteKlineStore()
+        rows = repository.load(
+            symbol=self.app_config.symbol,
+            interval=self._closed_bar_interval,
+            time_range=TimeRange(candidate_open, candidate_close),
+        )
+        closed_rows = [r for r in rows if r.is_closed and r.open_time_ms == candidate_open]
+        if not closed_rows:
+            logger.info(
+                "Startup catchup skipped | reason=no_closed_bar_found "
+                "candidate_open_ms=%s",
+                candidate_open,
+            )
+            return
+        kline = closed_rows[-1]
+
+        # ── Determine current price ──
+        current_price = kline.close
+        theoretical_open = kline.close  # bar close ≈ theoretical open of new candle
+
+        # ── State checks ──
+        store = self._position_plan_store
+        has_active_position = bool(
+            store is not None and store.list_active_positions()
+        )
+        has_pending_orders = self._has_open_orders()
+        has_unresolved_follower = self._has_unresolved_follower_close()
+
+        # ── Dedup: has the scheduler already seen this bar? ──
+        already_emitted = (
+            self._closed_bar_scheduler.last_emitted_open_time_ms == candidate_open
+        )
+
+        # ── Range aggregate availability ──
+        range_aggregate_available = False
+        if self.requirements.range_bars.enabled:
+            rb_store = self._get_range_bar_store()
+            rb_rows = rb_store.load(
+                symbol=self.app_config.symbol,
+                range_pct=str(self._range_pct),
+                time_range=TimeRange(candidate_open, candidate_close + 1),
+            )
+            range_aggregate_available = len(rb_rows) > 0
+        else:
+            # If range bars are not required by the strategy, treat as available.
+            range_aggregate_available = True
+
+        # ── Determine side from kline direction ──
+        # Use a simple heuristic: close > open → bullish bias (long),
+        # close < open → bearish bias (short). The actual side is
+        # determined by the strategy engine; we pass a reasonable
+        # default for the price guard check.
+        side = "long" if kline.close >= kline.open else "short"
+
+        # ── Evaluate eligibility ──
+        decision = evaluate_startup_catchup_eligibility(
+            now_ms=now_ms,
+            current_4h_open_time_ms=current_4h_open,
+            candidate_closed_bar_open_time_ms=candidate_open,
+            candidate_closed_bar_close_time_ms=candidate_close,
+            previous_heartbeat=previous_heartbeat,
+            current_price=current_price,
+            theoretical_open_price=theoretical_open,
+            side=side,
+            has_active_position=has_active_position,
+            has_pending_orders=has_pending_orders,
+            has_unresolved_follower_close=has_unresolved_follower,
+            already_executed=already_emitted,
+            range_aggregate_available=range_aggregate_available,
+            config=config,
+        )
+        self._startup_catchup_decision = decision
+
+        if not decision.eligible:
+            logger.info(
+                "Startup catchup skipped | reason=%s metadata=%s",
+                decision.reason,
+                decision.metadata,
+            )
+            # Mark the bar as emitted so poll_closed_bar_once won't pick
+            # it up again during normal operation.
+            self._closed_bar_scheduler.mark_emitted(candidate_open)
+            return
+
+        logger.info(
+            "Startup catchup eligible — dispatching closed bar | "
+            "reason=%s metadata=%s",
+            decision.reason,
+            decision.metadata,
+        )
+
+        # ── Dispatch: emit closed kline + range aggregate to the strategy ──
+        await self.process_market_feature(closed_kline_feature(kline))
+        self._closed_bar_scheduler.mark_emitted(candidate_open)
+        self.stats.closed_klines_seen += 1
+
+        # Emit range aggregate for this bucket (or unavailable placeholder).
+        if self.requirements.range_bars.enabled:
+            features = await self.emit_range_aggregate_for_bucket(candidate_open)
+            if not features:
+                unavailable = range_aggregate_unavailable_feature(
+                    symbol=self.app_config.symbol,
+                    exchange=self.app_config.data_exchange,
+                    timeframe=self._range_aggregate_interval,
+                    range_pct=self._range_pct,
+                    bucket_start_ms=candidate_open,
+                    bucket_end_ms=candidate_open + h4_ms - 1,
+                    reference_price=kline.close,
+                    reason="startup_catchup_range_aggregate_unavailable",
+                )
+                await self.process_market_feature(unavailable)
+                logger.info(
+                    "Startup catchup range aggregate unavailable | "
+                    "bucket_start_ms=%s",
+                    candidate_open,
+                )
+            else:
+                logger.info(
+                    "Startup catchup range aggregate emitted | "
+                    "bucket_start_ms=%s features=%s",
+                    candidate_open,
+                    len(features),
+                )
+
+    def _has_open_orders(self) -> bool:
+        """Check for open orders across all configured exchanges."""
+        list_open = getattr(self.context.state_store, "list_open_orders", None)
+        if not callable(list_open):
+            return False
+        for exchange in self.app_config.exchanges:
+            if list_open(exchange=exchange, symbol=self.app_config.symbol, include_stop_orders=True):
+                return True
+        return False
+
     def _start_producers(self) -> list[asyncio.Task]:
         tasks: list[asyncio.Task] = []
         if self.requirements.trades.enabled and self.requirements.trades.stream_enabled:
@@ -610,6 +794,8 @@ class LiveRuntimeRunner:
         if self.requirements.order_state.poll_when_position_enabled:
             tasks.append(asyncio.create_task(self._get_order_sync_service().run_periodic(self._stop_event)))
             tasks.append(asyncio.create_task(self._periodic_follower_close_check(self._stop_event)))
+        # Heartbeat periodic task
+        tasks.append(asyncio.create_task(self._heartbeat_service.run_periodic(self._stop_event)))
         return tasks
 
     async def _periodic_follower_close_check(self, stop_event: asyncio.Event) -> None:
