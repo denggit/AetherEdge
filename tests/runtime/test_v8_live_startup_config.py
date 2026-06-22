@@ -51,6 +51,6 @@ def test_v8_live_env_loads_strategy_and_runtime_roles(tmp_path) -> None:
     req = context.strategy.runtime_requirements()
     assert req["order_book"]["enabled"] is False
     assert req["trades"]["stream_enabled"] is True
-    assert req["trades"]["warmup_enabled"] is True
+    assert "warmup_enabled" not in req["trades"]
     assert req["range_bars"]["enabled"] is True
     assert req["private_account_stream"]["enabled"] is True

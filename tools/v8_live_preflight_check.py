@@ -26,8 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.app import AppConfig
 from src.market_data.derived import RangeBarBuilder
 from src.market_data.models import TimeRange
-from src.market_data.storage import SqliteRangeBarStore, SqliteTradeStore
-from src.market_data.warmup.current_rangebar import CurrentRangeBarWarmupService
+from src.market_data.storage import SqliteRangeBarStore
 from src.market_data.warmup.gap_detector import interval_to_ms
 from src.platform import ExchangeName
 from src.platform.account.factory import create_account_client
@@ -122,8 +121,15 @@ async def main() -> int:
         await _check_follower_min_notional_balance(report, app=app, runtime=runtime)
     if not args.skip_kline:
         await _check_latest_closed_kline(report, app=app, runtime=runtime)
-        if not args.skip_api:
-            await _check_current_4h_trade_warmup_api_coverage(report, app=app, runtime=runtime)
+        report.add(
+            "current_4h_trade_warmup_api_coverage",
+            "ok",
+            detail={
+                "trades_warmup": False,
+                "removed": True,
+                "startup_behavior": "live-only trades; current partial 4H range bucket uses micro NO_CONTEXT until a fully captured bucket is available",
+            },
+        )
     _check_local_rangebar_builder(report, app=app)
 
     await _write_report(args.report, report)
@@ -163,8 +169,8 @@ def _check_runtime_config(report: PreflightReport, *, app: AppConfig, runtime_mo
         "order_book": requirements.order_book.enabled,
         "private_account_stream": requirements.private_account_stream.enabled,
     }
-    if not requirements.closed_kline.enabled or requirements.closed_kline.interval.lower() != "4h" or not requirements.trades.stream_enabled or not requirements.trades.warmup_enabled or not requirements.range_bars.enabled or requirements.order_book.enabled or not requirements.private_account_stream.enabled:
-        report.add("v8_runtime_requirements", "fail", detail=req_detail, error="V8 requirements must be closed 4H + trades stream/warmup + range bars + private account stream, without order_book")
+    if not requirements.closed_kline.enabled or requirements.closed_kline.interval.lower() != "4h" or not requirements.trades.stream_enabled or not requirements.range_bars.enabled or requirements.order_book.enabled or not requirements.private_account_stream.enabled:
+        report.add("v8_runtime_requirements", "fail", detail=req_detail, error="V8 requirements must be closed 4H + live trades + range bars + private account stream, without order_book")
     else:
         report.add("v8_runtime_requirements", "ok", detail=req_detail)
 
@@ -289,51 +295,6 @@ async def _check_latest_closed_kline(report: PreflightReport, *, app: AppConfig,
         report.add("latest_closed_4h_kline", "ok", detail={"open_time_ms": row.open_time_ms, "close_time_ms": row.close_time_ms, "close": str(row.close)})
     except Exception as exc:
         report.add("latest_closed_4h_kline", "fail", error=str(exc))
-
-
-async def _check_current_4h_trade_warmup_api_coverage(report: PreflightReport, *, app: AppConfig, runtime) -> None:
-    try:
-        interval_ms = interval_to_ms(runtime.closed_bar_interval)
-        now_ms = _now_ms()
-        bucket_start_ms = (now_ms // interval_ms) * interval_ms
-        if now_ms <= bucket_start_ms:
-            report.add("current_4h_trade_warmup_api_coverage", "warn", detail={"bucket_start_ms": bucket_start_ms, "now_ms": now_ms}, error="current bucket has not started")
-            return
-        data_feed = create_market_data_feed(
-            app.data_exchange,
-            symbol=app.symbol,
-            config=ExchangeConfig.from_env(app.data_exchange),
-            enable_trade_stream=False,
-            enable_order_book_stream=False,
-        )
-        contract_value = data_feed.market_profile.contract_value(app.data_exchange) or Decimal("1")
-        trade_store = SqliteTradeStore()
-        range_store = SqliteRangeBarStore()
-        service = CurrentRangeBarWarmupService(
-            trade_repository=trade_store,
-            trade_coverage_repository=trade_store,
-            range_bar_repository=range_store,
-            historical_trade_feed=data_feed,
-            range_pct=runtime.range_pct,
-            contract_value=contract_value,
-            batch_limit=int(os.getenv("AETHER_TRADE_WARMUP_BATCH_LIMIT", "50000")),
-        )
-        result = await service.warmup(symbol=app.symbol, time_range=TimeRange(bucket_start_ms, now_ms))
-        if result.caught_up:
-            report.add(
-                "current_4h_trade_warmup_api_coverage",
-                "ok",
-                detail={"bucket_start_ms": bucket_start_ms, "now_ms": now_ms, "trades_loaded": result.trades_loaded, "trades_available": result.trades_available, "range_bars_saved": result.range_bars_saved},
-            )
-        else:
-            report.add(
-                "current_4h_trade_warmup_api_coverage",
-                "fail",
-                detail={"bucket_start_ms": bucket_start_ms, "now_ms": now_ms, "trades_loaded": result.trades_loaded, "trades_available": result.trades_available},
-                error="current 4H trade coverage did not catch up",
-            )
-    except Exception as exc:
-        report.add("current_4h_trade_warmup_api_coverage", "fail", error=str(exc))
 
 
 async def _check_follower_min_notional_balance(report: PreflightReport, *, app: AppConfig, runtime) -> None:

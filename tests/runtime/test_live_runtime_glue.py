@@ -11,6 +11,7 @@ from src.market_data.derived import RangeBarAggregator, RangeBarBuilder
 from src.market_data.events import MarketFeatureEventType
 from src.market_data.models import RangeBar, TimeRange
 from src.market_data.storage import SqliteTradeStore
+from src.market_data.warmup.current_rangebar import CurrentRangeBarWarmupResult
 from src.platform import Balance, ExchangeName, LeverageInfo, Order, OrderStatus, PositionMode
 from src.platform.data.models import MarketKline, MarketTrade, TradeSide
 from src.platform.markets import get_market_profile
@@ -257,7 +258,7 @@ async def test_closed_bar_poll_uses_buffer_and_only_emits_closed_kline():
 
 
 @pytest.mark.asyncio
-async def test_closed_bar_poll_backfills_rangebar_gap_before_aggregate(tmp_path):
+async def test_closed_bar_poll_does_not_backfill_historical_trades_when_trade_warmup_removed(tmp_path):
     strategy = FeatureStrategy()
     data = FakeData()
     trade_store = SqliteTradeStore(tmp_path / "market.sqlite3")
@@ -276,7 +277,7 @@ async def test_closed_bar_poll_backfills_rangebar_gap_before_aggregate(tmp_path)
 
     req = StrategyRuntimeRequirements.from_mapping({
         "closed_kline": {"enabled": True, "interval": "4h", "close_buffer_ms": 60000},
-        "trades": {"enabled": True, "stream_enabled": True, "warmup_enabled": True},
+        "trades": {"enabled": True, "stream_enabled": True},
         "range_bars": {"enabled": True, "range_pct": "0.002", "aggregate_interval": "4h"},
     })
     feed = GapFillFeed()
@@ -298,11 +299,11 @@ async def test_closed_bar_poll_backfills_rangebar_gap_before_aggregate(tmp_path)
 
     events = await runner.poll_closed_bar_once(now_ms=12 * 60 * 60_000 + 60_000)
 
-    assert any(event.event_type is MarketFeatureEventType.RANGE_AGGREGATE for event in events)
-    assert feed.calls
-    assert range_store.rows
+    assert [event.type_value for event in events] == ["closed_kline"]
+    assert feed.calls == []
+    assert range_store.rows == []
     covered = trade_store.coverage_ranges(symbol="ETH-USDT-PERP", time_range=TimeRange(2 * H4, 3 * H4 - 1), source="historical_current_bucket")
-    assert covered == [TimeRange(2 * H4, 3 * H4 - 1)]
+    assert covered == []
 
 
 @pytest.mark.asyncio
@@ -455,3 +456,37 @@ async def test_private_account_stream_events_are_saved_and_sent_to_strategy(tmp_
     assert stats.account_events_seen == 1
     assert state.events == [event]
     assert "account:okx:order" in strategy.events
+
+
+@pytest.mark.asyncio
+async def test_closed_bar_poll_emits_unavailable_range_aggregate_for_live_only_partial_bucket():
+    strategy = FeatureStrategy()
+    data = FakeData()
+    req = StrategyRuntimeRequirements.from_mapping({
+        "closed_kline": {"enabled": True, "interval": "4h", "close_buffer_ms": 60000},
+        "trades": {"enabled": True, "stream_enabled": True},
+        "range_bars": {"enabled": True, "range_pct": "0.002", "aggregate_interval": "4h"},
+    })
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": req,
+            "range_bar_store": MemoryRangeBarStore(),
+            "range_bar_builder": RangeBarBuilder(range_pct=Decimal("0.002"), contract_value=Decimal("0.1")),
+            "range_bar_aggregator": RangeBarAggregator(),
+        },
+        dry_run=True,
+    )
+    runner._rangebar_trust_start_bucket_ms = 3 * H4
+
+    events = await runner.poll_closed_bar_once(now_ms=12 * 60 * 60_000 + 60_000)
+
+    assert [event.type_value for event in events] == ["closed_kline", "range_aggregate"]
+    assert events[-1].data["bar_count"] == 0
+    assert events[-1].data["context_available"] is False
+    assert events[-1].data["incomplete"] is True
+    assert strategy.events[-2:] == ["closed_kline", "range_aggregate"]
+

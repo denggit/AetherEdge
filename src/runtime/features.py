@@ -81,5 +81,47 @@ def range_aggregate_feature(aggregate: RangeBarAggregate, *, exchange, timeframe
     )
 
 
+def range_aggregate_unavailable_feature(
+    *,
+    symbol: str,
+    exchange,
+    timeframe: str,
+    range_pct: Decimal,
+    bucket_start_ms: int,
+    bucket_end_ms: int,
+    reference_price: Decimal,
+    reason: str,
+) -> MarketFeatureEvent:
+    price = Decimal(str(reference_price))
+    return MarketFeatureEvent(
+        event_type=MarketFeatureEventType.RANGE_AGGREGATE,
+        symbol=symbol,
+        exchange=exchange,
+        timeframe=timeframe,
+        event_time_ms=bucket_end_ms,
+        data={
+            "range_pct": _d(range_pct),
+            "bucket_start_ms": bucket_start_ms,
+            "bucket_end_ms": bucket_end_ms,
+            "bar_count": 0,
+            "first_open": _d(price),
+            "last_close": _d(price),
+            "high": _d(price),
+            "low": _d(price),
+            "buy_notional_sum": "0",
+            "sell_notional_sum": "0",
+            "delta_notional_sum": "0",
+            "notional_sum": "0",
+            "micro_return_pct": "0",
+            "imbalance": "0",
+            "taker_buy_ratio": "0",
+            "close_pos": "0.5",
+            "context_available": False,
+            "incomplete": True,
+            "reason": reason,
+        },
+    )
+
+
 def _d(value: Decimal) -> str:
     return format(value.normalize(), "f")

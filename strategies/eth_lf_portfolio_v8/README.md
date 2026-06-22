@@ -46,9 +46,14 @@ The strategy plugin:
 ```json
 {
   "closed_kline": {"enabled": true, "interval": "4h", "warmup_days": 365},
-  "trades": {"enabled": true, "stream_enabled": true, "warmup_enabled": true},
+  "trades": {"enabled": true, "stream_enabled": true},
   "range_bars": {"enabled": true, "range_pct": "0.002", "aggregate_interval": "4h"},
   "order_book": {"enabled": false},
   "private_account_stream": {"enabled": true}
 }
 ```
+
+
+## Live trades warmup policy
+
+V9C does not use REST historical trade warmup in live runtime. Range bars are built only from live websocket trades. If the process starts in the middle of a 4H bucket, that first bucket is treated as micro context unavailable; subsequent fully captured buckets use rangebar/micro risk scaling normally.
