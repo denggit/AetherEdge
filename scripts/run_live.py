@@ -19,9 +19,12 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.app import AppConfig, AppRunner, build_app_context
 from src.runtime import LiveRuntimeRunner, RuntimeMode, live_runtime_config_from_app, runtime_mode_from_env
+from src.runtime.runner import LiveRuntimeError, _is_fatal_startup_error
 from src.utils.log import get_logger
 
 logger = get_logger(__name__)
+
+FATAL_STARTUP_EXIT_CODE = 78
 
 
 async def main() -> None:
@@ -45,4 +48,10 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except LiveRuntimeError as exc:
+        logger.exception("Live runner fatal startup/runtime error")
+        if _is_fatal_startup_error(exc):
+            raise SystemExit(FATAL_STARTUP_EXIT_CODE)
+        raise

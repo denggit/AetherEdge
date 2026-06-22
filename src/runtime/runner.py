@@ -69,6 +69,21 @@ class LiveRuntimeError(RuntimeError):
     pass
 
 
+# ── Fatal error classification markers ──
+FATAL_STARTUP_ERROR_MARKERS = (
+    "closed-kline warmup loaded insufficient records",
+    "closed-kline warmup did not catch up",
+    "startup snapshot is required before live trading",
+    "runtime recovery failed",
+)
+
+
+def _is_fatal_startup_error(exc: BaseException) -> bool:
+    """Return True when the error should cause a fatal exit (code 78)."""
+    text = str(exc).lower()
+    return any(marker in text for marker in FATAL_STARTUP_ERROR_MARKERS)
+
+
 class LiveRuntimeRunner:
     """Live runtime orchestration for strategy plugins.
 
@@ -324,6 +339,15 @@ class LiveRuntimeRunner:
                 self.stats.warmup_runs += 1
         await self._run_requirement_warmup()
 
+    def _count_available_closed_klines(self, repository, *, symbol: str, interval: str, time_range: TimeRange) -> int:
+        """Return the number of closed klines currently available in the repository.
+
+        This counts **all** closed klines in the store for the given range,
+        NOT just records that were newly saved by the most recent warmup pass.
+        """
+        rows = repository.load(symbol=symbol, interval=interval, time_range=time_range)
+        return sum(1 for row in rows if row.is_closed)
+
     async def _run_requirement_warmup(self) -> None:
         # Closed-kline warmup is generic and can be built from the platform data feed.
         # Historical-trade warmup remains an adapter-specific capability; if a
@@ -348,6 +372,14 @@ class LiveRuntimeRunner:
                     )
                 )
                 self.stats.warmup_runs += 1
+
+                min_records = max(1, int(self.requirements.closed_kline.min_records or 1))
+                time_range = TimeRange(start_open, end_open)
+                newly_loaded_records = result.records_loaded  # newly saved this pass
+                available_records_before_backfill = self._count_available_closed_klines(
+                    repository, symbol=self.app_config.symbol, interval=self._closed_bar_interval, time_range=time_range
+                )
+
                 if not result.caught_up:
                     gap_details = [
                         {
@@ -358,38 +390,45 @@ class LiveRuntimeRunner:
                         for gap in result.gaps_after[:10]
                     ]
                     logger.error(
-                        "Closed-kline warmup gaps remain | interval=%s gap_count=%s first_gaps=%s records_loaded=%s",
+                        "Closed-kline warmup gaps remain | interval=%s gap_count=%s first_gaps=%s "
+                        "newly_loaded=%s available=%s",
                         self._closed_bar_interval,
                         len(result.gaps_after),
                         gap_details,
-                        result.records_loaded,
+                        newly_loaded_records,
+                        available_records_before_backfill,
                     )
                     raise LiveRuntimeError(f"closed-kline warmup did not catch up: {len(result.gaps_after)} gaps remain")
-                min_records = max(1, int(self.requirements.closed_kline.min_records or 1))
-                time_range = TimeRange(start_open, end_open)
-                records_loaded = result.records_loaded
 
                 logger.info(
-                    "Closed-kline warmup completed | interval=%s start_open=%s end_open=%s records_loaded=%s min_records=%s",
+                    "Closed-kline warmup completed | interval=%s start_open=%s end_open=%s "
+                    "newly_loaded=%s available=%s min_records=%s caught_up=%s",
                     self._closed_bar_interval,
                     start_open,
                     end_open,
-                    records_loaded,
+                    newly_loaded_records,
+                    available_records_before_backfill,
                     min_records,
+                    result.caught_up,
                 )
 
                 # ── Backfill fallback: when the local store is insufficient,
-                #     attempt a direct REST historical kline backfill. ──
+                #     attempt a direct REST historical kline backfill.
+                #     CRITICAL: use available_records (total in store), NOT
+                #     newly_loaded_records (only what warmup just saved). ──
                 store_path = str(getattr(repository, "path", ""))
                 store_class = type(repository).__name__
+                backfill_attempted = False
+                available_records = available_records_before_backfill
 
-                if records_loaded < min_records:
+                if available_records < min_records:
                     logger.warning(
                         "Closed-kline warmup insufficient — attempting REST backfill | "
-                        "symbol=%s interval=%s records_loaded=%s min_records=%s",
+                        "symbol=%s interval=%s newly_loaded=%s available=%s min_records=%s",
                         self.app_config.symbol,
                         self._closed_bar_interval,
-                        records_loaded,
+                        newly_loaded_records,
+                        available_records,
                         min_records,
                     )
                     try:
@@ -407,15 +446,20 @@ class LiveRuntimeRunner:
                             store_class=store_class,
                             store_path=store_path,
                         )
-                        records_loaded = backfill_diag.records_loaded_after
+                        backfill_attempted = True
+                        # Re-count available records directly from the repository
+                        # after backfill, rather than relying on a single field.
+                        available_records = self._count_available_closed_klines(
+                            repository, symbol=self.app_config.symbol, interval=self._closed_bar_interval, time_range=time_range
+                        )
                         logger.info(
                             "REST kline backfill completed | symbol=%s interval=%s "
-                            "fetched=%s saved=%s records_after=%s success=%s",
+                            "fetched=%s saved=%s available_after=%s success=%s",
                             backfill_diag.symbol,
                             backfill_diag.interval,
                             backfill_diag.fetched_records,
                             backfill_diag.saved_records,
-                            backfill_diag.records_loaded_after,
+                            available_records,
                             backfill_diag.success,
                         )
                     except Exception as backfill_exc:
@@ -429,8 +473,8 @@ class LiveRuntimeRunner:
                 # ── Hydrate strategy state with closed klines ──
                 await self._hydrate_strategy_closed_klines(repository, time_range=time_range)
 
-                # ── Fail fast when warmup (including backfill) still has too few records ──
-                if records_loaded < min_records:
+                # ── Fail fast when repository still has too few available records ──
+                if available_records < min_records:
                     dry_run = self.app_config.dry_run
                     # Build rich diagnostics for operators.
                     raw_aliases_str = "N/A"
@@ -456,8 +500,10 @@ class LiveRuntimeRunner:
                         f"end_open_ms={end_open}\n"
                         f"start_open_utc={start_utc}\n"
                         f"end_open_utc={end_utc}\n"
-                        f"records_loaded_before={result.records_loaded}\n"
-                        f"records_loaded_after={records_loaded}\n"
+                        f"newly_loaded_records={newly_loaded_records}\n"
+                        f"available_records_before_backfill={available_records_before_backfill}\n"
+                        f"available_records_after_backfill={available_records}\n"
+                        f"backfill_attempted={backfill_attempted}\n"
                         f"min_records={min_records}\n"
                         f"kline_store_class={store_class}\n"
                         f"kline_store_path={store_path}\n"
@@ -467,10 +513,10 @@ class LiveRuntimeRunner:
                     if dry_run:
                         logger.warning(
                             "Closed-kline warmup loaded fewer records than required — continuing in dry-run mode | "
-                            "interval=%s warmup_days=%s records_loaded=%s min_records=%s",
+                            "interval=%s warmup_days=%s available_records=%s min_records=%s",
                             self._closed_bar_interval,
                             self.requirements.closed_kline.warmup_days,
-                            records_loaded,
+                            available_records,
                             min_records,
                         )
                         self.context.alerts.emit(
@@ -491,7 +537,7 @@ class LiveRuntimeRunner:
                         raise LiveRuntimeError(
                             f"closed-kline warmup loaded insufficient records "
                             f"(symbol={self.app_config.symbol} interval={self._closed_bar_interval} "
-                            f"records_loaded={records_loaded} min_records={min_records})"
+                            f"available_records={available_records} min_records={min_records})"
                         )
 
     async def _hydrate_strategy_closed_klines(self, repository, *, time_range: TimeRange) -> None:

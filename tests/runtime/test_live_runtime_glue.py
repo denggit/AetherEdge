@@ -566,6 +566,24 @@ class FakeKlineStore:
         return []
 
 
+class PreloadedFakeKlineStore:
+    """In-memory store preloaded with synthetic closed klines."""
+
+    def __init__(self, rows: list[MarketKline] | None = None) -> None:
+        self._rows = list(rows or [])
+
+    def load(self, *, symbol: str, interval: str, time_range: TimeRange) -> list[MarketKline]:
+        return [
+            r for r in self._rows
+            if r.symbol == symbol and r.interval == interval
+            and time_range.start_time_ms <= r.open_time_ms <= time_range.end_time_ms
+        ]
+
+    def save(self, rows) -> int:
+        self._rows.extend(rows)
+        return len(rows)
+
+
 def _warmup_requirements() -> StrategyRuntimeRequirements:
     return StrategyRuntimeRequirements(
         closed_kline=ClosedKlineRequirement(enabled=True, interval="4h", warmup_days=30, min_records=1),
@@ -646,10 +664,22 @@ async def test_dry_run_allows_zero_closed_kline_warmup_with_warning():
 
 @pytest.mark.asyncio
 async def test_live_runtime_allows_warmup_with_records():
-    """Live mode with records_loaded > 0 must proceed without error."""
+    """Live mode with available_records >= min_records must proceed without error,
+    even when warmup did not load any NEW records (records_loaded=0)."""
     strategy = FeatureStrategy()
     data = FakeData()
     req = _warmup_requirements()
+
+    # Preload the store with 5 closed klines so available_records >= min_records.
+    store = PreloadedFakeKlineStore([
+        MarketKline(
+            exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP", raw_symbol="ETH-USDT-SWAP",
+            interval="4h", open_time_ms=H4 * i, close_time_ms=H4 * (i + 1) - 1,
+            open=Decimal("1000"), high=Decimal("1010"), low=Decimal("990"),
+            close=Decimal("1005"), volume=Decimal("10"), is_closed=True,
+        )
+        for i in range(5)
+    ])
 
     runner = _runner(
         strategy,
@@ -658,23 +688,27 @@ async def test_live_runtime_allows_warmup_with_records():
             "recovery_service": None,
             "snapshot": _snapshot(),
             "runtime_requirements": req,
-            "kline_store": FakeKlineStore(),
+            "kline_store": store,
         },
         dry_run=False,
     )
-    result = _zero_warmup_result()
-    # Simulate warmup that loaded records successfully
+    # Warmup returns newly_loaded=0 (all records already in store)
     result = WarmupResult(
-        request=result.request,
+        request=WarmupRequest(
+            symbol="ETH-USDT-PERP",
+            dataset=MarketDataSet.KLINES,
+            interval="4h",
+            time_range=TimeRange(0, H4 * 5),
+        ),
         gaps_before=(),
         gaps_after=(),
-        records_loaded=5,
+        records_loaded=0,
         caught_up=True,
     )
 
     with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
         MockSvc.return_value.warmup = AsyncMock(return_value=result)
-        # Must NOT raise
+        # Must NOT raise: available_records=5 >= min_records=1
         await runner._run_requirement_warmup()
 
     assert runner.stats.warmup_runs >= 1
@@ -800,3 +834,254 @@ async def test_closed_kline_min_records_is_enforced_by_runtime():
     error_msg = str(exc_info.value)
     assert "insufficient records" in error_msg
     assert "1000" in error_msg or "min_records" in error_msg.lower()
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# New tests: records_loaded → available_records semantic fix (V9C-LIVE-WARMUP-010)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _warmup_req(min_records: int = 1000) -> StrategyRuntimeRequirements:
+    return StrategyRuntimeRequirements(
+        closed_kline=ClosedKlineRequirement(enabled=True, interval="4h", warmup_days=365, min_records=min_records),
+    )
+
+
+def _make_klines(count: int, *, step_ms: int = H4) -> list[MarketKline]:
+    return [
+        MarketKline(
+            exchange=ExchangeName.OKX,
+            symbol="ETH-USDT-PERP",
+            raw_symbol="ETH-USDT-SWAP",
+            interval="4h",
+            open_time_ms=step_ms * i,
+            close_time_ms=step_ms * (i + 1) - 1,
+            open=Decimal("1000"),
+            high=Decimal("1010"),
+            low=Decimal("990"),
+            close=Decimal("1005"),
+            volume=Decimal("10"),
+            is_closed=True,
+        )
+        for i in range(count)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_live_runtime_uses_available_kline_records_not_newly_loaded_records():
+    """Repository has 1000 closed klines already. Warmup returns records_loaded=0
+    (no NEW records saved). The runner must use available_records (1000 >= min_records)
+    to proceed without backfill or failure."""
+    strategy = FeatureStrategy()
+    data = FakeData()
+    req = _warmup_req(min_records=1000)
+    store = PreloadedFakeKlineStore(_make_klines(1000))
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": req,
+            "kline_store": store,
+        },
+        dry_run=False,
+    )
+    # Warmup returns 0 newly loaded records — all 1000 were already in the store.
+    result = WarmupResult(
+        request=WarmupRequest(
+            symbol="ETH-USDT-PERP",
+            dataset=MarketDataSet.KLINES,
+            interval="4h",
+            time_range=TimeRange(0, H4 * 999),
+        ),
+        gaps_before=(),
+        gaps_after=(),
+        records_loaded=0,
+        caught_up=True,
+    )
+
+    # Patch time range computation so it covers the test klines (0 .. H4*999).
+    with patch("src.runtime.runner.closed_bar_open_time_ms", return_value=H4 * 999):
+        with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
+            MockSvc.return_value.warmup = AsyncMock(return_value=result)
+            # Must NOT raise — available_records=1000 >= min_records=1000
+            await runner._run_requirement_warmup()
+
+    assert runner.stats.warmup_runs >= 1
+
+
+@pytest.mark.asyncio
+async def test_live_runtime_backfills_when_available_records_below_min():
+    """Repository has 0 records. Warmup returns records_loaded=0.
+    Backfill provider saves 1000 records. Runner must proceed successfully."""
+    strategy = FeatureStrategy()
+    data = FakeData()
+    req = _warmup_req(min_records=1000)
+    store = PreloadedFakeKlineStore()  # empty
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": req,
+            "kline_store": store,
+        },
+        dry_run=False,
+    )
+    result = WarmupResult(
+        request=WarmupRequest(
+            symbol="ETH-USDT-PERP",
+            dataset=MarketDataSet.KLINES,
+            interval="4h",
+            time_range=TimeRange(0, H4 * 999),
+        ),
+        gaps_before=(),
+        gaps_after=(),
+        records_loaded=0,
+        caught_up=True,
+    )
+
+    from src.market_data.warmup.historical_klines import BackfillDiagnostics
+
+    fake_diag = BackfillDiagnostics(
+        symbol="ETH-USDT-PERP",
+        raw_aliases=("okx:ETH-USDT-SWAP",),
+        interval="4h",
+        start_open_ms=0,
+        end_open_ms=H4 * 999,
+        start_open_utc="2024-01-01T00:00:00+00:00",
+        end_open_utc="2024-02-01T00:00:00+00:00",
+        records_loaded_before=0,
+        records_loaded_after=1000,
+        min_records=1000,
+        kline_store_class="PreloadedFakeKlineStore",
+        kline_store_path=":memory:",
+        provider_used="MarketDataKlineProvider",
+        fetched_records=1000,
+        saved_records=1000,
+        success=True,
+    )
+
+    with patch("src.runtime.runner.closed_bar_open_time_ms", return_value=H4 * 999):
+        with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
+            MockSvc.return_value.warmup = AsyncMock(return_value=result)
+            with patch("src.market_data.warmup.kline_provider.MarketDataKlineProvider") as MockProv:
+                MockProv.return_value.backfill_and_reload = AsyncMock(return_value=fake_diag)
+                # Preload store after backfill to match what a real provider would do
+                store._rows = _make_klines(1000)
+                # Must NOT raise
+                await runner._run_requirement_warmup()
+
+    assert runner.stats.warmup_runs >= 1
+
+
+@pytest.mark.asyncio
+async def test_live_runtime_fails_when_available_records_below_min_after_backfill():
+    """Repository has 0 records. Backfill also only provides 5 records (< min=1000).
+    Runner must raise LiveRuntimeError."""
+    strategy = FeatureStrategy()
+    data = FakeData()
+    req = _warmup_req(min_records=1000)
+    store = PreloadedFakeKlineStore()  # empty
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": req,
+            "kline_store": store,
+        },
+        dry_run=False,
+    )
+    result = WarmupResult(
+        request=WarmupRequest(
+            symbol="ETH-USDT-PERP",
+            dataset=MarketDataSet.KLINES,
+            interval="4h",
+            time_range=TimeRange(0, H4 * 999),
+        ),
+        gaps_before=(),
+        gaps_after=(),
+        records_loaded=0,
+        caught_up=True,
+    )
+
+    from src.market_data.warmup.historical_klines import BackfillDiagnostics
+
+    fake_diag = BackfillDiagnostics(
+        symbol="ETH-USDT-PERP",
+        raw_aliases=("okx:ETH-USDT-SWAP",),
+        interval="4h",
+        start_open_ms=0,
+        end_open_ms=H4 * 999,
+        start_open_utc="2024-01-01T00:00:00+00:00",
+        end_open_utc="2024-02-01T00:00:00+00:00",
+        records_loaded_before=0,
+        records_loaded_after=5,
+        min_records=1000,
+        kline_store_class="PreloadedFakeKlineStore",
+        kline_store_path=":memory:",
+        provider_used="MarketDataKlineProvider",
+        fetched_records=5,
+        saved_records=5,
+        success=False,
+    )
+
+    with patch("src.runtime.runner.closed_bar_open_time_ms", return_value=H4 * 999):
+        with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
+            MockSvc.return_value.warmup = AsyncMock(return_value=result)
+            with patch("src.market_data.warmup.kline_provider.MarketDataKlineProvider") as MockProv:
+                MockProv.return_value.backfill_and_reload = AsyncMock(return_value=fake_diag)
+                store._rows = _make_klines(5)  # backfill only gave 5
+                with pytest.raises(LiveRuntimeError, match="insufficient records"):
+                    await runner._run_requirement_warmup()
+
+
+@pytest.mark.asyncio
+async def test_live_runtime_skips_backfill_when_available_records_already_sufficient():
+    """When repository already has >= min_records, backfill must NOT be invoked
+    even if newly_loaded_records is 0. This is the core semantic fix."""
+    strategy = FeatureStrategy()
+    data = FakeData()
+    req = _warmup_req(min_records=500)
+    store = PreloadedFakeKlineStore(_make_klines(1000))
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": req,
+            "kline_store": store,
+        },
+        dry_run=False,
+    )
+    result = WarmupResult(
+        request=WarmupRequest(
+            symbol="ETH-USDT-PERP",
+            dataset=MarketDataSet.KLINES,
+            interval="4h",
+            time_range=TimeRange(0, H4 * 999),
+        ),
+        gaps_before=(),
+        gaps_after=(),
+        records_loaded=0,
+        caught_up=True,
+    )
+
+    with patch("src.runtime.runner.closed_bar_open_time_ms", return_value=H4 * 999):
+        with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
+            MockSvc.return_value.warmup = AsyncMock(return_value=result)
+            with patch("src.market_data.warmup.kline_provider.MarketDataKlineProvider") as MockProv:
+                await runner._run_requirement_warmup()
+                # Backfill provider must NOT have been instantiated
+                MockProv.assert_not_called()
+
+    assert runner.stats.warmup_runs >= 1

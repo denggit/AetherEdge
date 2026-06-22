@@ -101,12 +101,13 @@ def _print_diagnostics(
     print(f"  End open (UTC):      {end_utc}")
     print(f"  KlineStore class:    {store_class}")
     print(f"  KlineStore path:     {store_path}")
-    print(f"  Local rows (closed): {local_count}")
+    print(f"  Available closed rows (before backfill): {local_count}")
     if backfill_attempted:
         print(f"  Backfill fetched:    {fetched}")
         print(f"  Backfill saved:      {saved}")
-        print(f"  Rows after backfill: {after_count}")
-    print(f"  Sufficient:          {'YES' if (after_count if backfill_attempted else local_count) >= min_records else 'NO'}")
+        print(f"  Available closed rows (after backfill):  {after_count}")
+    final_count = after_count if backfill_attempted else local_count
+    print(f"  Sufficient:          {'YES' if final_count >= min_records else 'NO'}")
 
 
 async def _run() -> int:

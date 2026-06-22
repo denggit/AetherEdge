@@ -94,3 +94,59 @@ class TestCheckLiveWarmupDataTool:
         # With min_records=0 no backfill is actually needed, but the flag
         # should not cause a parse error.
         assert result.returncode in (0, 2, 3)
+
+
+class TestCheckLocalAvailableRows:
+    """Unit tests for _check_local confirming it counts available (not newly-loaded) rows."""
+
+    def test_available_rows_counted_not_newly_loaded(self, tmp_path):
+        """_check_local queries the store directly for available rows,
+        independent of any warmup pass."""
+        import tools.check_live_warmup_data as tool_module
+
+        count, store_class, store_path = tool_module._check_local(
+            symbol="ETH-USDT-PERP",
+            interval="4h",
+            start_open_ms=0,
+            end_open_ms=4 * 60 * 60_000 * 10,
+            kline_store_path=str(tmp_path / "empty.sqlite3"),
+        )
+        # Fresh empty store → 0 available rows
+        assert count == 0
+        assert store_class == "SqliteKlineStore"
+
+    def test_check_local_returns_closed_only(self, tmp_path):
+        """_check_local only counts closed klines."""
+        from src.market_data.storage.kline_store import SqliteKlineStore
+        from src.platform.data.models import MarketKline, MarketDataSource
+        from src.platform.exchanges.models import ExchangeName
+        from decimal import Decimal
+        import tools.check_live_warmup_data as tool_module
+
+        store = SqliteKlineStore(tmp_path / "test.sqlite3")
+        store.save([
+            MarketKline(
+                exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP", raw_symbol="ETH-USDT-SWAP",
+                interval="4h", open_time_ms=4 * 60 * 60_000, close_time_ms=8 * 60 * 60_000 - 1,
+                open=Decimal("100"), high=Decimal("110"), low=Decimal("90"),
+                close=Decimal("105"), volume=Decimal("10"), is_closed=True,
+                source=MarketDataSource.REST,
+            ),
+            MarketKline(
+                exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP", raw_symbol="ETH-USDT-SWAP",
+                interval="4h", open_time_ms=8 * 60 * 60_000, close_time_ms=12 * 60 * 60_000 - 1,
+                open=Decimal("105"), high=Decimal("115"), low=Decimal("95"),
+                close=Decimal("110"), volume=Decimal("10"), is_closed=False,
+                source=MarketDataSource.REST,
+            ),
+        ])
+
+        count, _, _ = tool_module._check_local(
+            symbol="ETH-USDT-PERP",
+            interval="4h",
+            start_open_ms=0,
+            end_open_ms=16 * 60 * 60_000,
+            kline_store_path=str(tmp_path / "test.sqlite3"),
+        )
+        # Only the first kline is closed
+        assert count == 1
