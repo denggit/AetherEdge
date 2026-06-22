@@ -1,6 +1,7 @@
 import asyncio
 from decimal import Decimal
 
+from src.platform.exchanges.errors import ExchangeApiError
 from src.platform.exchanges import (
     CancelOrderRequest,
     ExchangeConfig,
@@ -29,7 +30,10 @@ class FakeHttpClient:
                 "timeout_seconds": timeout_seconds,
             }
         )
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
 
 def test_okx_public_klines_preserve_exchange_order_by_default():
@@ -179,3 +183,41 @@ def test_okx_private_requests_include_content_type_header():
     headers = http.calls[0]["headers"]
     assert headers["Content-Type"] == "application/json"
     assert "OK-ACCESS-KEY" in headers
+
+
+def test_okx_public_request_retries_rate_limited_history_trades(monkeypatch):
+    monkeypatch.setenv("OKX_PUBLIC_REST_RETRY_ATTEMPTS", "2")
+    monkeypatch.setenv("OKX_PUBLIC_REST_RETRY_BACKOFF_SECONDS", "0")
+    http = FakeHttpClient(
+        [
+            ExchangeApiError("HTTP 429 from exchange API", status_code=429, payload={"code": "50011", "msg": "Too Many Requests"}),
+            {
+                "code": "0",
+                "data": [{"tradeId": "1", "px": "100.1", "sz": "1", "side": "buy", "ts": "2000"}],
+            },
+            {"code": "0", "data": []},
+        ]
+    )
+    client = create_exchange_client(ExchangeName.OKX, ExchangeConfig(), http_client=http)
+
+    rows = asyncio.run(client.fetch_trades("ETH-USDT-PERP", start_time_ms=1000, end_time_ms=3000, limit=100, oldest_first=True))
+
+    assert len(http.calls) == 3
+    assert [row.trade_id for row in rows] == ["1"]
+
+
+def test_okx_public_request_does_not_retry_non_retryable_error(monkeypatch):
+    monkeypatch.setenv("OKX_PUBLIC_REST_RETRY_ATTEMPTS", "3")
+    monkeypatch.setenv("OKX_PUBLIC_REST_RETRY_BACKOFF_SECONDS", "0")
+    error = ExchangeApiError("HTTP 400 from exchange API", status_code=400, payload={"code": "51000"})
+    http = FakeHttpClient([error])
+    client = create_exchange_client(ExchangeName.OKX, ExchangeConfig(), http_client=http)
+
+    try:
+        asyncio.run(client.fetch_ticker("ETH-USDT-PERP"))
+    except ExchangeApiError as exc:
+        assert exc is error
+    else:  # pragma: no cover - defensive assertion
+        raise AssertionError("expected ExchangeApiError")
+
+    assert len(http.calls) == 1

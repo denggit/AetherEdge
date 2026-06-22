@@ -58,6 +58,7 @@ class LiveRuntimeStats:
     producer_failures: int = 0
     producer_stale: int = 0
     errors: int = 0
+    market_events_dropped: int = 0
 
 
 class LiveRuntimeError(RuntimeError):
@@ -118,6 +119,7 @@ class LiveRuntimeRunner:
             target_exchanges=self.app_config.exchanges,
         )
         self._last_snapshot: PlatformSnapshot | None = self.services.get("snapshot")
+        self._last_market_queue_full_alert_ms = 0
         self._health = RuntimeHealth(
             phase=RuntimePhase.CREATED,
             warmup_complete=not self.runtime_config.warmup_enabled,
@@ -375,12 +377,33 @@ class LiveRuntimeRunner:
 
     async def _enqueue_market_event(self, event: MarketEvent) -> None:
         if self._market_queue.full():
+            self.stats.market_events_dropped += 1
+            self._emit_market_queue_full_alert(event)
             try:
                 self._market_queue.get_nowait()
                 self._market_queue.task_done()
             except asyncio.QueueEmpty:
                 pass
         await self._market_queue.put(event)
+
+    def _emit_market_queue_full_alert(self, event: MarketEvent) -> None:
+        now_ms = int(time.time() * 1000)
+        # Avoid flooding email/alert sinks during a burst, but never drop market
+        # data silently.  The closed-bar catch-up path can repair range bars,
+        # while this alert tells operators the live stream fell behind.
+        if now_ms - self._last_market_queue_full_alert_ms < 60_000:
+            return
+        self._last_market_queue_full_alert_ms = now_ms
+        self.context.alerts.emit(
+            AppAlert(
+                subject="AetherEdge market queue full",
+                content=(
+                    f"Dropped oldest market event before enqueueing {event.event_type.value}; "
+                    f"queue_size={self._market_queue.qsize()} maxsize={self._market_queue.maxsize}"
+                ),
+                severity="error",
+            )
+        )
 
     async def _process_account_event(self, event: AccountEvent) -> None:
         self.stats.account_events_seen += 1
@@ -603,6 +626,7 @@ class LiveRuntimeRunner:
         error: str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> None:
+        self._last_market_queue_full_alert_ms = 0
         self._health = RuntimeHealth(
             phase=phase,
             healthy=self._health.healthy if healthy is None else healthy,

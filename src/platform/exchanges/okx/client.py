@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
 import json
+import os
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Mapping
@@ -51,6 +54,43 @@ _OKX_ORDER_STATUS = {
     "canceled": OrderStatus.CANCELED,
 }
 
+_OKX_TOO_MANY_REQUESTS_CODE = "50011"
+_RETRYABLE_PUBLIC_HTTP_STATUS = {429, 500, 502, 503, 504}
+
+
+class _OkxPrivateWriteRateLimiter:
+    """Conservative async limiter for OKX private write calls.
+
+    This mirrors the proven ReclaimEdge pattern: only private POST/write
+    requests are spaced out, while public market data and websocket paths stay
+    unaffected.  It prevents bursts of order/cancel/stop writes from tripping
+    OKX rate limits during recovery or stop replacement.
+    """
+
+    def __init__(self, *, enabled: bool, min_interval_seconds: float) -> None:
+        self.enabled = enabled
+        self.min_interval_seconds = max(float(min_interval_seconds), 0.0)
+        self._lock = asyncio.Lock()
+        self._last_write_monotonic = 0.0
+
+    @classmethod
+    def from_env(cls) -> "_OkxPrivateWriteRateLimiter":
+        enabled = os.getenv("OKX_PRIVATE_WRITE_RATE_LIMIT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "y", "on"}
+        min_interval = float(os.getenv("OKX_PRIVATE_WRITE_MIN_INTERVAL_SECONDS", "0.25"))
+        return cls(enabled=enabled, min_interval_seconds=min_interval)
+
+    async def acquire(self) -> None:
+        if not self.enabled or self.min_interval_seconds <= 0:
+            return
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_write_monotonic
+            if elapsed < self.min_interval_seconds:
+                await asyncio.sleep(self.min_interval_seconds - elapsed)
+                self._last_write_monotonic = time.monotonic()
+            else:
+                self._last_write_monotonic = now
+
 
 class OkxExchangeClient:
     """OKX USDⓈ perpetual adapter behind the unified ExchangeClient port."""
@@ -59,6 +99,7 @@ class OkxExchangeClient:
         self._config = config
         self._http = http_client
         self._base_url = OKX_DEMO_REST_URL if config.sandbox else OKX_PROD_REST_URL
+        self._private_write_rate_limiter = _OkxPrivateWriteRateLimiter.from_env()
 
     @property
     def exchange(self) -> ExchangeName:
@@ -480,12 +521,25 @@ class OkxExchangeClient:
         *,
         params: Mapping[str, Any] | None = None,
     ) -> Any:
-        return await self._http.request(
-            method,
-            f"{self._base_url}{path}",
-            params=params,
-            timeout_seconds=self._config.timeout_seconds,
-        )
+        attempts = max(1, int(os.getenv("OKX_PUBLIC_REST_RETRY_ATTEMPTS", "5")))
+        base_sleep = max(0.0, float(os.getenv("OKX_PUBLIC_REST_RETRY_BACKOFF_SECONDS", "2")))
+        max_sleep = max(base_sleep, float(os.getenv("OKX_PUBLIC_REST_RETRY_MAX_SLEEP_SECONDS", "30")))
+        last_error: ExchangeApiError | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return await self._http.request(
+                    method,
+                    f"{self._base_url}{path}",
+                    params=params,
+                    timeout_seconds=self._config.timeout_seconds,
+                )
+            except ExchangeApiError as exc:
+                last_error = exc
+                if attempt >= attempts or not _is_retryable_public_error(exc):
+                    raise
+                await asyncio.sleep(_retry_sleep_seconds(attempt, base_sleep=base_sleep, max_sleep=max_sleep))
+        assert last_error is not None
+        raise last_error
 
     async def _request_private(
         self,
@@ -520,6 +574,8 @@ class OkxExchangeClient:
         }
         if self._config.sandbox:
             headers["x-simulated-trading"] = "1"
+        if method == "POST":
+            await self._private_write_rate_limiter.acquire()
         return await self._http.request(
             method,
             f"{self._base_url}{path}",
@@ -532,6 +588,21 @@ class OkxExchangeClient:
     def _require_credentials(self) -> None:
         if not self._config.api_key or not self._config.api_secret or not self._config.passphrase:
             raise ExchangeConfigError("OKX private API requires api_key, api_secret and passphrase")
+
+
+def _is_retryable_public_error(exc: ExchangeApiError) -> bool:
+    if exc.status_code in _RETRYABLE_PUBLIC_HTTP_STATUS:
+        return True
+    payload = exc.payload
+    if isinstance(payload, Mapping) and str(payload.get("code")) == _OKX_TOO_MANY_REQUESTS_CODE:
+        return True
+    return False
+
+
+def _retry_sleep_seconds(attempt: int, *, base_sleep: float, max_sleep: float) -> float:
+    if base_sleep <= 0:
+        return 0.0
+    return min(base_sleep * (2 ** max(0, attempt - 1)), max_sleep)
 
 
 def _okx_timestamp() -> str:
