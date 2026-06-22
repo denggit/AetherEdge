@@ -69,8 +69,8 @@ V8 不订阅 order_book，只订阅 trades + closed 4H + rangebar aggregate + pr
 - [x] AE-0501 V8 Plugin Skeleton
 - [x] AE-0502 V8 Feature Engine
 - [x] AE-0503 V8 Micro Context
-- [ ] AE-0504 V8 Position State
-- [ ] AE-0505 V8 Signal Mapper
+- [x] AE-0504 V8 Position State
+- [x] AE-0505 V8 Signal Mapper
 - [ ] AE-0506 Readonly Parity Mode
 - [ ] AE-0507 Live Trading Mode
 
@@ -173,4 +173,20 @@ V8 插件位于 strategies/eth_lf_portfolio_v8。
 策略声明 runtime_requirements，不订阅 order_book。
 插件只消费 closed 4H kline 和 4H range aggregate feature。
 当前包不产生交易信号；LF engines / position state execution 在后续包实现。
+```
+
+
+## Board 5 package 2：V8 Position State / Signal Mapper / Engine Hooks
+
+- [x] AE-0504 V8 Position State
+- [x] AE-0505 V8 Signal Mapper
+- [ ] AE-0506 Readonly Parity Mode
+
+设计结论：
+
+```text
+V8 position state 分成 master canonical state 和 exchange leg state。
+account/order event 只能让 master exchange 驱动 canonical state，follower 只更新自己的 leg。
+SignalMapper 将 V8TradeDecision 映射成标准 TradeSignal，quantity 仍然是 base asset。
+Momentum / Bear / Bull engine 类和 PortfolioRouter 钩子已就绪，但完整 LF parity 和 readonly audit 仍在下一包。
 ```

@@ -129,3 +129,194 @@ def _ctx(event: MarketFeatureEvent):
     from strategies.eth_lf_portfolio_v8.features.feature_frame import parse_range_aggregate
 
     return parse_range_aggregate(event)
+
+from dataclasses import dataclass
+from src.platform.account.events import AccountEvent, AccountEventType
+from src.platform.exchanges.models import OrderSide, OrderStatus
+from src.signals import SignalAction
+from strategies.eth_lf_portfolio_v8.domain.models import BarReadyContext, EngineSignal, RoutedSignal, V8DecisionType, V8TradeDecision
+from strategies.eth_lf_portfolio_v8.domain.position_state import V8PositionState
+from strategies.eth_lf_portfolio_v8.engines.router import PortfolioRouter
+from strategies.eth_lf_portfolio_v8.execution.signal_mapper import SignalMapperConfig, V8SignalMapper
+from strategies.eth_lf_portfolio_v8.persistence.state_store import JsonV8StateStore
+
+
+@dataclass(frozen=True)
+class _StaticEngine:
+    name: str
+    priority: int
+    side: Side
+
+    def evaluate(self, context: BarReadyContext):
+        if self.side is Side.FLAT:
+            return None
+        return EngineSignal(side=self.side, engine=self.name, priority=self.priority, reason=self.name)
+
+
+def test_v8_router_respects_engine_priority() -> None:
+    router = PortfolioRouter()
+    selected = router.select(
+        [
+            EngineSignal(side=Side.LONG, engine="bull_reclaim_v2", priority=50),
+            EngineSignal(side=Side.SHORT, engine="bear_v3_only", priority=90),
+            EngineSignal(side=Side.LONG, engine="momentum_v3", priority=150),
+        ]
+    )
+
+    assert selected.side is Side.LONG
+    assert selected.engine == "momentum_v3"
+    assert selected.priority == 150
+
+
+def test_v8_signal_mapper_maps_open_close_and_stop() -> None:
+    mapper = V8SignalMapper(SignalMapperConfig(strategy_id="v8", target_exchanges=("okx", "binance")))
+    open_signal = mapper.map_decision(
+        V8TradeDecision(
+            decision_type=V8DecisionType.OPEN,
+            side=Side.LONG,
+            symbol="ETH-USDT-PERP",
+            quantity=Decimal("0.12"),
+            engine="momentum_v3",
+            bar_close_time_ms=1_700_000_000_000,
+            entry_risk_scale=Decimal("0.65"),
+        )
+    )[0]
+    stop_signal = mapper.map_decision(
+        V8TradeDecision(
+            decision_type=V8DecisionType.PLACE_STOP,
+            side=Side.LONG,
+            symbol="ETH-USDT-PERP",
+            quantity=Decimal("0.12"),
+            stop_price=Decimal("1650"),
+            engine="momentum_v3",
+        )
+    )[0]
+    close_signal = mapper.map_decision(
+        V8TradeDecision(
+            decision_type=V8DecisionType.CLOSE,
+            side=Side.LONG,
+            symbol="ETH-USDT-PERP",
+            quantity=Decimal("0.12"),
+            engine="momentum_v3",
+        )
+    )[0]
+
+    assert open_signal.action is SignalAction.OPEN_LONG
+    assert open_signal.quantity == Decimal("0.12")
+    assert open_signal.metadata["target_exchanges"] == ["okx", "binance"]
+    assert open_signal.metadata["entry_risk_scale"] == "0.65"
+    assert stop_signal.action is SignalAction.PLACE_STOP_LOSS_LONG
+    assert stop_signal.trigger_price == Decimal("1650")
+    assert close_signal.action is SignalAction.CLOSE_LONG
+    assert close_signal.metadata["reduce_only"] is True
+
+
+def test_v8_position_state_tracks_master_and_follower_legs() -> None:
+    state = V8PositionState()
+    state.open_master(
+        side=Side.LONG,
+        entry_time_ms=1_700_000_000_000,
+        avg_entry=Decimal("1730"),
+        qty=Decimal("0.12"),
+        stop_price=Decimal("1640"),
+        entry_engine="momentum_v3",
+        entry_risk_mult=Decimal("1.3"),
+    )
+    state.mark_leg_open(exchange="okx", avg_fill_price=Decimal("1730"), base_qty=Decimal("0.12"), native_qty=Decimal("1.2"))
+    state.mark_leg_open(exchange="binance", avg_fill_price=Decimal("1731"), base_qty=Decimal("0.12"), native_qty=Decimal("0.12"))
+
+    assert state.in_pos is True
+    assert state.risk_per_coin == Decimal("90")
+    assert set(state.open_legs) == {"okx", "binance"}
+
+    state.mark_leg_closed(exchange="binance", sync_status="follower_closed_early")
+    assert state.in_pos is True
+    assert state.legs["binance"].sync_status == "follower_closed_early"
+    assert set(state.open_legs) == {"okx"}
+
+
+def test_v8_position_state_applies_master_account_event_without_following_follower() -> None:
+    state = V8PositionState()
+    state.apply_account_event(
+        AccountEvent(
+            exchange=ExchangeName.BINANCE,
+            event_type=AccountEventType.ORDER,
+            symbol="ETH-USDT-PERP",
+            order_status=OrderStatus.FILLED,
+            side=OrderSide.BUY,
+            price=Decimal("1731"),
+            filled_quantity=Decimal("0.12"),
+        ),
+        master_exchange="okx",
+    )
+    assert state.in_pos is False
+    assert state.legs["binance"].is_open is True
+
+    state.apply_account_event(
+        AccountEvent(
+            exchange=ExchangeName.OKX,
+            event_type=AccountEventType.ORDER,
+            symbol="ETH-USDT-PERP",
+            order_status=OrderStatus.FILLED,
+            side=OrderSide.BUY,
+            price=Decimal("1730"),
+            filled_quantity=Decimal("0.12"),
+        ),
+        master_exchange="okx",
+    )
+    assert state.in_pos is True
+    assert state.avg_entry == Decimal("1730")
+
+    state.apply_account_event(
+        AccountEvent(
+            exchange=ExchangeName.OKX,
+            event_type=AccountEventType.ORDER,
+            symbol="ETH-USDT-PERP",
+            order_status=OrderStatus.FILLED,
+            side=OrderSide.SELL,
+            price=Decimal("1720"),
+            filled_quantity=Decimal("0.12"),
+        ),
+        master_exchange="okx",
+    )
+    assert state.in_pos is False
+    assert state.legs == {}
+
+
+def test_v8_state_store_roundtrips_position_state(tmp_path) -> None:
+    store = JsonV8StateStore(tmp_path / "v8_state.json")
+    state = V8PositionState()
+    state.open_master(
+        side=Side.SHORT,
+        entry_time_ms=1,
+        avg_entry=Decimal("1800"),
+        qty=Decimal("0.2"),
+        stop_price=Decimal("1880"),
+        entry_engine="bear_v3_only",
+    )
+    state.mark_leg_open(exchange="okx", avg_fill_price=Decimal("1800"), base_qty=Decimal("0.2"), native_qty=Decimal("2"))
+
+    store.save(state)
+    loaded = store.load()
+
+    assert loaded.in_pos is True
+    assert loaded.side is Side.SHORT
+    assert loaded.avg_entry == Decimal("1800")
+    assert loaded.legs["okx"].native_qty == Decimal("2")
+
+
+@pytest.mark.asyncio
+async def test_strategy_router_flow_records_routed_signal_without_emitting_orders() -> None:
+    strategy = Strategy()
+    strategy.router = PortfolioRouter(engines=(_StaticEngine(name="momentum_v3", priority=150, side=Side.LONG),))
+    close_time_ms = 1_700_000_000_000
+
+    await strategy.on_market_feature(_closed_kline(close_time_ms))
+    signals = await strategy.on_market_feature(_range_aggregate(close_time_ms, imbalance="-0.1", close_pos="0.2"))
+
+    assert signals == []
+    ready = strategy.bar_ready_events[-1]
+    assert ready.routed_signal.engine == "momentum_v3"
+    assert ready.micro.signal_side is Side.LONG
+    assert ready.micro.contra is True
+    assert ready.final_entry_risk_scale == Decimal("0.650")

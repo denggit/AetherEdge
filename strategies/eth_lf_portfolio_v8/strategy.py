@@ -14,6 +14,11 @@ from src.reconcile.models import ReconcileReport
 from src.signals import TradeSignal
 from src.strategy import StrategyRecoveryContext
 from strategies.eth_lf_portfolio_v8.domain.models import BarReadyContext, Side
+from strategies.eth_lf_portfolio_v8.engines.bear_v3 import BearV3OnlyEngine
+from strategies.eth_lf_portfolio_v8.engines.bull_reclaim_v2 import BullReclaimV2Engine
+from strategies.eth_lf_portfolio_v8.engines.momentum_v3 import MomentumV3Engine
+from strategies.eth_lf_portfolio_v8.engines.router import PortfolioRouter
+from strategies.eth_lf_portfolio_v8.execution.signal_mapper import SignalMapperConfig, V8SignalMapper
 from strategies.eth_lf_portfolio_v8.domain.position_state import V8PositionState
 from strategies.eth_lf_portfolio_v8.features.buffer import V8FeatureBuffer
 from strategies.eth_lf_portfolio_v8.features.feature_frame import parse_closed_kline, parse_range_aggregate
@@ -66,6 +71,8 @@ class Strategy:
         self.buffer = V8FeatureBuffer()
         self.micro_engine = MicroContextEngine(self.config.micro_context)
         self.position = V8PositionState()
+        self.router = PortfolioRouter(engines=(MomentumV3Engine(), BearV3OnlyEngine(), BullReclaimV2Engine()))
+        self.signal_mapper = V8SignalMapper(SignalMapperConfig(strategy_id=self.config.strategy_id))
         self.bar_ready_events: list[BarReadyContext] = []
         self.recovered = False
         self.started = False
@@ -110,19 +117,31 @@ class Strategy:
         return self._evaluate_ready_bars()
 
     def _evaluate_ready_bars(self) -> list[TradeSignal]:
-        # Engines are not wired yet. We evaluate micro with FLAT so the package
-        # can validate event timing without producing live orders.
+        # Engine classes are present but still parity-empty in this package.
+        # The flow is now complete enough for the next package to plug in the
+        # real LF engine votes without changing event timing or IO boundaries.
+        signals: list[TradeSignal] = []
         for close_time_ms in self.buffer.ready_times():
             kline = self.buffer.closed_klines[close_time_ms]
             aggregate = self.buffer.range_aggregates.get(close_time_ms)
-            micro = self.micro_engine.evaluate(signal_side=Side.FLAT, aggregate=aggregate)
-            self.bar_ready_events.append(
-                BarReadyContext(
-                    kline=kline,
-                    range_aggregate=aggregate,
-                    micro=micro,
-                    global_risk_scale=self.config.global_risk_scale,
-                )
+            bootstrap_micro = self.micro_engine.evaluate(signal_side=Side.FLAT, aggregate=aggregate)
+            bootstrap_context = BarReadyContext(
+                kline=kline,
+                range_aggregate=aggregate,
+                micro=bootstrap_micro,
+                global_risk_scale=self.config.global_risk_scale,
             )
+            routed = self.router.evaluate(bootstrap_context)
+            micro = self.micro_engine.evaluate(signal_side=routed.side, aggregate=aggregate)
+            ready = BarReadyContext(
+                kline=kline,
+                range_aggregate=aggregate,
+                micro=micro,
+                global_risk_scale=self.config.global_risk_scale,
+                routed_signal=routed,
+            )
+            self.bar_ready_events.append(ready)
+            # No live order is emitted until sizing/stops and LF engine parity are
+            # migrated. Signal mapper is delivered and unit-tested separately.
             self.buffer.mark_evaluated(close_time_ms)
-        return []
+        return signals
