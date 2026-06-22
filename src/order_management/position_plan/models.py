@@ -14,6 +14,7 @@ class PositionPlanStatus(str, Enum):
     CLOSED = "closed"
     MASTER_ACTIVE_PLAN_UNKNOWN = "master_active_plan_unknown"
     MANUAL_REQUIRED = "manual_required"
+    MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED = "master_closed_follower_close_required"
 
 
 class LegRole(str, Enum):
@@ -35,6 +36,7 @@ class LegSyncStatus(str, Enum):
     TOPUP_FAILED = "topup_failed"
     MANUAL_REQUIRED = "manual_required"
     CLOSED = "closed"
+    FOLLOWER_CLOSE_FAILED = "follower_close_failed"
 
 
 @dataclass(frozen=True)

@@ -574,6 +574,63 @@ async def test_strategy_order_result_feedback_normal_close_with_master_and_follo
 
 
 @pytest.mark.asyncio
+async def test_master_close_follower_failed_emits_follower_close_retry_signal() -> None:
+    """Master close fills but follower result ok=False → emit follower-only close signal."""
+    strategy = Strategy()
+    await strategy.on_start(_snapshot())
+    strategy.position.open_master(side=Side.LONG, entry_time_ms=1, avg_entry=Decimal("2000"), qty=Decimal("0.1"), stop_price=Decimal("1978"), entry_engine="MOMENTUM_V3", position_id="p1")
+    strategy.position.mark_leg_open(exchange="okx", avg_fill_price=Decimal("2000"), base_qty=Decimal("0.1"))
+    strategy.position.mark_leg_open(exchange="binance", avg_fill_price=Decimal("2001"), base_qty=Decimal("0.1"))
+    close_signal = TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.CLOSE_LONG, quantity=Decimal("0.1"), metadata={"target_exchanges": ["okx", "binance"]})
+
+    follow_up = await strategy.on_order_results(
+        signal=close_signal,
+        source="request_sync",
+        event_time_ms=2,
+        results=[
+            ExchangeOrderResult(exchange=ExchangeName.OKX, ok=True, order_id="close-m", status=OrderStatus.FILLED, side=OrderSide.SELL, quantity=Decimal("0.1"), filled_quantity=Decimal("0.1"), avg_fill_price=Decimal("2010")),
+            ExchangeOrderResult(exchange=ExchangeName.BINANCE, ok=False, order_id="close-f", status=OrderStatus.PARTIALLY_FILLED, side=OrderSide.SELL, quantity=Decimal("0.1"), filled_quantity=Decimal("0"), error="insufficient margin"),
+        ],
+    )
+
+    assert len(follow_up) == 1
+    assert follow_up[0].action is SignalAction.CLOSE_LONG
+    assert follow_up[0].metadata["target_exchanges"] == ["binance"]
+    assert follow_up[0].metadata["execution_purpose"] == "follower_close_after_master_close"
+    assert follow_up[0].metadata["reduce_only"] is True
+    assert follow_up[0].metadata["master_already_closed"] is True
+    assert follow_up[0].metadata["close_required_reason"] == "master_closed_follower_not_closed"
+
+
+@pytest.mark.asyncio
+async def test_master_close_follower_missing_result_emits_follower_close_retry_signal() -> None:
+    """Results only contain master close fill → emit follower close for missing follower."""
+    strategy = Strategy()
+    await strategy.on_start(_snapshot())
+    strategy.position.open_master(side=Side.LONG, entry_time_ms=1, avg_entry=Decimal("2000"), qty=Decimal("0.1"), stop_price=Decimal("1978"), entry_engine="MOMENTUM_V3", position_id="p1")
+    strategy.position.mark_leg_open(exchange="okx", avg_fill_price=Decimal("2000"), base_qty=Decimal("0.1"))
+    strategy.position.mark_leg_open(exchange="binance", avg_fill_price=Decimal("2001"), base_qty=Decimal("0.1"))
+    close_signal = TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.CLOSE_LONG, quantity=Decimal("0.1"), metadata={"target_exchanges": ["okx", "binance"]})
+
+    follow_up = await strategy.on_order_results(
+        signal=close_signal,
+        source="request_sync",
+        event_time_ms=2,
+        results=[
+            ExchangeOrderResult(exchange=ExchangeName.OKX, ok=True, order_id="close-m", status=OrderStatus.FILLED, side=OrderSide.SELL, quantity=Decimal("0.1"), filled_quantity=Decimal("0.1"), avg_fill_price=Decimal("2010")),
+        ],
+    )
+
+    assert len(follow_up) == 1
+    assert follow_up[0].action is SignalAction.CLOSE_LONG
+    assert follow_up[0].metadata["target_exchanges"] == ["binance"]
+    assert follow_up[0].metadata["execution_purpose"] == "follower_close_after_master_close"
+    assert follow_up[0].metadata["reduce_only"] is True
+    assert follow_up[0].metadata["master_already_closed"] is True
+    assert follow_up[0].metadata["close_required_reason"] == "master_closed_follower_not_closed"
+
+
+@pytest.mark.asyncio
 async def test_strategy_order_result_feedback_stop_and_cancel_do_not_recurse() -> None:
     strategy = Strategy()
     stop_signal = TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.PLACE_STOP_LOSS_LONG, quantity=Decimal("0.1"), trigger_price=Decimal("1900"))

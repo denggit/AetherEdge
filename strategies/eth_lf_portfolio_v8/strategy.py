@@ -236,7 +236,6 @@ class Strategy:
             return []
         target_exchanges = _target_exchanges(signal)
         master_close_event: AccountEvent | None = None
-        follower_close_filled = False
         follower_closed_exchanges: list[str] = []
         for event in events:
             exchange = event.exchange.value
@@ -249,14 +248,29 @@ class Strategy:
                 continue
             if not is_master and _is_close_side(event.side, self.position.side):
                 follower_closed_exchanges.append(exchange)
-                follower_close_filled = True
 
         if master_close_event is None:
             for exchange in follower_closed_exchanges:
                 self.position.mark_leg_closed(exchange=exchange, sync_status="follower_closed")
             return []
-        has_follower_target = any(exchange != self.config.data_exchange for exchange in target_exchanges)
-        follow_up = [] if has_follower_target or follower_close_filled else self._follower_close_signals_after_master_close(event_time_ms=master_close_event.event_time_ms)
+
+        # Collect unclosed follower exchanges BEFORE close_master() resets open_legs.
+        unclosed_followers: list[str] = []
+        for exchange, leg in sorted(self.position.open_legs.items()):
+            if exchange == self.config.data_exchange:
+                continue
+            if leg.base_qty <= 0:
+                continue
+            if exchange not in follower_closed_exchanges:
+                unclosed_followers.append(exchange)
+
+        follow_up: list[TradeSignal] = []
+        if unclosed_followers:
+            follow_up = self._follower_close_signals_after_master_close(
+                event_time_ms=master_close_event.event_time_ms,
+                only_exchanges=unclosed_followers,
+            )
+
         self.position.close_master(exit_time_ms=master_close_event.event_time_ms)
         self.pending_entry = None
         for exchange in follower_closed_exchanges:
@@ -770,13 +784,16 @@ class Strategy:
         )[0]
         return [cancel, stop]
 
-    def _follower_close_signals_after_master_close(self, *, event_time_ms: int | None) -> list[TradeSignal]:
+    def _follower_close_signals_after_master_close(self, *, event_time_ms: int | None, only_exchanges: list[str] | None = None) -> list[TradeSignal]:
         if not self.position.in_pos or self.position.side is Side.FLAT:
             return []
         action = SignalAction.CLOSE_LONG if self.position.side is Side.LONG else SignalAction.CLOSE_SHORT
+        only_set: set[str] | None = set(only_exchanges) if only_exchanges is not None else None
         signals: list[TradeSignal] = []
         for exchange, leg in sorted(self.position.open_legs.items()):
             if exchange == self.config.data_exchange or leg.base_qty <= 0:
+                continue
+            if only_set is not None and exchange not in only_set:
                 continue
             signals.append(
                 TradeSignal(
@@ -790,6 +807,8 @@ class Strategy:
                         "execution_purpose": "follower_close_after_master_close",
                         "position_id": self.position.position_id,
                         "master_close_event_time_ms": event_time_ms,
+                        "master_already_closed": True,
+                        "close_required_reason": "master_closed_follower_not_closed",
                     },
                 )
             )

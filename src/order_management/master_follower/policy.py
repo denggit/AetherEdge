@@ -33,6 +33,7 @@ class MasterFollowerExecutionPolicy:
     entry_deviation_alert_pct: Decimal = Decimal("0.005")
     follower_entry_retry: RetryPolicy = field(default_factory=RetryPolicy)
     master_entry_retry: RetryPolicy = field(default_factory=RetryPolicy)
+    follower_close_retry: RetryPolicy = field(default_factory=lambda: RetryPolicy(max_attempts=3, retry_delay_seconds=1.0))
     manual_grace_seconds_after_master_fail: int = 1800
     close_orphan_follower_after_grace: bool = True
     do_not_rejoin_mid_position_after_follower_desync: bool = True
@@ -45,6 +46,7 @@ class MasterFollowerExecutionPolicy:
             entry_deviation_alert_pct=config.entry_deviation_alert_pct,
             follower_entry_retry=config.follower_entry_retry,
             master_entry_retry=config.master_entry_retry,
+            follower_close_retry=config.follower_close_retry,
             manual_grace_seconds_after_master_fail=config.manual_grace_seconds_after_master_fail,
             close_orphan_follower_after_grace=config.close_orphan_follower_after_grace,
             do_not_rejoin_mid_position_after_follower_desync=config.do_not_rejoin_mid_position_after_follower_desync,

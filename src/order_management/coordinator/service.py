@@ -138,6 +138,8 @@ class MultiExchangeOrderCoordinator:
             self._record_open_or_topup_plan(intent, results, purpose=purpose)
         elif signal.action in {SignalAction.PLACE_STOP_LOSS_LONG, SignalAction.PLACE_STOP_LOSS_SHORT}:
             self._record_stop_plan(intent, results)
+        elif signal.action in {SignalAction.CLOSE_LONG, SignalAction.CLOSE_SHORT}:
+            self._record_close_plan(intent, results, purpose=purpose)
 
     def _record_open_or_topup_plan(self, intent: OrderIntent, results: Sequence[ExchangeOrderResult], *, purpose: str) -> None:
         signal = intent.signal
@@ -228,10 +230,100 @@ class MultiExchangeOrderCoordinator:
                     stop_client_order_id=result.client_order_id,
                 )
 
+    def _record_close_plan(self, intent: OrderIntent, results: Sequence[ExchangeOrderResult], *, purpose: str) -> None:
+        signal = intent.signal
+        if not signal.metadata or not signal.metadata.get("position_id"):
+            return
+        position_id = str(signal.metadata["position_id"])
+        existing = self.position_plan_store.get_position(position_id)
+        if existing is None:
+            return
+        by_exchange = {result.exchange: result for result in results}
+        master_exchange = existing.master_exchange
+
+        if purpose == "follower_close_after_master_close":
+            for exchange in intent.target_exchanges:
+                result = by_exchange.get(exchange)
+                if result is None:
+                    continue
+                if result.ok:
+                    self.position_plan_store.update_leg_sync_status(
+                        position_id=position_id, exchange=exchange, sync_status=LegSyncStatus.CLOSED,
+                    )
+                else:
+                    self.position_plan_store.update_leg_sync_status(
+                        position_id=position_id, exchange=exchange, sync_status=LegSyncStatus.FOLLOWER_CLOSE_FAILED,
+                    )
+            self._maybe_close_position_plan(position_id)
+            return
+
+        if purpose == "normal_close":
+            master_result = by_exchange.get(master_exchange)
+            if master_result is not None and master_result.ok:
+                self.position_plan_store.update_leg_sync_status(
+                    position_id=position_id, exchange=master_exchange, sync_status=LegSyncStatus.CLOSED,
+                )
+            for exchange in intent.target_exchanges:
+                if exchange == master_exchange:
+                    continue
+                result = by_exchange.get(exchange)
+                if result is not None and result.ok:
+                    self.position_plan_store.update_leg_sync_status(
+                        position_id=position_id, exchange=exchange, sync_status=LegSyncStatus.CLOSED,
+                    )
+                elif result is not None and not result.ok:
+                    self.position_plan_store.update_leg_sync_status(
+                        position_id=position_id, exchange=exchange, sync_status=LegSyncStatus.FOLLOWER_CLOSE_FAILED,
+                    )
+            has_unresolved = False
+            for leg in self.position_plan_store.get_legs(position_id):
+                if leg.exchange == master_exchange or leg.role == LegRole.MASTER:
+                    continue
+                if leg.sync_status != LegSyncStatus.CLOSED:
+                    has_unresolved = True
+                    break
+            if has_unresolved:
+                self.position_plan_store.upsert_position(
+                    replace(existing, status=PositionPlanStatus.MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED),
+                )
+            else:
+                self._maybe_close_position_plan(position_id)
+            return
+
+        self._maybe_close_position_plan(position_id)
+
+    def _maybe_close_position_plan(self, position_id: str) -> None:
+        plan = self.position_plan_store.get_position(position_id)
+        if plan is None:
+            return
+        legs = self.position_plan_store.get_legs(position_id)
+        all_closed = all(
+            leg.sync_status == LegSyncStatus.CLOSED for leg in legs
+            if leg.role in {LegRole.MASTER, LegRole.FOLLOWER}
+        )
+        if all_closed and plan.status != PositionPlanStatus.CLOSED:
+            self.position_plan_store.upsert_position(replace(plan, status=PositionPlanStatus.CLOSED))
+
     async def _execute_master_follower(self, clients: Sequence[ExecutionClient], intent: OrderIntent, items: Sequence[PlannedExecution]) -> list[ExchangeOrderResult]:
         assert self.master_follower_policy is not None
         if self._bypasses_master_gating(intent):
-            results_nested = await asyncio.gather(*(self._execute_for_client(client, intent, items) for client in clients))
+            purpose = str(intent.signal.metadata.get("execution_purpose", "") if intent.signal.metadata else "").strip().lower()
+            if purpose == "follower_close_after_master_close":
+                close_retry = self.master_follower_policy.follower_close_retry
+                results_nested = await asyncio.gather(
+                    *(
+                        self._execute_for_client(
+                            client,
+                            intent,
+                            items,
+                            max_attempts=close_retry.max_attempts,
+                            retry_delay_seconds=close_retry.retry_delay_seconds,
+                        )
+                        for client in clients
+                    )
+                )
+            else:
+                results_nested = await asyncio.gather(*(self._execute_for_client(client, intent, items) for client in clients))
             return [item for group in results_nested for item in group]
         client_by_exchange = {client.exchange: client for client in clients}
         master = client_by_exchange.get(self.master_follower_policy.master_exchange)

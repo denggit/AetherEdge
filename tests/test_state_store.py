@@ -133,3 +133,67 @@ def test_sqlite_store_reconcile_open_orders_snapshot_marks_missing_open_orders_c
     assert loaded is not None
     assert loaded.status is OrderStatus.CANCELED
     assert loaded.raw["local_reconcile_reason"] == "missing_from_exchange_open_orders"
+
+
+def test_sqlite_store_reconcile_missing_order_with_null_client_order_id(tmp_path):
+    store = SqliteStateStore(tmp_path / "state.sqlite3")
+    order = Order(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP",
+        order_id="stale-null-cid",
+        client_order_id=None,
+        status=OrderStatus.NEW,
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        price=Decimal("3000"),
+        quantity=Decimal("0.1"),
+        raw={"uTime": "1710000000000"},
+    )
+    store.save_order(order)
+
+    changed = store.mark_missing_open_orders_closed(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        live_order_keys=set(),
+        is_stop_order=False,
+    )
+
+    assert changed == 1
+    assert store.list_open_orders(exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP") == []
+    loaded = store.get_order(exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP", order_id="stale-null-cid")
+    assert loaded is not None
+    assert loaded.status is OrderStatus.CANCELED
+    assert loaded.raw["local_reconcile_reason"] == "missing_from_exchange_open_orders"
+
+
+def test_sqlite_store_reconcile_missing_order_with_null_order_id(tmp_path):
+    store = SqliteStateStore(tmp_path / "state.sqlite3")
+    order = Order(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP",
+        order_id=None,
+        client_order_id="stale-null-oid",
+        status=OrderStatus.NEW,
+        side=OrderSide.BUY,
+        order_type=OrderType.LIMIT,
+        price=Decimal("3000"),
+        quantity=Decimal("0.1"),
+        raw={"uTime": "1710000000000"},
+    )
+    store.save_order(order)
+
+    changed = store.mark_missing_open_orders_closed(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        live_order_keys=set(),
+        is_stop_order=False,
+    )
+
+    assert changed == 1
+    assert store.list_open_orders(exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP") == []
+    loaded = store.get_order(exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP", client_order_id="stale-null-oid")
+    assert loaded is not None
+    assert loaded.status is OrderStatus.CANCELED
+    assert loaded.raw["local_reconcile_reason"] == "missing_from_exchange_open_orders"

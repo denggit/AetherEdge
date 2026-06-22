@@ -134,3 +134,29 @@ async def test_master_follower_coordinator_retries_follower_without_closing_mast
     assert binance.attempts == 3
     assert [r.ok for r in results] == [True, True]
     assert repo.get_intent("mf-intent").status is OrderIntentStatus.SUBMITTED  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_follower_close_after_master_close_retries_at_least_three_times(tmp_path):
+    """follower_close_after_master_close signals must retry at least 3 times on failure."""
+    repo = SqliteOrderJournalStore(tmp_path / "journal.sqlite3")
+    binance = FollowerFailsTwiceClient(ExchangeName.BINANCE, fail_times=2)
+    policy = MasterFollowerExecutionPolicy(
+        master_exchange=ExchangeName.OKX,
+        follower_exchanges=(ExchangeName.BINANCE,),
+        follower_close_retry=RetryPolicy(max_attempts=3, retry_delay_seconds=0),
+    )
+    coordinator = MultiExchangeOrderCoordinator(clients=[binance], repository=repo, master_follower_policy=policy)
+    close_signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.CLOSE_LONG,
+        quantity=Decimal("0.1"),
+        metadata={"execution_purpose": "follower_close_after_master_close", "target_exchanges": ["binance"]},
+    )
+    intent = OrderIntent(intent_id="fc-intent", strategy_id="v8", signal=close_signal, target_exchanges=(ExchangeName.BINANCE,))
+
+    results = await coordinator.execute(intent)
+
+    assert binance.attempts == 3
+    assert [r.ok for r in results] == [True]
+    assert repo.get_intent("fc-intent").status is OrderIntentStatus.SUBMITTED  # type: ignore[union-attr]

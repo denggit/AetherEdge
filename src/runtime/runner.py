@@ -15,7 +15,7 @@ from src.market_data.models import MarketDataSet, RangeBar, TimeRange, WarmupReq
 from src.market_data.storage import SqliteKlineStore, SqliteRangeBarStore
 from src.market_data.warmup.gap_detector import interval_to_ms
 from src.market_data.warmup.service import KlineWarmupService
-from src.order_management import MasterFollowerExecutionPolicy, MultiExchangeOrderCoordinator, RepositoryDuplicateOrderGuard, SqliteOrderJournalStore, SqlitePositionPlanStore
+from src.order_management import LegSyncStatus, MasterFollowerExecutionPolicy, MultiExchangeOrderCoordinator, PositionPlanStatus, RepositoryDuplicateOrderGuard, SqliteOrderJournalStore, SqlitePositionPlanStore
 from src.order_management.models import ExchangeOrderResult, OrderIntentStatus
 from src.platform import create_account_client, create_execution_client
 from src.platform.account.events import AccountEvent
@@ -127,6 +127,7 @@ class LiveRuntimeRunner:
         )
         self._last_snapshot: PlatformSnapshot | None = self.services.get("snapshot")
         self._last_market_queue_full_alert_ms = 0
+        self._follower_close_alert_last_ms: dict[str, int] = {}
         self._health = RuntimeHealth(
             phase=RuntimePhase.CREATED,
             warmup_complete=not self.runtime_config.warmup_enabled,
@@ -431,7 +432,44 @@ class LiveRuntimeRunner:
             tasks.append(asyncio.create_task(self._get_account_sync_service().run_periodic(self._stop_event)))
         if self.requirements.order_state.poll_when_position_enabled:
             tasks.append(asyncio.create_task(self._get_order_sync_service().run_periodic(self._stop_event)))
+            tasks.append(asyncio.create_task(self._periodic_follower_close_check(self._stop_event)))
         return tasks
+
+    async def _periodic_follower_close_check(self, stop_event: asyncio.Event) -> None:
+        await asyncio.sleep(30)
+        while not stop_event.is_set():
+            try:
+                store = self._position_plan_store
+                if store is None:
+                    return
+                strategy = self.context.strategy
+                for plan in store.list_active_positions():
+                    if plan.status != PositionPlanStatus.MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED:
+                        continue
+                    for leg in store.get_legs(plan.position_id):
+                        if leg.exchange == plan.master_exchange:
+                            continue
+                        if leg.sync_status == LegSyncStatus.FOLLOWER_CLOSE_FAILED:
+                            logger.warning(
+                                "Unresolved follower close detected | position_id=%s exchange=%s sync_status=%s",
+                                plan.position_id,
+                                leg.exchange.value,
+                                leg.sync_status.value,
+                            )
+                            if hasattr(strategy, "position") and hasattr(strategy.position, "in_pos"):
+                                continue
+                            if hasattr(strategy, "_follower_close_signals_after_master_close"):
+                                signals = strategy._follower_close_signals_after_master_close(event_time_ms=None, only_exchanges=[leg.exchange.value])
+                                if signals:
+                                    logger.info(
+                                        "Auto-triggering follower close retry | position_id=%s exchange=%s",
+                                        plan.position_id,
+                                        leg.exchange.value,
+                                    )
+                                    await self._execute_signals(signals, source="follower_close_periodic_check", event_time_ms=None, metadata={"trigger": "periodic_follower_close_check"})
+            except Exception as exc:
+                logger.error("Periodic follower close check error | error=%s", exc)
+            await _jittered_sleep(stop_event, 60)
 
     async def _enqueue_market_event(self, event: MarketEvent) -> None:
         if self._market_queue.full():
@@ -560,6 +598,7 @@ class LiveRuntimeRunner:
             results = await self._get_order_coordinator().execute(intent)
             self._record_order_results(results)
             self._save_order_results(signal, results)
+            self._check_follower_close_failure(signal, results)
             if self.requirements.order_state.post_submit_sync_enabled:
                 logger.info("Post-submit order sync started | action=%s source=%s", signal.action.value, source)
                 await self._get_order_sync_service().sync_once(sync_type="post_submit", priority=True)
@@ -599,6 +638,52 @@ class LiveRuntimeRunner:
             self.stats.failed_intents += 1
             logger.error("Order intent failed | total=%s errors=%s", len(results), [result.error for result in results])
             self._set_health(RuntimePhase.RUNNING, healthy=False, error="exchange execution failed")
+
+    def _check_follower_close_failure(self, signal: TradeSignal, results: Sequence[ExchangeOrderResult]) -> None:
+        purpose = str(signal.metadata.get("execution_purpose", "") if signal.metadata else "").strip().lower()
+        if purpose != "follower_close_after_master_close":
+            return
+        all_failed = all(not result.ok for result in results) if results else True
+        if not all_failed:
+            return
+        now_ms = int(time.time() * 1000)
+        position_id = str(signal.metadata.get("position_id", "unknown")) if signal.metadata else "unknown"
+        for result in results:
+            if result.ok:
+                continue
+            throttle_key = f"{position_id}:{result.exchange.value}"
+            last_ms = self._follower_close_alert_last_ms.get(throttle_key, 0)
+            if now_ms - last_ms < 60_000:
+                continue
+            self._follower_close_alert_last_ms[throttle_key] = now_ms
+            attempts = result.raw.get("attempts", 0) if isinstance(result.raw, dict) else 0
+            self.context.alerts.emit(
+                AppAlert(
+                    subject="AetherEdge follower close failed after master close",
+                    severity="error",
+                    content=(
+                        f"strategy_id={signal.metadata.get('strategy_id', 'unknown') if signal.metadata else 'unknown'}\n"
+                        f"position_id={position_id}\n"
+                        f"master_exchange={self.app_config.data_exchange.value}\n"
+                        f"follower_exchange={result.exchange.value}\n"
+                        f"symbol={signal.symbol}\n"
+                        f"side={signal.action.value}\n"
+                        f"quantity={str(signal.quantity)}\n"
+                        f"order_id={result.order_id or 'N/A'}\n"
+                        f"client_order_id={result.client_order_id or 'N/A'}\n"
+                        f"attempts={attempts}\n"
+                        f"error={result.error or 'unknown'}\n"
+                        f"timestamp={now_ms}\n"
+                    ),
+                )
+            )
+            logger.error(
+                "Follower close failed after master close | position_id=%s exchange=%s error=%s attempts=%s",
+                position_id,
+                result.exchange.value,
+                result.error,
+                attempts,
+            )
 
     def _save_order_results(self, signal: TradeSignal, results: Sequence[ExchangeOrderResult]) -> None:
         save_order = getattr(self.context.state_store, "save_order", None)
@@ -844,3 +929,12 @@ def _event_time_ms(event: MarketEvent) -> int | None:
     if isinstance(event, MarketTicker):
         return event.time_ms
     return None
+
+
+async def _jittered_sleep(stop_event: asyncio.Event, interval_seconds: float) -> None:
+    import random
+    jitter = random.uniform(0, min(5.0, interval_seconds * 0.1))
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds + jitter)
+    except asyncio.TimeoutError:
+        pass

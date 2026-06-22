@@ -27,6 +27,7 @@ class MasterFollowerPolicyConfig:
     entry_deviation_alert_pct: Decimal = Decimal("0.005")
     follower_entry_retry: RetryPolicy = RetryPolicy()
     master_entry_retry: RetryPolicy = RetryPolicy()
+    follower_close_retry: RetryPolicy = RetryPolicy(max_attempts=3, retry_delay_seconds=1.0)
     manual_grace_seconds_after_master_fail: int = 1800
     close_orphan_follower_after_grace: bool = True
     do_not_rejoin_mid_position_after_follower_desync: bool = True
@@ -70,6 +71,10 @@ class MasterFollowerPolicyConfig:
             master_entry_retry=RetryPolicy(
                 max_attempts=int(values.get("AETHER_MASTER_ENTRY_MAX_ATTEMPTS", 3)),
                 retry_delay_seconds=float(values.get("AETHER_MASTER_ENTRY_RETRY_DELAY_SECONDS", 10)),
+            ),
+            follower_close_retry=RetryPolicy(
+                max_attempts=int(values.get("AETHER_FOLLOWER_CLOSE_MAX_ATTEMPTS", 3)),
+                retry_delay_seconds=float(values.get("AETHER_FOLLOWER_CLOSE_RETRY_DELAY_SECONDS", 1.0)),
             ),
             manual_grace_seconds_after_master_fail=int(values.get("AETHER_MASTER_FAIL_MANUAL_GRACE_SECONDS", 1800)),
             close_orphan_follower_after_grace=_bool(values.get("AETHER_CLOSE_ORPHAN_FOLLOWER_AFTER_GRACE", True)),

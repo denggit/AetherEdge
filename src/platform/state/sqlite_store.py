@@ -136,7 +136,7 @@ class SqliteStateStore:
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
-                SELECT order_id, client_order_id, raw_json
+                SELECT rowid, order_id, client_order_id, raw_json
                 FROM orders
                 WHERE exchange = ?
                   AND symbol = ?
@@ -146,7 +146,7 @@ class SqliteStateStore:
                 (exchange.value, symbol, 1 if is_stop_order else 0, *_OPEN_ORDER_STATUSES),
             ).fetchall()
             changed = 0
-            for order_id, client_order_id, raw_json in rows:
+            for rowid, order_id, client_order_id, raw_json in rows:
                 key = (_key(order_id), _key(client_order_id))
                 if key in live_keys:
                     continue
@@ -162,16 +162,13 @@ class SqliteStateStore:
                     """
                     UPDATE orders
                     SET status = ?, updated_time_ms = ?, raw_json = ?
-                    WHERE exchange = ? AND symbol = ? AND order_id = ? AND client_order_id = ?
+                    WHERE rowid = ?
                     """,
                     (
                         missing_status.value,
                         now_ms,
                         _json(raw),
-                        exchange.value,
-                        symbol,
-                        order_id,
-                        client_order_id,
+                        rowid,
                     ),
                 )
                 changed += 1

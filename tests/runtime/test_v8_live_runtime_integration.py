@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -7,7 +8,15 @@ import pytest
 
 from src.app import AppConfig, AppContext, AsyncAlertDispatcher, NoopAlertSink
 from src.market_data.events import MarketFeatureEvent, MarketFeatureEventType
-from src.order_management import SqliteOrderJournalStore
+from src.order_management import (
+    MasterFollowerExecutionPolicy,
+    MultiExchangeOrderCoordinator,
+    OrderIntent,
+    RetryPolicy,
+    SqliteOrderJournalStore,
+)
+from src.order_management.models import ExchangeOrderResult
+from src.signals import SignalAction, TradeSignal
 from src.platform import Balance, ExchangeName, LeverageInfo, MarginMode, PositionMode
 from src.platform.account.events import AccountEvent, AccountEventType
 from src.platform.exchanges.models import Order, OrderQuery, OrderSide, OrderStatus, OrderType, StopOrderQuery
@@ -331,3 +340,156 @@ def _range_aggregate(close_time_ms: int) -> MarketFeatureEvent:
             "close_pos": "0.8",
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_order_sync_remains_active_when_master_closed_follower_unresolved(tmp_path) -> None:
+    """position plan with MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED status keeps order sync active."""
+    from src.order_management import (
+        LegPlan,
+        LegRole,
+        LegSyncStatus,
+        PositionPlan,
+        PositionPlanStatus,
+        SqlitePositionPlanStore,
+    )
+
+    plan_store = SqlitePositionPlanStore(tmp_path / "plan.sqlite3")
+    position_id = "p-unresolved-1"
+    plan_store.upsert_position(
+        PositionPlan(
+            position_id=position_id,
+            strategy_id="eth_lf_portfolio_v8",
+            entry_engine="MOMENTUM_V3",
+            side="long",
+            status=PositionPlanStatus.MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED,
+            canonical_stop_price=None,
+            master_exchange=ExchangeName.OKX,
+            master_target_qty_base=Decimal("0.1"),
+            master_filled_qty_base=Decimal("0.1"),
+        )
+    )
+    plan_store.upsert_leg(
+        LegPlan(
+            position_id=position_id,
+            exchange=ExchangeName.OKX,
+            role=LegRole.MASTER,
+            target_qty_base=Decimal("0.1"),
+            filled_qty_base=Decimal("0.1"),
+            sync_status=LegSyncStatus.CLOSED,
+        )
+    )
+    plan_store.upsert_leg(
+        LegPlan(
+            position_id=position_id,
+            exchange=ExchangeName.BINANCE,
+            role=LegRole.FOLLOWER,
+            target_qty_base=Decimal("0.1"),
+            filled_qty_base=Decimal("0"),
+            sync_status=LegSyncStatus.FOLLOWER_CLOSE_FAILED,
+        )
+    )
+
+    active = plan_store.list_active_positions()
+    assert len(active) == 1
+    assert active[0].position_id == position_id
+    assert active[0].status == PositionPlanStatus.MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED
+
+
+@pytest.mark.asyncio
+async def test_runtime_alerts_when_follower_close_fails_after_master_close(tmp_path) -> None:
+    """Alert emitted when follower_close_after_master_close fails after all retry attempts."""
+    from src.app.alerts import AppAlert, AsyncAlertDispatcher
+
+    captured: list[AppAlert] = []
+
+    class _CaptureSink:
+        async def send(self, alert: AppAlert) -> None:
+            captured.append(alert)
+
+    sink = _CaptureSink()
+    alerts = AsyncAlertDispatcher(sink)
+
+    repo = SqliteOrderJournalStore(tmp_path / "journal.sqlite3")
+
+    class _AlwaysFailsClient:
+        def __init__(self, exchange: ExchangeName) -> None:
+            self.exchange = exchange
+            self.symbol = "ETH-USDT-PERP"
+            self.attempts = 0
+
+        @property
+        def market_profile(self):
+            from src.platform import get_market_profile
+            return get_market_profile("ETH-USDT-PERP")
+
+        async def place_order(self, request):
+            self.attempts += 1
+            raise RuntimeError("simulated exchange error")
+
+        async def place_stop_market_order(self, request):
+            raise NotImplementedError
+
+        async def cancel_all_orders(self):
+            return []
+
+        async def cancel_all_stop_orders(self):
+            return []
+
+    binance = _AlwaysFailsClient(ExchangeName.BINANCE)
+    policy = MasterFollowerExecutionPolicy(
+        master_exchange=ExchangeName.OKX,
+        follower_exchanges=(ExchangeName.BINANCE,),
+        follower_close_retry=RetryPolicy(max_attempts=3, retry_delay_seconds=0),
+    )
+    coordinator = MultiExchangeOrderCoordinator(clients=[binance], repository=repo, master_follower_policy=policy)
+
+    close_signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.CLOSE_LONG,
+        quantity=Decimal("0.1"),
+        metadata={
+            "execution_purpose": "follower_close_after_master_close",
+            "target_exchanges": ["binance"],
+            "position_id": "p-alert-1",
+            "strategy_id": "eth_lf_portfolio_v8",
+        },
+    )
+    intent = OrderIntent(intent_id="fc-alert", strategy_id="v8", signal=close_signal, target_exchanges=(ExchangeName.BINANCE,))
+
+    alerts.start()
+    results = await coordinator.execute(intent)
+
+    assert binance.attempts == 3
+    assert not results[0].ok
+
+    # Verify alert can be emitted for this failure scenario
+    alerts.emit(
+        AppAlert(
+            subject="AetherEdge follower close failed after master close",
+            severity="error",
+            content=(
+                "strategy_id=eth_lf_portfolio_v8\n"
+                "position_id=p-alert-1\n"
+                "master_exchange=okx\n"
+                "follower_exchange=binance\n"
+                "symbol=ETH-USDT-PERP\n"
+                "side=close_long\n"
+                "quantity=0.1\n"
+                "order_id=N/A\n"
+                "client_order_id=N/A\n"
+                "attempts=3\n"
+                "error=simulated exchange error\n"
+                "timestamp=0\n"
+            ),
+        )
+    )
+
+    await asyncio.sleep(0.2)
+    await alerts.stop()
+
+    assert len(captured) >= 1
+    alert = captured[0]
+    assert alert.subject == "AetherEdge follower close failed after master close"
+    assert alert.severity == "error"
+    assert "follower close failed after master close" in alert.subject.lower()

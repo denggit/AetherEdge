@@ -115,10 +115,10 @@ class SqlitePositionPlanStore:
                        canonical_stop_price, master_exchange, master_target_qty_base,
                        master_filled_qty_base, created_time_ms, updated_time_ms, metadata_json
                 FROM position_plans
-                WHERE status IN (?, ?, ?)
+                WHERE status IN (?, ?, ?, ?)
                 ORDER BY updated_time_ms DESC
                 """,
-                (PositionPlanStatus.ACTIVE.value, PositionPlanStatus.MASTER_ACTIVE_PLAN_UNKNOWN.value, PositionPlanStatus.MANUAL_REQUIRED.value),
+                (PositionPlanStatus.ACTIVE.value, PositionPlanStatus.MASTER_ACTIVE_PLAN_UNKNOWN.value, PositionPlanStatus.MANUAL_REQUIRED.value, PositionPlanStatus.MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED.value),
             ).fetchall()
         return tuple(_row_to_position(row) for row in rows)
 
