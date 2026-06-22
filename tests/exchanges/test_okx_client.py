@@ -54,8 +54,27 @@ def test_okx_public_klines_preserve_exchange_order_by_default():
     assert rows[0].symbol == "ETH-USDT-PERP"
     assert rows[0].raw_symbol == "ETH-USDT-SWAP"
     assert [row.open_time_ms for row in rows] == [1710000060000, 1710000000000]
+    assert rows[0].close_time_ms == 1710000119999
     assert rows[0].close == Decimal("3015")
 
+
+
+def test_okx_public_klines_sets_4h_close_time_from_open_time():
+    http = FakeHttpClient(
+        [
+            {
+                "code": "0",
+                "data": [["1710000000000", "3000", "3010", "2990", "3005", "12", "120", "36000", "1"]],
+            }
+        ]
+    )
+    client = create_exchange_client(ExchangeName.OKX, ExchangeConfig(), http_client=http)
+
+    rows = asyncio.run(client.fetch_klines("ETH-USDT-PERP", interval="4h", limit=1))
+
+    assert http.calls[0]["params"]["bar"] == "4H"
+    assert rows[0].open_time_ms == 1710000000000
+    assert rows[0].close_time_ms == 1710014399999
 
 
 def test_okx_public_klines_maps_normalized_4h_to_exchange_4H():

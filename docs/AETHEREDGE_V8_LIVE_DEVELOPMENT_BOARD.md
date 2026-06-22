@@ -376,3 +376,16 @@ OKX adapter 现在会把 1h/2h/4h 等转换为 1H/2H/4H，同时不影响 Binanc
 4. V8/V9C 正式启动不受影响，因为真实启动不会传 synthetic environ={}.
 ```
 
+## Board 5 package 14：OKX Kline Close Time Fix
+
+- [x] AE-0518 OKX Kline Close Time Mapping Fix
+
+设计结论：
+
+```text
+preflight 已全 OK，但 report 暴露出 OKX latest_closed_4h_kline 的 close_time_ms 等于 open_time_ms。
+这会影响 runtime closed_kline feature event_time_ms 和 V8 kline/range aggregate 对齐。
+修复 OKX kline adapter：close_time_ms = open_time_ms + interval_ms - 1。
+覆盖 1m 和 4h 单测，确认 4h close_time_ms 为 open + 14,400,000 - 1。
+```
+

@@ -574,13 +574,14 @@ def _map_okx_kline(row: list[Any], *, symbol: str, raw_symbol: str, interval: st
     if len(row) < 6:
         raise ExchangeMappingError("OKX kline row is too short", payload=row)
     open_time_ms = int(row[0])
+    interval_ms = _okx_interval_to_ms(interval)
     return Kline(
         exchange=ExchangeName.OKX,
         symbol=symbol,
         raw_symbol=raw_symbol,
         interval=interval,
         open_time_ms=open_time_ms,
-        close_time_ms=open_time_ms,
+        close_time_ms=open_time_ms + interval_ms - 1,
         open=_decimal(row[1], field="open"),
         high=_decimal(row[2], field="high"),
         low=_decimal(row[3], field="low"),
@@ -590,6 +591,23 @@ def _map_okx_kline(row: list[Any], *, symbol: str, raw_symbol: str, interval: st
         is_closed=(str(row[8]) == "1") if len(row) > 8 else True,
         raw={"row": row},
     )
+
+
+def _okx_interval_to_ms(interval: str) -> int:
+    value = str(interval).strip().lower()
+    units = (
+        ("mth", 30 * 24 * 60 * 60_000),
+        ("ms", 1),
+        ("m", 60_000),
+        ("h", 60 * 60_000),
+        ("d", 24 * 60 * 60_000),
+        ("w", 7 * 24 * 60 * 60_000),
+    )
+    for suffix, multiplier in units:
+        if value.endswith(suffix):
+            num = value[: -len(suffix)] or "1"
+            return int(num) * multiplier
+    raise ExchangeMappingError(f"Unsupported OKX kline interval={interval}", payload={"interval": interval})
 
 
 def _map_okx_order_row(row: Mapping[str, Any], *, symbol: str, raw_symbol: str) -> Order:
