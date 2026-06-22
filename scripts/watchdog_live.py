@@ -55,6 +55,21 @@ def _resolve_path(raw: str | None, default: Path) -> Path:
     return path
 
 
+def _parse_fatal_exit_codes(raw: str | None) -> frozenset[int]:
+    if not raw:
+        return frozenset()
+    codes: set[int] = set()
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            codes.add(int(part))
+        except ValueError:
+            log(f"Ignoring non-integer fatal exit code value: {part!r}")
+    return frozenset(codes)
+
+
 def _send_watchdog_alert(subject: str, content: str) -> None:
     if not _truthy(os.getenv("AETHER_ENABLE_EMAIL_ALERT")):
         return
@@ -64,6 +79,44 @@ def _send_watchdog_alert(subject: str, content: str) -> None:
         asyncio.run(send_email(subject=subject, content=content, content_type="plain"))
     except Exception as exc:  # noqa: BLE001 - watchdog must never crash because alert failed
         log(f"Failed to send watchdog email alert: {exc}")
+
+
+def _send_quick_fail_alert(
+    *,
+    quick_failure_count: int,
+    quick_fail_seconds: float,
+    last_returncode: int,
+    last_uptime_seconds: float,
+    live_script: Path,
+    log_file: Path,
+) -> None:
+    subject = "AetherEdge watchdog quick-fail circuit opened"
+    content = (
+        f"project_root={PROJECT_ROOT}\n"
+        f"live_script={live_script}\n"
+        f"quick_failure_count={quick_failure_count}\n"
+        f"quick_fail_seconds={quick_fail_seconds}\n"
+        f"last_returncode={last_returncode}\n"
+        f"last_uptime_seconds={last_uptime_seconds:.2f}\n"
+        f"log_file={log_file}\n"
+    )
+    _send_watchdog_alert(subject, content)
+
+
+def _send_fatal_exit_alert(
+    *,
+    returncode: int,
+    live_script: Path,
+    log_file: Path,
+) -> None:
+    subject = "AetherEdge watchdog received fatal exit code"
+    content = (
+        f"project_root={PROJECT_ROOT}\n"
+        f"live_script={live_script}\n"
+        f"returncode={returncode}\n"
+        f"log_file={log_file}\n"
+    )
+    _send_watchdog_alert(subject, content)
 
 
 def terminate_child(reason: str) -> None:
@@ -135,15 +188,27 @@ def main() -> int:
 
     restart_seconds = float(os.getenv("AETHER_WATCHDOG_RESTART_DELAY_SECONDS", "5"))
     max_restarts = int(os.getenv("AETHER_WATCHDOG_MAX_RESTARTS", "0"))  # 0 means unlimited
+    quick_fail_seconds = float(os.getenv("WATCHDOG_QUICK_FAIL_SECONDS", "60"))
+    max_quick_failures = int(os.getenv("WATCHDOG_MAX_QUICK_FAILURES", "3"))
+    fatal_exit_codes = _parse_fatal_exit_codes(os.getenv("WATCHDOG_FATAL_EXIT_CODES", "78"))
+
     restart_count = 0
+    quick_failure_count = 0
+    _quick_fail_alert_sent = False
+    live_script = _resolve_path(os.getenv("LIVE_SCRIPT"), DEFAULT_LIVE_SCRIPT)
+    live_log_path = _resolve_path(os.getenv("LIVE_LOG_FILE"), DEFAULT_LIVE_LOG)
 
     log("Watchdog started")
     log(f"Project root: {PROJECT_ROOT}")
     log(f"Restart delay: {restart_seconds}s, max_restarts={max_restarts or 'unlimited'}")
+    log(f"Quick-fail: {quick_fail_seconds}s, max_quick_failures={max_quick_failures}")
+    log(f"Fatal exit codes: {sorted(fatal_exit_codes) if fatal_exit_codes else 'none'}")
 
     while _running:
+        start_monotonic = time.monotonic()
         _child = start_child()
         returncode = _child.wait()
+        uptime = time.monotonic() - start_monotonic
         try:
             _resolve_path(os.getenv("LIVE_PID_FILE"), DEFAULT_CHILD_PID_FILE).unlink(missing_ok=True)
         except Exception:
@@ -152,8 +217,61 @@ def main() -> int:
         if not _running:
             break
 
+        # ── Child exited successfully ──
+        if returncode == 0:
+            quick_failure_count = 0
+            log("Live child exited normally returncode=0. Watchdog stops.")
+            return 0
+
+        # ── Fatal exit code: stop immediately, no restart ──
+        if returncode in fatal_exit_codes:
+            log(f"Fatal exit code received returncode={returncode}. Watchdog stops.")
+            if not _quick_fail_alert_sent:
+                _send_fatal_exit_alert(
+                    returncode=returncode,
+                    live_script=live_script,
+                    log_file=live_log_path,
+                )
+            return returncode
+
+        # ── Quick-fail detection ──
+        if uptime < quick_fail_seconds:
+            quick_failure_count += 1
+            log(
+                f"Quick failure detected | returncode={returncode} uptime={uptime:.2f}s "
+                f"quick_failure_count={quick_failure_count}/{max_quick_failures}"
+            )
+        else:
+            # Ran long enough — reset quick-failure counter.
+            if quick_failure_count > 0:
+                log(
+                    f"Quick-failure counter reset after long-running child | "
+                    f"uptime={uptime:.2f}s previous_quick_failures={quick_failure_count} "
+                    f"returncode={returncode}"
+                )
+            quick_failure_count = 0
+
+        # ── Quick-fail circuit breaker ──
+        if quick_failure_count >= max_quick_failures:
+            log("Quick-fail circuit breaker opened. Watchdog stops.")
+            if not _quick_fail_alert_sent:
+                _quick_fail_alert_sent = True
+                _send_quick_fail_alert(
+                    quick_failure_count=quick_failure_count,
+                    quick_fail_seconds=quick_fail_seconds,
+                    last_returncode=returncode,
+                    last_uptime_seconds=uptime,
+                    live_script=live_script,
+                    log_file=live_log_path,
+                )
+            return returncode or 1
+
+        # ── Normal restart path ──
         restart_count += 1
-        message = f"Live child exited unexpectedly returncode={returncode}. restart_count={restart_count}"
+        message = (
+            f"Live child exited unexpectedly returncode={returncode}. "
+            f"restart_count={restart_count} quick_failure_count={quick_failure_count}"
+        )
         log(message)
         _send_watchdog_alert("AetherEdge live runner exited", message)
         if max_restarts > 0 and restart_count >= max_restarts:

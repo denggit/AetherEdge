@@ -365,40 +365,118 @@ class LiveRuntimeRunner:
                         result.records_loaded,
                     )
                     raise LiveRuntimeError(f"closed-kline warmup did not catch up: {len(result.gaps_after)} gaps remain")
-                await self._hydrate_strategy_closed_klines(repository, time_range=TimeRange(start_open, end_open))
+                min_records = max(1, int(self.requirements.closed_kline.min_records or 1))
+                time_range = TimeRange(start_open, end_open)
+                records_loaded = result.records_loaded
+
                 logger.info(
-                    "Closed-kline warmup completed | interval=%s start_open=%s end_open=%s records_loaded=%s",
+                    "Closed-kline warmup completed | interval=%s start_open=%s end_open=%s records_loaded=%s min_records=%s",
                     self._closed_bar_interval,
                     start_open,
                     end_open,
-                    result.records_loaded,
+                    records_loaded,
+                    min_records,
                 )
-                # ── Fail fast when warmup loaded fewer records than required ──
-                min_records = max(1, int(self.requirements.closed_kline.min_records or 1))
-                if result.records_loaded < min_records:
+
+                # ── Backfill fallback: when the local store is insufficient,
+                #     attempt a direct REST historical kline backfill. ──
+                store_path = str(getattr(repository, "path", ""))
+                store_class = type(repository).__name__
+
+                if records_loaded < min_records:
+                    logger.warning(
+                        "Closed-kline warmup insufficient — attempting REST backfill | "
+                        "symbol=%s interval=%s records_loaded=%s min_records=%s",
+                        self.app_config.symbol,
+                        self._closed_bar_interval,
+                        records_loaded,
+                        min_records,
+                    )
+                    try:
+                        from src.market_data.warmup.kline_provider import MarketDataKlineProvider
+
+                        provider = MarketDataKlineProvider(
+                            data_feed=self.context.data,
+                            repository=repository,
+                        )
+                        backfill_diag = await provider.backfill_and_reload(
+                            symbol=self.app_config.symbol,
+                            interval=self._closed_bar_interval,
+                            time_range=time_range,
+                            min_records=min_records,
+                            store_class=store_class,
+                            store_path=store_path,
+                        )
+                        records_loaded = backfill_diag.records_loaded_after
+                        logger.info(
+                            "REST kline backfill completed | symbol=%s interval=%s "
+                            "fetched=%s saved=%s records_after=%s success=%s",
+                            backfill_diag.symbol,
+                            backfill_diag.interval,
+                            backfill_diag.fetched_records,
+                            backfill_diag.saved_records,
+                            backfill_diag.records_loaded_after,
+                            backfill_diag.success,
+                        )
+                    except Exception as backfill_exc:
+                        logger.error(
+                            "REST kline backfill failed | symbol=%s interval=%s error=%s",
+                            self.app_config.symbol,
+                            self._closed_bar_interval,
+                            backfill_exc,
+                        )
+
+                # ── Hydrate strategy state with closed klines ──
+                await self._hydrate_strategy_closed_klines(repository, time_range=time_range)
+
+                # ── Fail fast when warmup (including backfill) still has too few records ──
+                if records_loaded < min_records:
                     dry_run = self.app_config.dry_run
+                    # Build rich diagnostics for operators.
+                    raw_aliases_str = "N/A"
+                    try:
+                        from src.platform.markets import get_market_profile
+                        profile = get_market_profile(self.app_config.symbol)
+                        raw_aliases_str = ", ".join(
+                            f"{exchange.value}:{profile.raw_symbol(exchange)}"
+                            for exchange in profile.exchange_symbols
+                        )
+                    except Exception:
+                        pass
+
+                    from datetime import datetime, timezone
+                    start_utc = datetime.fromtimestamp(start_open / 1000, tz=timezone.utc).isoformat()
+                    end_utc = datetime.fromtimestamp(end_open / 1000, tz=timezone.utc).isoformat()
+
+                    diag_content = (
+                        f"symbol={self.app_config.symbol}\n"
+                        f"raw_aliases={raw_aliases_str}\n"
+                        f"interval={self._closed_bar_interval}\n"
+                        f"start_open_ms={start_open}\n"
+                        f"end_open_ms={end_open}\n"
+                        f"start_open_utc={start_utc}\n"
+                        f"end_open_utc={end_utc}\n"
+                        f"records_loaded_before={result.records_loaded}\n"
+                        f"records_loaded_after={records_loaded}\n"
+                        f"min_records={min_records}\n"
+                        f"kline_store_class={store_class}\n"
+                        f"kline_store_path={store_path}\n"
+                        f"warmup_days={self.requirements.closed_kline.warmup_days}\n"
+                        f"dry_run={dry_run}\n"
+                    )
                     if dry_run:
                         logger.warning(
                             "Closed-kline warmup loaded fewer records than required — continuing in dry-run mode | "
                             "interval=%s warmup_days=%s records_loaded=%s min_records=%s",
                             self._closed_bar_interval,
                             self.requirements.closed_kline.warmup_days,
-                            result.records_loaded,
+                            records_loaded,
                             min_records,
                         )
                         self.context.alerts.emit(
                             AppAlert(
                                 subject="AetherEdge closed-kline warmup below minimum records",
-                                content=(
-                                    f"symbol={self.app_config.symbol}\n"
-                                    f"interval={self._closed_bar_interval}\n"
-                                    f"warmup_days={self.requirements.closed_kline.warmup_days}\n"
-                                    f"records_loaded={result.records_loaded}\n"
-                                    f"min_records={min_records}\n"
-                                    f"start_open={start_open}\n"
-                                    f"end_open={end_open}\n"
-                                    f"dry_run={dry_run}\n"
-                                ),
+                                content=diag_content,
                                 severity="warning",
                             )
                         )
@@ -406,23 +484,14 @@ class LiveRuntimeRunner:
                         self.context.alerts.emit(
                             AppAlert(
                                 subject="AetherEdge closed-kline warmup failed",
-                                content=(
-                                    f"symbol={self.app_config.symbol}\n"
-                                    f"interval={self._closed_bar_interval}\n"
-                                    f"warmup_days={self.requirements.closed_kline.warmup_days}\n"
-                                    f"records_loaded={result.records_loaded}\n"
-                                    f"min_records={min_records}\n"
-                                    f"start_open={start_open}\n"
-                                    f"end_open={end_open}\n"
-                                    f"dry_run={dry_run}\n"
-                                ),
+                                content=diag_content,
                                 severity="error",
                             )
                         )
                         raise LiveRuntimeError(
                             f"closed-kline warmup loaded insufficient records "
                             f"(symbol={self.app_config.symbol} interval={self._closed_bar_interval} "
-                            f"records_loaded={result.records_loaded} min_records={min_records})"
+                            f"records_loaded={records_loaded} min_records={min_records})"
                         )
 
     async def _hydrate_strategy_closed_klines(self, repository, *, time_range: TimeRange) -> None:
