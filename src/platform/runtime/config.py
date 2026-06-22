@@ -19,7 +19,7 @@ class RuntimeConfig:
     symbol: str = DEFAULT_MARKET_SYMBOL
     asset: str = "USDT"
     state_db_path: str | Path = "data/state/aether_state.sqlite3"
-    enable_private_event_stream: bool = True
+    enable_private_event_stream: bool = False
     save_startup_snapshot: bool = True
     reconnect_private_stream: bool = True
     reconnect_delay_seconds: float = 1.0

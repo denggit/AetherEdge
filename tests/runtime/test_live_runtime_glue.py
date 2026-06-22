@@ -19,6 +19,7 @@ from src.platform.snapshot import PlatformSnapshot
 from src.order_management import OrderIntentStatus, SqliteOrderJournalStore
 from src.planner import ExecutionPlanner
 from src.runtime import LiveRuntimeConfig, LiveRuntimeRunner, RuntimeMode, RuntimePhase, StrategyRuntimeRequirements
+from src.runtime.account_sync import RequestThrottle
 from src.runtime.recovery.models import RecoveryReport
 from src.runtime.tasks import ClosedBarScheduler
 from src.signals import SignalAction, TradeSignal
@@ -102,8 +103,20 @@ class FakeData:
 
 
 class FakeStateStore:
+    def __init__(self):
+        self.orders = []
+
     def save_snapshot(self, snapshot):
         self.snapshot = snapshot
+
+    def save_order(self, order, *, is_stop_order=False):
+        self.orders.append((order, is_stop_order))
+
+    def list_open_orders(self, *, exchange, symbol, include_stop_orders=True):
+        return []
+
+    def mark_missing_open_orders_closed(self, **kwargs):
+        return 0
 
 
 class FeatureStrategy:
@@ -174,11 +187,43 @@ class FakeExecutionClient:
     async def place_stop_market_order(self, request):
         raise AssertionError("not expected")
 
+    async def fetch_order_status(self, query):
+        return Order(exchange=self.exchange, symbol=query.symbol, raw_symbol=query.symbol, order_id=query.order_id, client_order_id=query.client_order_id, status=OrderStatus.FILLED, quantity=Decimal("0.5"), filled_quantity=Decimal("0.5"), raw={"avgPx": "100"})
+
+    async def fetch_open_orders(self):
+        return []
+
+    async def fetch_stop_order_status(self, query):
+        return Order(exchange=self.exchange, symbol=query.symbol, raw_symbol=query.symbol, order_id=query.stop_order_id, client_order_id=query.client_order_id, status=OrderStatus.NEW)
+
+    async def fetch_open_stop_orders(self):
+        return []
+
     async def cancel_all_orders(self):
         return []
 
     async def cancel_all_stop_orders(self):
         return []
+
+
+class FakeAccountClient:
+    symbol = "ETH-USDT-PERP"
+    market_profile = get_market_profile("ETH-USDT-PERP")
+
+    def __init__(self, exchange: ExchangeName) -> None:
+        self.exchange = exchange
+
+    async def fetch_balance(self, asset="USDT"):
+        return Balance(exchange=self.exchange, asset=asset, total=Decimal("1000"), available=Decimal("1000"))
+
+    async def fetch_positions(self, symbol=None):
+        return []
+
+    async def fetch_leverage(self, *, margin_mode=None):
+        return LeverageInfo(exchange=self.exchange, symbol=self.symbol, raw_symbol=self.symbol, leverage=Decimal("1"))
+
+    async def fetch_position_mode(self):
+        return PositionMode.ONE_WAY
 
 
 class MemoryRangeBarStore:
@@ -351,6 +396,7 @@ async def _run_smoke(tmp_path, *, binance_fail: bool):
         services={
             "recovery_service": FakeRecoveryService(),
             "execution_clients": (okx, binance),
+            "account_clients": (FakeAccountClient(ExchangeName.OKX), FakeAccountClient(ExchangeName.BINANCE)),
             "order_journal": repo,
             "range_bar_builder": RangeBarBuilder(range_pct=Decimal("0.002"), contract_value=Decimal("0.01")),
             "range_bar_store": store,
@@ -419,6 +465,56 @@ async def test_legacy_private_account_stream_requirement_does_not_start_account_
 
     assert len(tasks) == 1
     assert {item.name for item in runner._producer_monitor.snapshot()} <= {"trades"}
+
+
+def test_request_sync_contexts_fail_fast_on_account_execution_exchange_mismatch():
+    strategy = FeatureStrategy()
+    runner = _runner(
+        strategy,
+        services={
+            "recovery_service": FakeRecoveryService(),
+            "execution_clients": (FakeExecutionClient(ExchangeName.OKX),),
+            "account_clients": (FakeAccountClient(ExchangeName.BINANCE),),
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="exchange mismatch"):
+        runner._get_sync_contexts()
+
+
+def test_request_sync_contexts_fail_fast_on_partial_injection():
+    strategy = FeatureStrategy()
+    runner = _runner(
+        strategy,
+        services={
+            "recovery_service": FakeRecoveryService(),
+            "execution_clients": (FakeExecutionClient(ExchangeName.OKX),),
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="injected together"):
+        runner._get_sync_contexts()
+
+
+def test_request_sync_services_share_runtime_throttle():
+    strategy = FeatureStrategy()
+    throttle = RequestThrottle(min_interval_seconds=0)
+    runner = _runner(
+        strategy,
+        services={
+            "recovery_service": FakeRecoveryService(),
+            "execution_clients": (FakeExecutionClient(ExchangeName.OKX), FakeExecutionClient(ExchangeName.BINANCE)),
+            "account_clients": (FakeAccountClient(ExchangeName.BINANCE), FakeAccountClient(ExchangeName.OKX)),
+            "request_sync_throttle": throttle,
+        },
+    )
+
+    account_service = runner._get_account_sync_service()
+    order_service = runner._get_order_sync_service()
+
+    assert account_service.throttle is throttle
+    assert order_service.throttle is throttle
+    assert [context.account.exchange for context in account_service.contexts] == [ExchangeName.OKX, ExchangeName.BINANCE]
 
 
 @pytest.mark.asyncio

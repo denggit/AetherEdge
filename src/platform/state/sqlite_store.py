@@ -119,6 +119,64 @@ class SqliteStateStore:
             rows = conn.execute(sql, params).fetchall()
         return [_row_to_order(row) for row in rows]
 
+    def mark_missing_open_orders_closed(
+        self,
+        *,
+        exchange: ExchangeName,
+        symbol: str,
+        live_order_keys: set[tuple[str | None, str | None]],
+        is_stop_order: bool,
+        missing_status: OrderStatus = OrderStatus.CANCELED,
+        reason: str = "missing_from_exchange_open_orders",
+    ) -> int:
+        if missing_status.value in _OPEN_ORDER_STATUSES:
+            raise ValueError("missing_status must not be an open status")
+        live_keys = {(_key(order_id), _key(client_order_id)) for order_id, client_order_id in live_order_keys}
+        now_ms = int(time.time() * 1000)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT order_id, client_order_id, raw_json
+                FROM orders
+                WHERE exchange = ?
+                  AND symbol = ?
+                  AND is_stop_order = ?
+                  AND status IN ({','.join('?' for _ in _OPEN_ORDER_STATUSES)})
+                """,
+                (exchange.value, symbol, 1 if is_stop_order else 0, *_OPEN_ORDER_STATUSES),
+            ).fetchall()
+            changed = 0
+            for order_id, client_order_id, raw_json in rows:
+                key = (_key(order_id), _key(client_order_id))
+                if key in live_keys:
+                    continue
+                raw = json.loads(raw_json or "{}")
+                raw.update(
+                    {
+                        "local_reconcile_reason": reason,
+                        "missing_from_exchange_open_orders": True,
+                        "reconciled_time_ms": now_ms,
+                    }
+                )
+                conn.execute(
+                    """
+                    UPDATE orders
+                    SET status = ?, updated_time_ms = ?, raw_json = ?
+                    WHERE exchange = ? AND symbol = ? AND order_id = ? AND client_order_id = ?
+                    """,
+                    (
+                        missing_status.value,
+                        now_ms,
+                        _json(raw),
+                        exchange.value,
+                        symbol,
+                        order_id,
+                        client_order_id,
+                    ),
+                )
+                changed += 1
+        return changed
+
     def load_recent_events(self, *, exchange: ExchangeName, symbol: str | None = None, limit: int = 100) -> list[StoredEvent]:
         where = ["exchange = ?"]
         params: list[Any] = [exchange.value]
@@ -473,6 +531,10 @@ def _first_raw_value(raw: Mapping[str, Any], *keys: str) -> Any:
         if value not in (None, ""):
             return value
     return None
+
+
+def _key(value: str | None) -> str:
+    return "" if value is None else str(value)
 
 
 def _dec(value: Decimal | None) -> str | None:

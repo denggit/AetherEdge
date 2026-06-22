@@ -101,6 +101,7 @@ class LiveRuntimeRunner:
         self._order_coordinator = self.services.get("order_coordinator")
         self._account_sync_service = self.services.get("account_sync_service")
         self._order_sync_service = self.services.get("order_sync_service")
+        self._request_sync_throttle = self.services.get("request_sync_throttle") or RequestThrottle(min_interval_seconds=0.25)
         self._recovery_service = self.services.get("recovery_service", "__default__")
         self._range_bar_store = self.services.get("range_bar_store")
         self._range_bar_builder = self.services.get("range_bar_builder")
@@ -725,13 +726,27 @@ class LiveRuntimeRunner:
 
     def _get_sync_contexts(self) -> tuple[SyncExchangeContext, ...]:
         if ("execution_clients" in self.services) != ("account_clients" in self.services):
-            logger.warning("Request sync disabled because execution/account clients were only partially injected")
-            return ()
+            raise LiveRuntimeError("request sync requires account_clients and execution_clients to be injected together")
         clients = self._get_execution_clients()
         accounts = self._get_account_clients()
+        execution_by_exchange = {client.exchange: client for client in clients}
+        account_by_exchange = {client.exchange: client for client in accounts}
+        expected = set(self.app_config.exchanges)
+        if set(execution_by_exchange) != set(account_by_exchange):
+            raise LiveRuntimeError(
+                "request sync account/execution exchange mismatch: "
+                f"accounts={sorted(exchange.value for exchange in account_by_exchange)} "
+                f"executions={sorted(exchange.value for exchange in execution_by_exchange)}"
+            )
+        if set(execution_by_exchange) != expected:
+            raise LiveRuntimeError(
+                "request sync clients do not cover configured exchanges: "
+                f"expected={sorted(exchange.value for exchange in expected)} "
+                f"actual={sorted(exchange.value for exchange in execution_by_exchange)}"
+            )
         return tuple(
-            SyncExchangeContext(account=account, execution=execution, state_store=self.context.state_store)
-            for account, execution in zip(accounts, clients, strict=False)
+            SyncExchangeContext(account=account_by_exchange[exchange], execution=execution_by_exchange[exchange], state_store=self.context.state_store)
+            for exchange in self.app_config.exchanges
         )
 
     def _get_account_sync_service(self):
@@ -740,7 +755,7 @@ class LiveRuntimeRunner:
                 contexts=self._get_sync_contexts(),
                 config=self.requirements.account_state,
                 alert_sink=self.context.alerts,
-                throttle=RequestThrottle(min_interval_seconds=0.25),
+                throttle=self._request_sync_throttle,
             )
         return self._account_sync_service
 
@@ -750,7 +765,7 @@ class LiveRuntimeRunner:
                 contexts=self._get_sync_contexts(),
                 config=self.requirements.order_state,
                 alert_sink=self.context.alerts,
-                throttle=RequestThrottle(min_interval_seconds=0.25),
+                throttle=self._request_sync_throttle,
                 active_check=self._order_sync_active,
                 position_plan_store=self._get_position_plan_store(),
             )

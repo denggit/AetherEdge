@@ -22,12 +22,26 @@ class MemoryState:
     def __init__(self) -> None:
         self.snapshots = []
         self.orders = []
+        self.closed_snapshots = []
 
     def save_snapshot(self, snapshot):
         self.snapshots.append(snapshot)
 
     def save_order(self, order, *, is_stop_order=False):
         self.orders.append((order, is_stop_order))
+
+    def mark_missing_open_orders_closed(self, *, exchange, symbol, live_order_keys, is_stop_order, missing_status=OrderStatus.CANCELED, reason="missing_from_exchange_open_orders"):
+        self.closed_snapshots.append(
+            {
+                "exchange": exchange,
+                "symbol": symbol,
+                "live_order_keys": live_order_keys,
+                "is_stop_order": is_stop_order,
+                "missing_status": missing_status,
+                "reason": reason,
+            }
+        )
+        return 1
 
 
 class FakeAccount:
@@ -61,15 +75,21 @@ class FakeExecution:
     exchange = ExchangeName.OKX
     symbol = "ETH-USDT-PERP"
 
-    def __init__(self) -> None:
+    def __init__(self, *, open_orders=None, open_stop_orders=None) -> None:
         self.calls: list[str] = []
+        self.open_orders = open_orders
+        self.open_stop_orders = open_stop_orders
 
     async def fetch_open_orders(self):
         self.calls.append("fetch_open_orders")
+        if self.open_orders is not None:
+            return list(self.open_orders)
         return [Order(exchange=self.exchange, symbol=self.symbol, raw_symbol=self.symbol, order_id="o1", client_order_id="c1", status=OrderStatus.NEW, side=OrderSide.BUY)]
 
     async def fetch_open_stop_orders(self):
         self.calls.append("fetch_open_stop_orders")
+        if self.open_stop_orders is not None:
+            return list(self.open_stop_orders)
         return [Order(exchange=self.exchange, symbol=self.symbol, raw_symbol=self.symbol, order_id="s1", client_order_id="sc1", status=OrderStatus.NEW, side=OrderSide.SELL)]
 
 
@@ -125,3 +145,43 @@ async def test_order_sync_fetches_positions_open_orders_and_open_stop_orders_whe
     assert "fetch_positions" in account.calls
     assert execution.calls == ["fetch_open_orders", "fetch_open_stop_orders"]
     assert [(order.order_id, is_stop) for order, is_stop in state.orders] == [("o1", False), ("s1", True)]
+
+
+@pytest.mark.asyncio
+async def test_order_sync_reconciles_missing_regular_open_orders_as_closed():
+    state = MemoryState()
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=FakeAccount(), execution=FakeExecution(open_orders=[], open_stop_orders=[]), state_store=state),),
+        config=OrderStateRequirement(sync_position=False, sync_open_orders=True, sync_open_stop_orders=False),
+        active_check=lambda: True,
+    )
+
+    results = await service.sync_once()
+
+    assert results[0].success is True
+    assert state.closed_snapshots == [
+        {
+            "exchange": ExchangeName.OKX,
+            "symbol": "ETH-USDT-PERP",
+            "live_order_keys": set(),
+            "is_stop_order": False,
+            "missing_status": OrderStatus.CANCELED,
+            "reason": "missing_from_exchange_open_orders",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_order_sync_reconciles_missing_stop_orders_as_closed():
+    state = MemoryState()
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=FakeAccount(), execution=FakeExecution(open_orders=[], open_stop_orders=[]), state_store=state),),
+        config=OrderStateRequirement(sync_position=False, sync_open_orders=False, sync_open_stop_orders=True),
+        active_check=lambda: True,
+    )
+
+    results = await service.sync_once()
+
+    assert results[0].success is True
+    assert state.closed_snapshots[0]["is_stop_order"] is True
+    assert state.closed_snapshots[0]["live_order_keys"] == set()

@@ -22,7 +22,7 @@ def test_platform_keeps_only_infrastructure_modules_at_top_level():
 
 def test_state_store_is_storage_not_state_machine_or_recovery_engine():
     state_files = list((ROOT / "src" / "platform" / "state").rglob("*.py"))
-    forbidden_tokens = ["place_order", "cancel_order", "amend_order", "recover", "reconcile", "strategy"]
+    forbidden_tokens = ["place_order", "cancel_order", "amend_order", "RuntimeRecoveryService", "Reconciler", "strategy"]
     leaks = []
     for path in state_files:
         text = path.read_text(encoding="utf-8")

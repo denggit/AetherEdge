@@ -16,6 +16,7 @@ from src.platform import (
     RuntimeConfig,
     RuntimeContext,
 )
+from src.platform.runtime.factory import build_runtime_context
 
 
 class FakeData:
@@ -87,7 +88,7 @@ class FakeHandler:
         self.events.append(event)
 
 
-def test_runtime_collects_snapshot_and_consumes_private_events_without_trading():
+def test_runtime_legacy_private_stream_collects_events_when_explicitly_enabled():
     event = AccountEvent(
         exchange=ExchangeName.OKX,
         event_type=AccountEventType.ORDER,
@@ -139,3 +140,26 @@ def test_runtime_can_collect_only_snapshot_when_private_stream_disabled():
     assert len(store.snapshots) == 1
     assert store.events == []
     assert result.stats.account_events_saved == 0
+
+
+def test_runtime_config_disables_private_event_stream_by_default():
+    assert RuntimeConfig(exchange=ExchangeName.OKX).enable_private_event_stream is False
+
+
+def test_build_runtime_context_default_does_not_create_account_event_stream(monkeypatch, tmp_path):
+    called = False
+
+    def fake_private_stream(*args, **kwargs):
+        nonlocal called
+        called = True
+        return object()
+
+    monkeypatch.setattr("src.platform.runtime.factory.create_market_data_feed", lambda *args, **kwargs: FakeData())
+    monkeypatch.setattr("src.platform.runtime.factory.create_execution_client", lambda *args, **kwargs: FakeExecution())
+    monkeypatch.setattr("src.platform.runtime.factory.create_account_client", lambda *args, **kwargs: FakeAccount())
+    monkeypatch.setattr("src.platform.runtime.factory.create_account_event_stream", fake_private_stream)
+
+    context = build_runtime_context(RuntimeConfig(exchange=ExchangeName.OKX, state_db_path=tmp_path / "state.sqlite3"))
+
+    assert context.account_event_stream is None
+    assert called is False

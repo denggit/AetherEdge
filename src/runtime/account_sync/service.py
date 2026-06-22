@@ -3,13 +3,11 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from dataclasses import replace
 from typing import Any, Callable, Iterable, Mapping
 
 from src.app.alerts import AppAlert
-from src.platform.exchanges.models import Balance, LeverageInfo, MarginMode, Order, OrderQuery, PositionMode, StopOrderQuery
+from src.platform.exchanges.models import Balance, MarginMode, Order, OrderQuery, OrderStatus, StopOrderQuery
 from src.platform.snapshot import PlatformSnapshot
-from src.reconcile.checker import Reconciler
 from src.runtime.account_sync.models import SyncExchangeContext, SyncResult
 from src.runtime.requirements import AccountStateRequirement, OrderStateRequirement
 from src.utils.log import get_logger
@@ -85,7 +83,13 @@ class AccountStateSyncService:
             request_count += 1
             snapshot = PlatformSnapshot(
                 symbol=context.account.symbol,
-                balance=balance,
+                balance=Balance(
+                    exchange=balance.exchange,
+                    asset=balance.asset,
+                    total=balance.total,
+                    available=balance.available,
+                    raw={**dict(balance.raw), "snapshot_scope": "account_state_only"},
+                ),
                 positions=positions,
                 open_orders=[],
                 open_stop_orders=[],
@@ -174,12 +178,14 @@ class OrderStateSyncService:
                 request_count += 1
                 for order in orders:
                     context.state_store.save_order(order, is_stop_order=False)
+                self._mark_missing_open_orders_closed(context, orders=orders, is_stop_order=False)
                 logger.info("Open orders synced | exchange=%s sync_type=%s count=%s", exchange, sync_type, len(orders))
             if self.config.sync_open_stop_orders:
                 stop_orders = await context.execution.fetch_open_stop_orders()
                 request_count += 1
                 for order in stop_orders:
                     context.state_store.save_order(order, is_stop_order=True)
+                self._mark_missing_open_orders_closed(context, orders=stop_orders, is_stop_order=True)
                 logger.info("Open stop orders synced | exchange=%s sync_type=%s count=%s", exchange, sync_type, len(stop_orders))
             for order_id in self._known_ids(exchange, key="orders"):
                 query = OrderQuery(symbol=context.execution.symbol, order_id=order_id)
@@ -236,6 +242,31 @@ class OrderStateSyncService:
                 if value:
                     ids.append(value)
         return tuple(dict.fromkeys(ids))
+
+    def _mark_missing_open_orders_closed(self, context: SyncExchangeContext, *, orders: Iterable[Order], is_stop_order: bool) -> None:
+        marker = getattr(context.state_store, "mark_missing_open_orders_closed", None)
+        if not callable(marker):
+            logger.warning(
+                "State store does not support open order snapshot cleanup | exchange=%s is_stop_order=%s",
+                context.execution.exchange.value,
+                is_stop_order,
+            )
+            return
+        closed = marker(
+            exchange=context.execution.exchange,
+            symbol=context.execution.symbol,
+            live_order_keys={(order.order_id, order.client_order_id) for order in orders},
+            is_stop_order=is_stop_order,
+            missing_status=OrderStatus.CANCELED,
+            reason="missing_from_exchange_open_orders",
+        )
+        if closed:
+            logger.info(
+                "Missing local open orders marked closed | exchange=%s is_stop_order=%s count=%s",
+                context.execution.exchange.value,
+                is_stop_order,
+                closed,
+            )
 
 
 def _result(exchange: str, sync_type: str, request_count: int, start: float, success: bool, *, error: str | None = None, metadata: Mapping[str, Any] | None = None) -> SyncResult:

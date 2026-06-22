@@ -527,13 +527,13 @@ async def test_strategy_order_result_feedback_replaces_private_stream_for_entry_
 
 
 @pytest.mark.asyncio
-async def test_strategy_order_result_feedback_master_close_triggers_follower_close() -> None:
+async def test_strategy_order_result_feedback_master_only_close_still_emits_follower_close() -> None:
     strategy = Strategy()
     await strategy.on_start(_snapshot())
     strategy.position.open_master(side=Side.LONG, entry_time_ms=1, avg_entry=Decimal("2000"), qty=Decimal("0.1"), stop_price=Decimal("1978"), entry_engine="MOMENTUM_V3", position_id="p1")
     strategy.position.mark_leg_open(exchange="okx", avg_fill_price=Decimal("2000"), base_qty=Decimal("0.1"))
     strategy.position.mark_leg_open(exchange="binance", avg_fill_price=Decimal("2001"), base_qty=Decimal("0.1"))
-    close_signal = TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.CLOSE_LONG, quantity=Decimal("0.1"), metadata={"target_exchanges": ["okx", "binance"]})
+    close_signal = TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.CLOSE_LONG, quantity=Decimal("0.1"), metadata={"target_exchanges": ["okx"]})
 
     follow_up = await strategy.on_order_results(
         signal=close_signal,
@@ -545,6 +545,32 @@ async def test_strategy_order_result_feedback_master_close_triggers_follower_clo
     assert len(follow_up) == 1
     assert follow_up[0].action is SignalAction.CLOSE_LONG
     assert follow_up[0].metadata["target_exchanges"] == ["binance"]
+    assert follow_up[0].metadata["execution_purpose"] == "follower_close_after_master_close"
+
+
+@pytest.mark.asyncio
+async def test_strategy_order_result_feedback_normal_close_with_master_and_follower_results_does_not_emit_duplicate_follower_close() -> None:
+    strategy = Strategy()
+    await strategy.on_start(_snapshot())
+    strategy.position.open_master(side=Side.LONG, entry_time_ms=1, avg_entry=Decimal("2000"), qty=Decimal("0.1"), stop_price=Decimal("1978"), entry_engine="MOMENTUM_V3", position_id="p1")
+    strategy.position.mark_leg_open(exchange="okx", avg_fill_price=Decimal("2000"), base_qty=Decimal("0.1"))
+    strategy.position.mark_leg_open(exchange="binance", avg_fill_price=Decimal("2001"), base_qty=Decimal("0.1"))
+    close_signal = TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.CLOSE_LONG, quantity=Decimal("0.1"), metadata={"target_exchanges": ["okx", "binance"]})
+
+    follow_up = await strategy.on_order_results(
+        signal=close_signal,
+        source="request_sync",
+        event_time_ms=2,
+        results=[
+            ExchangeOrderResult(exchange=ExchangeName.OKX, ok=True, order_id="close-m", status=OrderStatus.FILLED, side=OrderSide.SELL, quantity=Decimal("0.1"), filled_quantity=Decimal("0.1"), avg_fill_price=Decimal("2010")),
+            ExchangeOrderResult(exchange=ExchangeName.BINANCE, ok=True, order_id="close-f", status=OrderStatus.FILLED, side=OrderSide.SELL, quantity=Decimal("0.1"), filled_quantity=Decimal("0.1"), avg_fill_price=Decimal("2010")),
+        ],
+    )
+
+    assert follow_up == []
+    assert strategy.position.in_pos is False
+    assert strategy.position.legs["binance"].sync_status == "follower_closed"
+    assert strategy.position.legs["binance"].is_open is False
 
 
 @pytest.mark.asyncio

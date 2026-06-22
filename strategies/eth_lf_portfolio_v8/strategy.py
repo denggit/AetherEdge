@@ -203,35 +203,65 @@ class Strategy:
             return []
 
         signals: list[TradeSignal] = []
-        for result in results:
-            event = _account_event_from_order_result(signal=signal, result=result, event_time_ms=event_time_ms)
-            if event is None:
-                continue
+        events = [
+            event
+            for result in results
+            if (event := _account_event_from_order_result(signal=signal, result=result, event_time_ms=event_time_ms)) is not None
+        ]
+        if signal.action in {SignalAction.CLOSE_LONG, SignalAction.CLOSE_SHORT}:
+            return self._handle_close_order_result_events(signal=signal, events=events)
+
+        # Entry fills can intentionally cascade: the master fill establishes the
+        # canonical stop, then follower fills reuse it. Keep this path
+        # sequential while close handling below remains two-phase to avoid
+        # duplicate follower close signals.
+        for event in events:
             exchange = event.exchange.value
             is_master = exchange == self.config.data_exchange
             filled_qty = event.filled_quantity or event.quantity or Decimal("0")
             if filled_qty <= 0:
                 continue
 
-            if signal.action in {SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT}:
-                if self.pending_entry is not None and _is_entry_side(event.side, self.pending_entry.side):
-                    if is_master:
-                        signals.extend(self._handle_master_entry_fill(event=event, filled_qty=filled_qty))
-                    elif self.position.in_pos:
-                        signals.extend(self._handle_follower_entry_fill(event=event, filled_qty=filled_qty))
-                elif self.position.in_pos and _is_entry_side(event.side, self.position.side) and not is_master:
+            if self.pending_entry is not None and _is_entry_side(event.side, self.pending_entry.side):
+                if is_master:
+                    signals.extend(self._handle_master_entry_fill(event=event, filled_qty=filled_qty))
+                elif self.position.in_pos:
                     signals.extend(self._handle_follower_entry_fill(event=event, filled_qty=filled_qty))
-                continue
-
-            if signal.action in {SignalAction.CLOSE_LONG, SignalAction.CLOSE_SHORT}:
-                if self.position.in_pos and is_master and _is_close_side(event.side, self.position.side):
-                    follower_close_signals = self._follower_close_signals_after_master_close(event_time_ms=event.event_time_ms)
-                    self.position.close_master(exit_time_ms=event.event_time_ms)
-                    self.pending_entry = None
-                    signals.extend(follower_close_signals)
-                elif self.position.in_pos and not is_master and _is_close_side(event.side, self.position.side):
-                    self.position.mark_leg_closed(exchange=exchange, sync_status="follower_closed")
+            elif self.position.in_pos and _is_entry_side(event.side, self.position.side) and not is_master:
+                signals.extend(self._handle_follower_entry_fill(event=event, filled_qty=filled_qty))
         return signals
+
+    def _handle_close_order_result_events(self, *, signal: TradeSignal, events: Sequence[AccountEvent]) -> Sequence[TradeSignal]:
+        if not self.position.in_pos or self.position.side is Side.FLAT:
+            return []
+        target_exchanges = _target_exchanges(signal)
+        master_close_event: AccountEvent | None = None
+        follower_close_filled = False
+        follower_closed_exchanges: list[str] = []
+        for event in events:
+            exchange = event.exchange.value
+            is_master = exchange == self.config.data_exchange
+            filled_qty = event.filled_quantity or event.quantity or Decimal("0")
+            if filled_qty <= 0:
+                continue
+            if is_master and _is_close_side(event.side, self.position.side):
+                master_close_event = event
+                continue
+            if not is_master and _is_close_side(event.side, self.position.side):
+                follower_closed_exchanges.append(exchange)
+                follower_close_filled = True
+
+        if master_close_event is None:
+            for exchange in follower_closed_exchanges:
+                self.position.mark_leg_closed(exchange=exchange, sync_status="follower_closed")
+            return []
+        has_follower_target = any(exchange != self.config.data_exchange for exchange in target_exchanges)
+        follow_up = [] if has_follower_target or follower_close_filled else self._follower_close_signals_after_master_close(event_time_ms=master_close_event.event_time_ms)
+        self.position.close_master(exit_time_ms=master_close_event.event_time_ms)
+        self.pending_entry = None
+        for exchange in follower_closed_exchanges:
+            self.position.mark_leg_closed(exchange=exchange, sync_status="follower_closed")
+        return follow_up
 
     async def on_market_feature(self, event: MarketFeatureEvent) -> Sequence[TradeSignal]:
         if event.type_value == MarketFeatureEventType.CLOSED_KLINE.value:
@@ -925,6 +955,20 @@ def _signal_order_side(action: SignalAction) -> OrderSide | None:
     if action in {SignalAction.OPEN_SHORT, SignalAction.CLOSE_LONG}:
         return OrderSide.SELL
     return None
+
+
+def _target_exchanges(signal: TradeSignal) -> tuple[str, ...]:
+    raw = signal.metadata.get("target_exchanges") if signal.metadata else None
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        items = raw.split(",")
+    else:
+        try:
+            items = tuple(raw)
+        except TypeError:
+            items = (raw,)
+    return tuple(str(item.value if hasattr(item, "value") else item).strip().lower() for item in items if str(item).strip())
 
 
 def _first_active_position(positions: Sequence[Position]) -> Position | None:

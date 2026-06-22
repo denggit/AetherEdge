@@ -29,7 +29,7 @@ def test_live_order_intent_factory_respects_signal_target_exchanges() -> None:
         metadata={"target_exchanges": ["binance"]},
     )
 
-    intent = factory.create(signal, source="account:binance", event_time_ms=2)
+    intent = factory.create(signal, source="request_sync:binance", event_time_ms=2)
 
     assert intent.target_exchanges == (ExchangeName.BINANCE,)
     assert intent.metadata["target_exchanges"] == ["binance"]

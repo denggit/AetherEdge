@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from src.platform.account.events import AccountEvent
-from src.platform.exchanges.models import ExchangeName, Order
+from src.platform.exchanges.models import ExchangeName, Order, OrderStatus
 from src.platform.snapshot import PlatformSnapshot
 from src.platform.state.models import StoredAccountSnapshot, StoredEvent, StoredFill, StoredOrder
 
@@ -35,6 +35,18 @@ class StateStore(Protocol):
         ...
 
     def list_open_orders(self, *, exchange: ExchangeName, symbol: str, include_stop_orders: bool = True) -> list[StoredOrder]:
+        ...
+
+    def mark_missing_open_orders_closed(
+        self,
+        *,
+        exchange: ExchangeName,
+        symbol: str,
+        live_order_keys: set[tuple[str | None, str | None]],
+        is_stop_order: bool,
+        missing_status: OrderStatus = OrderStatus.CANCELED,
+        reason: str = "missing_from_exchange_open_orders",
+    ) -> int:
         ...
 
     def load_recent_events(self, *, exchange: ExchangeName, symbol: str | None = None, limit: int = 100) -> list[StoredEvent]:

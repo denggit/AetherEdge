@@ -73,6 +73,12 @@ class _FakeStateStore:
     def save_order(self, order, *, is_stop_order=False):
         self.orders.append((order, is_stop_order))
 
+    def list_open_orders(self, *, exchange, symbol, include_stop_orders=True):
+        return []
+
+    def mark_missing_open_orders_closed(self, **kwargs):
+        return 0
+
 
 class _FakeExecutionClient:
     def __init__(self, exchange: ExchangeName) -> None:
@@ -167,6 +173,32 @@ class _FakeExecutionClient:
             )
         ]
 
+    async def fetch_open_orders(self):
+        return []
+
+    async def fetch_open_stop_orders(self):
+        return []
+
+
+class _FakeAccountClient:
+    symbol = "ETH-USDT-PERP"
+    market_profile = get_market_profile("ETH-USDT-PERP")
+
+    def __init__(self, exchange: ExchangeName) -> None:
+        self.exchange = exchange
+
+    async def fetch_balance(self, asset="USDT"):
+        return Balance(exchange=self.exchange, asset=asset, total=Decimal("1000"), available=Decimal("1000"))
+
+    async def fetch_positions(self, symbol=None):
+        return []
+
+    async def fetch_leverage(self, *, margin_mode=None):
+        return LeverageInfo(exchange=self.exchange, symbol=self.symbol, raw_symbol=self.symbol, leverage=Decimal("10"))
+
+    async def fetch_position_mode(self):
+        return PositionMode.ONE_WAY
+
 
 @pytest.mark.asyncio
 async def test_v8_live_runtime_routes_entry_and_leg_specific_stops(tmp_path) -> None:
@@ -199,6 +231,7 @@ async def test_v8_live_runtime_routes_entry_and_leg_specific_stops(tmp_path) -> 
             "recovery_service": None,
             "snapshot": _snapshot(),
             "execution_clients": (okx, binance),
+            "account_clients": (_FakeAccountClient(ExchangeName.OKX), _FakeAccountClient(ExchangeName.BINANCE)),
             "order_journal": journal,
         },
     )
