@@ -987,7 +987,11 @@ class LiveRuntimeRunner:
         if not callable(handler):
             return ()
         follow_up = await handler(signal=signal, results=results, source=source, event_time_ms=event_time_ms)
-        logger.info("Strategy order results processed | action=%s results=%s follow_up_signals=%s", signal.action.value, len(results), len(follow_up or ()))
+        follow_up_count = len(follow_up or ())
+        if follow_up_count > 0:
+            logger.info("Strategy order results processed | action=%s results=%s follow_up_signals=%s", signal.action.value, len(results), follow_up_count)
+        else:
+            logger.debug("Strategy order results processed | action=%s results=%s follow_up_signals=0", signal.action.value, len(results))
         return follow_up or ()
 
     async def _stop_producers(self) -> None:

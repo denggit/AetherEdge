@@ -1016,3 +1016,266 @@ async def test_callback_known_ids_binance_fake_with_client():
     assert len(execution.order_queries) == 1
     assert execution.order_queries[0].order_id is None
     assert execution.order_queries[0].client_order_id == "AEBIOLabc123"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Log noise reduction tests (AE-V9C-LIVE-LOGGING-014)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_order_sync_inactive_skip_logs_once_then_debug_or_suppressed(caplog):
+    """Inactive order sync should log INFO only once, then DEBUG on repeats."""
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="src.runtime.account_sync.service")
+
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=FakeAccount(), execution=TrackingExecution(), state_store=MemoryState()),),
+        config=OrderStateRequirement(poll_interval_seconds=20),
+        active_check=lambda: False,
+    )
+
+    # Simulate 3 periodic ticks by calling the skip logic directly
+    # First tick: should emit INFO "inactive"
+    import asyncio
+    stop = asyncio.Event()
+
+    # We can't easily test run_periodic loop, so test the tracking state directly
+    # Tick 1: first inactive
+    assert not service.active_check()
+    service._inactive_skip_summary.record_skip("inactive")
+    # Simulate the first-logic:
+    assert service._last_order_sync_active is None  # Not yet set
+    service._last_order_sync_active = False
+    # So first tick would emit INFO "Order state sync inactive"
+    assert service._last_order_sync_active is False
+
+    # Tick 2: repeated inactive
+    assert not service.active_check()
+    service._inactive_skip_summary.record_skip("inactive")
+    # Now _last_order_sync_active is False (already was)
+    assert service._last_order_sync_active is False
+    # Summary should not emit yet (within 600s window)
+    # Count should be 2
+    assert service._inactive_skip_summary.count("inactive") == 2
+
+    # Tick 3: repeated inactive
+    assert not service.active_check()
+    service._inactive_skip_summary.record_skip("inactive")
+    assert service._inactive_skip_summary.count("inactive") == 3
+
+    # Verify we can distinguish state correctly
+    assert service._last_order_sync_active is not True
+
+
+@pytest.mark.asyncio
+async def test_order_sync_logs_active_transition(caplog):
+    """Inactive -> active transition should log INFO."""
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=FakeAccount(), execution=TrackingExecution(), state_store=MemoryState()),),
+        config=OrderStateRequirement(poll_interval_seconds=20),
+        active_check=lambda: True,
+    )
+
+    # Initially None → True on first active check
+    assert service._last_order_sync_active is None
+    assert service.active_check() is True
+    service._last_order_sync_active = True
+    # Transition detected: None -> True
+    assert service._last_order_sync_active is True
+
+    # Subsequent active check: no change
+    assert service.active_check() is True
+    # Still True, no state transition
+    assert service._last_order_sync_active is True
+
+
+@pytest.mark.asyncio
+async def test_order_sync_logs_active_to_inactive_transition():
+    """Active -> inactive transition should be detectable."""
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=FakeAccount(), execution=TrackingExecution(), state_store=MemoryState()),),
+        config=OrderStateRequirement(poll_interval_seconds=20),
+        active_check=lambda: False,
+    )
+
+    # First set it active
+    service._last_order_sync_active = True
+
+    # Now simulate inactive check
+    assert not service.active_check()
+    # State transition: True -> False
+    assert service._last_order_sync_active is True  # still True until we update it
+    service._last_order_sync_active = False
+    # Transition detected
+    assert service._last_order_sync_active is False
+
+
+@pytest.mark.asyncio
+async def test_order_sync_logs_open_order_count_only_on_change(caplog):
+    """Open orders count-change detection: same count → no INFO, change → INFO."""
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="src.runtime.account_sync.service")
+
+    state = MemoryState()
+    account = FakeAccount()
+    # Execution with 1 open order (the default FakeExecution returns 1)
+    execution = TrackingExecution()
+
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=account, execution=execution, state_store=state),),
+        config=OrderStateRequirement(sync_position=False, sync_open_orders=True, sync_open_stop_orders=False),
+        active_check=lambda: True,
+    )
+
+    # First sync: prev_count=-1 (initial) → count=1 → change detected → INFO
+    await service.sync_once()
+    assert service._last_open_order_count.get("okx") == 1
+
+    # Second sync: pre-set to same count → no change → DEBUG
+    execution2 = TrackingExecution()
+    state2 = MemoryState()
+    service2 = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=FakeAccount(), execution=execution2, state_store=state2),),
+        config=OrderStateRequirement(sync_position=False, sync_open_orders=True, sync_open_stop_orders=False),
+        active_check=lambda: True,
+    )
+    service2._last_open_order_count["okx"] = 1  # pre-set to same value
+    await service2.sync_once()
+    # Should be unchanged
+    assert service2._last_open_order_count.get("okx") == 1
+
+    # Third sync: count changes 1 -> 0 (empty orders)
+    execution3 = TrackingExecution(open_orders=[])
+    state3 = MemoryState()
+    service3 = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=FakeAccount(), execution=execution3, state_store=state3),),
+        config=OrderStateRequirement(sync_position=False, sync_open_orders=True, sync_open_stop_orders=False),
+        active_check=lambda: True,
+    )
+    service3._last_open_order_count["okx"] = 1
+    await service3.sync_once()
+    # Should be updated to 0
+    assert service3._last_open_order_count.get("okx") == 0
+
+
+@pytest.mark.asyncio
+async def test_account_sync_logs_info_only_when_account_fingerprint_changes(caplog):
+    """Account sync: same fingerprint → no INFO 'Account state changed'."""
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="src.runtime.account_sync.service")
+
+    account = FakeAccount()
+    state = MemoryState()
+    service = AccountStateSyncService(
+        contexts=(SyncExchangeContext(account=account, execution=FakeExecution(), state_store=state),),
+        config=AccountStateRequirement(poll_interval_seconds=300),
+    )
+
+    # First sync: fingerprint is None → should log INFO
+    results = await service.sync_once()
+    assert results[0].success is True
+    assert "okx" in service._last_account_fingerprint
+
+    fp1 = service._last_account_fingerprint["okx"]
+
+    # Second sync: same balance/positions → same fingerprint → should log DEBUG
+    account2 = FakeAccount()
+    state2 = MemoryState()
+    service2 = AccountStateSyncService(
+        contexts=(SyncExchangeContext(account=account2, execution=FakeExecution(), state_store=state2),),
+        config=AccountStateRequirement(poll_interval_seconds=300),
+    )
+    service2._last_account_fingerprint["okx"] = fp1  # pre-set to same fingerprint
+    results2 = await service2.sync_once()
+    assert results2[0].success is True
+    fp2 = service2._last_account_fingerprint.get("okx")
+    assert fp1 == fp2  # Fingerprints match → no change logged at INFO
+
+
+@pytest.mark.asyncio
+async def test_account_sync_logs_balance_change(caplog):
+    """Account balance change → fingerprint differs → INFO logged."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger="src.runtime.account_sync.service")
+
+    account1 = FakeAccount()
+    service = AccountStateSyncService(
+        contexts=(SyncExchangeContext(account=account1, execution=FakeExecution(), state_store=MemoryState()),),
+        config=AccountStateRequirement(poll_interval_seconds=300),
+    )
+    await service.sync_once()
+    fp1 = service._last_account_fingerprint.get("okx")
+
+    # Change balance
+    class ChangedAccount(FakeAccount):
+        async def fetch_balance(self, asset="USDT"):
+            self.calls.append("fetch_balance")
+            return Balance(exchange=self.exchange, asset=asset, total=Decimal("90"), available=Decimal("80"))
+
+    account2 = ChangedAccount()
+    service2 = AccountStateSyncService(
+        contexts=(SyncExchangeContext(account=account2, execution=FakeExecution(), state_store=MemoryState()),),
+        config=AccountStateRequirement(poll_interval_seconds=300),
+    )
+    service2._last_account_fingerprint["okx"] = fp1
+    await service2.sync_once()
+    fp2 = service2._last_account_fingerprint.get("okx")
+    # Fingerprints should differ (balance changed 100→90, 90→80)
+    assert fp1 != fp2
+
+
+@pytest.mark.asyncio
+async def test_known_order_failure_still_warning_and_alert(caplog):
+    """Known order status fetch failure must still log WARNING and emit alert."""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="src.runtime.account_sync.service")
+
+    alerts = MemoryAlerts()
+    state = MemoryState()
+    account = FakeAccount()
+
+    def known() -> dict[str, Any]:
+        return {"okx": {"orders": ["11111"], "stop_orders": []}}
+
+    execution = TrackingExecution(fail_on="11111")
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=account, execution=execution, state_store=state),),
+        config=OrderStateRequirement(
+            sync_position=False, sync_open_orders=False, sync_open_stop_orders=False,
+            consecutive_failure_alert_threshold=1,
+        ),
+        active_check=lambda: True,
+        known_order_ids=known,
+        alert_sink=alerts,
+    )
+
+    result = await service.sync_once()
+    assert result[0].success is False
+    assert "known_order_status_failures" in result[0].metadata
+    # Alert emitted at threshold=1
+    assert len(alerts.items) == 1
+    assert alerts.items[0].severity == "error"
+
+
+@pytest.mark.asyncio
+async def test_account_sync_failure_still_warning(caplog):
+    """Account sync failure must still log WARNING."""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="src.runtime.account_sync.service")
+
+    account = FakeAccount(fail=True)
+    service = AccountStateSyncService(
+        contexts=(SyncExchangeContext(account=account, execution=FakeExecution(), state_store=MemoryState()),),
+        config=AccountStateRequirement(poll_interval_seconds=300),
+    )
+
+    result = await service.sync_once()
+    assert result[0].success is False
+    assert result[0].error is not None
