@@ -55,7 +55,7 @@ def runtime_mode_from_env(
     environ: Mapping[str, str] | None = None,
 ) -> RuntimeMode:
     defaults = _load_defaults(defaults_path)
-    env = load_env_config(env_file, environ=environ)
+    env = _load_runtime_env(env_file=env_file, environ=environ)
     value = env.get("AETHER_RUNTIME_MODE", str(defaults.get("runtime_mode", RuntimeMode.LEGACY_APP.value)))
     return RuntimeMode(str(value).strip().lower())
 
@@ -68,7 +68,7 @@ def live_runtime_config_from_app(
     environ: Mapping[str, str] | None = None,
 ) -> LiveRuntimeConfig:
     defaults = _load_defaults(defaults_path)
-    env = load_env_config(env_file, environ=environ)
+    env = _load_runtime_env(env_file=env_file, environ=environ)
     master_follower_env = _master_follower_env(env, env_file=env_file, environ=environ)
     return LiveRuntimeConfig(
         app=app_config,
@@ -86,6 +86,18 @@ def live_runtime_config_from_app(
             env=master_follower_env,
         ),
     )
+
+
+def _load_runtime_env(*, env_file: str | Path | None, environ: Mapping[str, str] | None) -> dict[str, str]:
+    values = dict(load_env_config(env_file, environ=environ))
+    if environ is not None and env_file is None:
+        # Synthetic environ mappings used by tests should be hermetic: do not
+        # inherit the developer's project .env just because load_env_config can
+        # read it by default. Production calls pass environ=None and still load
+        # the real project environment.
+        allowed = {str(key) for key in environ.keys()}
+        values = {key: value for key, value in values.items() if key in allowed}
+    return values
 
 
 def _load_defaults(path: str | Path) -> dict[str, Any]:

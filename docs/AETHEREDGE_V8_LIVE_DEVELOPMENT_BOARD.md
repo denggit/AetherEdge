@@ -362,3 +362,17 @@ OKX adapter 现在会把 1h/2h/4h 等转换为 1H/2H/4H，同时不影响 Binanc
 5. 策略导入路径暂保留 strategies.eth_lf_portfolio_v8:Strategy，避免启动配置和 preflight 连锁改动；内部 strategy_id 已标记为 eth_lf_portfolio_v9c_reclaim_priority。
 ```
 
+## Board 5 package 13：Runtime Config Hermetic Test Fix
+
+- [x] AE-0517 Runtime Mode Defaults Test Fix
+
+设计结论：
+
+```text
+修复 runtime_mode_from_env(defaults_path=missing, environ={}) 被项目 .env / config/aether_defaults.json 污染的问题。
+1. 生产调用 environ=None 时，仍读取项目 .env / defaults。
+2. 单测或显式注入 environ={} 且未传 env_file 时，只使用注入的 environ，不继承开发机项目 .env。
+3. 因此 missing defaults + empty environ 会回到 RuntimeMode.LEGACY_APP，保持旧测试语义。
+4. V8/V9C 正式启动不受影响，因为真实启动不会传 synthetic environ={}.
+```
+
