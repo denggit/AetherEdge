@@ -9,7 +9,7 @@
     "binance": "ETHUSDT"
   },
   "contract_value_by_exchange": {
-    "okx": "0.01",
+    "okx": "0.1",
     "binance": "1"
   },
   "min_quantity_by_exchange": {

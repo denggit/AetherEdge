@@ -42,7 +42,8 @@ python tools/exchange_connectivity_smoke.py \
 
 Default behavior:
 
-- uses `2 USDT` margin budget and `10x` leverage, so roughly `20 USDT` notional;
+- uses `2 USDT` margin budget and `10x` leverage, so roughly `20 USDT` requested notional;
+- never intentionally exceeds the requested notional unless `--allow-min-notional-round-up` is passed;
 - sets one-way position mode where possible;
 - sets isolated margin where possible;
 - sets leverage;
@@ -62,7 +63,11 @@ Safety gates:
 Useful options:
 
 ```bash
---skip-order-test      # read/config APIs only
---skip-stop-test       # skip temporary stop-order placement/cancel
---no-cleanup           # do not attempt emergency cleanup close; not recommended
+--skip-order-test                  # read/config APIs only
+--skip-stop-test                   # skip temporary stop-order placement/cancel
+--allow-min-notional-round-up      # explicitly allow a tiny notional bump to satisfy exchange min notional / step size
+--max-notional-overrun-pct 0.10    # cap the allowed bump when round-up is enabled
+--no-cleanup                       # do not attempt emergency cleanup close; not recommended
 ```
+
+If Binance rejects a strict `2 USDT * 10x` order because the rounded quantity is slightly below its minimum notional, either increase `--margin-usdt` a little or pass `--allow-min-notional-round-up` explicitly.

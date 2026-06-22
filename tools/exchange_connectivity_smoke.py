@@ -83,6 +83,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--side", choices=("long", "short"), default="long", help="Test direction. Default: long")
     parser.add_argument("--hold-seconds", type=float, default=3.0, help="Seconds to hold before close. Default: 3")
     parser.add_argument("--stop-distance-pct", type=Decimal, default=Decimal("0.05"), help="Temporary stop distance from ticker. Default: 5%%")
+    parser.add_argument("--min-order-notional-usdt", type=Decimal, default=Decimal("20"), help="Exchange minimum order notional used for optional round-up preview. Default: 20")
+    parser.add_argument("--allow-min-notional-round-up", action="store_true", help="Allow quantity to round up to satisfy minimum notional/quantity. Without this, the tool never intentionally exceeds the requested margin*leverage budget.")
+    parser.add_argument("--max-notional-overrun-pct", type=Decimal, default=Decimal("0.10"), help="Maximum notional overrun allowed when --allow-min-notional-round-up is used. Default: 10%%")
     parser.add_argument("--live", action="store_true", help="Actually place orders. Without this flag the script is read-only + dry preview.")
     parser.add_argument("--skip-stop-test", action="store_true", help="Skip temporary stop placement/fetch/cancel test.")
     parser.add_argument("--skip-order-test", action="store_true", help="Only test read/config APIs; do not place entry/stop/close orders.")
@@ -133,8 +136,21 @@ async def main() -> int:
         await _write_report(args.report, report)
         return 2
     price = Decimal(str(ticker.price))
-    base_qty = _floor_decimal((args.margin_usdt * args.leverage) / price, Decimal("0.000001"))
-    print(f"[sizing] price={price} notional={args.margin_usdt * args.leverage} base_qty={base_qty}")
+    requested_notional = args.margin_usdt * args.leverage
+    base_qty = _floor_decimal(requested_notional / price, Decimal("0.000001"))
+    if args.allow_min_notional_round_up:
+        min_base_qty = _ceil_decimal(args.min_order_notional_usdt / price, Decimal("0.001"))
+        rounded_notional = min_base_qty * price
+        max_allowed = requested_notional * (Decimal("1") + args.max_notional_overrun_pct)
+        if min_base_qty > base_qty:
+            if rounded_notional > max_allowed:
+                raise SystemExit(
+                    f"Refusing min-notional round-up: requested_notional={requested_notional}, "
+                    f"rounded_notional={rounded_notional}, max_allowed={max_allowed}. "
+                    "Increase --margin-usdt or --max-notional-overrun-pct explicitly."
+                )
+            base_qty = min_base_qty
+    print(f"[sizing] price={price} requested_notional={requested_notional} base_qty={base_qty} estimated_notional={base_qty * price}")
 
     account_clients = {
         exchange: create_account_client(exchange, symbol=app_config.symbol, config=ExchangeConfig.from_env(exchange))
@@ -182,6 +198,7 @@ async def main() -> int:
     )
 
     opened = False
+    opened_exchanges: tuple[ExchangeName, ...] = ()
     stop_results: list[ExchangeOrderResult] = []
     try:
         entry_action = SignalAction.OPEN_LONG if args.side == "long" else SignalAction.OPEN_SHORT
@@ -202,7 +219,8 @@ async def main() -> int:
                 metadata={"tool": "exchange_connectivity_smoke"},
             ),
         )
-        opened = any(result.ok for result in entry_results)
+        opened_exchanges = tuple(result.exchange for result in entry_results if result.ok)
+        opened = bool(opened_exchanges)
         for exchange, client in account_clients.items():
             await _step(report, "fetch_positions_after_entry", exchange, client.fetch_positions, soft=True)
 
@@ -212,6 +230,7 @@ async def main() -> int:
                 coordinator,
                 strategy_id="tools.exchange_connectivity_smoke",
                 intent_suffix="stop",
+                target_exchanges=opened_exchanges,
                 signal=TradeSignal(
                     symbol=app_config.symbol,
                     action=stop_action,
@@ -231,6 +250,7 @@ async def main() -> int:
                 coordinator,
                 strategy_id="tools.exchange_connectivity_smoke",
                 intent_suffix="close",
+                target_exchanges=opened_exchanges,
                 signal=TradeSignal(
                     symbol=app_config.symbol,
                     action=close_action,
@@ -251,6 +271,7 @@ async def main() -> int:
                     coordinator,
                     strategy_id="tools.exchange_connectivity_smoke",
                     intent_suffix="emergency-close",
+                    target_exchanges=opened_exchanges,
                     signal=TradeSignal(
                         symbol=app_config.symbol,
                         action=close_action,
@@ -274,12 +295,13 @@ async def _execute_intent(
     strategy_id: str,
     intent_suffix: str,
     signal: TradeSignal,
+    target_exchanges: Sequence[ExchangeName] | None = None,
 ) -> list[ExchangeOrderResult]:
     intent = OrderIntent(
         intent_id=f"smoke-{intent_suffix}-{_now_ms()}",
         strategy_id=strategy_id,
         signal=signal,
-        target_exchanges=tuple(ExchangeName(exchange) for exchange in report.exchanges),
+        target_exchanges=tuple(target_exchanges or tuple(ExchangeName(exchange) for exchange in report.exchanges)),
         metadata={"tool": "exchange_connectivity_smoke", "intent_suffix": intent_suffix},
     )
     try:
@@ -350,6 +372,13 @@ def _stop_price(price: Decimal, *, side: str, distance_pct: Decimal) -> Decimal:
 
 def _floor_decimal(value: Decimal, step: Decimal) -> Decimal:
     return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+
+def _ceil_decimal(value: Decimal, step: Decimal) -> Decimal:
+    floored = _floor_decimal(value, step)
+    if floored == value:
+        return floored
+    return floored + step
 
 
 def _result_json(result: ExchangeOrderResult) -> dict[str, Any]:

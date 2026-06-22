@@ -320,7 +320,7 @@ async def test_live_runtime_smoke_success_records_submitted_journal(tmp_path):
 
     assert repo.get_intent(intent_id).status is OrderIntentStatus.SUBMITTED  # type: ignore[union-attr]
     assert len(repo.list_results(intent_id=intent_id)) == 2
-    assert okx.orders[0].quantity == Decimal("50")
+    assert okx.orders[0].quantity == Decimal("5")
     assert binance.orders[0].quantity == Decimal("0.5")
     assert strategy.events[0] == "on_start"
     assert runner.stats.submitted_intents == 1

@@ -25,7 +25,7 @@ def test_default_market_profile_is_eth_usdt_perp():
     assert profile.base_asset == "ETH"
     assert profile.raw_symbol(ExchangeName.OKX) == "ETH-USDT-SWAP"
     assert profile.raw_symbol(ExchangeName.BINANCE) == "ETHUSDT"
-    assert profile.contract_value(ExchangeName.OKX) == Decimal("0.01")
+    assert profile.contract_value(ExchangeName.OKX) == Decimal("0.1")
 
 
 def test_can_register_future_market_without_changing_exchange_code():
@@ -51,7 +51,7 @@ def test_platform_clients_are_bound_to_configured_market_symbol():
     assert data.symbol == "ETH-USDT-PERP"
     assert execution.symbol == "ETH-USDT-PERP"
     assert account.symbol == "ETH-USDT-PERP"
-    assert data.market_profile.contract_value(ExchangeName.OKX) == Decimal("0.01")
+    assert data.market_profile.contract_value(ExchangeName.OKX) == Decimal("0.1")
 
 
 def test_account_client_rejects_position_query_for_unbound_symbol():

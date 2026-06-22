@@ -18,7 +18,7 @@ def test_native_quantity_converter_maps_base_qty_to_binance_and_okx():
     okx = converter.convert_quantity(exchange=ExchangeName.OKX, symbol=profile.symbol, base_quantity=Decimal("0.5"), market_profile=profile)
 
     assert binance.native_quantity == Decimal("0.5")
-    assert okx.native_quantity == Decimal("50")
+    assert okx.native_quantity == Decimal("5")
 
 
 class NativeFakeExchange:
@@ -53,5 +53,5 @@ def test_coordinator_converts_before_existing_execution_step_normalization(tmp_p
 
     asyncio.run(coordinator.execute(intent))
 
-    assert okx_native.placed[0].quantity == Decimal("50")
+    assert okx_native.placed[0].quantity == Decimal("5")
     assert binance_native.placed[0].quantity == Decimal("0.5")
