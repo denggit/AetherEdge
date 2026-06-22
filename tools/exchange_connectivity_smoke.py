@@ -6,7 +6,7 @@ import json
 import os
 import sys
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Any, Sequence
@@ -20,6 +20,7 @@ from src.order_management import (
     MasterFollowerExecutionPolicy,
     MultiExchangeOrderCoordinator,
     RepositoryDuplicateOrderGuard,
+    RetryPolicy,
     SqliteOrderJournalStore,
 )
 from src.order_management.models import ExchangeOrderResult, OrderIntent
@@ -84,11 +85,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hold-seconds", type=float, default=3.0, help="Seconds to hold before close. Default: 3")
     parser.add_argument("--stop-distance-pct", type=Decimal, default=Decimal("0.05"), help="Temporary stop distance from ticker. Default: 5%%")
     parser.add_argument("--min-order-notional-usdt", type=Decimal, default=Decimal("20"), help="Exchange minimum order notional used for optional round-up preview. Default: 20")
-    parser.add_argument("--allow-min-notional-round-up", action="store_true", help="Allow quantity to round up to satisfy minimum notional/quantity. Without this, the tool never intentionally exceeds the requested margin*leverage budget.")
-    parser.add_argument("--max-notional-overrun-pct", type=Decimal, default=Decimal("0.10"), help="Maximum notional overrun allowed when --allow-min-notional-round-up is used. Default: 10%%")
+    parser.add_argument("--allow-min-notional-round-up", action="store_true", help="Deprecated compatibility flag; min-notional round-up is enabled by default unless --no-min-notional-round-up is passed.")
+    parser.add_argument("--no-min-notional-round-up", action="store_true", help="Disable automatic small top-up to satisfy minimum order notional.")
+    parser.add_argument("--max-min-notional-topup-usdt", type=Decimal, default=Decimal("2"), help="Maximum USDT notional top-up allowed for min-notional round-up. Default: 2")
+    parser.add_argument("--max-notional-overrun-pct", type=Decimal, default=Decimal("0.10"), help="Additional maximum percentage overrun guard when min-notional round-up is used. Default: 10%%")
     parser.add_argument("--live", action="store_true", help="Actually place orders. Without this flag the script is read-only + dry preview.")
     parser.add_argument("--skip-stop-test", action="store_true", help="Skip temporary stop placement/fetch/cancel test.")
     parser.add_argument("--skip-order-test", action="store_true", help="Only test read/config APIs; do not place entry/stop/close orders.")
+    parser.add_argument("--allow-partial-entry", action="store_true", help="Allow master to open even if a follower is expected to fail. Default false for smoke safety.")
+    parser.add_argument("--order-retry-attempts", type=int, default=1, help="Smoke-test order retry attempts. Default: 1 to avoid long silent waits.")
+    parser.add_argument("--order-retry-delay-seconds", type=float, default=0.0, help="Smoke-test order retry delay. Default: 0")
     parser.add_argument("--no-cleanup", action="store_true", help="Do not auto-close the test position on failure. Not recommended.")
     parser.add_argument("--journal-db", default="data/state/connectivity_smoke_order_journal.sqlite3", help="Order journal DB path.")
     parser.add_argument("--report", default=None, help="Optional report JSON output path.")
@@ -138,19 +144,32 @@ async def main() -> int:
     price = Decimal(str(ticker.price))
     requested_notional = args.margin_usdt * args.leverage
     base_qty = _floor_decimal(requested_notional / price, Decimal("0.000001"))
-    if args.allow_min_notional_round_up:
-        min_base_qty = _ceil_decimal(args.min_order_notional_usdt / price, Decimal("0.001"))
-        rounded_notional = min_base_qty * price
+    allow_min_notional_round_up = not args.no_min_notional_round_up
+    min_base_qty = _ceil_decimal(args.min_order_notional_usdt / price, Decimal("0.001"))
+    rounded_notional = min_base_qty * price
+    min_notional_topup = max(Decimal("0"), rounded_notional - requested_notional)
+    if allow_min_notional_round_up and min_base_qty > base_qty:
         max_allowed = requested_notional * (Decimal("1") + args.max_notional_overrun_pct)
-        if min_base_qty > base_qty:
-            if rounded_notional > max_allowed:
-                raise SystemExit(
-                    f"Refusing min-notional round-up: requested_notional={requested_notional}, "
-                    f"rounded_notional={rounded_notional}, max_allowed={max_allowed}. "
-                    "Increase --margin-usdt or --max-notional-overrun-pct explicitly."
-                )
+        if min_notional_topup <= args.max_min_notional_topup_usdt and rounded_notional <= max_allowed:
+            print(
+                f"[sizing-topup] requested_notional={requested_notional} rounded_notional={rounded_notional} "
+                f"topup={min_notional_topup} reason=min_order_notional"
+            )
             base_qty = min_base_qty
-    print(f"[sizing] price={price} requested_notional={requested_notional} base_qty={base_qty} estimated_notional={base_qty * price}")
+        else:
+            print(
+                f"[warn] min-notional round-up refused: requested_notional={requested_notional}, "
+                f"rounded_notional={rounded_notional}, topup={min_notional_topup}, "
+                f"max_topup={args.max_min_notional_topup_usdt}, max_pct_allowed={max_allowed}"
+            )
+    estimated_notional = base_qty * price
+    print(f"[sizing] price={price} requested_notional={requested_notional} base_qty={base_qty} estimated_notional={estimated_notional}")
+    min_notional_warning = estimated_notional < args.min_order_notional_usdt
+    if min_notional_warning:
+        print(
+            f"[warn] estimated_notional={estimated_notional} is below min_order_notional={args.min_order_notional_usdt}. "
+            "Binance may reject. Increase --margin-usdt, raise --max-min-notional-topup-usdt, or pass --no-min-notional-round-up intentionally."
+        )
 
     account_clients = {
         exchange: create_account_client(exchange, symbol=app_config.symbol, config=ExchangeConfig.from_env(exchange))
@@ -188,8 +207,28 @@ async def main() -> int:
     if os.getenv("AETHER_DRY_RUN", "true").strip().lower() in {"1", "true", "yes", "on"}:
         raise SystemExit("Refusing live smoke order while AETHER_DRY_RUN=true. Set AETHER_DRY_RUN=false and pass --live.")
 
+    if min_notional_warning and not args.allow_partial_entry and len(app_config.exchanges) > 1:
+        report.add(
+            StepResult(
+                name="preflight_min_notional",
+                ok=False,
+                detail={
+                    "estimated_notional": str(estimated_notional),
+                    "min_order_notional_usdt": str(args.min_order_notional_usdt),
+                    "reason": "strict 2U*10x order is expected to fail on at least one follower after quantity-step rounding",
+                    "fix": "increase --margin-usdt, raise --max-min-notional-topup-usdt, or pass --allow-partial-entry",
+                },
+            )
+        )
+        await _write_report(args.report, report)
+        print(report.to_json())
+        return 1
+
     journal = SqliteOrderJournalStore(args.journal_db)
     policy = None if runtime_config.master_follower_policy is None else MasterFollowerExecutionPolicy.from_config(runtime_config.master_follower_policy)
+    if policy is not None:
+        retry = RetryPolicy(max_attempts=args.order_retry_attempts, retry_delay_seconds=args.order_retry_delay_seconds)
+        policy = replace(policy, master_entry_retry=retry, follower_entry_retry=retry)
     coordinator = MultiExchangeOrderCoordinator(
         clients=execution_clients,
         repository=journal,

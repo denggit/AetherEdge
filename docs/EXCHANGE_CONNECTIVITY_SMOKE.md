@@ -43,7 +43,7 @@ python tools/exchange_connectivity_smoke.py \
 Default behavior:
 
 - uses `2 USDT` margin budget and `10x` leverage, so roughly `20 USDT` requested notional;
-- never intentionally exceeds the requested notional unless `--allow-min-notional-round-up` is passed;
+- automatically tops up to the configured minimum order notional when the gap is small; default max top-up is `2 USDT`;
 - sets one-way position mode where possible;
 - sets isolated margin where possible;
 - sets leverage;
@@ -65,9 +65,21 @@ Useful options:
 ```bash
 --skip-order-test                  # read/config APIs only
 --skip-stop-test                   # skip temporary stop-order placement/cancel
---allow-min-notional-round-up      # explicitly allow a tiny notional bump to satisfy exchange min notional / step size
---max-notional-overrun-pct 0.10    # cap the allowed bump when round-up is enabled
+--no-min-notional-round-up         # disable automatic small top-up
+--max-min-notional-topup-usdt 2    # cap absolute top-up; default 2 USDT
+--max-notional-overrun-pct 0.10    # cap percentage overrun as a second guard
 --no-cleanup                       # do not attempt emergency cleanup close; not recommended
 ```
 
-If Binance rejects a strict `2 USDT * 10x` order because the rounded quantity is slightly below its minimum notional, either increase `--margin-usdt` a little or pass `--allow-min-notional-round-up` explicitly.
+If a strict `2 USDT * 10x` order would round slightly below Binance's minimum notional, the tool now tops it up to the minimum by default as long as the top-up is within `--max-min-notional-topup-usdt` and `--max-notional-overrun-pct`.
+
+The tool uses smoke-test retry defaults, not strategy runtime retry defaults:
+
+```bash
+--order-retry-attempts 1
+--order-retry-delay-seconds 0
+```
+
+This avoids a misleading 30-second silent wait when a follower order is expected to fail.
+
+For safety, when multiple exchanges are configured and strict sizing is expected to fail the follower min-notional check, the tool aborts before opening the master unless `--allow-partial-entry` is explicitly passed.
