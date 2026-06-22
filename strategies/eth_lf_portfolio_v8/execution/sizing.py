@@ -30,6 +30,7 @@ class V8RiskSizer:
         quality_mult: Decimal = Decimal("1"),
         micro_entry_risk_scale: Decimal = Decimal("1"),
         global_risk_scale: Decimal = Decimal("1"),
+        current_qty: Decimal = Decimal("0"),
     ) -> Decimal:
         risk_per_coin = abs(entry_price - stop_price)
         if equity <= 0:
@@ -42,5 +43,6 @@ class V8RiskSizer:
         qty = risk_budget / risk_per_coin
         if self.config.max_total_notional_mult is not None:
             max_qty = (equity * self.config.max_total_notional_mult) / entry_price
-            qty = min(qty, max_qty)
+            remaining_qty = max(Decimal("0"), max_qty - current_qty)
+            qty = min(qty, remaining_qty)
         return qty

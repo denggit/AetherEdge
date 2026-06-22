@@ -44,7 +44,7 @@ class V8PositionState:
     last_exit_time_ms: int | None = None
     legs: dict[str, ExchangeLegState] = field(default_factory=dict)
 
-    def reset(self) -> None:
+    def reset(self, *, keep_last_exit: bool = False) -> None:
         self.in_pos = False
         self.side = Side.FLAT
         self.entry_time_ms = None
@@ -94,6 +94,40 @@ class V8PositionState:
         self.entry_engine = entry_engine
         self.entry_risk_mult = entry_risk_mult
 
+
+    def add_master_fill(self, *, avg_fill_price: Decimal, add_qty: Decimal) -> None:
+        if not self.in_pos:
+            raise ValueError("cannot add when not in position")
+        if avg_fill_price <= 0:
+            raise ValueError("avg_fill_price must be positive")
+        if add_qty <= 0:
+            raise ValueError("add_qty must be positive")
+        total_qty = self.qty + add_qty
+        if total_qty <= 0:
+            return
+        old_avg = self.avg_entry or avg_fill_price
+        self.avg_entry = (old_avg * self.qty + avg_fill_price * add_qty) / total_qty
+        self.qty = total_qty
+        self.units += 1
+
+    def update_favorable_extremes(self, *, high: Decimal, low: Decimal) -> None:
+        if not self.in_pos:
+            return
+        if self.max_fav == Decimal("0"):
+            self.max_fav = self.first_entry or self.avg_entry or Decimal("0")
+        if self.max_adv == Decimal("0"):
+            self.max_adv = self.first_entry or self.avg_entry or Decimal("0")
+        if self.side is Side.LONG:
+            self.max_fav = max(self.max_fav, high)
+            self.max_adv = min(self.max_adv, low)
+        elif self.side is Side.SHORT:
+            self.max_fav = min(self.max_fav, low)
+            self.max_adv = max(self.max_adv, high)
+
+    def close_master(self, *, exit_time_ms: int | None = None) -> None:
+        self.reset()
+        self.last_exit_time_ms = exit_time_ms
+
     def update_stop(self, stop_price: Decimal) -> None:
         if stop_price <= 0:
             raise ValueError("stop_price must be positive")
@@ -125,6 +159,41 @@ class V8PositionState:
         leg.entry_order_id = order_id or leg.entry_order_id
         leg.entry_client_order_id = client_order_id or leg.entry_client_order_id
         leg.stop_price = self.stop_price
+        leg.sync_status = sync_status
+        self.legs[exchange] = leg
+        return leg
+
+    def add_leg_fill(
+        self,
+        *,
+        exchange: str,
+        avg_fill_price: Decimal,
+        add_base_qty: Decimal,
+        native_qty: Decimal | None = None,
+        order_id: str | None = None,
+        client_order_id: str | None = None,
+        sync_status: str = "open",
+    ) -> ExchangeLegState:
+        if add_base_qty <= 0:
+            raise ValueError("add_base_qty must be positive")
+        leg = self.legs.get(exchange)
+        if leg is None or not leg.is_open or leg.base_qty <= 0 or leg.avg_fill_price is None:
+            return self.mark_leg_open(
+                exchange=exchange,
+                avg_fill_price=avg_fill_price,
+                base_qty=add_base_qty,
+                native_qty=native_qty,
+                order_id=order_id,
+                client_order_id=client_order_id,
+                sync_status=sync_status,
+            )
+        total_qty = leg.base_qty + add_base_qty
+        leg.avg_fill_price = (leg.avg_fill_price * leg.base_qty + avg_fill_price * add_base_qty) / total_qty
+        leg.base_qty = total_qty
+        if native_qty is not None:
+            leg.native_qty = (leg.native_qty or Decimal("0")) + native_qty
+        leg.entry_order_id = order_id or leg.entry_order_id
+        leg.entry_client_order_id = client_order_id or leg.entry_client_order_id
         leg.sync_status = sync_status
         self.legs[exchange] = leg
         return leg
@@ -171,7 +240,7 @@ class V8PositionState:
             elif event.side is OrderSide.SELL:
                 self.mark_leg_closed(exchange=exchange)
                 if master_exchange is not None and exchange == master_exchange:
-                    self.reset()
+                    self.close_master(exit_time_ms=event.event_time_ms)
 
     @property
     def open_legs(self) -> dict[str, ExchangeLegState]:

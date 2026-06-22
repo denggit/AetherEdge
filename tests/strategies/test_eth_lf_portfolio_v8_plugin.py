@@ -460,10 +460,12 @@ async def test_strategy_places_master_and_follower_stop_after_fills() -> None:
             filled_quantity=Decimal("0.1"),
         )
     )
-    assert len(master_stop) == 1
-    assert master_stop[0].action is SignalAction.PLACE_STOP_LOSS_LONG
-    assert master_stop[0].trigger_price == Decimal("1978.0")
+    assert len(master_stop) == 2
+    assert master_stop[0].action is SignalAction.CANCEL_ALL_STOP_ORDERS
     assert master_stop[0].metadata["target_exchanges"] == ["okx"]
+    assert master_stop[1].action is SignalAction.PLACE_STOP_LOSS_LONG
+    assert master_stop[1].trigger_price == Decimal("1978.0")
+    assert master_stop[1].metadata["target_exchanges"] == ["okx"]
 
     follower_stop = await strategy.on_account_event(
         AccountEvent(
@@ -477,9 +479,11 @@ async def test_strategy_places_master_and_follower_stop_after_fills() -> None:
             filled_quantity=Decimal("0.1"),
         )
     )
-    assert len(follower_stop) == 1
-    assert follower_stop[0].trigger_price == Decimal("1978.0")
+    assert len(follower_stop) == 2
+    assert follower_stop[0].action is SignalAction.CANCEL_ALL_STOP_ORDERS
     assert follower_stop[0].metadata["target_exchanges"] == ["binance"]
+    assert follower_stop[1].trigger_price == Decimal("1978.0")
+    assert follower_stop[1].metadata["target_exchanges"] == ["binance"]
 
 
 @pytest.mark.asyncio
@@ -505,6 +509,100 @@ async def test_strategy_emits_close_signal_for_active_position_on_exit_channel()
     assert signals[0].action is SignalAction.CLOSE_LONG
     assert signals[0].metadata["reduce_only"] is True
 
+
+@pytest.mark.asyncio
+async def test_strategy_emits_add_signal_when_next_r_trigger_is_hit() -> None:
+    strategy = Strategy()
+    await strategy.on_start(_snapshot())
+    close_time_ms = 1_700_000_000_000
+    strategy.position.open_master(
+        side=Side.LONG,
+        entry_time_ms=close_time_ms - 4 * 60 * 60 * 1000,
+        avg_entry=Decimal("100"),
+        qty=Decimal("0.1"),
+        stop_price=Decimal("90"),
+        entry_engine="MOMENTUM_V3",
+    )
+    strategy.router = PortfolioRouter(engines=(_StaticEngine(name="none", priority=0, side=Side.FLAT),))
+    strategy.feature_builder = _FakeFeatureBuilder(atr="10")
+
+    await strategy.on_market_feature(_closed_kline(close_time_ms))
+    signals = await strategy.on_market_feature(_range_aggregate(close_time_ms))
+
+    assert len(signals) == 1
+    assert signals[0].action is SignalAction.OPEN_LONG
+    assert signals[0].metadata["decision_type"] == "add"
+    assert signals[0].metadata["micro_entry_risk_scale_applied"] is False
+    assert strategy.pending_entry is not None and strategy.pending_entry.is_add is True
+
+
+@pytest.mark.asyncio
+async def test_strategy_updates_protected_stop_when_favorable_move_reaches_threshold() -> None:
+    strategy = Strategy()
+    await strategy.on_start(_snapshot())
+    close_time_ms = 1_700_000_000_000
+    strategy.position.open_master(
+        side=Side.LONG,
+        entry_time_ms=close_time_ms - 4 * 60 * 60 * 1000,
+        avg_entry=Decimal("100"),
+        qty=Decimal("0.1"),
+        stop_price=Decimal("90"),
+        entry_engine="MOMENTUM_V3",
+        units=4,
+    )
+    strategy.position.mark_leg_open(exchange="okx", avg_fill_price=Decimal("100"), base_qty=Decimal("0.1"))
+    strategy.router = PortfolioRouter(engines=(_StaticEngine(name="none", priority=0, side=Side.FLAT),))
+    strategy.feature_builder = _FakeFeatureBuilder(atr="10")
+
+    await strategy.on_market_feature(_closed_kline(close_time_ms))
+    signals = await strategy.on_market_feature(_range_aggregate(close_time_ms))
+
+    assert len(signals) == 2
+    assert signals[0].action is SignalAction.CANCEL_ALL_STOP_ORDERS
+    assert signals[0].metadata["target_exchanges"] == ["okx"]
+    assert signals[1].action is SignalAction.PLACE_STOP_LOSS_LONG
+    assert signals[1].trigger_price == Decimal("101.0")
+    assert strategy.position.stop_price == Decimal("101.0")
+
+
+@pytest.mark.asyncio
+async def test_strategy_emits_close_signal_when_max_hold_is_reached() -> None:
+    strategy = Strategy()
+    await strategy.on_start(_snapshot())
+    close_time_ms = 1_700_000_000_000
+    strategy.position.open_master(
+        side=Side.LONG,
+        entry_time_ms=close_time_ms - 181 * 4 * 60 * 60 * 1000,
+        avg_entry=Decimal("2000"),
+        qty=Decimal("0.1"),
+        stop_price=Decimal("1978"),
+        entry_engine="MOMENTUM_V3",
+    )
+    strategy.router = PortfolioRouter(engines=(_StaticEngine(name="none", priority=0, side=Side.FLAT),))
+    strategy.feature_builder = _FakeFeatureBuilder(atr="10")
+
+    await strategy.on_market_feature(_closed_kline(close_time_ms))
+    signals = await strategy.on_market_feature(_range_aggregate(close_time_ms))
+
+    assert len(signals) == 1
+    assert signals[0].action is SignalAction.CLOSE_LONG
+    assert signals[0].reason == "V8_MAX_HOLD_EXIT"
+
+
+@pytest.mark.asyncio
+async def test_strategy_respects_cooldown_after_master_exit() -> None:
+    strategy = Strategy()
+    await strategy.on_start(_snapshot())
+    close_time_ms = 1_700_000_000_000
+    strategy.position.last_exit_time_ms = close_time_ms - 4 * 60 * 60 * 1000
+    strategy.router = PortfolioRouter(engines=(_StaticEngine(name="MOMENTUM_V3", priority=150, side=Side.LONG),))
+    strategy.feature_builder = _FakeFeatureBuilder(atr="10")
+
+    await strategy.on_market_feature(_closed_kline(close_time_ms))
+    signals = await strategy.on_market_feature(_range_aggregate(close_time_ms, imbalance="0.1", close_pos="0.8"))
+
+    assert signals == []
+    assert strategy.pending_entry is None
 
 def _snapshot() -> PlatformSnapshot:
     return PlatformSnapshot(
