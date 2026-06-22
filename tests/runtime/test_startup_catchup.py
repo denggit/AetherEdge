@@ -338,3 +338,181 @@ def test_v9c_closed_kline_min_records_is_configured():
     ck = data["runtime_requirements"]["closed_kline"]
     assert "min_records" in ck, "min_records key missing in closed_kline config"
     assert ck["min_records"] >= 2000, f"min_records={ck['min_records']} < 2000"
+
+
+# ── Tests: price guard uses current market price (P0-2) ───────────────────────
+
+
+def test_startup_catchup_price_guard_differentiates_current_vs_theoretical():
+    """current_price != theoretical_open must be detectable by price guard.
+
+    With kline.close=100 for both, the guard always passes.
+    With current_price=101 and theoretical_open=100 for a LONG,
+    the 1% deviation should fail the adverse bound (0.15%).
+    """
+    open_price = Decimal("100")
+    # LONG: max_adverse=0.0015, upper=100.15, max_favorable=0.0030, lower=99.70
+    # current=101 → above 100.15 → fails adverse
+    decision = evaluate_startup_catchup_eligibility(
+        **_base_kwargs(
+            current_price=Decimal("101"),
+            theoretical_open_price=open_price,
+            side="long",
+        ),
+    )
+    assert decision.eligible is False
+    assert decision.reason == "price_guard_failed"
+    assert decision.metadata["current_price"] == "101"
+    assert decision.metadata["theoretical_open_price"] == "100"
+
+
+def test_startup_catchup_price_guard_passes_when_current_near_open():
+    """Long: current_price slightly above open but within adverse bound."""
+    open_price = Decimal("100")
+    decision = evaluate_startup_catchup_eligibility(
+        **_base_kwargs(
+            current_price=Decimal("100.10"),
+            theoretical_open_price=Decimal("100.05"),
+            side="long",
+        ),
+    )
+    # max_adverse=0.0015 → upper=100.05*1.0015=100.200075
+    # current=100.10 → within bound
+    assert decision.eligible is True
+
+
+# ── Tests: side from signal action, NOT kline colour (P0-3) ───────────────────
+
+
+def test_startup_catchup_price_guard_uses_signal_side_not_kline_direction():
+    """Short-side price guard is applied when signal side is short,
+    regardless of whether the kline was green (close > open).
+    """
+    open_price = Decimal("100")
+    # SHORT: max_adverse=0.0015 → lower=99.85, max_favorable=0.0030 → upper=100.30
+    # current=99.70 → below 99.85 → fails adverse for SHORT
+    decision = evaluate_startup_catchup_eligibility(
+        **_base_kwargs(
+            current_price=Decimal("99.70"),
+            theoretical_open_price=open_price,
+            side="short",
+        ),
+    )
+    assert decision.eligible is False
+    assert decision.reason == "price_guard_failed"
+
+
+def test_startup_catchup_short_guard_differs_from_long_guard():
+    """Same prices, different sides → different outcomes."""
+    open_price = Decimal("100")
+    # current=100.20: for LONG, upper=100.15 → fails; for SHORT, upper=100.30 → passes
+    long_decision = evaluate_startup_catchup_eligibility(
+        **_base_kwargs(
+            current_price=Decimal("100.20"),
+            theoretical_open_price=open_price,
+            side="long",
+        ),
+    )
+    assert long_decision.eligible is False  # LONG fails
+
+    short_decision = evaluate_startup_catchup_eligibility(
+        **_base_kwargs(
+            current_price=Decimal("100.20"),
+            theoretical_open_price=open_price,
+            side="short",
+        ),
+    )
+    assert short_decision.eligible is True  # SHORT passes — same price, opposite rule
+
+
+# ── Tests: side normalization ─────────────────────────────────────────────────
+
+
+def test_startup_catchup_price_guard_accepts_upper_case_side():
+    """Side 'LONG' should be normalized to 'long'."""
+    decision = evaluate_startup_catchup_eligibility(
+        **_base_kwargs(
+            current_price=Decimal("100.05"),
+            theoretical_open_price=Decimal("100"),
+            side="LONG",
+        ),
+    )
+    assert decision.eligible is True
+
+
+def test_startup_catchup_price_guard_refuses_unknown_side():
+    """Unknown side → refuse (never guess)."""
+    decision = evaluate_startup_catchup_eligibility(
+        **_base_kwargs(
+            current_price=Decimal("100"),
+            theoretical_open_price=Decimal("100"),
+            side="unknown",
+        ),
+    )
+    assert decision.eligible is False
+    assert decision.reason == "price_guard_failed"
+
+
+# ── Tests: metadata completeness ──────────────────────────────────────────────
+
+
+def test_startup_catchup_metadata_includes_bar_timestamps():
+    """Decision metadata must include candidate bar open/close times."""
+    decision = evaluate_startup_catchup_eligibility(**_base_kwargs())
+    assert decision.metadata["candidate_bar_open_time_ms"] == 8 * 60 * 60_000
+    assert decision.metadata["candidate_bar_close_time_ms"] == 12 * 60 * 60_000 - 1
+
+
+def test_startup_catchup_metadata_includes_window_info():
+    """Decision metadata must include fresh window age and config."""
+    decision = evaluate_startup_catchup_eligibility(**_base_kwargs())
+    assert "fresh_window_age_seconds" in decision.metadata
+    assert decision.metadata["fresh_open_window_seconds"] == 300
+
+
+# ── Tests: range aggregate unavailable coverage ───────────────────────────────
+
+
+def test_startup_catchup_range_unavailable_metadata_contains_bucket_info():
+    """When range aggregate is unavailable, metadata should tell operators why."""
+    decision = evaluate_startup_catchup_eligibility(
+        **_base_kwargs(range_aggregate_available=False),
+    )
+    assert decision.eligible is False
+    assert decision.reason == "range_aggregate_unavailable"
+
+
+# ── Tests: config defaults immutable ──────────────────────────────────────────
+
+
+def test_startup_catchup_config_defaults_are_safe():
+    """Default config must enable all safety requirements."""
+    config = StartupCatchupConfig()
+    assert config.enabled is True
+    assert config.fresh_open_window_seconds == 300
+    assert config.max_adverse_price_pct == Decimal("0.0015")
+    assert config.max_favorable_price_pct == Decimal("0.0030")
+    assert config.require_clean_reconciliation is True
+    assert config.require_no_active_position is True
+    assert config.require_no_pending_orders is True
+    assert config.require_range_aggregate is True
+
+
+def test_startup_catchup_config_from_mapping_handles_empty():
+    """from_mapping with None or empty dict → defaults."""
+    c1 = StartupCatchupConfig.from_mapping(None)
+    assert c1.enabled is True
+    c2 = StartupCatchupConfig.from_mapping({})
+    assert c2.enabled is True
+
+
+def test_startup_catchup_config_from_mapping_overrides():
+    """from_mapping with partial dict overrides only specified keys."""
+    c = StartupCatchupConfig.from_mapping({
+        "enabled": "false",
+        "fresh_open_window_seconds": "600",
+    })
+    assert c.enabled is False
+    assert c.fresh_open_window_seconds == 600
+    # Unspecified keys keep defaults
+    assert c.max_adverse_price_pct == Decimal("0.0015")

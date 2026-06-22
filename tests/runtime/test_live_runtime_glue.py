@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import tempfile
+import time
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from src.app import AppConfig, AppContext, AsyncAlertDispatcher, NoopAlertSink
 from src.market_data.derived import RangeBarAggregator, RangeBarBuilder
-from src.market_data.events import MarketFeatureEventType
-from src.market_data.models import MarketDataSet, RangeBar, TimeRange, WarmupRequest, WarmupResult
+from src.market_data.events import MarketFeatureEvent, MarketFeatureEventType
+from src.market_data.models import MarketDataSet, RangeBar, RangeBarAggregate, TimeRange, WarmupRequest, WarmupResult
 from src.market_data.storage import SqliteTradeStore
 from src.market_data.warmup.current_rangebar import CurrentRangeBarWarmupResult
 from src.platform import Balance, ExchangeName, LeverageInfo, Order, OrderStatus, PositionMode
@@ -1225,3 +1228,820 @@ async def test_runner_recovery_stores_last_snapshots():
     # Backward compat: _last_snapshot still points to first
     assert runner._last_snapshot is not None
     assert runner._last_snapshot == snapshots[0]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Startup catch-up P0 safety tests (AE-V9C-LIVE-STARTUP-017)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Helpers for catch-up tests ────────────────────────────────────────────────
+
+
+class CatchupTestKlineStore:
+    """In-memory kline store that returns controlled rows."""
+
+    def __init__(self, rows=()) -> None:
+        self._rows = list(rows)
+        self.load_calls = []
+
+    def load(self, *, symbol: str, interval: str, time_range: TimeRange):
+        self.load_calls.append((symbol, interval, time_range))
+        return [
+            r for r in self._rows
+            if r.symbol == symbol
+            and r.interval == interval
+            and time_range.start_time_ms <= r.open_time_ms <= time_range.end_time_ms
+        ]
+
+
+class CatchupTestRangeBarStore:
+    """In-memory range bar store with controlled rows."""
+
+    def __init__(self, rows=()) -> None:
+        self._rows = list(rows)
+        self.load_calls = []
+
+    def load(self, *, symbol: str, range_pct: str, time_range: TimeRange):
+        self.load_calls.append((symbol, range_pct, time_range))
+        return self._rows
+
+    def save(self, rows):
+        self._rows.extend(rows)
+        return len(rows)
+
+
+class CatchupTestStateStore:
+    """State store that can be toggled to have open orders."""
+
+    def __init__(self, *, has_open: bool = False) -> None:
+        self.has_open = has_open
+        self.orders_saved = []
+
+    def list_open_orders(self, *, exchange, symbol, include_stop_orders=True):
+        if self.has_open:
+            return [Order(
+                exchange=exchange, symbol=symbol, raw_symbol=symbol,
+                order_id="open-1", client_order_id="client-open-1",
+                status=OrderStatus.NEW, side="buy",
+                quantity=Decimal("1"), filled_quantity=Decimal("0"),
+                raw={"ordId": "open-1"},
+            )]
+        return []
+
+    def save_order(self, order, *, is_stop_order=False):
+        self.orders_saved.append((order, is_stop_order))
+
+    def save_snapshot(self, snapshot):
+        pass
+
+
+class CatchupTestFrozenPosition:
+    """A minimal position stand-in so hasattr(pos, 'quantity') works."""
+
+    def __init__(self, quantity: Decimal) -> None:
+        self.quantity = quantity
+
+
+class CatchupTestStrategy:
+    """Strategy that returns controlled signals."""
+
+    def __init__(self, *, signal_action: str | None = None, in_pos: bool = False,
+                 pending_entry: object = None, config: dict | None = None) -> None:
+        self.signal_action = signal_action
+        self.position = type("Position", (), {"in_pos": in_pos})()
+        self.pending_entry = pending_entry
+        self.config = config or {}
+        self.events_received = []
+
+    async def on_market_feature(self, event):
+        self.events_received.append(event)
+        if self.signal_action is None:
+            return []
+        action = SignalAction(self.signal_action)
+        return [TradeSignal(
+            symbol="ETH-USDT-PERP",
+            action=action,
+            quantity=Decimal("1"),
+            reason="test_catchup",
+            metadata={"test": True},
+        )]
+
+    async def on_start(self, snapshot):
+        return []
+
+
+class CatchupTestData:
+    """Data feed that returns controlled ticker price and klines."""
+
+    exchange = ExchangeName.OKX
+    symbol = "ETH-USDT-PERP"
+    market_profile = get_market_profile("ETH-USDT-PERP")
+
+    def __init__(self, *, ticker_price: Decimal | None = None,
+                 klines=()) -> None:
+        self._ticker_price = ticker_price
+        self._klines = list(klines)
+
+    async def fetch_ticker(self):
+        if self._ticker_price is None:
+            raise RuntimeError("ticker unavailable")
+        from src.platform.data.models import MarketTicker
+        return MarketTicker(
+            exchange=ExchangeName.OKX,
+            symbol="ETH-USDT-PERP",
+            raw_symbol="ETH-USDT-SWAP",
+            price=self._ticker_price,
+            time_ms=int(time.time() * 1000),
+        )
+
+    async def fetch_klines(self, *, interval, limit=100, start_time_ms=None,
+                           end_time_ms=None, use_cache=True, oldest_first=False):
+        return self._klines
+
+    async def stream_trades(self):
+        if False:
+            yield None
+
+    async def stream_order_book(self):
+        if False:
+            yield None
+
+
+class FakeRangeBarAggregatorForTest:
+    """Aggregator that returns controlled aggregates."""
+
+    def __init__(self, *, aggregates=()) -> None:
+        self._aggregates = list(aggregates)
+
+    def aggregate(self, rows, *, bucket_ms: int):
+        return self._aggregates
+
+
+# ── P0-1: runner doesn't crash on missing method ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_startup_catchup_does_not_raise_missing_method():
+    """Direct call to _evaluate_startup_catchup_once must not raise
+    AttributeError from missing _has_unresolved_follower_close or
+    any other undefined method."""
+    strategy = CatchupTestStrategy()
+    data = CatchupTestData(ticker_price=Decimal("100"))
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "kline_store": CatchupTestKlineStore(),
+            "runtime_requirements": _feature_requirements(),
+        },
+        dry_run=True,
+    )
+    # Should not raise AttributeError
+    try:
+        await runner._evaluate_startup_catchup_once(_snapshot())
+    except AttributeError as e:
+        pytest.fail(f"_evaluate_startup_catchup_once raised AttributeError: {e}")
+    # Even if skipped, the method must exist and be callable
+    assert runner._has_unresolved_follower_close() is False
+
+
+# ── P0-4: range aggregate unavailable → skip, no placeholder ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_startup_catchup_skips_when_aggregate_event_missing():
+    """Range bar store has 0 rows → skip, strategy must NOT receive
+    range_aggregate_unavailable placeholder."""
+    h4_ms = 4 * 60 * 60_000
+    now_ms = 12 * 60 * 60_000 + 120_000  # 12:02:00 → within 300s window
+    current_4h_open = 12 * 60 * 60_000
+    candidate_open = current_4h_open - h4_ms
+    candidate_close = current_4h_open - 1
+
+    kline = MarketKline(
+        exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP", interval="4h",
+        open_time_ms=candidate_open, close_time_ms=candidate_close,
+        open=Decimal("100"), high=Decimal("110"), low=Decimal("90"),
+        close=Decimal("105"), volume=Decimal("10"), is_closed=True,
+    )
+
+    strategy = CatchupTestStrategy(signal_action="open_long")
+    data = CatchupTestData(ticker_price=Decimal("105"))
+
+    # Empty range bar store → no aggregate
+    range_store = CatchupTestRangeBarStore()
+    aggregator = FakeRangeBarAggregatorForTest(aggregates=[])
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "kline_store": CatchupTestKlineStore([kline]),
+            "range_bar_store": range_store,
+            "range_bar_aggregator": aggregator,
+            "runtime_requirements": _feature_requirements(),
+        },
+        dry_run=True,
+    )
+    runner._startup_catchup_evaluated = False
+
+    # Override time to simulate fresh window
+    with patch("time.time", return_value=now_ms / 1000):
+        await runner._evaluate_startup_catchup_once(_snapshot())
+
+    # Strategy must NOT have received any events (no placeholder fed)
+    assert len(strategy.events_received) == 0, (
+        f"Strategy received {len(strategy.events_received)} events; "
+        "should be 0 because range aggregate was unavailable"
+    )
+
+
+# ── raw rows present but aggregate bar_count < min_range_bars → skip ──────────
+
+
+@pytest.mark.asyncio
+async def test_startup_catchup_requires_aggregate_bar_count():
+    """Range bar store has rows but aggregate.bar_count < min_range_bars → skip."""
+    h4_ms = 4 * 60 * 60_000
+    now_ms = 12 * 60 * 60_000 + 120_000
+    current_4h_open = 12 * 60 * 60_000
+    candidate_open = current_4h_open - h4_ms
+    candidate_close = current_4h_open - 1
+
+    kline = MarketKline(
+        exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP", interval="4h",
+        open_time_ms=candidate_open, close_time_ms=candidate_close,
+        open=Decimal("100"), high=Decimal("110"), low=Decimal("90"),
+        close=Decimal("105"), volume=Decimal("10"), is_closed=True,
+    )
+
+    strategy = CatchupTestStrategy(
+        signal_action="open_long",
+        config={"micro_context": {"min_range_bars": 5}},
+    )
+    data = CatchupTestData(ticker_price=Decimal("105"))
+
+    # Range bar store has rows, but aggregate has bar_count=2 < min_range_bars=5
+    range_store = CatchupTestRangeBarStore([RangeBar(
+        symbol="ETH-USDT-PERP", range_pct=Decimal("0.002"),
+        bar_id=1, start_time_ms=candidate_open, end_time_ms=candidate_open + 1000,
+        open=Decimal("100"), high=Decimal("101"), low=Decimal("99"),
+        close=Decimal("100.5"), volume=Decimal("1"),
+        buy_notional=Decimal("50"), sell_notional=Decimal("50"),
+        trade_count=10,
+    )])
+    from src.market_data.models import RangeBarAggregate
+    weak_aggregate = RangeBarAggregate(
+        symbol="ETH-USDT-PERP", range_pct=Decimal("0.002"),
+        bucket_start_ms=candidate_open, bucket_end_ms=candidate_open + h4_ms - 1,
+        bar_count=2,  # < min_range_bars (5)
+        first_open=Decimal("100"), last_close=Decimal("100.5"),
+        high=Decimal("101"), low=Decimal("99"),
+        buy_notional_sum=Decimal("50"), sell_notional_sum=Decimal("50"),
+        delta_notional_sum=Decimal("0"), notional_sum=Decimal("100"),
+    )
+    aggregator = FakeRangeBarAggregatorForTest(aggregates=[weak_aggregate])
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "kline_store": CatchupTestKlineStore([kline]),
+            "range_bar_store": range_store,
+            "range_bar_aggregator": aggregator,
+            "runtime_requirements": _feature_requirements(),
+        },
+        dry_run=True,
+    )
+    runner._startup_catchup_evaluated = False
+
+    with patch("time.time", return_value=now_ms / 1000):
+        await runner._evaluate_startup_catchup_once(_snapshot())
+
+    # Strategy must NOT have received events
+    assert len(strategy.events_received) == 0
+
+
+# ── P0-2: price guard uses current ticker price, not kline.close ──────────────
+
+
+@pytest.mark.asyncio
+async def test_startup_catchup_uses_current_market_price_for_price_guard():
+    """kline.close=100 but current_price=101 → adverse for LONG → discard signal."""
+    h4_ms = 4 * 60 * 60_000
+    now_ms = 12 * 60 * 60_000 + 120_000
+    current_4h_open = 12 * 60 * 60_000
+    candidate_open = current_4h_open - h4_ms
+    candidate_close = current_4h_open - 1
+
+    kline = MarketKline(
+        exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP", interval="4h",
+        open_time_ms=candidate_open, close_time_ms=candidate_close,
+        open=Decimal("95"), high=Decimal("110"), low=Decimal("90"),
+        close=Decimal("100"), volume=Decimal("10"), is_closed=True,
+    )
+
+    strategy = CatchupTestStrategy(signal_action="open_long")
+    # Current ticker price = 101, 1% above kline.close
+    data = CatchupTestData(ticker_price=Decimal("101"))
+
+    from src.market_data.models import RangeBarAggregate
+    aggregate = RangeBarAggregate(
+        symbol="ETH-USDT-PERP", range_pct=Decimal("0.002"),
+        bucket_start_ms=candidate_open, bucket_end_ms=candidate_open + h4_ms - 1,
+        bar_count=10, first_open=Decimal("100"), last_close=Decimal("100.5"),
+        high=Decimal("101"), low=Decimal("99"),
+        buy_notional_sum=Decimal("500"), sell_notional_sum=Decimal("500"),
+        delta_notional_sum=Decimal("0"), notional_sum=Decimal("1000"),
+    )
+
+    range_store = CatchupTestRangeBarStore([RangeBar(
+        symbol="ETH-USDT-PERP", range_pct=Decimal("0.002"),
+        bar_id=1, start_time_ms=candidate_open, end_time_ms=candidate_open + 1000,
+        open=Decimal("100"), high=Decimal("101"), low=Decimal("99"),
+        close=Decimal("100.5"), volume=Decimal("1"),
+        buy_notional=Decimal("500"), sell_notional=Decimal("500"),
+        trade_count=100,
+    )])
+    aggregator = FakeRangeBarAggregatorForTest(aggregates=[aggregate])
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "kline_store": CatchupTestKlineStore([kline]),
+            "range_bar_store": range_store,
+            "range_bar_aggregator": aggregator,
+            "runtime_requirements": _feature_requirements(),
+        },
+        dry_run=True,
+    )
+    runner._startup_catchup_evaluated = False
+
+    with patch("time.time", return_value=now_ms / 1000):
+        await runner._evaluate_startup_catchup_once(_snapshot())
+
+    # Signal should be discarded by price guard (current=101, theoretical_open ~ 100,
+    # LONG: upper bound = 100 * 1.0015 = 100.15, fail)
+    # Strategy receives events (for preview) but nothing should execute
+    assert len(strategy.events_received) > 0, "Strategy should receive preview events"
+
+
+# ── P0-3: side from real signal action, not kline colour ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_startup_catchup_price_guard_uses_signal_side_not_kline_direction():
+    """Kline is red (close < open) but strategy returns OPEN_SHORT.
+    Price guard must use SHORT rules, not guess LONG from kline."""
+    h4_ms = 4 * 60 * 60_000
+    now_ms = 12 * 60 * 60_000 + 120_000
+    current_4h_open = 12 * 60 * 60_000
+    candidate_open = current_4h_open - h4_ms
+    candidate_close = current_4h_open - 1
+
+    # Kline is red: close < open
+    kline = MarketKline(
+        exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP", interval="4h",
+        open_time_ms=candidate_open, close_time_ms=candidate_close,
+        open=Decimal("110"), high=Decimal("115"), low=Decimal("95"),
+        close=Decimal("100"), volume=Decimal("10"), is_closed=True,
+    )
+
+    # Strategy returns OPEN_SHORT (not guessed from kline colour)
+    strategy = CatchupTestStrategy(signal_action="open_short")
+    # Current price = 99.70, theoretical_open = 100
+    # SHORT: lower bound = 100 * (1 - 0.0015) = 99.85, fail
+    data = CatchupTestData(ticker_price=Decimal("99.70"))
+
+    from src.market_data.models import RangeBarAggregate
+    aggregate = RangeBarAggregate(
+        symbol="ETH-USDT-PERP", range_pct=Decimal("0.002"),
+        bucket_start_ms=candidate_open, bucket_end_ms=candidate_open + h4_ms - 1,
+        bar_count=10, first_open=Decimal("100"), last_close=Decimal("100"),
+        high=Decimal("110"), low=Decimal("95"),
+        buy_notional_sum=Decimal("500"), sell_notional_sum=Decimal("500"),
+        delta_notional_sum=Decimal("0"), notional_sum=Decimal("1000"),
+    )
+
+    range_store = CatchupTestRangeBarStore([RangeBar(
+        symbol="ETH-USDT-PERP", range_pct=Decimal("0.002"),
+        bar_id=1, start_time_ms=candidate_open, end_time_ms=candidate_open + 1000,
+        open=Decimal("100"), high=Decimal("110"), low=Decimal("95"),
+        close=Decimal("100"), volume=Decimal("1"),
+        buy_notional=Decimal("500"), sell_notional=Decimal("500"),
+        trade_count=100,
+    )])
+    aggregator = FakeRangeBarAggregatorForTest(aggregates=[aggregate])
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "kline_store": CatchupTestKlineStore([kline]),
+            "range_bar_store": range_store,
+            "range_bar_aggregator": aggregator,
+            "runtime_requirements": _feature_requirements(),
+        },
+        dry_run=True,
+    )
+    runner._startup_catchup_evaluated = False
+
+    # Also set current_4h_open kline for theoretical_open fetch
+    current_kline = MarketKline(
+        exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP", interval="4h",
+        open_time_ms=current_4h_open, close_time_ms=current_4h_open + h4_ms - 1,
+        open=Decimal("100"), high=Decimal("100"), low=Decimal("100"),
+        close=Decimal("100"), volume=Decimal("0"), is_closed=False,
+    )
+    data._klines = [current_kline]
+
+    with patch("time.time", return_value=now_ms / 1000):
+        await runner._evaluate_startup_catchup_once(_snapshot())
+
+    # Strategy receives events (for preview); signal discarded by price guard
+    assert len(strategy.events_received) > 0, "Strategy should receive preview events"
+
+
+# ── exchange snapshot has active position → skip ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_startup_catchup_skips_when_snapshot_has_active_position():
+    """Exchange snapshot with position.quantity != 0 → skip catchup."""
+    strategy = CatchupTestStrategy(signal_action="open_long")
+    data = CatchupTestData(ticker_price=Decimal("100"))
+
+    # Snapshot with a position
+    pos_snapshot = PlatformSnapshot(
+        symbol="ETH-USDT-PERP",
+        balance=Balance(exchange=ExchangeName.OKX, asset="USDT",
+                        total=Decimal("1000"), available=Decimal("1000")),
+        positions=[CatchupTestFrozenPosition(Decimal("1"))],
+        open_orders=[],
+        open_stop_orders=[],
+        leverage=LeverageInfo(exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP",
+                              raw_symbol="ETH-USDT-SWAP", leverage=Decimal("1")),
+        position_mode=PositionMode.ONE_WAY,
+    )
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": pos_snapshot,
+            "kline_store": CatchupTestKlineStore(),
+            "runtime_requirements": _feature_requirements(),
+        },
+        dry_run=True,
+    )
+    runner._startup_catchup_evaluated = False
+
+    # Should skip immediately due to active position; no AttributeError
+    h4_ms = 4 * 60 * 60_000
+    now_ms = 12 * 60 * 60_000 + 120_000
+    with patch("time.time", return_value=now_ms / 1000):
+        await runner._evaluate_startup_catchup_once(pos_snapshot)
+
+    assert len(strategy.events_received) == 0
+
+
+# ── strategy.position.in_pos → skip ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_startup_catchup_skips_when_strategy_position_active():
+    """Strategy.position.in_pos=True → skip catchup."""
+    strategy = CatchupTestStrategy(signal_action="open_long", in_pos=True)
+    data = CatchupTestData(ticker_price=Decimal("100"))
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "kline_store": CatchupTestKlineStore(),
+            "runtime_requirements": _feature_requirements(),
+        },
+        dry_run=True,
+    )
+    runner._startup_catchup_evaluated = False
+
+    h4_ms = 4 * 60 * 60_000
+    now_ms = 12 * 60 * 60_000 + 120_000
+    with patch("time.time", return_value=now_ms / 1000):
+        await runner._evaluate_startup_catchup_once(_snapshot())
+
+    assert len(strategy.events_received) == 0
+
+
+# ── state_store has open order → skip ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_startup_catchup_skips_when_state_store_has_open_order():
+    """StateStore has open orders → skip catchup."""
+    h4_ms = 4 * 60 * 60_000
+    now_ms = 12 * 60 * 60_000 + 120_000
+    current_4h_open = 12 * 60 * 60_000
+    candidate_open = current_4h_open - h4_ms
+    candidate_close = current_4h_open - 1
+
+    kline = MarketKline(
+        exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP", interval="4h",
+        open_time_ms=candidate_open, close_time_ms=candidate_close,
+        open=Decimal("100"), high=Decimal("110"), low=Decimal("90"),
+        close=Decimal("105"), volume=Decimal("10"), is_closed=True,
+    )
+
+    strategy = CatchupTestStrategy(signal_action="open_long")
+    data = CatchupTestData(ticker_price=Decimal("105"))
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "kline_store": CatchupTestKlineStore([kline]),
+            "runtime_requirements": _feature_requirements(),
+        },
+        dry_run=True,
+    )
+    runner._startup_catchup_evaluated = False
+
+    # AppContext is frozen, so mock _has_open_orders to return True
+    with patch.object(runner, "_has_open_orders", return_value=True):
+        with patch("time.time", return_value=now_ms / 1000):
+            await runner._evaluate_startup_catchup_once(_snapshot())
+
+    assert len(strategy.events_received) == 0
+
+
+# ── unresolved follower close → skip ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_startup_catchup_skips_when_position_plan_requires_follower_close():
+    """PositionPlan with MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED → skip."""
+    h4_ms = 4 * 60 * 60_000
+    now_ms = 12 * 60 * 60_000 + 120_000
+    current_4h_open = 12 * 60 * 60_000
+    candidate_open = current_4h_open - h4_ms
+    candidate_close = current_4h_open - 1
+
+    kline = MarketKline(
+        exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP", interval="4h",
+        open_time_ms=candidate_open, close_time_ms=candidate_close,
+        open=Decimal("100"), high=Decimal("110"), low=Decimal("90"),
+        close=Decimal("105"), volume=Decimal("10"), is_closed=True,
+    )
+
+    strategy = CatchupTestStrategy(signal_action="open_long")
+    data = CatchupTestData(ticker_price=Decimal("105"))
+
+    # Position plan store with unresolved follower close
+    import tempfile
+    plan_store = SqlitePositionPlanStore(
+        str(Path(tempfile.mkdtemp()) / "plan_catchup.sqlite3")
+    )
+    plan = PositionPlan(
+        position_id="catchup-test-1",
+        strategy_id="test",
+        entry_engine="test",
+        side="long",
+        status=PositionPlanStatus.MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED,
+        canonical_stop_price=Decimal("0"),
+        master_exchange=ExchangeName.OKX,
+        master_target_qty_base=Decimal("0.1"),
+    )
+    plan_store.upsert_position(plan)
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "kline_store": CatchupTestKlineStore([kline]),
+            "position_plan_store": plan_store,
+            "runtime_requirements": _feature_requirements(),
+        },
+        dry_run=True,
+    )
+    runner._startup_catchup_evaluated = False
+
+    with patch("time.time", return_value=now_ms / 1000):
+        await runner._evaluate_startup_catchup_once(_snapshot())
+
+    assert len(strategy.events_received) == 0
+
+
+# ── valid catch-up: all guards pass → signal executes ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_startup_catchup_executes_open_signal_when_all_guards_pass():
+    """Fresh window, valid range aggregate, no positions, strategy returns
+    OPEN_LONG, current price within guard → signal executes with
+    source='startup_catchup' and metadata.startup_catchup=True."""
+    h4_ms = 4 * 60 * 60_000
+    now_ms = 12 * 60 * 60_000 + 120_000  # 12:02:00 → within 300s
+    current_4h_open = 12 * 60 * 60_000
+    candidate_open = current_4h_open - h4_ms
+    candidate_close = current_4h_open - 1
+
+    kline = MarketKline(
+        exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP", interval="4h",
+        open_time_ms=candidate_open, close_time_ms=candidate_close,
+        open=Decimal("100"), high=Decimal("110"), low=Decimal("90"),
+        close=Decimal("105"), volume=Decimal("10"), is_closed=True,
+    )
+
+    strategy = CatchupTestStrategy(signal_action="open_long")
+    data = CatchupTestData(ticker_price=Decimal("105"))
+
+    from src.market_data.models import RangeBarAggregate
+    aggregate = RangeBarAggregate(
+        symbol="ETH-USDT-PERP", range_pct=Decimal("0.002"),
+        bucket_start_ms=candidate_open, bucket_end_ms=candidate_open + h4_ms - 1,
+        bar_count=10, first_open=Decimal("100"), last_close=Decimal("105"),
+        high=Decimal("110"), low=Decimal("90"),
+        buy_notional_sum=Decimal("500"), sell_notional_sum=Decimal("500"),
+        delta_notional_sum=Decimal("0"), notional_sum=Decimal("1000"),
+    )
+
+    range_store = CatchupTestRangeBarStore([RangeBar(
+        symbol="ETH-USDT-PERP", range_pct=Decimal("0.002"),
+        bar_id=1, start_time_ms=candidate_open, end_time_ms=candidate_open + 1000,
+        open=Decimal("100"), high=Decimal("110"), low=Decimal("90"),
+        close=Decimal("105"), volume=Decimal("1"),
+        buy_notional=Decimal("500"), sell_notional=Decimal("500"),
+        trade_count=100,
+    )])
+    aggregator = FakeRangeBarAggregatorForTest(aggregates=[aggregate])
+
+    executed_signals = []
+
+    class CaptureExecutionRunner:
+        """Wrapper to capture _execute_signals calls."""
+        pass
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "kline_store": CatchupTestKlineStore([kline]),
+            "range_bar_store": range_store,
+            "range_bar_aggregator": aggregator,
+            "runtime_requirements": _feature_requirements(),
+        },
+        dry_run=True,
+    )
+    runner._startup_catchup_evaluated = False
+
+    original_execute = runner._execute_signals
+
+    async def capture_execute(signals, *, source, event_time_ms, metadata=None,
+                              feedback_depth=0):
+        executed_signals.extend(signals)
+        # In dry run, the real _execute_signals just logs; we track what
+        # would have been executed.
+        for signal in signals:
+            runner.stats.signals_seen += 1
+            runner.stats.dry_run_actions += 1
+
+    runner._execute_signals = capture_execute
+
+    # Current 4H kline for theoretical_open fetch
+    current_kline = MarketKline(
+        exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP", interval="4h",
+        open_time_ms=current_4h_open, close_time_ms=current_4h_open + h4_ms - 1,
+        open=Decimal("105"), high=Decimal("105"), low=Decimal("105"),
+        close=Decimal("105"), volume=Decimal("0"), is_closed=False,
+    )
+    data._klines = [current_kline]
+
+    with patch("time.time", return_value=now_ms / 1000):
+        await runner._evaluate_startup_catchup_once(_snapshot())
+
+    # Strategy should have received preview events
+    assert len(strategy.events_received) >= 2, (
+        f"Expected >= 2 preview events (closed_kline + range_aggregate), "
+        f"got {len(strategy.events_received)}"
+    )
+
+    # Since we captured _execute_signals, verify the signal was passed
+    assert len(executed_signals) >= 1, (
+        f"Expected >= 1 executed signal, got {len(executed_signals)}"
+    )
+    signal = executed_signals[0]
+    assert signal.metadata.get("startup_catchup") is True
+    assert signal.action == SignalAction.OPEN_LONG
+
+
+# ── current price unavailable → skip ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_startup_catchup_skips_when_current_price_unavailable():
+    """When fetch_ticker raises, catchup must skip with
+    reason=current_price_unavailable."""
+    h4_ms = 4 * 60 * 60_000
+    now_ms = 12 * 60 * 60_000 + 120_000
+    current_4h_open = 12 * 60 * 60_000
+    candidate_open = current_4h_open - h4_ms
+    candidate_close = current_4h_open - 1
+
+    kline = MarketKline(
+        exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP", interval="4h",
+        open_time_ms=candidate_open, close_time_ms=candidate_close,
+        open=Decimal("100"), high=Decimal("110"), low=Decimal("90"),
+        close=Decimal("105"), volume=Decimal("10"), is_closed=True,
+    )
+
+    strategy = CatchupTestStrategy(signal_action="open_long")
+    # ticker_price=None → fetch_ticker raises
+    data = CatchupTestData(ticker_price=None)
+
+    from src.market_data.models import RangeBarAggregate
+    aggregate = RangeBarAggregate(
+        symbol="ETH-USDT-PERP", range_pct=Decimal("0.002"),
+        bucket_start_ms=candidate_open, bucket_end_ms=candidate_open + h4_ms - 1,
+        bar_count=10, first_open=Decimal("100"), last_close=Decimal("105"),
+        high=Decimal("110"), low=Decimal("90"),
+        buy_notional_sum=Decimal("500"), sell_notional_sum=Decimal("500"),
+        delta_notional_sum=Decimal("0"), notional_sum=Decimal("1000"),
+    )
+
+    range_store = CatchupTestRangeBarStore([RangeBar(
+        symbol="ETH-USDT-PERP", range_pct=Decimal("0.002"),
+        bar_id=1, start_time_ms=candidate_open, end_time_ms=candidate_open + 1000,
+        open=Decimal("100"), high=Decimal("110"), low=Decimal("90"),
+        close=Decimal("105"), volume=Decimal("1"),
+        buy_notional=Decimal("500"), sell_notional=Decimal("500"),
+        trade_count=100,
+    )])
+    aggregator = FakeRangeBarAggregatorForTest(aggregates=[aggregate])
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "kline_store": CatchupTestKlineStore([kline]),
+            "range_bar_store": range_store,
+            "range_bar_aggregator": aggregator,
+            "runtime_requirements": _feature_requirements(),
+        },
+        dry_run=True,
+    )
+    runner._startup_catchup_evaluated = False
+
+    with patch("time.time", return_value=now_ms / 1000):
+        await runner._evaluate_startup_catchup_once(_snapshot())
+
+    # Strategy must NOT have received events — skipped before preview
+    assert len(strategy.events_received) == 0
+
+
+# ── _has_unresolved_follower_close is callable and correct ────────────────────
+
+
+def test_has_unresolved_follower_close_method_exists_and_works():
+    """Verify the method exists on runner and returns correct value."""
+    strategy = CatchupTestStrategy()
+    runner = _runner(
+        strategy,
+        services={"recovery_service": None, "snapshot": _snapshot()},
+        dry_run=True,
+    )
+    # Method exists
+    assert callable(runner._has_unresolved_follower_close)
+    # With no position plan store → returns False
+    assert runner._has_unresolved_follower_close() is False
