@@ -373,6 +373,49 @@ class LiveRuntimeRunner:
                     end_open,
                     result.records_loaded,
                 )
+                # ── Fail fast when warmup loaded zero records ──────────────────
+                if result.records_loaded <= 0:
+                    dry_run = self.app_config.dry_run
+                    if dry_run:
+                        logger.warning(
+                            "Closed-kline warmup loaded zero records — continuing in dry-run mode | "
+                            "interval=%s warmup_days=%s",
+                            self._closed_bar_interval,
+                            self.requirements.closed_kline.warmup_days,
+                        )
+                        self.context.alerts.emit(
+                            AppAlert(
+                                subject="AetherEdge closed-kline warmup empty",
+                                content=(
+                                    f"symbol={self.app_config.symbol}\n"
+                                    f"interval={self._closed_bar_interval}\n"
+                                    f"warmup_days={self.requirements.closed_kline.warmup_days}\n"
+                                    f"records_loaded={result.records_loaded}\n"
+                                    f"start_open={start_open}\n"
+                                    f"end_open={end_open}\n"
+                                ),
+                                severity="warning",
+                            )
+                        )
+                    else:
+                        self.context.alerts.emit(
+                            AppAlert(
+                                subject="AetherEdge closed-kline warmup failed",
+                                content=(
+                                    f"symbol={self.app_config.symbol}\n"
+                                    f"interval={self._closed_bar_interval}\n"
+                                    f"warmup_days={self.requirements.closed_kline.warmup_days}\n"
+                                    f"records_loaded={result.records_loaded}\n"
+                                    f"start_open={start_open}\n"
+                                    f"end_open={end_open}\n"
+                                ),
+                                severity="error",
+                            )
+                        )
+                        raise LiveRuntimeError(
+                            f"closed-kline warmup loaded zero records "
+                            f"(symbol={self.app_config.symbol} interval={self._closed_bar_interval})"
+                        )
 
     async def _hydrate_strategy_closed_klines(self, repository, *, time_range: TimeRange) -> None:
         handler = getattr(self.context.strategy, "on_market_feature", None)

@@ -8,11 +8,30 @@ from typing import Any, Callable, Iterable, Mapping
 from src.app.alerts import AppAlert
 from src.platform.exchanges.models import Balance, MarginMode, Order, OrderQuery, OrderStatus, StopOrderQuery
 from src.platform.snapshot import PlatformSnapshot
-from src.runtime.account_sync.models import SyncExchangeContext, SyncResult
+from src.runtime.account_sync.models import KnownOrderRef, SyncExchangeContext, SyncResult
 from src.runtime.requirements import AccountStateRequirement, OrderStateRequirement
 from src.utils.log import get_logger
 
 logger = get_logger(__name__)
+
+_INVALID_ID_VALUES: frozenset[str] = frozenset({"", "none", "null", "nan", "n/a", "na", "undefined"})
+
+
+def _clean_order_id(value: object) -> str | None:
+    """Return a trimmed, valid order-id string or ``None``.
+
+    Sentinel values like ``"None"``, ``"null"``, ``""``, ``"N/A"`` that
+    originate from stored plans or legacy callbacks are rejected so they
+    never reach an exchange REST endpoint.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.lower() in _INVALID_ID_VALUES:
+        return None
+    return text
 
 
 class RequestThrottle:
@@ -187,25 +206,72 @@ class OrderStateSyncService:
                     context.state_store.save_order(order, is_stop_order=True)
                 self._mark_missing_open_orders_closed(context, orders=stop_orders, is_stop_order=True)
                 logger.info("Open stop orders synced | exchange=%s sync_type=%s count=%s", exchange, sync_type, len(stop_orders))
-            for order_id in self._known_ids(exchange, key="orders"):
-                query = OrderQuery(symbol=context.execution.symbol, order_id=order_id)
-                order = await context.execution.fetch_order_status(query)
-                request_count += 1
-                context.state_store.save_order(order, is_stop_order=False)
-            for stop_order_id in self._known_ids(exchange, key="stop_orders"):
-                query = StopOrderQuery(symbol=context.execution.symbol, stop_order_id=stop_order_id)
-                order = await context.execution.fetch_stop_order_status(query)
-                request_count += 1
-                context.state_store.save_order(order, is_stop_order=True)
+            # ── known order status fetch (with client_order_id fallback) ──
+            known_failures: list[str] = []
+            skipped_invalid: int = 0
+            for ref in self._known_ids(exchange, key="orders"):
+                if ref.order_id is None and ref.client_order_id is None:
+                    skipped_invalid += 1
+                    logger.debug("Skipped invalid known order ref | exchange=%s key=orders", exchange)
+                    continue
+                query = OrderQuery(
+                    symbol=context.execution.symbol,
+                    order_id=ref.order_id,
+                    client_order_id=ref.client_order_id,
+                )
+                try:
+                    order = await context.execution.fetch_order_status(query)
+                    request_count += 1
+                    context.state_store.save_order(order, is_stop_order=False)
+                except Exception as exc:
+                    known_failures.append(f"order:{ref.order_id or ref.client_order_id}:{exc}")
+                    logger.warning(
+                        "Known order status fetch failed | exchange=%s order_id=%s client_order_id=%s error=%s",
+                        exchange,
+                        ref.order_id,
+                        ref.client_order_id,
+                        exc,
+                    )
+            for ref in self._known_ids(exchange, key="stop_orders"):
+                if ref.order_id is None and ref.client_order_id is None:
+                    skipped_invalid += 1
+                    logger.debug("Skipped invalid known stop order ref | exchange=%s key=stop_orders", exchange)
+                    continue
+                query = StopOrderQuery(
+                    symbol=context.execution.symbol,
+                    stop_order_id=ref.order_id,
+                    client_order_id=ref.client_order_id,
+                )
+                try:
+                    order = await context.execution.fetch_stop_order_status(query)
+                    request_count += 1
+                    context.state_store.save_order(order, is_stop_order=True)
+                except Exception as exc:
+                    known_failures.append(f"stop:{ref.order_id or ref.client_order_id}:{exc}")
+                    logger.warning(
+                        "Known stop order status fetch failed | exchange=%s stop_order_id=%s client_order_id=%s error=%s",
+                        exchange,
+                        ref.order_id,
+                        ref.client_order_id,
+                        exc,
+                    )
             self._failures[exchange] = 0
-            result = _result(exchange, sync_type, request_count, start, True)
+            success = len(known_failures) == 0
+            meta: dict[str, Any] = {}
+            if known_failures:
+                meta["known_order_status_failures"] = known_failures
+            if skipped_invalid > 0:
+                meta["skipped_invalid_order_refs"] = skipped_invalid
+            result = _result(exchange, sync_type, request_count, start, success, metadata=meta)
             logger.info(
-                "Order state synced | exchange=%s sync_type=%s request_count=%s duration_ms=%s success=%s",
+                "Order state synced | exchange=%s sync_type=%s request_count=%s duration_ms=%s success=%s known_failures=%s skipped_invalid=%s",
                 result.exchange,
                 result.sync_type,
                 result.request_count,
                 result.duration_ms,
                 result.success,
+                len(known_failures),
+                skipped_invalid,
             )
             logger.info("Position plan reconciled | exchange=%s sync_type=%s", exchange, sync_type)
             return result
@@ -227,21 +293,92 @@ class OrderStateSyncService:
                 _emit(self.alert_sink, AppAlert(subject="AetherEdge order sync failures", content=f"{exchange} {sync_type} failed {failures} times: {exc}", severity="error"))
             return result
 
-    def _known_ids(self, exchange: str, *, key: str) -> tuple[str, ...]:
+    def _known_ids(self, exchange: str, *, key: str) -> tuple[KnownOrderRef, ...]:
+        """Return cleaned order references for *exchange*.
+
+        Supports three sources (in priority order):
+
+        1. **known_order_ids callback** — may return either the legacy
+           ``{"okx": {"orders": ("id1",)}}`` shape (plain strings) or the
+           newer ``{"okx": {"orders": [{"order_id": "...",
+           "client_order_id": "..."}]}}`` shape (list of dicts).
+        2. **position_plan_store** — reads ``entry_order_id`` /
+           ``entry_client_order_id`` (key="orders") or ``stop_order_id`` /
+           ``stop_client_order_id`` (key="stop_orders") from each active leg.
+        3. Falls back to an empty tuple.
+        """
         if callable(self.known_order_ids):
             payload = self.known_order_ids()
-            return tuple(item for item in payload.get(exchange, {}).get(key, ()) if item)
+            exchange_payload = payload.get(exchange, {}).get(key, ())
+            if not exchange_payload:
+                return ()
+            refs: list[KnownOrderRef] = []
+            for item in exchange_payload:
+                if isinstance(item, dict):
+                    refs.append(
+                        KnownOrderRef(
+                            order_id=_clean_order_id(item.get("order_id")),
+                            client_order_id=_clean_order_id(item.get("client_order_id")),
+                        )
+                    )
+                elif isinstance(item, (list, tuple)):
+                    # (order_id, client_order_id) pair
+                    oid = _clean_order_id(item[0]) if len(item) > 0 else None
+                    cid = _clean_order_id(item[1]) if len(item) > 1 else None
+                    refs.append(KnownOrderRef(order_id=oid, client_order_id=cid))
+                else:
+                    # Legacy plain string — map to KnownOrderRef.order_id
+                    cleaned = _clean_order_id(item)
+                    if cleaned is not None:
+                        refs.append(KnownOrderRef(order_id=cleaned))
+                    else:
+                        logger.debug(
+                            "Skipped invalid known order ref | exchange=%s key=%s raw=%r",
+                            exchange,
+                            key,
+                            item,
+                        )
+            # Deduplicate while preserving order
+            seen: set[tuple[str | None, str | None]] = set()
+            deduped: list[KnownOrderRef] = []
+            for ref in refs:
+                sig = (ref.order_id, ref.client_order_id)
+                if sig not in seen:
+                    seen.add(sig)
+                    deduped.append(ref)
+            return tuple(deduped)
+
         if self.position_plan_store is None:
             return ()
-        ids: list[str] = []
+        refs: list[KnownOrderRef] = []
         for plan in getattr(self.position_plan_store, "list_active_positions", lambda: ())():
             for leg in getattr(self.position_plan_store, "get_legs", lambda _position_id: ())(plan.position_id):
                 if leg.exchange.value != exchange:
                     continue
-                value = leg.entry_order_id if key == "orders" else leg.stop_order_id
-                if value:
-                    ids.append(value)
-        return tuple(dict.fromkeys(ids))
+                if key == "orders":
+                    oid = _clean_order_id(leg.entry_order_id)
+                    cid = _clean_order_id(leg.entry_client_order_id)
+                else:
+                    oid = _clean_order_id(leg.stop_order_id)
+                    cid = _clean_order_id(leg.stop_client_order_id)
+                if oid is None and cid is None:
+                    logger.debug(
+                        "Skipped invalid order ref from position plan | exchange=%s key=%s position_id=%s",
+                        exchange,
+                        key,
+                        plan.position_id,
+                    )
+                    continue
+                refs.append(KnownOrderRef(order_id=oid, client_order_id=cid))
+        # Deduplicate while preserving order
+        seen: set[tuple[str | None, str | None]] = set()
+        deduped: list[KnownOrderRef] = []
+        for ref in refs:
+            sig = (ref.order_id, ref.client_order_id)
+            if sig not in seen:
+                seen.add(sig)
+                deduped.append(ref)
+        return tuple(deduped)
 
     def _mark_missing_open_orders_closed(self, context: SyncExchangeContext, *, orders: Iterable[Order], is_stop_order: bool) -> None:
         marker = getattr(context.state_store, "mark_missing_open_orders_closed", None)

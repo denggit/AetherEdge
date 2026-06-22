@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from dataclasses import dataclass
 from decimal import Decimal
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from src.app import AppConfig, AppContext, AsyncAlertDispatcher, NoopAlertSink
 from src.market_data.derived import RangeBarAggregator, RangeBarBuilder
 from src.market_data.events import MarketFeatureEventType
-from src.market_data.models import RangeBar, TimeRange
+from src.market_data.models import MarketDataSet, RangeBar, TimeRange, WarmupRequest, WarmupResult
 from src.market_data.storage import SqliteTradeStore
 from src.market_data.warmup.current_rangebar import CurrentRangeBarWarmupResult
 from src.platform import Balance, ExchangeName, LeverageInfo, Order, OrderStatus, PositionMode
@@ -21,6 +23,8 @@ from src.planner import ExecutionPlanner
 from src.runtime import LiveRuntimeConfig, LiveRuntimeRunner, RuntimeMode, RuntimePhase, StrategyRuntimeRequirements
 from src.runtime.account_sync import RequestThrottle
 from src.runtime.recovery.models import RecoveryReport
+from src.runtime.requirements import ClosedKlineRequirement
+from src.runtime.runner import LiveRuntimeError
 from src.runtime.tasks import ClosedBarScheduler
 from src.signals import SignalAction, TradeSignal
 
@@ -548,3 +552,143 @@ async def test_closed_bar_poll_emits_unavailable_range_aggregate_for_live_only_p
     assert events[-1].data["context_available"] is False
     assert events[-1].data["incomplete"] is True
     assert strategy.events[-2:] == ["closed_kline", "range_aggregate"]
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Warmup fail-fast tests
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class FakeKlineStore:
+    """In-memory store that returns no rows (used for zero-record warmup tests)."""
+
+    def load(self, *, symbol: str, interval: str, time_range: TimeRange) -> list:
+        return []
+
+
+def _warmup_requirements() -> StrategyRuntimeRequirements:
+    return StrategyRuntimeRequirements(
+        closed_kline=ClosedKlineRequirement(enabled=True, interval="4h", warmup_days=30, min_records=1),
+    )
+
+
+def _zero_warmup_result(request: WarmupRequest | None = None) -> WarmupResult:
+    if request is None:
+        request = WarmupRequest(
+            symbol="ETH-USDT-PERP",
+            dataset=MarketDataSet.KLINES,
+            interval="4h",
+            time_range=TimeRange(0, H4),
+        )
+    return WarmupResult(
+        request=request,
+        gaps_before=(),
+        gaps_after=(),
+        records_loaded=0,
+        caught_up=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_runtime_fails_when_closed_kline_warmup_loads_zero_records():
+    """Live mode (dry_run=False) must raise when warmup loads 0 records."""
+    strategy = FeatureStrategy()
+    data = FakeData()
+    req = _warmup_requirements()
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": req,
+            "kline_store": FakeKlineStore(),
+        },
+        dry_run=False,
+    )
+    zero = _zero_warmup_result()
+
+    with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
+        MockSvc.return_value.warmup = AsyncMock(return_value=zero)
+        with pytest.raises(LiveRuntimeError, match="zero records"):
+            await runner._run_requirement_warmup()
+
+
+@pytest.mark.asyncio
+async def test_dry_run_allows_zero_closed_kline_warmup_with_warning():
+    """Dry-run mode must NOT raise when warmup loads 0 records (warning only)."""
+    strategy = FeatureStrategy()
+    data = FakeData()
+    req = _warmup_requirements()
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": req,
+            "kline_store": FakeKlineStore(),
+        },
+        dry_run=True,
+    )
+    zero = _zero_warmup_result()
+
+    with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
+        MockSvc.return_value.warmup = AsyncMock(return_value=zero)
+        # Must NOT raise
+        await runner._run_requirement_warmup()
+
+    # Verify warmup was recorded
+    assert runner.stats.warmup_runs >= 1
+
+
+@pytest.mark.asyncio
+async def test_live_runtime_allows_warmup_with_records():
+    """Live mode with records_loaded > 0 must proceed without error."""
+    strategy = FeatureStrategy()
+    data = FakeData()
+    req = _warmup_requirements()
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": req,
+            "kline_store": FakeKlineStore(),
+        },
+        dry_run=False,
+    )
+    result = _zero_warmup_result()
+    # Simulate warmup that loaded records successfully
+    result = WarmupResult(
+        request=result.request,
+        gaps_before=(),
+        gaps_after=(),
+        records_loaded=5,
+        caught_up=True,
+    )
+
+    with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
+        MockSvc.return_value.warmup = AsyncMock(return_value=result)
+        # Must NOT raise
+        await runner._run_requirement_warmup()
+
+    assert runner.stats.warmup_runs >= 1
+
+
+def test_closed_kline_requirement_min_records_default():
+    """Default min_records is 1."""
+    req = ClosedKlineRequirement()
+    assert req.min_records == 1
+
+
+def test_closed_kline_requirement_min_records_configurable():
+    """min_records can be set via from_mapping."""
+    req = StrategyRuntimeRequirements.from_mapping({
+        "closed_kline": {"enabled": True, "interval": "4h", "warmup_days": 365, "min_records": 1000},
+    })
+    assert req.closed_kline.min_records == 1000

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal
+from typing import Any
 
 import pytest
 
 from src.app.alerts import AppAlert
-from src.platform import Balance, ExchangeName, LeverageInfo, Order, OrderSide, OrderStatus, Position, PositionMode, PositionSide
-from src.runtime.account_sync import AccountStateSyncService, OrderStateSyncService, SyncExchangeContext
+from src.platform import Balance, ExchangeName, LeverageInfo, Order, OrderQuery, OrderSide, OrderStatus, Position, PositionMode, PositionSide, StopOrderQuery
+from src.runtime.account_sync import AccountStateSyncService, KnownOrderRef, OrderStateSyncService, SyncExchangeContext
 from src.runtime.requirements import AccountStateRequirement, OrderStateRequirement
 
 
@@ -185,3 +187,402 @@ async def test_order_sync_reconciles_missing_stop_orders_as_closed():
     assert results[0].success is True
     assert state.closed_snapshots[0]["is_stop_order"] is True
     assert state.closed_snapshots[0]["live_order_keys"] == set()
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Extended fakes for known-order-ref tests
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class TrackingExecution(FakeExecution):
+    """Execution client that records every fetch_order_status / fetch_stop_order_status query."""
+
+    def __init__(self, *, open_orders=None, open_stop_orders=None, fail_on: str | None = None) -> None:
+        super().__init__(open_orders=open_orders, open_stop_orders=open_stop_orders)
+        self.order_queries: list[OrderQuery] = []
+        self.stop_order_queries: list[StopOrderQuery] = []
+        self._fail_on = fail_on
+
+    async def fetch_order_status(self, query: OrderQuery) -> Order:
+        self.order_queries.append(query)
+        if self._fail_on and self._fail_on in (query.order_id or ""):
+            raise RuntimeError(f"simulated fetch failure for {query.order_id}")
+        return Order(
+            exchange=self.exchange,
+            symbol=query.symbol,
+            raw_symbol=query.symbol,
+            order_id=query.order_id,
+            client_order_id=query.client_order_id,
+            status=OrderStatus.FILLED,
+            quantity=Decimal("0.5"),
+            filled_quantity=Decimal("0.5"),
+        )
+
+    async def fetch_stop_order_status(self, query: StopOrderQuery) -> Order:
+        self.stop_order_queries.append(query)
+        if self._fail_on and self._fail_on in (query.stop_order_id or ""):
+            raise RuntimeError(f"simulated fetch failure for {query.stop_order_id}")
+        return Order(
+            exchange=self.exchange,
+            symbol=query.symbol,
+            raw_symbol=query.symbol,
+            order_id=query.stop_order_id,
+            client_order_id=query.client_order_id,
+            status=OrderStatus.NEW,
+        )
+
+
+@dataclass
+class FakeLeg:
+    """Minimal leg with just the fields _known_ids reads."""
+    position_id: str = "p1"
+    exchange: ExchangeName = ExchangeName.OKX
+    entry_order_id: str | None = None
+    entry_client_order_id: str | None = None
+    stop_order_id: str | None = None
+    stop_client_order_id: str | None = None
+
+
+@dataclass
+class FakePlan:
+    position_id: str = "p1"
+
+
+class FakePositionPlanStore:
+    """Minimal store that returns pre-configured legs."""
+
+    def __init__(self, legs: list[FakeLeg] | None = None) -> None:
+        self._legs = legs or []
+
+    def list_active_positions(self) -> list[FakePlan]:
+        if not self._legs:
+            return []
+        return [FakePlan(position_id=self._legs[0].position_id)]
+
+    def get_legs(self, position_id: str) -> list[FakeLeg]:
+        return [leg for leg in self._legs if leg.position_id == position_id]
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Known-order-ref tests
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_order_sync_skips_invalid_known_order_ids():
+    """Invalid order_id / client_order_id values never reach the exchange."""
+    state = MemoryState()
+    execution = TrackingExecution()
+    account = FakeAccount()
+
+    def known() -> dict[str, Any]:
+        return {
+            "okx": {
+                "orders": ["", "None", "null", "nan", "N/A", "undefined", None, "   "],  # type: ignore[list-item]
+                "stop_orders": ["", "None", "null"],
+            }
+        }
+
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=account, execution=execution, state_store=state),),
+        config=OrderStateRequirement(sync_position=False, sync_open_orders=False, sync_open_stop_orders=False),
+        active_check=lambda: True,
+        known_order_ids=known,
+    )
+
+    results = await service.sync_once()
+
+    assert results[0].success is True
+    assert len(execution.order_queries) == 0, f"expected 0 order queries, got {len(execution.order_queries)}"
+    assert len(execution.stop_order_queries) == 0, f"expected 0 stop order queries, got {len(execution.stop_order_queries)}"
+
+
+@pytest.mark.asyncio
+async def test_order_sync_skips_invalid_known_order_ids_from_position_plan_store():
+    """Position plan legs with all-invalid refs are skipped."""
+    state = MemoryState()
+    execution = TrackingExecution()
+    account = FakeAccount()
+    store = FakePositionPlanStore(
+        legs=[
+            FakeLeg(entry_order_id=None, entry_client_order_id="", stop_order_id="None", stop_client_order_id="null"),
+        ]
+    )
+
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=account, execution=execution, state_store=state),),
+        config=OrderStateRequirement(sync_position=False, sync_open_orders=False, sync_open_stop_orders=False),
+        active_check=lambda: True,
+        position_plan_store=store,
+    )
+
+    results = await service.sync_once()
+
+    assert results[0].success is True
+    assert len(execution.order_queries) == 0
+    assert len(execution.stop_order_queries) == 0
+
+
+@pytest.mark.asyncio
+async def test_order_sync_fetches_known_order_by_client_order_id_when_order_id_missing():
+    """When order_id is None but client_order_id is valid, use client_order_id."""
+    state = MemoryState()
+    execution = TrackingExecution()
+    account = FakeAccount()
+
+    def known() -> dict[str, Any]:
+        return {
+            "okx": {
+                "orders": [{"order_id": None, "client_order_id": "client-abc"}],
+                "stop_orders": [{"order_id": None, "client_order_id": "stop-client-xyz"}],
+            }
+        }
+
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=account, execution=execution, state_store=state),),
+        config=OrderStateRequirement(sync_position=False, sync_open_orders=False, sync_open_stop_orders=False),
+        active_check=lambda: True,
+        known_order_ids=known,
+    )
+
+    results = await service.sync_once()
+
+    assert results[0].success is True
+    assert len(execution.order_queries) == 1
+    assert execution.order_queries[0].client_order_id == "client-abc"
+    assert execution.order_queries[0].order_id is None
+    assert len(execution.stop_order_queries) == 1
+    assert execution.stop_order_queries[0].client_order_id == "stop-client-xyz"
+    assert execution.stop_order_queries[0].stop_order_id is None
+
+
+@pytest.mark.asyncio
+async def test_order_sync_fetches_known_order_by_client_order_id_from_position_plan():
+    """Position plan leg with only client_order_id set still queries."""
+    state = MemoryState()
+    execution = TrackingExecution()
+    account = FakeAccount()
+    store = FakePositionPlanStore(
+        legs=[
+            FakeLeg(
+                entry_order_id=None,
+                entry_client_order_id="entry-client-1",
+                stop_order_id=None,
+                stop_client_order_id="stop-client-1",
+            ),
+        ]
+    )
+
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=account, execution=execution, state_store=state),),
+        config=OrderStateRequirement(sync_position=False, sync_open_orders=False, sync_open_stop_orders=False),
+        active_check=lambda: True,
+        position_plan_store=store,
+    )
+
+    results = await service.sync_once()
+
+    assert results[0].success is True
+    assert len(execution.order_queries) == 1
+    assert execution.order_queries[0].client_order_id == "entry-client-1"
+    assert execution.order_queries[0].order_id is None
+    assert len(execution.stop_order_queries) == 1
+    assert execution.stop_order_queries[0].client_order_id == "stop-client-1"
+    assert execution.stop_order_queries[0].stop_order_id is None
+
+
+@pytest.mark.asyncio
+async def test_order_sync_known_order_status_failure_does_not_abort_exchange_sync():
+    """A single known order fetch failure is recorded but does not abort the entire exchange sync."""
+    state = MemoryState()
+    execution = TrackingExecution(fail_on="bad-order")
+    account = FakeAccount()
+
+    def known() -> dict[str, Any]:
+        return {
+            "okx": {
+                "orders": ["bad-order", "good-order"],
+                "stop_orders": ["stop-1"],
+            }
+        }
+
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=account, execution=execution, state_store=state),),
+        config=OrderStateRequirement(sync_position=True, sync_open_orders=True, sync_open_stop_orders=True),
+        active_check=lambda: True,
+        known_order_ids=known,
+    )
+
+    results = await service.sync_once()
+
+    # The overall result should be unsuccessful because a known fetch failed
+    assert results[0].success is False
+    # But the sync did NOT raise — it returned a result
+    assert "known_order_status_failures" in results[0].metadata
+    assert any("bad-order" in f for f in results[0].metadata["known_order_status_failures"])
+    # good-order was still attempted (request_count includes it)
+    assert len(execution.order_queries) == 2
+    # stop order was still attempted
+    assert len(execution.stop_order_queries) == 1
+    # open orders and positions synced normally
+    assert "fetch_open_orders" in execution.calls
+    assert "fetch_open_stop_orders" in execution.calls
+    assert "fetch_positions" in account.calls
+
+
+@pytest.mark.asyncio
+async def test_order_sync_success_when_all_known_refs_fetch_ok():
+    """When all known refs are valid and fetch successfully, result.success is True."""
+    state = MemoryState()
+    execution = TrackingExecution()
+    account = FakeAccount()
+
+    def known() -> dict[str, Any]:
+        return {
+            "okx": {
+                "orders": ["o1", "o2"],
+                "stop_orders": ["s1"],
+            }
+        }
+
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=account, execution=execution, state_store=state),),
+        config=OrderStateRequirement(sync_position=False, sync_open_orders=False, sync_open_stop_orders=False),
+        active_check=lambda: True,
+        known_order_ids=known,
+    )
+
+    results = await service.sync_once()
+
+    assert results[0].success is True
+    assert len(execution.order_queries) == 2
+    assert len(execution.stop_order_queries) == 1
+    assert "known_order_status_failures" not in results[0].metadata
+
+
+@pytest.mark.asyncio
+async def test_order_sync_skips_cleans_and_fetches_mixed_valid_invalid_known_ids():
+    """Mixed bag of valid, invalid, and sentinel IDs — valid ones fetch, invalid ones skip."""
+    state = MemoryState()
+    execution = TrackingExecution()
+    account = FakeAccount()
+
+    def known() -> dict[str, Any]:
+        return {
+            "okx": {
+                "orders": ["real-order-1", "", "None", "real-order-2"],
+                "stop_orders": [None, "real-stop-1", "null"],
+            }
+        }
+
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=account, execution=execution, state_store=state),),
+        config=OrderStateRequirement(sync_position=False, sync_open_orders=False, sync_open_stop_orders=False),
+        active_check=lambda: True,
+        known_order_ids=known,
+    )
+
+    results = await service.sync_once()
+
+    assert results[0].success is True
+    order_ids_queried = [q.order_id for q in execution.order_queries]
+    assert order_ids_queried == ["real-order-1", "real-order-2"]
+    stop_ids_queried = [q.stop_order_id for q in execution.stop_order_queries]
+    assert stop_ids_queried == ["real-stop-1"]
+    # Invalid legacy items ("", "None", None, "null") are filtered out
+    # inside _known_ids() — they never produce KnownOrderRef objects,
+    # so skipped_invalid_order_refs in sync_context may be 0.
+    # The important thing: only valid refs reached the exchange.
+    assert len(execution.order_queries) == 2
+    assert len(execution.stop_order_queries) == 1
+
+
+@pytest.mark.asyncio
+async def test_known_ids_deduplicates_order_refs():
+    """Duplicate order refs from the callback are deduplicated."""
+    state = MemoryState()
+    execution = TrackingExecution()
+    account = FakeAccount()
+
+    def known() -> dict[str, Any]:
+        return {
+            "okx": {
+                "orders": ["dup-1", "dup-1", "dup-2"],
+            }
+        }
+
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=account, execution=execution, state_store=state),),
+        config=OrderStateRequirement(sync_position=False, sync_open_orders=False, sync_open_stop_orders=False),
+        active_check=lambda: True,
+        known_order_ids=known,
+    )
+
+    results = await service.sync_once()
+
+    assert results[0].success is True
+    assert len(execution.order_queries) == 2
+    order_ids_queried = [q.order_id for q in execution.order_queries]
+    assert sorted(order_ids_queried) == ["dup-1", "dup-2"]
+
+
+@pytest.mark.asyncio
+async def test_known_ids_legacy_tuple_pair_format():
+    """Legacy (order_id, client_order_id) tuple pair format is supported."""
+    state = MemoryState()
+    execution = TrackingExecution()
+    account = FakeAccount()
+
+    def known() -> dict[str, Any]:
+        return {
+            "okx": {
+                "orders": [("oid-1", "cid-1")],
+                "stop_orders": [("soid-1", "scid-1")],
+            }
+        }
+
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=account, execution=execution, state_store=state),),
+        config=OrderStateRequirement(sync_position=False, sync_open_orders=False, sync_open_stop_orders=False),
+        active_check=lambda: True,
+        known_order_ids=known,
+    )
+
+    results = await service.sync_once()
+
+    assert results[0].success is True
+    assert len(execution.order_queries) == 1
+    assert execution.order_queries[0].order_id == "oid-1"
+    assert execution.order_queries[0].client_order_id == "cid-1"
+
+
+@pytest.mark.asyncio
+async def test_clean_order_id_helper():
+    """Unit-test _clean_order_id directly."""
+    from src.runtime.account_sync.service import _clean_order_id
+
+    assert _clean_order_id(None) is None
+    assert _clean_order_id("") is None
+    assert _clean_order_id("   ") is None
+    assert _clean_order_id("None") is None
+    assert _clean_order_id("null") is None
+    assert _clean_order_id("N/A") is None
+    assert _clean_order_id("nan") is None
+    assert _clean_order_id("undefined") is None
+    assert _clean_order_id("Na") is None
+    assert _clean_order_id("  None  ") is None
+    assert _clean_order_id("real-id") == "real-id"
+    assert _clean_order_id("  12345  ") == "12345"
+    assert _clean_order_id(12345) == "12345"
+
+
+@pytest.mark.asyncio
+async def test_known_order_ref_dataclass():
+    """KnownOrderRef is a frozen dataclass with optional fields."""
+    ref = KnownOrderRef(order_id="abc", client_order_id="xyz")
+    assert ref.order_id == "abc"
+    assert ref.client_order_id == "xyz"
+
+    ref2 = KnownOrderRef()
+    assert ref2.order_id is None
+    assert ref2.client_order_id is None

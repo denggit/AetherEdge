@@ -16,6 +16,18 @@ class SyncExchangeContext:
 
 
 @dataclass(frozen=True)
+class KnownOrderRef:
+    """Cleaned reference to a known exchange order.
+
+    At least one of *order_id* or *client_order_id* must be non‑None after
+    cleaning; the caller should skip refs where both are ``None``.
+    """
+
+    order_id: str | None = None
+    client_order_id: str | None = None
+
+
+@dataclass(frozen=True)
 class SyncResult:
     exchange: str
     sync_type: str
