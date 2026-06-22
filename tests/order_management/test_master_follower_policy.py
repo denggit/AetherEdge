@@ -383,3 +383,296 @@ async def test_close_plan_marks_follower_closed_only_when_filled(tmp_path):
     plan = plan_store.get_position(position_id)
     assert plan is not None
     assert plan.status == PositionPlanStatus.CLOSED
+
+
+# ── normal_close master-not-filled guard tests ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_normal_close_does_not_mark_master_closed_required_when_master_result_not_filled(tmp_path):
+    """When normal_close master result is NOT FILLED, the position plan must NOT
+    enter MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED, master leg must NOT be marked
+    CLOSED, and follower leg must NOT be marked FOLLOWER_CLOSE_FAILED."""
+    from src.order_management import (
+        LegPlan,
+        LegRole,
+        LegSyncStatus,
+        PositionPlan,
+        PositionPlanStatus,
+        SqlitePositionPlanStore,
+    )
+
+    repo = SqliteOrderJournalStore(tmp_path / "journal.sqlite3")
+    plan_store = SqlitePositionPlanStore(tmp_path / "plan.sqlite3")
+    position_id = "p-nc-master-not-filled-1"
+
+    # Pre-create ACTIVE position plan with both legs OPEN.
+    plan_store.upsert_position(
+        PositionPlan(
+            position_id=position_id,
+            strategy_id="v8",
+            entry_engine="MOMENTUM_V3",
+            side="long",
+            status=PositionPlanStatus.ACTIVE,
+            canonical_stop_price=None,
+            master_exchange=ExchangeName.OKX,
+            master_target_qty_base=Decimal("0.1"),
+            master_filled_qty_base=Decimal("0.1"),
+        )
+    )
+    plan_store.upsert_leg(
+        LegPlan(
+            position_id=position_id,
+            exchange=ExchangeName.OKX,
+            role=LegRole.MASTER,
+            target_qty_base=Decimal("0.1"),
+            filled_qty_base=Decimal("0.1"),
+            sync_status=LegSyncStatus.OPEN,
+        )
+    )
+    plan_store.upsert_leg(
+        LegPlan(
+            position_id=position_id,
+            exchange=ExchangeName.BINANCE,
+            role=LegRole.FOLLOWER,
+            target_qty_base=Decimal("0.08"),
+            filled_qty_base=Decimal("0.08"),
+            sync_status=LegSyncStatus.OPEN,
+        )
+    )
+
+    # Master close result: ok=True but status=NEW, filled_quantity=0
+    okx = _FakeFilledCheckClient(
+        ExchangeName.OKX, ok=True, status=OrderStatus.NEW, filled_quantity=Decimal("0")
+    )
+    # Follower result: missing or skipped
+    binance = _FakeFilledCheckClient(
+        ExchangeName.BINANCE, ok=False, status=OrderStatus.NEW, filled_quantity=Decimal("0")
+    )
+    policy = MasterFollowerExecutionPolicy(
+        master_exchange=ExchangeName.OKX,
+        follower_exchanges=(ExchangeName.BINANCE,),
+    )
+    coordinator = MultiExchangeOrderCoordinator(
+        clients=[okx, binance], repository=repo, master_follower_policy=policy,
+        position_plan_store=plan_store,
+    )
+    close_signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.CLOSE_LONG,
+        quantity=Decimal("0.1"),
+        metadata={
+            "execution_purpose": "normal_close",
+            "target_exchanges": ["okx", "binance"],
+            "position_id": position_id,
+        },
+    )
+    intent = OrderIntent(
+        intent_id="nc-not-filled", strategy_id="v8", signal=close_signal,
+        target_exchanges=(ExchangeName.OKX, ExchangeName.BINANCE),
+    )
+
+    await coordinator.execute(intent)
+
+    # Master leg must NOT be CLOSED.
+    legs = {leg.exchange: leg for leg in plan_store.get_legs(position_id)}
+    master_leg = legs[ExchangeName.OKX]
+    assert master_leg.sync_status != LegSyncStatus.CLOSED
+    # Follower leg must NOT be FOLLOWER_CLOSE_FAILED.
+    follower_leg = legs[ExchangeName.BINANCE]
+    assert follower_leg.sync_status != LegSyncStatus.FOLLOWER_CLOSE_FAILED
+    # Position plan must NOT be MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED.
+    plan = plan_store.get_position(position_id)
+    assert plan is not None
+    assert plan.status != PositionPlanStatus.MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED
+    assert plan.status == PositionPlanStatus.ACTIVE
+
+
+@pytest.mark.asyncio
+async def test_normal_close_master_filled_follower_failed_enters_master_closed_follower_required(tmp_path):
+    """When normal_close master result IS FILLED but follower is NOT filled,
+    master leg is marked CLOSED, follower leg FOLLOWER_CLOSE_FAILED, and
+    plan enters MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED."""
+    from src.order_management import (
+        LegPlan,
+        LegRole,
+        LegSyncStatus,
+        PositionPlan,
+        PositionPlanStatus,
+        SqlitePositionPlanStore,
+    )
+
+    repo = SqliteOrderJournalStore(tmp_path / "journal.sqlite3")
+    plan_store = SqlitePositionPlanStore(tmp_path / "plan.sqlite3")
+    position_id = "p-nc-master-filled-follower-failed-1"
+
+    # Pre-create ACTIVE position plan with both legs OPEN.
+    plan_store.upsert_position(
+        PositionPlan(
+            position_id=position_id,
+            strategy_id="v8",
+            entry_engine="MOMENTUM_V3",
+            side="long",
+            status=PositionPlanStatus.ACTIVE,
+            canonical_stop_price=None,
+            master_exchange=ExchangeName.OKX,
+            master_target_qty_base=Decimal("0.1"),
+            master_filled_qty_base=Decimal("0.1"),
+        )
+    )
+    plan_store.upsert_leg(
+        LegPlan(
+            position_id=position_id,
+            exchange=ExchangeName.OKX,
+            role=LegRole.MASTER,
+            target_qty_base=Decimal("0.1"),
+            filled_qty_base=Decimal("0.1"),
+            sync_status=LegSyncStatus.OPEN,
+        )
+    )
+    plan_store.upsert_leg(
+        LegPlan(
+            position_id=position_id,
+            exchange=ExchangeName.BINANCE,
+            role=LegRole.FOLLOWER,
+            target_qty_base=Decimal("0.08"),
+            filled_qty_base=Decimal("0.08"),
+            sync_status=LegSyncStatus.OPEN,
+        )
+    )
+
+    # Master close result: ok=True, status=FILLED, filled_quantity>0
+    okx = _FakeFilledCheckClient(
+        ExchangeName.OKX, ok=True, status=OrderStatus.FILLED, filled_quantity=Decimal("0.1")
+    )
+    # Follower close result: ok=False, status=NEW
+    binance = _FakeFilledCheckClient(
+        ExchangeName.BINANCE, ok=False, status=OrderStatus.NEW, filled_quantity=Decimal("0")
+    )
+    policy = MasterFollowerExecutionPolicy(
+        master_exchange=ExchangeName.OKX,
+        follower_exchanges=(ExchangeName.BINANCE,),
+    )
+    coordinator = MultiExchangeOrderCoordinator(
+        clients=[okx, binance], repository=repo, master_follower_policy=policy,
+        position_plan_store=plan_store,
+    )
+    close_signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.CLOSE_LONG,
+        quantity=Decimal("0.1"),
+        metadata={
+            "execution_purpose": "normal_close",
+            "target_exchanges": ["okx", "binance"],
+            "position_id": position_id,
+        },
+    )
+    intent = OrderIntent(
+        intent_id="nc-master-filled", strategy_id="v8", signal=close_signal,
+        target_exchanges=(ExchangeName.OKX, ExchangeName.BINANCE),
+    )
+
+    await coordinator.execute(intent)
+
+    # Master leg must be CLOSED.
+    legs = {leg.exchange: leg for leg in plan_store.get_legs(position_id)}
+    master_leg = legs[ExchangeName.OKX]
+    assert master_leg.sync_status == LegSyncStatus.CLOSED
+    # Follower leg must be FOLLOWER_CLOSE_FAILED.
+    follower_leg = legs[ExchangeName.BINANCE]
+    assert follower_leg.sync_status == LegSyncStatus.FOLLOWER_CLOSE_FAILED
+    # Position plan must be MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED.
+    plan = plan_store.get_position(position_id)
+    assert plan is not None
+    assert plan.status == PositionPlanStatus.MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED
+
+
+@pytest.mark.asyncio
+async def test_normal_close_master_result_missing_does_not_escalate(tmp_path):
+    """When normal_close has NO master result at all (missing), the position
+    plan must stay ACTIVE and no follower should be marked CLOSE_FAILED."""
+    from src.order_management import (
+        LegPlan,
+        LegRole,
+        LegSyncStatus,
+        PositionPlan,
+        PositionPlanStatus,
+        SqlitePositionPlanStore,
+    )
+
+    repo = SqliteOrderJournalStore(tmp_path / "journal.sqlite3")
+    plan_store = SqlitePositionPlanStore(tmp_path / "plan.sqlite3")
+    position_id = "p-nc-master-missing-1"
+
+    plan_store.upsert_position(
+        PositionPlan(
+            position_id=position_id,
+            strategy_id="v8",
+            entry_engine="MOMENTUM_V3",
+            side="long",
+            status=PositionPlanStatus.ACTIVE,
+            canonical_stop_price=None,
+            master_exchange=ExchangeName.OKX,
+            master_target_qty_base=Decimal("0.1"),
+            master_filled_qty_base=Decimal("0.1"),
+        )
+    )
+    plan_store.upsert_leg(
+        LegPlan(
+            position_id=position_id,
+            exchange=ExchangeName.OKX,
+            role=LegRole.MASTER,
+            target_qty_base=Decimal("0.1"),
+            filled_qty_base=Decimal("0.1"),
+            sync_status=LegSyncStatus.OPEN,
+        )
+    )
+    plan_store.upsert_leg(
+        LegPlan(
+            position_id=position_id,
+            exchange=ExchangeName.BINANCE,
+            role=LegRole.FOLLOWER,
+            target_qty_base=Decimal("0.08"),
+            filled_qty_base=Decimal("0.08"),
+            sync_status=LegSyncStatus.OPEN,
+        )
+    )
+
+    # Only a follower client is available; master result is entirely missing.
+    binance = _FakeFilledCheckClient(
+        ExchangeName.BINANCE, ok=True, status=OrderStatus.FILLED, filled_quantity=Decimal("0.08")
+    )
+    policy = MasterFollowerExecutionPolicy(
+        master_exchange=ExchangeName.OKX,
+        follower_exchanges=(ExchangeName.BINANCE,),
+    )
+    coordinator = MultiExchangeOrderCoordinator(
+        clients=[binance], repository=repo, master_follower_policy=policy,
+        position_plan_store=plan_store,
+    )
+    close_signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.CLOSE_LONG,
+        quantity=Decimal("0.1"),
+        metadata={
+            "execution_purpose": "normal_close",
+            "target_exchanges": ["okx", "binance"],
+            "position_id": position_id,
+        },
+    )
+    intent = OrderIntent(
+        intent_id="nc-master-missing", strategy_id="v8", signal=close_signal,
+        target_exchanges=(ExchangeName.OKX, ExchangeName.BINANCE),
+    )
+
+    await coordinator.execute(intent)
+
+    legs = {leg.exchange: leg for leg in plan_store.get_legs(position_id)}
+    # Master must remain OPEN (no result → not CLOSED).
+    assert legs[ExchangeName.OKX].sync_status == LegSyncStatus.OPEN
+    # Follower must NOT be FOLLOWER_CLOSE_FAILED.
+    assert legs[ExchangeName.BINANCE].sync_status != LegSyncStatus.FOLLOWER_CLOSE_FAILED
+    # Plan must stay ACTIVE.
+    plan = plan_store.get_position(position_id)
+    assert plan is not None
+    assert plan.status == PositionPlanStatus.ACTIVE

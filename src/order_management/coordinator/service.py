@@ -6,7 +6,7 @@ from decimal import Decimal
 from typing import Sequence
 
 from src.order_management.idempotency.client_order_id import DeterministicClientOrderIdFactory
-from src.order_management.models import ExchangeOrderResult, OrderIntent, OrderIntentStatus
+from src.order_management.models import ExchangeOrderResult, OrderIntent, OrderIntentStatus, OrderJournalEvent
 from src.order_management.position_plan import LegPlan, LegRole, LegSyncStatus, PositionPlan, PositionPlanStatus
 from src.order_management.ports import ClientOrderIdFactory, DuplicateOrderGuard, OrderIntentRepository
 from src.order_management.quantity import NativeQuantityConverter
@@ -112,8 +112,6 @@ class MultiExchangeOrderCoordinator:
             decision = self.master_follower_evaluator.evaluate(intent=intent, results=results)
             add_event = getattr(self.repository, "add_event", None)
             if callable(add_event):
-                from src.order_management.models import OrderJournalEvent
-
                 add_event(
                     OrderJournalEvent(
                         intent_id=intent.intent_id,
@@ -262,20 +260,48 @@ class MultiExchangeOrderCoordinator:
 
         if purpose == "normal_close":
             master_result = by_exchange.get(master_exchange)
-            if master_result is not None and _result_is_filled(master_result):
-                self.position_plan_store.update_leg_sync_status(
-                    position_id=position_id, exchange=master_exchange, sync_status=LegSyncStatus.CLOSED,
-                )
-            elif master_result is not None:
-                # Master close was attempted but not filled — leave leg status
-                # unchanged so the runtime can retry or alert.
+            master_filled = master_result is not None and _result_is_filled(master_result)
+            if not master_filled:
+                # Master close was attempted but NOT filled.
+                # We must NOT mark master CLOSED, must NOT mark follower
+                # FOLLOWER_CLOSE_FAILED, and must NOT enter
+                # MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED.
+                # The position plan stays ACTIVE so the runtime can retry
+                # or alert.
                 logger.warning(
-                    "Master close result not filled | position_id=%s exchange=%s status=%s filled_qty=%s",
+                    "Master close not filled — position plan unchanged | position_id=%s exchange=%s status=%s filled_qty=%s ok=%s error=%s",
                     position_id,
                     master_exchange.value,
-                    master_result.status.value if master_result.status else "unknown",
-                    str(master_result.filled_quantity or Decimal("0")),
+                    master_result.status.value if master_result is not None and master_result.status else "missing",
+                    str(master_result.filled_quantity) if master_result is not None and master_result.filled_quantity is not None else "missing",
+                    master_result.ok if master_result is not None else "missing",
+                    master_result.error if master_result is not None else "missing result",
                 )
+                add_event = getattr(self.repository, "add_event", None)
+                if callable(add_event):
+                    add_event(
+                        OrderJournalEvent(
+                            intent_id=intent.intent_id,
+                            status=OrderIntentStatus.PARTIALLY_SUBMITTED,
+                            message="master_close_not_filled",
+                            exchange=master_exchange,
+                            metadata={
+                                "position_id": position_id,
+                                "master_exchange": master_exchange.value,
+                                "status": master_result.status.value if master_result is not None and master_result.status else "missing",
+                                "filled_quantity": str(master_result.filled_quantity) if master_result is not None and master_result.filled_quantity is not None else "0",
+                                "ok": master_result.ok if master_result is not None else False,
+                                "error": master_result.error if master_result is not None else "missing result",
+                            },
+                        )
+                    )
+                return
+
+            # Master close FILLED — mark CLOSED before processing followers.
+            self.position_plan_store.update_leg_sync_status(
+                position_id=position_id, exchange=master_exchange, sync_status=LegSyncStatus.CLOSED,
+            )
+
             for exchange in intent.target_exchanges:
                 if exchange == master_exchange:
                     continue
@@ -293,6 +319,7 @@ class MultiExchangeOrderCoordinator:
                     self.position_plan_store.update_leg_sync_status(
                         position_id=position_id, exchange=exchange, sync_status=LegSyncStatus.FOLLOWER_CLOSE_FAILED,
                     )
+
             has_unresolved = False
             for leg in self.position_plan_store.get_legs(position_id):
                 if leg.exchange == master_exchange or leg.role == LegRole.MASTER:

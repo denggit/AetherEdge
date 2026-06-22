@@ -794,3 +794,77 @@ def test_runtime_does_not_call_strategy_private_follower_close_method() -> None:
     assert "_follower_close_signals_after_master_close" not in content, (
         "runner.py must not call strategy._follower_close_signals_after_master_close"
     )
+
+
+@pytest.mark.asyncio
+async def test_master_close_not_filled_does_not_create_unresolved_follower_retry_signal(tmp_path) -> None:
+    """When normal_close master is NOT filled, the plan stays ACTIVE and
+    _build_unresolved_follower_close_signals() must return an empty list —
+    no follower-only close retry should be triggered."""
+    from src.order_management import (
+        LegPlan, LegRole, LegSyncStatus, PositionPlan, PositionPlanStatus,
+        SqlitePositionPlanStore,
+    )
+
+    plan_store = SqlitePositionPlanStore(tmp_path / "plan.sqlite3")
+    position_id = "p-active-1"
+
+    # Simulate a position plan still ACTIVE (master close not filled).
+    plan_store.upsert_position(
+        PositionPlan(
+            position_id=position_id,
+            strategy_id="eth_lf_portfolio_v8",
+            entry_engine="MOMENTUM_V3",
+            side="long",
+            status=PositionPlanStatus.ACTIVE,
+            canonical_stop_price=None,
+            master_exchange=ExchangeName.OKX,
+            master_target_qty_base=Decimal("0.1"),
+            master_filled_qty_base=Decimal("0.1"),
+        )
+    )
+    plan_store.upsert_leg(
+        LegPlan(
+            position_id=position_id,
+            exchange=ExchangeName.OKX,
+            role=LegRole.MASTER,
+            target_qty_base=Decimal("0.1"),
+            filled_qty_base=Decimal("0.1"),
+            sync_status=LegSyncStatus.OPEN,
+        )
+    )
+    plan_store.upsert_leg(
+        LegPlan(
+            position_id=position_id,
+            exchange=ExchangeName.BINANCE,
+            role=LegRole.FOLLOWER,
+            target_qty_base=Decimal("0.08"),
+            filled_qty_base=Decimal("0.08"),
+            sync_status=LegSyncStatus.OPEN,
+        )
+    )
+
+    strategy = Strategy()
+    await strategy.on_start(_snapshot())
+    cfg = _app_config(dry_run=False)
+    runner = LiveRuntimeRunner(
+        app_config=cfg,
+        app_context=AppContext(
+            data=_FakeData(),
+            execution=object(),
+            state_store=_FakeStateStore(),
+            strategy=strategy,
+            planner=ExecutionPlanner(),
+            alerts=AsyncAlertDispatcher(NoopAlertSink()),
+        ),
+        runtime_config=LiveRuntimeConfig(app=cfg, mode=RuntimeMode.LIVE_RUNTIME, warmup_enabled=False),
+        services={
+            "runtime_requirements": StrategyRuntimeRequirements.from_mapping({}),
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "position_plan_store": plan_store,
+        },
+    )
+
+    signals = runner._build_unresolved_follower_close_signals()
+    assert signals == []  # ACTIVE plans must not generate follower retry signals
