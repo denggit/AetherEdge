@@ -43,11 +43,5 @@
   },
   "risk": {
     "global_risk_scale": "1.3"
-  },
-  "readonly_parity": {
-    "enabled": false,
-    "reference_signal_audit_csv": "",
-    "timestamp_key": "open_time_ms",
-    "decimal_tolerance": "0.000001"
   }
 }

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from decimal import Decimal
 
 import pytest
@@ -321,86 +320,3 @@ async def test_strategy_router_flow_records_routed_signal_without_emitting_order
     assert ready.micro.signal_side is Side.LONG
     assert ready.micro.contra is True
     assert ready.final_entry_risk_scale == Decimal("0.650")
-
-from strategies.eth_lf_portfolio_v8.persistence.parity_audit import ReadonlyParityChecker, SignalAuditReference
-
-
-def _write_reference_csv(path, *, timestamp="2023-11-14 18:13:20", signal=0, selected_engine="NONE", priority=0, micro_action="NO_SIGNAL") -> None:
-    path.write_text(
-        "timestamp,signal,selected_engine,selected_priority,micro_context_available,micro_aligned,micro_contra,micro_entry_risk_scale,final_entry_risk_scale,micro_filter_action\n"
-        f"{timestamp},{signal},{selected_engine},{priority},False,False,False,1,1.3,{micro_action}\n",
-        encoding="utf-8",
-    )
-
-
-def test_readonly_parity_checker_matches_reference_row(tmp_path) -> None:
-    reference_path = tmp_path / "signal_audit.csv"
-    _write_reference_csv(reference_path)
-    reference = SignalAuditReference.from_csv(reference_path)
-    checker = ReadonlyParityChecker(reference, timestamp_key="open_time_ms")
-    close_time_ms = 1_700_000_000_000
-    kline = _ctx_kline(_closed_kline(close_time_ms))
-    aggregate = _ctx(_range_aggregate(close_time_ms))
-    micro = MicroContextEngine(MicroContextConfig(mode="soft")).evaluate(signal_side=Side.FLAT, aggregate=aggregate)
-    comparison = checker.compare(BarReadyContext(kline=kline, range_aggregate=aggregate, micro=micro, global_risk_scale=Decimal("1.3")))
-
-    assert comparison.matched is True
-    assert checker.mismatch_count == 0
-
-
-def test_readonly_parity_checker_reports_mismatch(tmp_path) -> None:
-    reference_path = tmp_path / "signal_audit.csv"
-    _write_reference_csv(reference_path, signal=1, selected_engine="MOMENTUM_V3", priority=150)
-    reference = SignalAuditReference.from_csv(reference_path)
-    checker = ReadonlyParityChecker(reference, timestamp_key="open_time_ms")
-    close_time_ms = 1_700_000_000_000
-    kline = _ctx_kline(_closed_kline(close_time_ms))
-    aggregate = _ctx(_range_aggregate(close_time_ms))
-    micro = MicroContextEngine(MicroContextConfig(mode="soft")).evaluate(signal_side=Side.FLAT, aggregate=aggregate)
-    comparison = checker.compare(BarReadyContext(kline=kline, range_aggregate=aggregate, micro=micro, global_risk_scale=Decimal("1.3")))
-
-    assert comparison.matched is False
-    assert "signal" in comparison.mismatches
-    assert "selected_engine" in comparison.mismatches
-
-
-@pytest.mark.asyncio
-async def test_strategy_readonly_parity_mode_records_comparison(tmp_path) -> None:
-    reference_path = tmp_path / "signal_audit.csv"
-    _write_reference_csv(reference_path)
-    config_path = tmp_path / "config.json"
-    base = Strategy().config
-    # Keep a minimal config file so the plugin is exercised through normal config parsing.
-    config_path.write_text(
-        json.dumps(
-            {
-                "strategy_id": base.strategy_id,
-                "symbol": base.symbol,
-                "runtime_requirements": base.runtime_requirements,
-                "micro_context": {"mode": "soft"},
-                "risk": {"global_risk_scale": "1.3"},
-                "readonly_parity": {
-                    "enabled": True,
-                    "reference_signal_audit_csv": str(reference_path),
-                    "timestamp_key": "open_time_ms",
-                },
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    strategy = Strategy(config_path=config_path)
-    close_time_ms = 1_700_000_000_000
-
-    await strategy.on_market_feature(_closed_kline(close_time_ms))
-    signals = await strategy.on_market_feature(_range_aggregate(close_time_ms))
-
-    assert signals == []
-    assert len(strategy.parity_results) == 1
-    assert strategy.parity_results[0].matched is True
-
-
-def _ctx_kline(event: MarketFeatureEvent):
-    from strategies.eth_lf_portfolio_v8.features.feature_frame import parse_closed_kline
-
-    return parse_closed_kline(event)

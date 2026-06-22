@@ -11,5 +11,5 @@ class BearV3OnlyEngine:
     priority: int = 90
 
     def evaluate(self, context: BarReadyContext) -> EngineSignal | None:
-        # Full V8 Bear V3 Only parity is migrated in the next package.
+        # Full V8 Bear V3 Only signal rules are migrated in the next package.
         return None

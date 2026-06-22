@@ -11,5 +11,5 @@ class MomentumV3Engine:
     priority: int = 150
 
     def evaluate(self, context: BarReadyContext) -> EngineSignal | None:
-        # Full V8 Momentum V3 parity is migrated in the next package.
+        # Full V8 Momentum V3 signal rules are migrated in the next package.
         return None

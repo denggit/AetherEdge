@@ -11,5 +11,5 @@ class BullReclaimV2Engine:
     priority: int = 50
 
     def evaluate(self, context: BarReadyContext) -> EngineSignal | None:
-        # Full V8 Bull Reclaim V2 parity is migrated in the next package.
+        # Full V8 Bull Reclaim V2 signal rules are migrated in the next package.
         return None
