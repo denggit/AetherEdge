@@ -10,7 +10,7 @@ from strategies.eth_lf_portfolio_v8.domain.models import BarReadyContext, Engine
 @dataclass(frozen=True)
 class BullReclaimV2Engine:
     name: str = "BULL_RECLAIM_V2"
-    priority: int = 50
+    priority: int = 150
 
     def evaluate(self, context: BarReadyContext) -> EngineSignal | None:
         row = context.engine_features.get("bull") if context.engine_features else None

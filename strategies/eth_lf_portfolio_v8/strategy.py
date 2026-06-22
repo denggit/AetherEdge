@@ -102,7 +102,7 @@ class PendingEntryPlan:
 
 
 class Strategy:
-    """AetherEdge live plugin for ETH LF Portfolio V8."""
+    """AetherEdge live plugin for ETH LF Portfolio V9C reclaim-first routing."""
 
     def __init__(self, config_path: str | Path | None = None) -> None:
         self.config = V8Config.from_file(config_path or DEFAULT_CONFIG_PATH)
@@ -110,7 +110,7 @@ class Strategy:
         self.micro_engine = MicroContextEngine(self.config.micro_context)
         self.feature_builder = V8LiveFeatureBuilder()
         self.position = V8PositionState()
-        self.router = PortfolioRouter(engines=(MomentumV3Engine(), BearV3OnlyEngine(), BullReclaimV2Engine()))
+        self.router = PortfolioRouter(engines=(BullReclaimV2Engine(), MomentumV3Engine(), BearV3OnlyEngine()))
         self.signal_mapper = V8SignalMapper(SignalMapperConfig(strategy_id=self.config.strategy_id))
         self.engine_params = _default_engine_execution_params()
         self.equity: Decimal | None = None

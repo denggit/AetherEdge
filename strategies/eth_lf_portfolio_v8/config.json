@@ -1,11 +1,20 @@
 {
-  "strategy_id": "eth_lf_portfolio_v8",
+  "strategy_id": "eth_lf_portfolio_v9c_reclaim_priority",
   "symbol": "ETH-USDT-PERP",
   "data_exchange": "okx",
   "execution_policy": {
     "quantity_semantics": "base_asset",
     "stop_price_source": "master",
     "same_stop_price_as_master": true
+  },
+  "portfolio_router": {
+    "priority_mode": "reclaim_first",
+    "priority_order": ["BULL_RECLAIM_V2", "MOMENTUM_V3", "BEAR_V3_ONLY"],
+    "priorities": {
+      "BULL_RECLAIM_V2": 150,
+      "MOMENTUM_V3": 100,
+      "BEAR_V3_ONLY": 50
+    }
   },
   "runtime_requirements": {
     "closed_kline": {

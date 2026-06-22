@@ -153,19 +153,25 @@ class _StaticEngine:
         return EngineSignal(side=self.side, engine=self.name, priority=self.priority, reason=self.name)
 
 
-def test_v8_router_respects_engine_priority() -> None:
+def test_v9c_router_respects_reclaim_first_priority() -> None:
     router = PortfolioRouter()
     selected = router.select(
         [
-            EngineSignal(side=Side.LONG, engine="bull_reclaim_v2", priority=50),
-            EngineSignal(side=Side.SHORT, engine="bear_v3_only", priority=90),
-            EngineSignal(side=Side.LONG, engine="momentum_v3", priority=150),
+            EngineSignal(side=Side.LONG, engine="bull_reclaim_v2", priority=150),
+            EngineSignal(side=Side.SHORT, engine="bear_v3_only", priority=50),
+            EngineSignal(side=Side.LONG, engine="momentum_v3", priority=100),
         ]
     )
 
     assert selected.side is Side.LONG
-    assert selected.engine == "momentum_v3"
+    assert selected.engine == "bull_reclaim_v2"
     assert selected.priority == 150
+
+
+def test_v9c_default_engine_priorities_are_reclaim_momentum_bear() -> None:
+    assert BullReclaimV2Engine().priority == 150
+    assert MomentumV3Engine().priority == 100
+    assert BearV3OnlyEngine().priority == 50
 
 
 def test_v8_signal_mapper_maps_open_close_and_stop() -> None:

@@ -10,7 +10,7 @@ from strategies.eth_lf_portfolio_v8.domain.models import BarReadyContext, Engine
 @dataclass(frozen=True)
 class BearV3OnlyEngine:
     name: str = "BEAR_V3_ONLY"
-    priority: int = 90
+    priority: int = 50
 
     def evaluate(self, context: BarReadyContext) -> EngineSignal | None:
         row = context.engine_features.get("bear") if context.engine_features else None

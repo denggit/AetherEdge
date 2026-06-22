@@ -16,9 +16,9 @@ class V8Engine(Protocol):
 
 @dataclass
 class PortfolioRouter:
-    """Route V8 LF engine votes by original priority order.
+    """Route LF engine votes by V9C reclaim-first priority order.
 
-    Final routing order is: Momentum V3 first, Bear V3 second, Bull Reclaim V2 third.
+    Final routing order is: Bull Reclaim V2 first, Momentum V3 second, Bear V3 third.
     Engines that return FLAT/None do not open a position.
     """
 

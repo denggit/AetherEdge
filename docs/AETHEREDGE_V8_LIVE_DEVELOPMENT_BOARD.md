@@ -347,3 +347,18 @@ OKX adapter 现在会把 1h/2h/4h 等转换为 1H/2H/4H，同时不影响 Binanc
 10. 因此即使启动/补数据花了几十秒，只要历史 trades API 能覆盖，最终用于信号的 closed 4H range aggregate 仍会先补齐再发给策略。
 ```
 
+## Board 5 package 12：V9C Reclaim Priority Live Routing
+
+- [x] AE-0516 V9C Reclaim Priority Routing
+
+设计结论：
+
+```text
+根据 CoinBacktest 的 eth_lf_portfolio_v9c_reclaim_priority_backtest.py，V9C 相对当前实盘 V8 的核心变化是 portfolio conflict routing。
+1. V8 原优先级：Momentum V3 > Bear V3 Only > Bull Reclaim V2。
+2. V9C reclaim_first：Bull Reclaim V2 > Momentum V3 > Bear V3 Only。
+3. AetherEdge 实盘插件保持同一套 Momentum/Bear/Bull 特征、micro context、sizing、stop/lifecycle，不引入新的未来函数或时序变化。
+4. global_risk_scale 继续使用 1.30；这与 V9C 默认 global-risk-scale=1.30 一致。
+5. 策略导入路径暂保留 strategies.eth_lf_portfolio_v8:Strategy，避免启动配置和 preflight 连锁改动；内部 strategy_id 已标记为 eth_lf_portfolio_v9c_reclaim_priority。
+```
+

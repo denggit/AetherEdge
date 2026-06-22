@@ -10,7 +10,7 @@ from strategies.eth_lf_portfolio_v8.domain.models import BarReadyContext, Engine
 @dataclass(frozen=True)
 class MomentumV3Engine:
     name: str = "MOMENTUM_V3"
-    priority: int = 150
+    priority: int = 100
 
     def evaluate(self, context: BarReadyContext) -> EngineSignal | None:
         row = context.engine_features.get("momentum") if context.engine_features else None
