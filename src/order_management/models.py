@@ -51,6 +51,10 @@ class ExchangeOrderResult:
     status: OrderStatus | None = None
     side: OrderSide | None = None
     quantity: Decimal | None = None
+    filled_quantity: Decimal | None = None
+    avg_fill_price: Decimal | None = None
+    fee: Decimal | None = None
+    fee_asset: str | None = None
     error: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict)
 

@@ -67,8 +67,8 @@ class SqliteOrderJournalStore:
                 """
                 INSERT INTO exchange_order_results (
                     intent_id, exchange, ok, order_id, client_order_id, status,
-                    side, quantity, error, raw_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    side, quantity, filled_quantity, avg_fill_price, fee, fee_asset, error, raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     intent_id,
@@ -79,6 +79,10 @@ class SqliteOrderJournalStore:
                     None if result.status is None else result.status.value,
                     None if result.side is None else result.side.value,
                     None if result.quantity is None else _decimal(result.quantity),
+                    None if result.filled_quantity is None else _decimal(result.filled_quantity),
+                    None if result.avg_fill_price is None else _decimal(result.avg_fill_price),
+                    None if result.fee is None else _decimal(result.fee),
+                    result.fee_asset,
                     result.error,
                     _json(result.raw),
                 ),
@@ -141,7 +145,8 @@ class SqliteOrderJournalStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT exchange, ok, order_id, client_order_id, status, side, quantity, error, raw_json
+                SELECT exchange, ok, order_id, client_order_id, status, side, quantity,
+                       filled_quantity, avg_fill_price, fee, fee_asset, error, raw_json
                 FROM exchange_order_results
                 WHERE intent_id = ?
                 ORDER BY rowid ASC
@@ -176,6 +181,10 @@ class SqliteOrderJournalStore:
                     status TEXT,
                     side TEXT,
                     quantity TEXT,
+                    filled_quantity TEXT,
+                    avg_fill_price TEXT,
+                    fee TEXT,
+                    fee_asset TEXT,
                     error TEXT,
                     raw_json TEXT NOT NULL
                 )
@@ -193,6 +202,10 @@ class SqliteOrderJournalStore:
                 )
                 """
             )
+            _ensure_column(conn, "exchange_order_results", "filled_quantity", "TEXT")
+            _ensure_column(conn, "exchange_order_results", "avg_fill_price", "TEXT")
+            _ensure_column(conn, "exchange_order_results", "fee", "TEXT")
+            _ensure_column(conn, "exchange_order_results", "fee_asset", "TEXT")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_order_results_intent ON exchange_order_results(intent_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_order_events_intent ON order_journal_events(intent_id)")
 
@@ -245,8 +258,12 @@ def _row_to_result(row: tuple[Any, ...]) -> ExchangeOrderResult:
         status=OrderStatus(str(row[4])) if row[4] is not None else None,
         side=OrderSide(str(row[5])) if row[5] is not None else None,
         quantity=Decimal(str(row[6])) if row[6] is not None else None,
-        error=str(row[7]) if row[7] is not None else None,
-        raw=json.loads(str(row[8] or "{}")),
+        filled_quantity=Decimal(str(row[7])) if row[7] is not None else None,
+        avg_fill_price=Decimal(str(row[8])) if row[8] is not None else None,
+        fee=Decimal(str(row[9])) if row[9] is not None else None,
+        fee_asset=str(row[10]) if row[10] is not None else None,
+        error=str(row[11]) if row[11] is not None else None,
+        raw=json.loads(str(row[12] or "{}")),
     )
 
 
@@ -256,3 +273,9 @@ def _json(value: Any) -> str:
 
 def _decimal(value: Decimal) -> str:
     return format(value.normalize(), "f")
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    existing = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")

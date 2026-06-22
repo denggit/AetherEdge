@@ -10,3 +10,4 @@ data/
 *.sqlite
 *.sqlite3
 .env
+/.agents/
