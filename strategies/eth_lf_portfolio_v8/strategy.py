@@ -9,7 +9,7 @@ from typing import Any, Mapping, Sequence
 from src.market_data.events import MarketFeatureEvent, MarketFeatureEventType
 from src.platform.account.events import AccountEvent, AccountEventType
 from src.platform.data.models import MarketKline, MarketOrderBook, MarketTicker, MarketTrade
-from src.platform.exchanges.models import OrderSide, OrderStatus
+from src.platform.exchanges.models import OrderSide, OrderStatus, Position, PositionSide
 from src.platform.snapshot import PlatformSnapshot
 from src.signals import SignalAction, TradeSignal
 from src.strategy import StrategyRecoveryContext
@@ -84,6 +84,7 @@ class EngineExecutionParams:
 
 @dataclass(frozen=True)
 class PendingEntryPlan:
+    position_id: str
     side: Side
     engine: str
     quantity: Decimal
@@ -116,6 +117,7 @@ class Strategy:
         self.equity: Decimal | None = None
         self.pending_entry: PendingEntryPlan | None = None
         self.bar_ready_events: list[BarReadyContext] = []
+        self.recovery_alerts: list[str] = []
         self.recovered = False
         self.started = False
 
@@ -133,7 +135,8 @@ class Strategy:
             if snapshot.balance.exchange.value == self.config.data_exchange:
                 self.equity = snapshot.balance.available if snapshot.balance.available > 0 else snapshot.balance.total
                 break
-        return []
+        plans = tuple(context.metadata.get("active_position_plans", ()) if context.metadata else ())
+        return self._recover_position_from_plans(snapshots=context.snapshots, plans=plans)
 
     async def on_kline(self, kline: MarketKline) -> Sequence[TradeSignal]:
         return []
@@ -171,8 +174,10 @@ class Strategy:
             return self._handle_follower_entry_fill(event=event, filled_qty=filled_qty)
 
         if self.position.in_pos and is_master and _is_close_side(event.side, self.position.side):
+            follower_close_signals = self._follower_close_signals_after_master_close(event_time_ms=event.event_time_ms)
             self.position.close_master(exit_time_ms=event.event_time_ms)
             self.pending_entry = None
+            signals.extend(follower_close_signals)
         elif self.position.in_pos and not is_master and _is_close_side(event.side, self.position.side):
             self.position.mark_leg_closed(exchange=exchange, sync_status="follower_closed")
         return signals
@@ -260,8 +265,10 @@ class Strategy:
         )
         if qty <= 0:
             return []
+        position_id = f"v9c-{context.kline.close_time_ms}-{routed.engine}-{routed.side.name.lower()}"
         entry_risk_scale = context.micro.entry_risk_scale * self.config.global_risk_scale
         self.pending_entry = PendingEntryPlan(
+            position_id=position_id,
             side=routed.side,
             engine=routed.engine,
             quantity=qty,
@@ -292,6 +299,8 @@ class Strategy:
                     "estimated_initial_stop": str(estimated_stop),
                     "micro_filter_action": context.micro.action,
                     "await_master_fill_before_stop": True,
+                    "execution_purpose": "normal_entry",
+                    "position_id": position_id,
                 },
             )
         )
@@ -325,7 +334,7 @@ class Strategy:
             engine=self.position.entry_engine,
             reason=reason,
             bar_close_time_ms=context.kline.close_time_ms,
-            metadata={"reduce_only": True},
+            metadata={"reduce_only": True, "execution_purpose": "normal_close", "position_id": self.position.position_id},
         )
 
     def _add_signal_if_needed(self, context: BarReadyContext) -> list[TradeSignal]:
@@ -358,7 +367,9 @@ class Strategy:
         )
         if qty <= 0:
             return []
+        position_id = self.position.position_id or f"v9c-add-{context.kline.close_time_ms}-{self.position.entry_engine}-{self.position.side.name.lower()}"
         self.pending_entry = PendingEntryPlan(
+            position_id=position_id,
             side=self.position.side,
             engine=self.position.entry_engine,
             quantity=qty,
@@ -384,7 +395,12 @@ class Strategy:
                 entry_risk_scale=self.config.global_risk_scale,
                 risk_mult=context.routed_signal.risk_mult,
                 quality_mult=context.routed_signal.quality_mult,
-                metadata={"add_unit_number": self.position.units + 1, "micro_entry_risk_scale_applied": False},
+                metadata={
+                    "add_unit_number": self.position.units + 1,
+                    "micro_entry_risk_scale_applied": False,
+                    "execution_purpose": "normal_entry",
+                    "position_id": position_id,
+                },
             )
         )
 
@@ -441,6 +457,7 @@ class Strategy:
                 stop_price=stop_price,
                 entry_engine=self.pending_entry.engine,
                 entry_risk_mult=self.pending_entry.entry_risk_scale,
+                position_id=self.pending_entry.position_id,
             )
         self.position.mark_leg_open(
             exchange=exchange,
@@ -480,12 +497,156 @@ class Strategy:
             bar_close_time_ms=event.event_time_ms,
         )
 
+    def _recover_position_from_plans(self, *, snapshots: Sequence[PlatformSnapshot], plans: Sequence[Mapping[str, Any]]) -> list[TradeSignal]:
+        snapshot_by_exchange = {snapshot.balance.exchange.value: snapshot for snapshot in snapshots}
+        master_snapshot = snapshot_by_exchange.get(self.config.data_exchange)
+        if master_snapshot is None:
+            return []
+        active_master = _first_active_position(master_snapshot.positions)
+        active_plan = _first_active_plan(plans)
+        if active_master is not None and active_plan is not None:
+            return self._recover_active_master_with_plan(master=active_master, master_snapshot=master_snapshot, snapshots=snapshot_by_exchange, plan_payload=active_plan)
+        if active_master is not None:
+            self._recover_active_master_without_plan(active_master)
+            return []
+        if active_plan is not None:
+            return self._recover_master_closed_with_active_plan(snapshots=snapshot_by_exchange, plan_payload=active_plan)
+        return []
+
+    def _recover_active_master_with_plan(self, *, master: Position, master_snapshot: PlatformSnapshot, snapshots: Mapping[str, PlatformSnapshot], plan_payload: Mapping[str, Any]) -> list[TradeSignal]:
+        plan = dict(plan_payload.get("position", {}))
+        legs = [dict(item) for item in plan_payload.get("legs", [])]
+        side = _side_from_plan(plan.get("side"))
+        actual_side = _side_from_position(master)
+        if side is Side.FLAT or actual_side is Side.FLAT or side is not actual_side:
+            self.recovery_alerts.append("master_active_plan_side_mismatch_manual_required")
+            self._recover_active_master_without_plan(master)
+            return []
+        stop_price = _dec_or_none(plan.get("canonical_stop_price"))
+        if stop_price is None:
+            self.recovery_alerts.append("master_active_plan_missing_canonical_stop_manual_required")
+            self._recover_active_master_without_plan(master)
+            return []
+        qty = abs(master.quantity)
+        entry_price = master.entry_price or stop_price
+        self.position.open_master(
+            side=side,
+            entry_time_ms=int(plan.get("created_time_ms") or 0),
+            avg_entry=entry_price,
+            qty=qty,
+            stop_price=stop_price,
+            entry_engine=str(plan.get("entry_engine") or "unknown"),
+            position_id=str(plan.get("position_id") or ""),
+        )
+        self.position.mark_leg_open(exchange=self.config.data_exchange, avg_fill_price=entry_price, base_qty=qty, sync_status="recovered_master")
+        signals: list[TradeSignal] = []
+        if not _has_stop_at_price(master_snapshot.open_stop_orders, stop_price):
+            signals.extend(
+                self._replace_stop_signals(
+                    target_exchanges=[self.config.data_exchange],
+                    quantity=qty,
+                    stop_price=stop_price,
+                    reason="RECOVERY_MASTER_STOP_SYNC",
+                    bar_close_time_ms=None,
+                )
+            )
+        for leg in legs:
+            exchange = str(leg.get("exchange") or "").lower()
+            if not exchange or exchange == self.config.data_exchange:
+                continue
+            target_qty = _dec_or_zero(leg.get("target_qty_base"))
+            follower_snapshot = snapshots.get(exchange)
+            same_qty, reverse_qty = _side_quantities(follower_snapshot.positions if follower_snapshot else [], side)
+            if reverse_qty > 0:
+                self.position.legs[exchange] = self.position.legs.get(exchange) or self.position.mark_leg_closed(exchange=exchange, sync_status="reverse_position_manual_required")
+                self.position.legs[exchange].sync_status = "reverse_position_manual_required"
+                self.recovery_alerts.append(f"follower_reverse_position:{exchange}")
+                continue
+            if same_qty <= 0 and target_qty > 0:
+                self.position.mark_leg_closed(exchange=exchange, sync_status="missing")
+                signals.append(self._follower_topup_signal(exchange=exchange, side=side, quantity=target_qty, plan=plan))
+            elif same_qty < target_qty:
+                self.position.mark_leg_open(exchange=exchange, avg_fill_price=entry_price, base_qty=same_qty, sync_status="underfilled")
+                signals.append(self._follower_topup_signal(exchange=exchange, side=side, quantity=target_qty - same_qty, plan=plan))
+            elif same_qty > target_qty and target_qty > 0:
+                self.position.mark_leg_open(exchange=exchange, avg_fill_price=entry_price, base_qty=same_qty, sync_status="overfilled")
+                self.recovery_alerts.append(f"follower_overfilled:{exchange}")
+            elif same_qty > 0:
+                self.position.mark_leg_open(exchange=exchange, avg_fill_price=entry_price, base_qty=same_qty, sync_status="synced")
+        return signals
+
+    def _recover_active_master_without_plan(self, master: Position) -> None:
+        side = _side_from_position(master)
+        if side is Side.FLAT:
+            return
+        entry_price = master.entry_price or Decimal("1")
+        fallback_stop = entry_price * (Decimal("0.99") if side is Side.LONG else Decimal("1.01"))
+        self.position.open_master(
+            side=side,
+            entry_time_ms=0,
+            avg_entry=entry_price,
+            qty=abs(master.quantity),
+            stop_price=fallback_stop,
+            entry_engine="unknown",
+            position_id=None,
+        )
+        self.position.mark_leg_open(exchange=self.config.data_exchange, avg_fill_price=entry_price, base_qty=abs(master.quantity), sync_status="master_active_plan_unknown")
+        self.recovery_alerts.append("master_active_plan_unknown_manual_required")
+
+    def _recover_master_closed_with_active_plan(self, *, snapshots: Mapping[str, PlatformSnapshot], plan_payload: Mapping[str, Any]) -> list[TradeSignal]:
+        plan = dict(plan_payload.get("position", {}))
+        side = _side_from_plan(plan.get("side"))
+        if side is Side.FLAT:
+            return []
+        signals: list[TradeSignal] = []
+        for leg in plan_payload.get("legs", []):
+            exchange = str(dict(leg).get("exchange") or "").lower()
+            if not exchange or exchange == self.config.data_exchange:
+                continue
+            snapshot = snapshots.get(exchange)
+            same_qty, _ = _side_quantities(snapshot.positions if snapshot else [], side)
+            if same_qty > 0:
+                signals.append(
+                    TradeSignal(
+                        symbol=self.config.symbol,
+                        action=SignalAction.CLOSE_LONG if side is Side.LONG else SignalAction.CLOSE_SHORT,
+                        quantity=same_qty,
+                        reason="RECOVERY_MASTER_CLOSED_CLOSE_FOLLOWER",
+                        metadata={
+                            "target_exchanges": [exchange],
+                            "reduce_only": True,
+                            "execution_purpose": "follower_close_after_master_close",
+                            "position_id": plan.get("position_id"),
+                        },
+                    )
+                )
+                self.recovery_alerts.append(f"master_closed_follower_still_open:{exchange}")
+        return signals
+
+    def _follower_topup_signal(self, *, exchange: str, side: Side, quantity: Decimal, plan: Mapping[str, Any]) -> TradeSignal:
+        return TradeSignal(
+            symbol=self.config.symbol,
+            action=SignalAction.OPEN_LONG if side is Side.LONG else SignalAction.OPEN_SHORT,
+            quantity=quantity,
+            reason="RECOVERY_FOLLOWER_TOPUP",
+            metadata={
+                "target_exchanges": [exchange],
+                "execution_purpose": "follower_recovery_topup",
+                "position_id": plan.get("position_id"),
+                "engine": plan.get("entry_engine"),
+            },
+        )
+
     def _replace_stop_signals(self, *, target_exchanges: list[str], quantity: Decimal, stop_price: Decimal, reason: str, bar_close_time_ms: int | None) -> list[TradeSignal]:
         cancel = TradeSignal(
             symbol=self.config.symbol,
             action=SignalAction.CANCEL_ALL_STOP_ORDERS,
             reason=f"{reason}_CANCEL_OLD",
-            metadata={"target_exchanges": target_exchanges},
+            metadata={
+                "target_exchanges": target_exchanges,
+                "execution_purpose": "stop_sync",
+                "position_id": self.position.position_id,
+            },
         )
         stop = self.signal_mapper.map_decision(
             V8TradeDecision(
@@ -497,10 +658,40 @@ class Strategy:
                 engine=self.position.entry_engine,
                 reason=reason,
                 bar_close_time_ms=bar_close_time_ms,
-                metadata={"target_exchanges": target_exchanges, "stop_price_source": "master_canonical"},
+                metadata={
+                    "target_exchanges": target_exchanges,
+                    "stop_price_source": "master_canonical",
+                    "execution_purpose": "stop_sync",
+                    "position_id": self.position.position_id,
+                },
             )
         )[0]
         return [cancel, stop]
+
+    def _follower_close_signals_after_master_close(self, *, event_time_ms: int | None) -> list[TradeSignal]:
+        if not self.position.in_pos or self.position.side is Side.FLAT:
+            return []
+        action = SignalAction.CLOSE_LONG if self.position.side is Side.LONG else SignalAction.CLOSE_SHORT
+        signals: list[TradeSignal] = []
+        for exchange, leg in sorted(self.position.open_legs.items()):
+            if exchange == self.config.data_exchange or leg.base_qty <= 0:
+                continue
+            signals.append(
+                TradeSignal(
+                    symbol=self.config.symbol,
+                    action=action,
+                    quantity=leg.base_qty,
+                    reason="MASTER_CLOSE_FILLED_CLOSE_FOLLOWER",
+                    metadata={
+                        "target_exchanges": [exchange],
+                        "reduce_only": True,
+                        "execution_purpose": "follower_close_after_master_close",
+                        "position_id": self.position.position_id,
+                        "master_close_event_time_ms": event_time_ms,
+                    },
+                )
+            )
+        return signals
 
     def _unit_qty(
         self,
@@ -582,3 +773,71 @@ def _is_close_side(order_side: OrderSide | None, position_side: Side) -> bool:
     if position_side is Side.SHORT:
         return order_side is OrderSide.BUY
     return False
+
+
+def _first_active_position(positions: Sequence[Position]) -> Position | None:
+    for position in positions:
+        if position.quantity != 0:
+            return position
+    return None
+
+
+def _first_active_plan(plans: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
+    for item in plans:
+        plan = item.get("position", {}) if isinstance(item, Mapping) else {}
+        if str(plan.get("status", "")).lower() == "active":
+            return item
+    return plans[0] if plans else None
+
+
+def _side_from_plan(value: Any) -> Side:
+    text = str(value or "").lower()
+    if text == "long":
+        return Side.LONG
+    if text == "short":
+        return Side.SHORT
+    return Side.FLAT
+
+
+def _side_from_position(position: Position) -> Side:
+    if position.side is PositionSide.LONG:
+        return Side.LONG
+    if position.side is PositionSide.SHORT:
+        return Side.SHORT
+    if position.quantity > 0:
+        return Side.LONG
+    if position.quantity < 0:
+        return Side.SHORT
+    return Side.FLAT
+
+
+def _side_quantities(positions: Sequence[Position], side: Side) -> tuple[Decimal, Decimal]:
+    same = Decimal("0")
+    reverse = Decimal("0")
+    for position in positions:
+        if position.quantity == 0:
+            continue
+        pos_side = _side_from_position(position)
+        qty = abs(position.quantity)
+        if pos_side is side:
+            same += qty
+        elif pos_side is not Side.FLAT:
+            reverse += qty
+    return same, reverse
+
+
+def _has_stop_at_price(orders, stop_price: Decimal) -> bool:
+    for order in orders:
+        if order.price is not None and order.price == stop_price:
+            return True
+    return False
+
+
+def _dec_or_none(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    return Decimal(str(value))
+
+
+def _dec_or_zero(value: Any) -> Decimal:
+    return _dec_or_none(value) or Decimal("0")

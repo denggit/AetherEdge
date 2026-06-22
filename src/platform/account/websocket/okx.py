@@ -148,7 +148,7 @@ def _map_okx_order_event(row: Mapping[str, Any], *, fallback_symbol: str) -> Acc
         order_status=_OKX_ORDER_STATUS.get(str(row.get("state", "")).lower(), OrderStatus.UNKNOWN),
         side=_map_order_side(row.get("side")),
         position_side=_map_position_side(row.get("posSide")),
-        price=_optional_decimal(row.get("px")),
+        price=_first_positive_decimal(row, "avgPx", "fillPx", "px"),
         quantity=_optional_decimal(row.get("sz")),
         filled_quantity=_optional_decimal(row.get("accFillSz")),
         raw=row,
@@ -231,6 +231,14 @@ def _optional_decimal(value: Any) -> Decimal | None:
     if value in (None, ""):
         return None
     return Decimal(str(value))
+
+
+def _first_positive_decimal(row: Mapping[str, Any], *keys: str) -> Decimal | None:
+    for key in keys:
+        value = _optional_decimal(row.get(key))
+        if value is not None and value > 0:
+            return value
+    return None
 
 
 def _optional_int(value: Any) -> int | None:

@@ -27,6 +27,7 @@ class ExchangeLegState:
 
 @dataclass
 class V8PositionState:
+    position_id: str | None = None
     in_pos: bool = False
     side: Side = Side.FLAT
     entry_time_ms: int | None = None
@@ -46,6 +47,7 @@ class V8PositionState:
 
     def reset(self, *, keep_last_exit: bool = False) -> None:
         self.in_pos = False
+        self.position_id = None
         self.side = Side.FLAT
         self.entry_time_ms = None
         self.first_entry = None
@@ -72,6 +74,7 @@ class V8PositionState:
         entry_engine: str,
         entry_risk_mult: Decimal = Decimal("1"),
         units: int = 1,
+        position_id: str | None = None,
     ) -> None:
         if side is Side.FLAT:
             raise ValueError("cannot open flat position")
@@ -82,6 +85,7 @@ class V8PositionState:
         if stop_price <= 0:
             raise ValueError("stop_price must be positive")
         self.in_pos = True
+        self.position_id = position_id or self.position_id
         self.side = side
         self.entry_time_ms = entry_time_ms
         self.first_entry = avg_entry if self.first_entry is None else self.first_entry

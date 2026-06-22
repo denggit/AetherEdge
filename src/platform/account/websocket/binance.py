@@ -97,7 +97,7 @@ def _map_binance_order_event(row: Mapping[str, Any], payload: Mapping[str, Any],
         order_status=_BINANCE_ORDER_STATUS.get(str(row.get("X", "")).upper(), OrderStatus.UNKNOWN),
         side=_map_order_side(row.get("S")),
         position_side=_map_position_side(row.get("ps")),
-        price=_optional_decimal(row.get("p")),
+        price=_first_positive_decimal(row, "ap", "L", "p"),
         quantity=_optional_decimal(row.get("q")),
         filled_quantity=_optional_decimal(row.get("z")),
         raw=row,
@@ -183,6 +183,14 @@ def _optional_decimal(value: Any) -> Decimal | None:
     if value in (None, ""):
         return None
     return Decimal(str(value))
+
+
+def _first_positive_decimal(row: Mapping[str, Any], *keys: str) -> Decimal | None:
+    for key in keys:
+        value = _optional_decimal(row.get(key))
+        if value is not None and value > 0:
+            return value
+    return None
 
 
 def _optional_int(value: Any) -> int | None:

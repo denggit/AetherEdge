@@ -79,8 +79,18 @@ class TradeWarmupService:
             if not clean_rows:
                 break
             total += self.repository.save(clean_rows)
+            min_time = min(_trade_time_ms(row) for row in clean_rows)
             max_time = max(_trade_time_ms(row) for row in clean_rows)
+            assert min_time is not None
             assert max_time is not None
+            if min_time > cursor and len(clean_rows) >= self.batch_limit:
+                # Some exchange adapters can only page recent trades backward.
+                # If the first returned batch starts after our requested cursor
+                # and is already full, we have not proven the earlier interval
+                # is empty. Mark only the interval actually covered by returned
+                # rows so the remaining prefix stays visible as a gap.
+                self.coverage_repository.mark_coverage(symbol=symbol, time_range=TimeRange(min_time, max_time), source=self.coverage_source)
+                break
             self.coverage_repository.mark_coverage(symbol=symbol, time_range=TimeRange(cursor, max_time), source=self.coverage_source)
             if len(clean_rows) < self.batch_limit:
                 if max_time < time_range.end_time_ms:

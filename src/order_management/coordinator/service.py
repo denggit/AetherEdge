@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from decimal import Decimal
 from typing import Sequence
 
 from src.order_management.idempotency.client_order_id import DeterministicClientOrderIdFactory
 from src.order_management.models import ExchangeOrderResult, OrderIntent, OrderIntentStatus
+from src.order_management.position_plan import LegPlan, LegRole, LegSyncStatus, PositionPlan, PositionPlanStatus
 from src.order_management.ports import ClientOrderIdFactory, DuplicateOrderGuard, OrderIntentRepository
 from src.order_management.quantity import NativeQuantityConverter
 from src.order_management.master_follower import MasterFollowerExecutionPolicy, MasterFollowerPolicyEvaluator
@@ -13,6 +15,15 @@ from src.order_management.sync import OrderStatusSynchronizer, extract_avg_fill_
 from src.planner import ExecutionPlanner, PlannedExecution, PlannedExecutionAction
 from src.platform.execution import ExecutionClient
 from src.platform.exchanges.models import Order, OrderRequest, StopMarketOrderRequest
+from src.signals.models import SignalAction
+
+
+_MASTER_GATED_PURPOSES = {"normal_entry", "normal_close"}
+_BYPASS_MASTER_PURPOSES = {
+    "stop_sync",
+    "follower_recovery_topup",
+    "follower_close_after_master_close",
+}
 
 
 class MultiExchangeOrderCoordinator:
@@ -29,6 +40,7 @@ class MultiExchangeOrderCoordinator:
         quantity_converter: NativeQuantityConverter | None = None,
         order_status_synchronizer: OrderStatusSynchronizer | None = None,
         master_follower_policy: MasterFollowerExecutionPolicy | None = None,
+        position_plan_store=None,
     ) -> None:
         if not clients:
             raise ValueError("at least one execution client is required")
@@ -41,6 +53,7 @@ class MultiExchangeOrderCoordinator:
         self.order_status_synchronizer = order_status_synchronizer or OrderStatusSynchronizer()
         self.master_follower_policy = master_follower_policy
         self.master_follower_evaluator = MasterFollowerPolicyEvaluator(master_follower_policy) if master_follower_policy is not None else None
+        self.position_plan_store = position_plan_store
 
     async def execute(self, intent: OrderIntent) -> list[ExchangeOrderResult]:
         if self.duplicate_guard is not None:
@@ -60,6 +73,7 @@ class MultiExchangeOrderCoordinator:
             save_result = getattr(self.repository, "save_result", None)
             if save_result is not None:
                 save_result(intent_id=intent.intent_id, result=result)
+        self._record_position_plan(intent, results)
         final_status = _final_status(results)
         self.repository.update_status(intent_id=intent.intent_id, status=final_status)
         if self.master_follower_evaluator is not None:
@@ -83,8 +97,105 @@ class MultiExchangeOrderCoordinator:
                 )
         return results
 
+    def _record_position_plan(self, intent: OrderIntent, results: Sequence[ExchangeOrderResult]) -> None:
+        if self.position_plan_store is None:
+            return
+        signal = intent.signal
+        purpose = str(signal.metadata.get("execution_purpose", "") if signal.metadata else "").strip().lower()
+        if signal.action in {SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT}:
+            self._record_open_or_topup_plan(intent, results, purpose=purpose)
+        elif signal.action in {SignalAction.PLACE_STOP_LOSS_LONG, SignalAction.PLACE_STOP_LOSS_SHORT}:
+            self._record_stop_plan(intent, results)
+
+    def _record_open_or_topup_plan(self, intent: OrderIntent, results: Sequence[ExchangeOrderResult], *, purpose: str) -> None:
+        signal = intent.signal
+        if signal.quantity is None or signal.quantity <= 0:
+            return
+        position_id = str(signal.metadata.get("position_id") or f"pos-{intent.intent_id}") if signal.metadata else f"pos-{intent.intent_id}"
+        side = "long" if signal.action is SignalAction.OPEN_LONG else "short"
+        existing = self.position_plan_store.get_position(position_id)
+        master_exchange = self.master_follower_policy.master_exchange if self.master_follower_policy is not None else intent.target_exchanges[0]
+        entry_engine = str(signal.metadata.get("engine") or (existing.entry_engine if existing else "unknown")) if signal.metadata else (existing.entry_engine if existing else "unknown")
+        stop_price = _optional_decimal(signal.metadata.get("estimated_initial_stop") if signal.metadata else None)
+        if existing is None:
+            self.position_plan_store.upsert_position(
+                PositionPlan(
+                    position_id=position_id,
+                    strategy_id=intent.strategy_id,
+                    entry_engine=entry_engine,
+                    side=side,
+                    status=PositionPlanStatus.ACTIVE,
+                    canonical_stop_price=stop_price,
+                    master_exchange=master_exchange,
+                    master_target_qty_base=signal.quantity if master_exchange in intent.target_exchanges else Decimal("0"),
+                    master_filled_qty_base=Decimal("0"),
+                    metadata={"intent_id": intent.intent_id},
+                )
+            )
+            for exchange in intent.target_exchanges:
+                role = LegRole.MASTER if exchange is master_exchange else LegRole.FOLLOWER
+                self.position_plan_store.upsert_leg(
+                    LegPlan(
+                        position_id=position_id,
+                        exchange=exchange,
+                        role=role,
+                        target_qty_base=signal.quantity,
+                        sync_status=LegSyncStatus.PLANNED,
+                    )
+                )
+        elif purpose != "follower_recovery_topup":
+            for exchange in intent.target_exchanges:
+                self.position_plan_store.add_to_leg_target(position_id=position_id, exchange=exchange, delta_target_qty_base=signal.quantity)
+            if master_exchange in intent.target_exchanges:
+                self.position_plan_store.upsert_position(replace(existing, master_target_qty_base=existing.master_target_qty_base + signal.quantity))
+        by_exchange = {result.exchange: result for result in results}
+        for exchange in intent.target_exchanges:
+            result = by_exchange.get(exchange)
+            if result is None:
+                continue
+            leg = {item.exchange: item for item in self.position_plan_store.get_legs(position_id)}.get(exchange)
+            if leg is None:
+                continue
+            if result.ok:
+                filled = signal.quantity if result.filled_quantity is None else _result_filled_base(result, fallback=signal.quantity)
+                self.position_plan_store.upsert_leg(
+                    replace(
+                        leg,
+                        filled_qty_base=max(leg.filled_qty_base, filled) if purpose == "follower_recovery_topup" else leg.filled_qty_base + filled,
+                        entry_order_id=result.order_id or leg.entry_order_id,
+                        entry_client_order_id=result.client_order_id or leg.entry_client_order_id,
+                        sync_status=LegSyncStatus.TOPUP_SUBMITTED if purpose == "follower_recovery_topup" else LegSyncStatus.OPEN,
+                    )
+                )
+                if exchange is master_exchange:
+                    plan = self.position_plan_store.get_position(position_id)
+                    if plan is not None:
+                        self.position_plan_store.upsert_position(replace(plan, master_filled_qty_base=plan.master_filled_qty_base + filled))
+            elif purpose == "follower_recovery_topup":
+                self.position_plan_store.update_leg_sync_status(position_id=position_id, exchange=exchange, sync_status=LegSyncStatus.TOPUP_FAILED)
+
+    def _record_stop_plan(self, intent: OrderIntent, results: Sequence[ExchangeOrderResult]) -> None:
+        signal = intent.signal
+        if signal.trigger_price is None:
+            return
+        if not signal.metadata or not signal.metadata.get("position_id"):
+            return
+        position_id = str(signal.metadata["position_id"])
+        for result in results:
+            if result.ok:
+                self.position_plan_store.update_stop(
+                    position_id=position_id,
+                    exchange=result.exchange,
+                    stop_price=signal.trigger_price,
+                    stop_order_id=result.order_id,
+                    stop_client_order_id=result.client_order_id,
+                )
+
     async def _execute_master_follower(self, clients: Sequence[ExecutionClient], intent: OrderIntent, items: Sequence[PlannedExecution]) -> list[ExchangeOrderResult]:
         assert self.master_follower_policy is not None
+        if self._bypasses_master_gating(intent):
+            results_nested = await asyncio.gather(*(self._execute_for_client(client, intent, items) for client in clients))
+            return [item for group in results_nested for item in group]
         client_by_exchange = {client.exchange: client for client in clients}
         master = client_by_exchange.get(self.master_follower_policy.master_exchange)
         followers = [client_by_exchange[exchange] for exchange in self.master_follower_policy.followers_for(intent.target_exchanges) if exchange in client_by_exchange]
@@ -116,6 +227,25 @@ class MultiExchangeOrderCoordinator:
             )
         )
         return [*master_results, *(item for group in follower_nested for item in group)]
+
+    def _bypasses_master_gating(self, intent: OrderIntent) -> bool:
+        purpose = str(intent.signal.metadata.get("execution_purpose", "") if intent.signal.metadata else "").strip().lower()
+        if purpose in _BYPASS_MASTER_PURPOSES:
+            return True
+        if purpose in _MASTER_GATED_PURPOSES:
+            return False
+        if self.master_follower_policy.master_exchange not in intent.target_exchanges:
+            # Leg-specific stop replacement, follower recovery top-up, and
+            # follower close intents intentionally target only follower venues.
+            # They must not require a master client in the filtered target set.
+            return True
+        if intent.signal.action in {
+            SignalAction.CANCEL_ALL_STOP_ORDERS,
+            SignalAction.PLACE_STOP_LOSS_LONG,
+            SignalAction.PLACE_STOP_LOSS_SHORT,
+        }:
+            return True
+        return False
 
     async def _execute_for_client(
         self,
@@ -286,3 +416,17 @@ def _final_status(results: Sequence[ExchangeOrderResult]) -> OrderIntentStatus:
     if ok_count > 0:
         return OrderIntentStatus.PARTIALLY_SUBMITTED
     return OrderIntentStatus.FAILED
+
+
+def _optional_decimal(value) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    return Decimal(str(value))
+
+
+def _result_filled_base(result: ExchangeOrderResult, *, fallback: Decimal) -> Decimal:
+    if result.filled_quantity is not None and result.filled_quantity > 0:
+        return result.filled_quantity
+    if result.quantity is not None and result.quantity > 0:
+        return result.quantity
+    return fallback

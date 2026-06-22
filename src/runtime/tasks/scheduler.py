@@ -38,5 +38,9 @@ class ClosedBarScheduler:
             return None
         if self.last_emitted_open_time_ms == open_time_ms:
             return None
-        self.last_emitted_open_time_ms = open_time_ms
         return open_time_ms
+
+    def mark_emitted(self, open_time_ms: int) -> None:
+        if open_time_ms < 0:
+            raise ValueError("open_time_ms must be non-negative")
+        self.last_emitted_open_time_ms = open_time_ms

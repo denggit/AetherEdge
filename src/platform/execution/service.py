@@ -110,17 +110,21 @@ class ExchangeExecutionService:
         )
 
     async def cancel_order(self, request: CancelOrderRequest) -> Order:
+        self._ensure_live_write_allowed("cancel_order")
         self._ensure_bound_symbol(request.symbol)
         return await self._exchange_client.cancel_order(request)
 
     async def cancel_all_orders(self) -> list[Order]:
+        self._ensure_live_write_allowed("cancel_all_orders")
         return await self._exchange_client.cancel_all_orders(self._symbol)
 
     async def cancel_stop_order(self, request: CancelStopOrderRequest) -> Order:
+        self._ensure_live_write_allowed("cancel_stop_order")
         self._ensure_bound_symbol(request.symbol)
         return await self._exchange_client.cancel_stop_order(request)
 
     async def cancel_all_stop_orders(self) -> list[Order]:
+        self._ensure_live_write_allowed("cancel_all_stop_orders")
         return await self._exchange_client.cancel_all_stop_orders(self._symbol)
 
     async def amend_order(self, request: AmendOrderRequest) -> Order:

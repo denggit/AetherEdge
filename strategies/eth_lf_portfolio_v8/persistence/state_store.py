@@ -29,6 +29,7 @@ class JsonV8StateStore:
             return V8PositionState()
         data = json.loads(self.path.read_text(encoding="utf-8"))
         state = V8PositionState(
+            position_id=data.get("position_id"),
             in_pos=bool(data.get("in_pos", False)),
             side=Side(int(data.get("side", 0))),
             entry_time_ms=data.get("entry_time_ms"),

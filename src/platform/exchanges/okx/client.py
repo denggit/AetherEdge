@@ -146,8 +146,6 @@ class OkxExchangeClient:
             min_time = min((ts for ts in times if ts is not None), default=None)
             if start_time_ms is not None and min_time is not None and min_time < start_time_ms:
                 break
-            if len(rows) >= limit:
-                break
             cursor = str(data[-1].get("tradeId") or "")
             if not cursor:
                 break

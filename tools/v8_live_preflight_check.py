@@ -25,6 +25,9 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.app import AppConfig
 from src.market_data.derived import RangeBarBuilder
+from src.market_data.models import TimeRange
+from src.market_data.storage import SqliteRangeBarStore, SqliteTradeStore
+from src.market_data.warmup.current_rangebar import CurrentRangeBarWarmupService
 from src.market_data.warmup.gap_detector import interval_to_ms
 from src.platform import ExchangeName
 from src.platform.account.factory import create_account_client
@@ -111,12 +114,16 @@ async def main() -> int:
     report.runtime_mode = runtime_mode.value
 
     _check_runtime_config(report, app=app, runtime_mode=runtime_mode, runtime=runtime, requirements=requirements, expect_real_live=args.expect_real_live)
+    _check_strategy_identity(report, strategy)
     _check_local_writable(report, app=app)
 
     if not args.skip_api:
         await _check_exchange_read_apis(report, app=app, allow_existing_position=args.allow_existing_position, allow_open_orders=args.allow_open_orders)
+        await _check_follower_min_notional_balance(report, app=app, runtime=runtime)
     if not args.skip_kline:
         await _check_latest_closed_kline(report, app=app, runtime=runtime)
+        if not args.skip_api:
+            await _check_current_4h_trade_warmup_api_coverage(report, app=app, runtime=runtime)
     _check_local_rangebar_builder(report, app=app)
 
     await _write_report(args.report, report)
@@ -184,6 +191,14 @@ def _check_runtime_config(report: PreflightReport, *, app: AppConfig, runtime_mo
     else:
         status = "warn" if app.dry_run or not live_trading else "ok"
         report.add("live_safety_switches", status, detail={"dry_run": app.dry_run, "live_trading": live_trading, "sandbox": sandbox_values})
+
+
+def _check_strategy_identity(report: PreflightReport, strategy: Any) -> None:
+    strategy_id = getattr(getattr(strategy, "config", None), "strategy_id", None)
+    if strategy_id != "eth_lf_portfolio_v9c_reclaim_priority":
+        report.add("strategy_id_v9c", "fail", detail={"strategy_id": strategy_id}, error="strategy_id must be eth_lf_portfolio_v9c_reclaim_priority")
+    else:
+        report.add("strategy_id_v9c", "ok", detail={"strategy_id": strategy_id})
 
 
 def _check_local_writable(report: PreflightReport, *, app: AppConfig) -> None:
@@ -274,6 +289,82 @@ async def _check_latest_closed_kline(report: PreflightReport, *, app: AppConfig,
         report.add("latest_closed_4h_kline", "ok", detail={"open_time_ms": row.open_time_ms, "close_time_ms": row.close_time_ms, "close": str(row.close)})
     except Exception as exc:
         report.add("latest_closed_4h_kline", "fail", error=str(exc))
+
+
+async def _check_current_4h_trade_warmup_api_coverage(report: PreflightReport, *, app: AppConfig, runtime) -> None:
+    try:
+        interval_ms = interval_to_ms(runtime.closed_bar_interval)
+        now_ms = _now_ms()
+        bucket_start_ms = (now_ms // interval_ms) * interval_ms
+        if now_ms <= bucket_start_ms:
+            report.add("current_4h_trade_warmup_api_coverage", "warn", detail={"bucket_start_ms": bucket_start_ms, "now_ms": now_ms}, error="current bucket has not started")
+            return
+        data_feed = create_market_data_feed(
+            app.data_exchange,
+            symbol=app.symbol,
+            config=ExchangeConfig.from_env(app.data_exchange),
+            enable_trade_stream=False,
+            enable_order_book_stream=False,
+        )
+        contract_value = data_feed.market_profile.contract_value(app.data_exchange) or Decimal("1")
+        trade_store = SqliteTradeStore()
+        range_store = SqliteRangeBarStore()
+        service = CurrentRangeBarWarmupService(
+            trade_repository=trade_store,
+            trade_coverage_repository=trade_store,
+            range_bar_repository=range_store,
+            historical_trade_feed=data_feed,
+            range_pct=runtime.range_pct,
+            contract_value=contract_value,
+            batch_limit=int(os.getenv("AETHER_TRADE_WARMUP_BATCH_LIMIT", "1000")),
+        )
+        result = await service.warmup(symbol=app.symbol, time_range=TimeRange(bucket_start_ms, now_ms))
+        if result.caught_up:
+            report.add(
+                "current_4h_trade_warmup_api_coverage",
+                "ok",
+                detail={"bucket_start_ms": bucket_start_ms, "now_ms": now_ms, "trades_loaded": result.trades_loaded, "trades_available": result.trades_available, "range_bars_saved": result.range_bars_saved},
+            )
+        else:
+            report.add(
+                "current_4h_trade_warmup_api_coverage",
+                "fail",
+                detail={"bucket_start_ms": bucket_start_ms, "now_ms": now_ms, "trades_loaded": result.trades_loaded, "trades_available": result.trades_available},
+                error="current 4H trade coverage did not catch up",
+            )
+    except Exception as exc:
+        report.add("current_4h_trade_warmup_api_coverage", "fail", error=str(exc))
+
+
+async def _check_follower_min_notional_balance(report: PreflightReport, *, app: AppConfig, runtime) -> None:
+    try:
+        policy = runtime.master_follower_policy
+        if policy is None:
+            report.add("follower_min_notional_balance", "warn", error="master/follower policy is not configured")
+            return
+        data_feed = create_market_data_feed(
+            app.data_exchange,
+            symbol=app.symbol,
+            config=ExchangeConfig.from_env(app.data_exchange),
+            enable_trade_stream=False,
+            enable_order_book_stream=False,
+        )
+        ticker = await data_feed.fetch_ticker()
+        profile = data_feed.market_profile
+        for follower in policy.follower_exchanges:
+            account = create_account_client(follower, symbol=app.symbol, config=ExchangeConfig.from_env(follower))
+            balance = await account.fetch_balance("USDT")
+            min_qty = profile.min_quantity(follower) or Decimal("0")
+            min_notional = min_qty * ticker.price
+            status = "ok" if balance.available >= min_notional else "fail"
+            report.add(
+                f"follower_min_notional_balance:{follower.value}",
+                status,
+                detail={"available": str(balance.available), "min_quantity": str(min_qty), "ticker_price": str(ticker.price), "estimated_min_notional": str(min_notional)},
+                error=None if status == "ok" else "follower balance is below estimated minimum notional",
+            )
+    except Exception as exc:
+        report.add("follower_min_notional_balance", "fail", error=str(exc))
 
 
 def _check_local_rangebar_builder(report: PreflightReport, *, app: AppConfig) -> None:

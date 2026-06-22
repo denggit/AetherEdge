@@ -16,7 +16,7 @@ from src.market_data.storage import SqliteKlineStore, SqliteRangeBarStore, Sqlit
 from src.market_data.warmup.gap_detector import interval_to_ms
 from src.market_data.warmup.current_rangebar import CurrentRangeBarWarmupService
 from src.market_data.warmup.service import KlineWarmupService
-from src.order_management import MasterFollowerExecutionPolicy, MultiExchangeOrderCoordinator, RepositoryDuplicateOrderGuard, SqliteOrderJournalStore
+from src.order_management import MasterFollowerExecutionPolicy, MultiExchangeOrderCoordinator, RepositoryDuplicateOrderGuard, SqliteOrderJournalStore, SqlitePositionPlanStore
 from src.order_management.models import ExchangeOrderResult, OrderIntentStatus
 from src.platform import create_account_client, create_execution_client
 from src.platform.account.event_factory import create_account_event_stream
@@ -92,6 +92,7 @@ class LiveRuntimeRunner:
         self._execution_clients: tuple[ExecutionClient, ...] | None = None
         self._account_clients: tuple[AccountClient, ...] | None = None
         self._order_journal = self.services.get("order_journal")
+        self._position_plan_store = self.services.get("position_plan_store")
         self._order_coordinator = self.services.get("order_coordinator")
         self._recovery_service = self.services.get("recovery_service", "__default__")
         self._range_bar_store = self.services.get("range_bar_store")
@@ -195,6 +196,11 @@ class LiveRuntimeRunner:
         event = closed_kline_feature(closed_rows[-1])
         self.stats.closed_klines_seen += 1
         await self.process_market_feature(event)
+        mark_emitted = getattr(self._closed_bar_scheduler, "mark_emitted", None)
+        if callable(mark_emitted):
+            mark_emitted(open_time_ms)
+        else:
+            self._closed_bar_scheduler.last_emitted_open_time_ms = open_time_ms
         features = [event]
         # Before producing the range aggregate for a just-closed 4H bar, close
         # any gap between startup warmup and the live websocket stream. This
@@ -278,6 +284,7 @@ class LiveRuntimeRunner:
                 self.stats.warmup_runs += 1
                 if not result.caught_up:
                     raise LiveRuntimeError(f"closed-kline warmup did not catch up: {len(result.gaps_after)} gaps remain")
+                await self._hydrate_strategy_closed_klines(repository, time_range=TimeRange(start_open, end_open))
         if self.requirements.range_bars.enabled and self.requirements.trades.enabled and self.requirements.trades.warmup_enabled:
             await self._run_current_rangebar_warmup()
 
@@ -319,6 +326,16 @@ class LiveRuntimeRunner:
         if fail_if_incomplete and not result.caught_up:
             raise LiveRuntimeError("range-bar trade warmup did not catch up; historical trade feed or local coverage is incomplete")
 
+    async def _hydrate_strategy_closed_klines(self, repository, *, time_range: TimeRange) -> None:
+        handler = getattr(self.context.strategy, "on_market_feature", None)
+        if not callable(handler):
+            return
+        rows = repository.load(symbol=self.app_config.symbol, interval=self._closed_bar_interval, time_range=time_range)
+        for row in rows:
+            if not row.is_closed:
+                continue
+            await self.process_market_feature(closed_kline_feature(row))
+
     async def _run_recovery(self) -> PlatformSnapshot:
         service = self._get_recovery_service()
         if service is None:
@@ -329,6 +346,8 @@ class LiveRuntimeRunner:
         self.stats.recovery_runs += 1
         if not report.ok:
             raise LiveRuntimeError(f"runtime recovery failed: {tuple(report.issues)}")
+        if report.strategy_signals:
+            await self._execute_signals(report.strategy_signals, source="recovery", event_time_ms=int(time.time() * 1000), metadata={"feature_type": "recovery"})
         if report.snapshots:
             self._last_snapshot = report.snapshots[0]
         if self._last_snapshot is None:
@@ -530,6 +549,7 @@ class LiveRuntimeRunner:
                     if self.runtime_config.master_follower_policy is None
                     else MasterFollowerExecutionPolicy.from_config(self.runtime_config.master_follower_policy)
                 ),
+                position_plan_store=self._get_position_plan_store(),
             )
         return self._order_coordinator
 
@@ -541,8 +561,14 @@ class LiveRuntimeRunner:
                 RecoveryExchangeContext(account=account, execution=execution, state_store=self.context.state_store)
                 for account, execution in zip(accounts, clients, strict=False)
             ]
-            self._recovery_service = RuntimeRecoveryService(exchange_contexts=contexts, order_journal=self._get_order_journal())
+            self._recovery_service = RuntimeRecoveryService(exchange_contexts=contexts, order_journal=self._get_order_journal(), position_plan_store=self._get_position_plan_store())
         return self._recovery_service
+
+    def _get_position_plan_store(self):
+        if self._position_plan_store is None:
+            path = os.getenv("AETHER_POSITION_PLAN_DB", "data/state/aether_position_plan.sqlite3")
+            self._position_plan_store = SqlitePositionPlanStore(path)
+        return self._position_plan_store
 
     def _get_range_bar_builder(self):
         if self._range_bar_builder is None:
