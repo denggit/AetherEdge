@@ -66,9 +66,9 @@ V8 不订阅 order_book，只订阅 trades + closed 4H + rangebar aggregate + pr
 
 ## Board 5：V8 Strategy Plugin
 
-- [ ] AE-0501 V8 Plugin Skeleton
-- [ ] AE-0502 V8 Feature Engine
-- [ ] AE-0503 V8 Micro Context
+- [x] AE-0501 V8 Plugin Skeleton
+- [x] AE-0502 V8 Feature Engine
+- [x] AE-0503 V8 Micro Context
 - [ ] AE-0504 V8 Position State
 - [ ] AE-0505 V8 Signal Mapper
 - [ ] AE-0506 Readonly Parity Mode
@@ -158,3 +158,19 @@ If `AETHER_MASTER_EXCHANGE` is omitted, live runtime uses
 followers default to `AETHER_EXCHANGES` excluding the master. Reversing the
 relationship, for example `AETHER_MASTER_EXCHANGE=binance` and
 `AETHER_FOLLOWER_EXCHANGES=okx`, should require only env/config changes.
+
+
+## Board 5 package 1：V8 Plugin Skeleton / Feature / Micro Context
+
+- [x] AE-0501 V8 Plugin Skeleton
+- [x] AE-0502 V8 Feature Engine
+- [x] AE-0503 V8 Micro Context
+
+设计结论：
+
+```text
+V8 插件位于 strategies/eth_lf_portfolio_v8。
+策略声明 runtime_requirements，不订阅 order_book。
+插件只消费 closed 4H kline 和 4H range aggregate feature。
+当前包不产生交易信号；LF engines / position state execution 在后续包实现。
+```

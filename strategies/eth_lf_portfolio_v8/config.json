@@ -1,0 +1,47 @@
+{
+  "strategy_id": "eth_lf_portfolio_v8",
+  "symbol": "ETH-USDT-PERP",
+  "data_exchange": "okx",
+  "execution_policy": {
+    "quantity_semantics": "base_asset",
+    "stop_price_source": "master",
+    "same_stop_price_as_master": true
+  },
+  "runtime_requirements": {
+    "closed_kline": {
+      "enabled": true,
+      "interval": "4h",
+      "warmup_days": 365,
+      "close_buffer_ms": 60000
+    },
+    "trades": {
+      "enabled": true,
+      "stream_enabled": true,
+      "warmup_enabled": false
+    },
+    "range_bars": {
+      "enabled": true,
+      "range_pct": "0.002",
+      "aggregate_interval": "4h"
+    },
+    "order_book": {
+      "enabled": false
+    },
+    "private_account_stream": {
+      "enabled": true
+    }
+  },
+  "micro_context": {
+    "mode": "soft",
+    "min_range_bars": 5,
+    "contra_imbalance": "0.05",
+    "aligned_imbalance": "0.05",
+    "bad_close_pos": "0.35",
+    "good_close_pos": "0.65",
+    "contra_risk_scale": "0.50",
+    "not_aligned_risk_scale": "0.50"
+  },
+  "risk": {
+    "global_risk_scale": "1.3"
+  }
+}
