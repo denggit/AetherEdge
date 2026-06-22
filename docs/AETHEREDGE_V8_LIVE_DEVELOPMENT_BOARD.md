@@ -277,3 +277,24 @@ V8 插件现在支持完整持仓周期第一版：
 5. dry_run 默认 true，live_trading 默认 false；真实启动前必须显式改成 AETHER_DRY_RUN=false 且 AETHER_LIVE_TRADING=true。
 6. 新增 startup config 测试，确认 live_runtime 能加载 V8 插件、解析 master/follower、读取 V8 runtime_requirements。
 ```
+
+
+## Board 5 package 8：V8 Live Preflight Check
+
+- [x] AE-0512 V8 Live Preflight Check
+
+设计结论：
+
+```text
+新增 tools/v8_live_preflight_check.py，只读、不下单、不撤单、不平仓。
+检查内容包括：
+1. live_runtime + V8 strategy 配置。
+2. V8 requirements：closed 4H、trades、range bars、private account stream，不订阅 order_book。
+3. master/follower 角色解析。
+4. dry_run / live_trading / sandbox 安全开关。
+5. 本地 state DB 和 order journal DB 可写。
+6. OKX/Binance read API：ticker、balance、positions、leverage、position mode、open orders、open stop orders。
+7. 默认不允许残留仓位或残留订单，避免带旧状态启动。
+8. 最近 closed 4H K线可拉取。
+9. 本地 range bar builder 可用。
+```
