@@ -110,6 +110,45 @@ def test_okx_public_klines_can_normalize_oldest_first_when_requested():
     assert [row.open_time_ms for row in rows] == [1710000000000, 1710000060000]
 
 
+def test_okx_public_klines_uses_history_candles_for_time_range():
+    start = 1710000000000
+    step = 60_000
+    http = FakeHttpClient(
+        [
+            {
+                "code": "0",
+                "data": [
+                    [str(start + step * 3), "3030", "3040", "3020", "3035", "15", "150", "45500", "1"],
+                    [str(start + step * 2), "3020", "3030", "3010", "3025", "14", "140", "42350", "1"],
+                    [str(start + step), "3010", "3020", "3000", "3015", "13", "130", "39000", "1"],
+                    [str(start), "3000", "3010", "2990", "3005", "12", "120", "36000", "1"],
+                ],
+            }
+        ]
+    )
+    client = create_exchange_client(ExchangeName.OKX, ExchangeConfig(), http_client=http)
+
+    rows = asyncio.run(
+        client.fetch_klines(
+            "ETH-USDT-PERP",
+            interval="1m",
+            limit=100,
+            start_time_ms=start,
+            end_time_ms=start + step * 2,
+            oldest_first=True,
+        )
+    )
+
+    assert http.calls[0]["url"].endswith("/api/v5/market/history-candles")
+    assert http.calls[0]["params"] == {
+        "instId": "ETH-USDT-SWAP",
+        "bar": "1m",
+        "limit": 100,
+        "after": start + step * 2 + 1_000,
+    }
+    assert [row.open_time_ms for row in rows] == [start, start + step, start + step * 2]
+
+
 
 def test_okx_fetch_historical_trades_filters_time_range():
     http = FakeHttpClient([

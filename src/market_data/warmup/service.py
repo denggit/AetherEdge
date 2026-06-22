@@ -21,13 +21,17 @@ class KlineWarmupService:
         repository: KlineRepository,
         gap_detector: KlineGapDetector | None = None,
         batch_limit: int = 100,
+        max_gap_passes: int = 100,
     ) -> None:
         if batch_limit <= 0:
             raise ValueError("batch_limit must be positive")
+        if max_gap_passes <= 0:
+            raise ValueError("max_gap_passes must be positive")
         self.data_feed = data_feed
         self.repository = repository
         self.gap_detector = gap_detector or KlineGapDetector(repository)
         self.batch_limit = batch_limit
+        self.max_gap_passes = max_gap_passes
 
     async def warmup(self, request: WarmupRequest) -> WarmupResult:
         if request.dataset is not MarketDataSet.KLINES:
@@ -37,10 +41,25 @@ class KlineWarmupService:
 
         gaps_before = tuple(self.gap_detector.find_gaps(symbol=request.symbol, dataset=request.dataset, time_range=request.time_range, interval=request.interval))
         records_loaded = 0
-        for gap in gaps_before:
-            records_loaded += await self._fill_gap(request=request, gap_range=gap.time_range)
+        gaps_after = gaps_before
 
-        gaps_after = tuple(self.gap_detector.find_gaps(symbol=request.symbol, dataset=request.dataset, time_range=request.time_range, interval=request.interval))
+        for _ in range(self.max_gap_passes):
+            if not gaps_after:
+                break
+
+            pass_start_signature = _gap_signature(gaps_after)
+            for gap in gaps_after:
+                records_loaded += await self._fill_gap(request=request, gap_range=gap.time_range)
+
+            next_gaps = tuple(self.gap_detector.find_gaps(symbol=request.symbol, dataset=request.dataset, time_range=request.time_range, interval=request.interval))
+            if not next_gaps:
+                gaps_after = next_gaps
+                break
+            if _gap_signature(next_gaps) == pass_start_signature:
+                gaps_after = next_gaps
+                break
+            gaps_after = next_gaps
+
         return WarmupResult(
             request=request,
             gaps_before=gaps_before,
@@ -54,7 +73,6 @@ class KlineWarmupService:
         step_ms = interval_to_ms(request.interval)
         cursor = gap_range.start_time_ms
         total = 0
-        previous_cursor: int | None = None
 
         while cursor <= gap_range.end_time_ms:
             rows = await self.data_feed.fetch_klines(
@@ -65,7 +83,13 @@ class KlineWarmupService:
                 use_cache=False,
                 oldest_first=True,
             )
-            closed_rows = [row for row in rows if row.is_closed and row.symbol == request.symbol and row.open_time_ms <= gap_range.end_time_ms]
+            closed_rows = [
+                row
+                for row in rows
+                if row.is_closed
+                and row.symbol == request.symbol
+                and cursor <= row.open_time_ms <= gap_range.end_time_ms
+            ]
             if not closed_rows:
                 break
 
@@ -73,11 +97,21 @@ class KlineWarmupService:
             total += saved
             max_open_time = max(row.open_time_ms for row in closed_rows)
             next_cursor = max_open_time + step_ms
-            if previous_cursor is not None and next_cursor <= previous_cursor:
+            if next_cursor <= cursor:
                 break
-            previous_cursor = cursor
             cursor = next_cursor
             if len(closed_rows) < self.batch_limit:
                 break
 
         return total
+
+
+def _gap_signature(gaps) -> tuple[tuple[int, int, str], ...]:
+    return tuple(
+        (
+            gap.time_range.start_time_ms,
+            gap.time_range.end_time_ms,
+            gap.reason,
+        )
+        for gap in gaps
+    )

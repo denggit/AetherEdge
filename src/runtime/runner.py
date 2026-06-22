@@ -340,6 +340,21 @@ class LiveRuntimeRunner:
                 )
                 self.stats.warmup_runs += 1
                 if not result.caught_up:
+                    gap_details = [
+                        {
+                            "start_time_ms": gap.time_range.start_time_ms,
+                            "end_time_ms": gap.time_range.end_time_ms,
+                            "reason": gap.reason,
+                        }
+                        for gap in result.gaps_after[:10]
+                    ]
+                    logger.error(
+                        "Closed-kline warmup gaps remain | interval=%s gap_count=%s first_gaps=%s records_loaded=%s",
+                        self._closed_bar_interval,
+                        len(result.gaps_after),
+                        gap_details,
+                        result.records_loaded,
+                    )
                     raise LiveRuntimeError(f"closed-kline warmup did not catch up: {len(result.gaps_after)} gaps remain")
                 await self._hydrate_strategy_closed_klines(repository, time_range=TimeRange(start_open, end_open))
                 logger.info(

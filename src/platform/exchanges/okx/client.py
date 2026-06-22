@@ -121,7 +121,19 @@ class OkxExchangeClient:
         oldest_first: bool = False,
     ) -> list[Kline]:
         raw_symbol = to_exchange_symbol(self.exchange, symbol)
-        params: dict[str, Any] = {"instId": raw_symbol, "bar": _map_okx_interval(interval), "limit": limit}
+        page_limit = min(max(int(limit or 100), 1), 100)
+        if start_time_ms is not None and end_time_ms is not None:
+            return await self._fetch_historical_kline_page(
+                symbol=symbol,
+                raw_symbol=raw_symbol,
+                interval=interval,
+                limit=page_limit,
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+                oldest_first=oldest_first,
+            )
+
+        params: dict[str, Any] = {"instId": raw_symbol, "bar": _map_okx_interval(interval), "limit": page_limit}
         if start_time_ms is not None:
             params["after"] = start_time_ms
         if end_time_ms is not None:
@@ -131,6 +143,35 @@ class OkxExchangeClient:
         if oldest_first:
             rows.reverse()
         return [_map_okx_kline(row, symbol=symbol, raw_symbol=raw_symbol, interval=interval) for row in rows]
+
+    async def _fetch_historical_kline_page(
+        self,
+        *,
+        symbol: str,
+        raw_symbol: str,
+        interval: str,
+        limit: int,
+        start_time_ms: int,
+        end_time_ms: int,
+        oldest_first: bool,
+    ) -> list[Kline]:
+        params: dict[str, Any] = {
+            "instId": raw_symbol,
+            "bar": _map_okx_interval(interval),
+            "limit": limit,
+            # OKX history-candles paginates backwards from this cursor. Add a
+            # small cushion so the candle whose open time equals end_time_ms
+            # remains eligible without needlessly pulling the next interval.
+            "after": end_time_ms + 1_000,
+        }
+        payload = await self._request_public("GET", "/api/v5/market/history-candles", params=params)
+        klines = [
+            _map_okx_kline(row, symbol=symbol, raw_symbol=raw_symbol, interval=interval)
+            for row in list(payload.get("data", []))
+        ]
+        klines = [row for row in klines if start_time_ms <= row.open_time_ms <= end_time_ms]
+        klines.sort(key=lambda row: row.open_time_ms, reverse=not oldest_first)
+        return klines
 
     async def fetch_ticker(self, symbol: str) -> Ticker:
         raw_symbol = to_exchange_symbol(self.exchange, symbol)
