@@ -21,7 +21,7 @@ from src.platform import Balance, ExchangeName, LeverageInfo, Order, OrderStatus
 from src.platform.data.models import MarketKline, MarketTrade, TradeSide
 from src.platform.markets import get_market_profile
 from src.platform.snapshot import PlatformSnapshot
-from src.order_management import OrderIntentStatus, SqliteOrderJournalStore, SqlitePositionPlanStore
+from src.order_management import OrderIntent, OrderIntentStatus, SqliteOrderJournalStore, SqlitePositionPlanStore
 from src.order_management.position_plan.models import LegPlan, LegRole, LegSyncStatus, PositionPlan, PositionPlanStatus
 from src.planner import ExecutionPlanner
 from src.runtime import LiveRuntimeConfig, LiveRuntimeRunner, RuntimeMode, RuntimePhase, StrategyRuntimeRequirements
@@ -1303,27 +1303,38 @@ class CatchupTestFrozenPosition:
 
 
 class CatchupTestStrategy:
-    """Strategy that returns controlled signals."""
+    """Strategy that returns controlled signals.
+
+    When *signal_action* is an OPEN_* action, :meth:`on_market_feature` sets
+    ``self.pending_entry`` to a truthy sentinel, mimicking real V9C behaviour.
+    """
 
     def __init__(self, *, signal_action: str | None = None, in_pos: bool = False,
-                 pending_entry: object = None, config: dict | None = None) -> None:
+                 pending_entry: object = None, config: dict | None = None,
+                 signal_metadata: dict | None = None) -> None:
         self.signal_action = signal_action
         self.position = type("Position", (), {"in_pos": in_pos})()
         self.pending_entry = pending_entry
         self.config = config or {}
+        self.signal_metadata = dict(signal_metadata or {})
         self.events_received = []
+        self.buffer = type("Buffer", (), {"evaluated_bars": set()})()
+        self.bar_ready_events: list = []
 
     async def on_market_feature(self, event):
         self.events_received.append(event)
         if self.signal_action is None:
             return []
         action = SignalAction(self.signal_action)
+        # Simulate V9C: an OPEN signal sets pending_entry.
+        if action in {SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT}:
+            self.pending_entry = True  # truthy sentinel
         return [TradeSignal(
             symbol="ETH-USDT-PERP",
             action=action,
             quantity=Decimal("1"),
             reason="test_catchup",
-            metadata={"test": True},
+            metadata={**{"test": True}, **self.signal_metadata},
         )]
 
     async def on_start(self, snapshot):
@@ -1962,6 +1973,11 @@ async def test_startup_catchup_executes_open_signal_when_all_guards_pass():
     assert signal.metadata.get("startup_catchup") is True
     assert signal.action == SignalAction.OPEN_LONG
 
+    # Valid catch-up must preserve pending_entry (set by strategy preview).
+    assert strategy.pending_entry is not None, (
+        "pending_entry should be preserved after valid catch-up execution"
+    )
+
 
 # ── current price unavailable → skip ──────────────────────────────────────────
 
@@ -2045,3 +2061,196 @@ def test_has_unresolved_follower_close_method_exists_and_works():
     assert callable(runner._has_unresolved_follower_close)
     # With no position plan store → returns False
     assert runner._has_unresolved_follower_close() is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Startup catch-up preview state capture / restore (AE-V9C-LIVE-STARTUP-018)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_startup_catchup_price_guard_failure_restores_pending_entry():
+    """Price guard failure must restore strategy.pending_entry to preview‑before
+    state and NOT execute any signal."""
+    h4_ms = 4 * 60 * 60_000
+    now_ms = 12 * 60 * 60_000 + 120_000
+    current_4h_open = 12 * 60 * 60_000
+    candidate_open = current_4h_open - h4_ms
+    candidate_close = current_4h_open - 1
+
+    kline = MarketKline(
+        exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP", interval="4h",
+        open_time_ms=candidate_open, close_time_ms=candidate_close,
+        open=Decimal("95"), high=Decimal("110"), low=Decimal("90"),
+        close=Decimal("100"), volume=Decimal("10"), is_closed=True,
+    )
+
+    strategy = CatchupTestStrategy(signal_action="open_long")
+    # Current price = 101 → adverse for LONG (1% above close)
+    data = CatchupTestData(ticker_price=Decimal("101"))
+
+    from src.market_data.models import RangeBarAggregate
+    aggregate = RangeBarAggregate(
+        symbol="ETH-USDT-PERP", range_pct=Decimal("0.002"),
+        bucket_start_ms=candidate_open, bucket_end_ms=candidate_open + h4_ms - 1,
+        bar_count=10, first_open=Decimal("100"), last_close=Decimal("100.5"),
+        high=Decimal("101"), low=Decimal("99"),
+        buy_notional_sum=Decimal("500"), sell_notional_sum=Decimal("500"),
+        delta_notional_sum=Decimal("0"), notional_sum=Decimal("1000"),
+    )
+
+    range_store = CatchupTestRangeBarStore([RangeBar(
+        symbol="ETH-USDT-PERP", range_pct=Decimal("0.002"),
+        bar_id=1, start_time_ms=candidate_open, end_time_ms=candidate_open + 1000,
+        open=Decimal("100"), high=Decimal("101"), low=Decimal("99"),
+        close=Decimal("100.5"), volume=Decimal("1"),
+        buy_notional=Decimal("500"), sell_notional=Decimal("500"),
+        trade_count=100,
+    )])
+    aggregator = FakeRangeBarAggregatorForTest(aggregates=[aggregate])
+
+    executed_signals = []
+
+    async def capture_execute(signals, *, source, event_time_ms, metadata=None,
+                              feedback_depth=0):
+        executed_signals.extend(signals)
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "kline_store": CatchupTestKlineStore([kline]),
+            "range_bar_store": range_store,
+            "range_bar_aggregator": aggregator,
+            "runtime_requirements": _feature_requirements(),
+        },
+        dry_run=True,
+    )
+    runner._startup_catchup_evaluated = False
+    runner._execute_signals = capture_execute
+
+    with patch("time.time", return_value=now_ms / 1000):
+        await runner._evaluate_startup_catchup_once(_snapshot())
+
+    # Price guard failed → pending_entry must be restored to None.
+    assert strategy.pending_entry is None, (
+        "pending_entry should be restored after price_guard_failed"
+    )
+    # No signal executed.
+    assert executed_signals == []
+
+
+@pytest.mark.asyncio
+async def test_startup_catchup_order_journal_duplicate_restores_pending_entry(tmp_path):
+    """OrderJournal duplicate position_id must skip execution and restore
+    strategy.pending_entry."""
+    h4_ms = 4 * 60 * 60_000
+    now_ms = 12 * 60 * 60_000 + 120_000
+    current_4h_open = 12 * 60 * 60_000
+    candidate_open = current_4h_open - h4_ms
+    candidate_close = current_4h_open - 1
+
+    kline = MarketKline(
+        exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP", interval="4h",
+        open_time_ms=candidate_open, close_time_ms=candidate_close,
+        open=Decimal("100"), high=Decimal("110"), low=Decimal("90"),
+        close=Decimal("105"), volume=Decimal("10"), is_closed=True,
+    )
+
+    strategy = CatchupTestStrategy(
+        signal_action="open_long",
+        signal_metadata={"position_id": "v9c-duplicate-position"},
+    )
+    data = CatchupTestData(ticker_price=Decimal("105"))
+
+    from src.market_data.models import RangeBarAggregate
+    aggregate = RangeBarAggregate(
+        symbol="ETH-USDT-PERP", range_pct=Decimal("0.002"),
+        bucket_start_ms=candidate_open, bucket_end_ms=candidate_open + h4_ms - 1,
+        bar_count=10, first_open=Decimal("100"), last_close=Decimal("105"),
+        high=Decimal("110"), low=Decimal("90"),
+        buy_notional_sum=Decimal("500"), sell_notional_sum=Decimal("500"),
+        delta_notional_sum=Decimal("0"), notional_sum=Decimal("1000"),
+    )
+
+    range_store = CatchupTestRangeBarStore([RangeBar(
+        symbol="ETH-USDT-PERP", range_pct=Decimal("0.002"),
+        bar_id=1, start_time_ms=candidate_open, end_time_ms=candidate_open + 1000,
+        open=Decimal("100"), high=Decimal("110"), low=Decimal("90"),
+        close=Decimal("105"), volume=Decimal("1"),
+        buy_notional=Decimal("500"), sell_notional=Decimal("500"),
+        trade_count=100,
+    )])
+    aggregator = FakeRangeBarAggregatorForTest(aggregates=[aggregate])
+
+    # Pre-populate OrderJournal with a matching intent.
+    journal = SqliteOrderJournalStore(tmp_path / "journal.sqlite3")
+    dup_signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.OPEN_LONG,
+        quantity=Decimal("1"),
+        metadata={"position_id": "v9c-duplicate-position"},
+        created_time_ms=100,
+    )
+    dup_intent = OrderIntent(
+        intent_id="dup-intent-1",
+        strategy_id="test",
+        signal=dup_signal,
+        target_exchanges=(ExchangeName.OKX,),
+        status=OrderIntentStatus.SUBMITTED,
+    )
+    journal.save_intent(dup_intent)
+
+    executed_signals = []
+
+    async def capture_execute(signals, *, source, event_time_ms, metadata=None,
+                              feedback_depth=0):
+        executed_signals.extend(signals)
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "kline_store": CatchupTestKlineStore([kline]),
+            "range_bar_store": range_store,
+            "range_bar_aggregator": aggregator,
+            "order_journal": journal,
+            "runtime_requirements": _feature_requirements(),
+        },
+        dry_run=True,
+    )
+    runner._startup_catchup_evaluated = False
+    runner._execute_signals = capture_execute
+
+    # Current 4H kline for theoretical_open fetch
+    current_kline = MarketKline(
+        exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP", interval="4h",
+        open_time_ms=current_4h_open, close_time_ms=current_4h_open + h4_ms - 1,
+        open=Decimal("105"), high=Decimal("105"), low=Decimal("105"),
+        close=Decimal("105"), volume=Decimal("0"), is_closed=False,
+    )
+    data._klines = [current_kline]
+
+    with patch("time.time", return_value=now_ms / 1000):
+        await runner._evaluate_startup_catchup_once(_snapshot())
+
+    # Duplicate journal hit → pending_entry must be restored.
+    assert strategy.pending_entry is None, (
+        "pending_entry should be restored after order_journal_duplicate"
+    )
+    # No signal executed.
+    assert executed_signals == []
+
+
+def test_runner_has_no_startup_catchup_dedupe_todo():
+    """runner.py must NOT contain the old startup catch-up dedupe TODO."""
+    text = Path("src/runtime/runner.py").read_text(encoding="utf-8")
+    assert "TODO: also check OrderJournal" not in text
+    assert "TODO: also check OrderJournal / PositionPlan / StateStore for dedup" not in text

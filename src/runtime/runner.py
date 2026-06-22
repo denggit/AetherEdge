@@ -94,6 +94,17 @@ def _is_fatal_startup_error(exc: BaseException) -> bool:
     return any(marker in text for marker in FATAL_STARTUP_ERROR_MARKERS)
 
 
+@dataclass
+class StartupPreviewState:
+    """Snapshot of strategy mutable state captured before a startup catch-up
+    preview so it can be rolled back when the previewed signal is ultimately
+    NOT executed (e.g. price guard failure or journal dedupe)."""
+
+    pending_entry: object | None
+    evaluated_bars: set[int] | None
+    bar_ready_events_len: int | None
+
+
 class LiveRuntimeRunner:
     """Live runtime orchestration for strategy plugins.
 
@@ -720,6 +731,45 @@ class LiveRuntimeRunner:
                 signals.extend(result)
         return signals
 
+    def _capture_startup_preview_state(self) -> StartupPreviewState:
+        strategy = self.context.strategy
+
+        pending_entry = getattr(strategy, "pending_entry", None)
+
+        evaluated_bars = None
+        buffer_obj = getattr(strategy, "buffer", None)
+        if buffer_obj is not None and hasattr(buffer_obj, "evaluated_bars"):
+            evaluated_bars = set(getattr(buffer_obj, "evaluated_bars"))
+
+        bar_ready_events_len = None
+        events = getattr(strategy, "bar_ready_events", None)
+        if isinstance(events, list):
+            bar_ready_events_len = len(events)
+
+        return StartupPreviewState(
+            pending_entry=pending_entry,
+            evaluated_bars=evaluated_bars,
+            bar_ready_events_len=bar_ready_events_len,
+        )
+
+    def _restore_startup_preview_state(self, state: StartupPreviewState) -> None:
+        strategy = self.context.strategy
+
+        if hasattr(strategy, "pending_entry"):
+            setattr(strategy, "pending_entry", state.pending_entry)
+
+        buffer_obj = getattr(strategy, "buffer", None)
+        if (
+            buffer_obj is not None
+            and state.evaluated_bars is not None
+            and hasattr(buffer_obj, "evaluated_bars")
+        ):
+            buffer_obj.evaluated_bars = set(state.evaluated_bars)
+
+        events = getattr(strategy, "bar_ready_events", None)
+        if isinstance(events, list) and state.bar_ready_events_len is not None:
+            del events[state.bar_ready_events_len:]
+
     async def _build_range_aggregate_events_for_bucket(
         self, bucket_start_ms: int
     ) -> list[MarketFeatureEvent]:
@@ -771,17 +821,34 @@ class LiveRuntimeRunner:
     def _get_min_range_bars(self) -> int:
         """Read ``min_range_bars`` from the strategy config, default 1.
 
-        V9C declares this in ``config.json`` → ``micro_context.min_range_bars``.
+        V9C declares this via ``config.micro_context.min_range_bars``
+        (an object/dataclass) or ``config["micro_context"]["min_range_bars"]``
+        (a dict).
         """
-        try:
-            strategy = self.context.strategy
-            cfg = getattr(strategy, "config", None)
-            if isinstance(cfg, dict):
-                micro = cfg.get("micro_context", {})
-                if isinstance(micro, dict):
-                    return max(1, int(micro.get("min_range_bars", 1) or 1))
-        except Exception:
-            pass
+        strategy = self.context.strategy
+        cfg = getattr(strategy, "config", None)
+
+        # 1. Object/dataclass path: strategy.config.micro_context.min_range_bars
+        micro_obj = getattr(cfg, "micro_context", None)
+        value = getattr(micro_obj, "min_range_bars", None)
+        if value is not None:
+            try:
+                return max(1, int(value))
+            except (TypeError, ValueError):
+                pass
+
+        # 2. Dict path: strategy.config["micro_context"]["min_range_bars"]
+        if isinstance(cfg, dict):
+            micro = cfg.get("micro_context", {})
+            if isinstance(micro, dict):
+                value = micro.get("min_range_bars")
+                if value is not None:
+                    try:
+                        return max(1, int(value))
+                    except (TypeError, ValueError):
+                        pass
+
+        # 3. Default
         return 1
 
     async def _evaluate_startup_catchup_once(self, snapshot: PlatformSnapshot) -> None:
@@ -889,12 +956,6 @@ class LiveRuntimeRunner:
             )
             return
 
-        # TODO: also check OrderJournal / PositionPlan / StateStore for dedup.
-        # The current OrderJournal query interface needs a
-        # ``has_order_for_open_time_ms`` helper before we can add those
-        # layers here.  For now the scheduler + position-plan + open-order
-        # checks provide three independent dedup layers.
-
         # ── 7. Range aggregate — MUST be available; NO placeholder ─────────
         range_events: list[MarketFeatureEvent] = []
         if self.requirements.range_bars.enabled:
@@ -947,6 +1008,7 @@ class LiveRuntimeRunner:
         # ── 10. Preview strategy signals WITHOUT executing (P0-3 fix) ───────
         preview_events: list[MarketFeatureEvent] = [closed_kline_feature(kline)]
         preview_events.extend(range_events)
+        preview_state = self._capture_startup_preview_state()
         signals = await self._preview_strategy_market_features(preview_events)
         logger.info(
             "Startup catchup strategy preview | total_signals=%s",
@@ -988,6 +1050,28 @@ class LiveRuntimeRunner:
                 )
                 continue
 
+            # OrderJournal dedupe guard — skip signal when an intent with the
+            # same position_id already exists in the order journal.
+            position_id = None
+            if signal.metadata:
+                position_id = signal.metadata.get("position_id")
+
+            if position_id:
+                journal = self._order_journal or self._get_order_journal()
+                has_duplicate = False
+                has_fn = getattr(journal, "has_intent_with_position_id", None)
+                if callable(has_fn):
+                    has_duplicate = bool(has_fn(str(position_id)))
+                if has_duplicate:
+                    logger.info(
+                        "Startup catchup signal discarded | reason=order_journal_duplicate "
+                        "position_id=%s action=%s candidate_open_ms=%s",
+                        position_id,
+                        signal.action.value,
+                        candidate_open,
+                    )
+                    continue
+
             # Enrich signal with startup_catchup source / metadata.
             enriched = TradeSignal(
                 symbol=signal.symbol,
@@ -1015,6 +1099,7 @@ class LiveRuntimeRunner:
             signals_to_execute.append(enriched)
 
         if not signals_to_execute:
+            self._restore_startup_preview_state(preview_state)
             logger.info(
                 "Startup catchup skipped | reason=no_open_signal_after_price_guard "
                 "total_signals=%s candidate_open_ms=%s",

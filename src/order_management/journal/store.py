@@ -155,6 +155,70 @@ class SqliteOrderJournalStore:
             ).fetchall()
         return [_row_to_result(row) for row in rows]
 
+    def has_intent_with_position_id(
+        self,
+        position_id: str,
+        *,
+        active_statuses: tuple[OrderIntentStatus, ...] = (
+            OrderIntentStatus.CREATED,
+            OrderIntentStatus.PLANNED,
+            OrderIntentStatus.SUBMITTED,
+            OrderIntentStatus.PARTIALLY_SUBMITTED,
+            OrderIntentStatus.FILLED,
+            OrderIntentStatus.RECOVERED,
+        ),
+        scan_limit: int = 1000,
+    ) -> bool:
+        """Return True when any active-order intent references *position_id*.
+
+        Searches three JSON paths per row (no ``json_extract``):
+
+        * ``signal_json["metadata"]["position_id"]``
+        * ``metadata_json["position_id"]``
+        * ``metadata_json["signal_metadata"]["position_id"]``
+
+        Silently skips rows whose JSON cannot be parsed.
+        """
+        if not position_id:
+            return False
+        statuses = ",".join(f"'{s.value}'" for s in active_statuses)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT signal_json, metadata_json, status "
+                f"FROM order_intents "
+                f"WHERE status IN ({statuses}) "
+                f"ORDER BY created_time_ms DESC "
+                f"LIMIT ?",
+                (scan_limit,),
+            ).fetchall()
+        for signal_json, metadata_json, _status in rows:
+            try:
+                sig = json.loads(str(signal_json))
+            except Exception:
+                try:
+                    meta = json.loads(str(metadata_json))
+                    if isinstance(meta.get("position_id"), str) and meta["position_id"] == position_id:
+                        return True
+                    if isinstance(meta.get("signal_metadata", {}).get("position_id"), str) and meta["signal_metadata"]["position_id"] == position_id:
+                        return True
+                except Exception:
+                    pass
+                continue
+            try:
+                if isinstance(sig.get("metadata", {}).get("position_id"), str) and sig["metadata"]["position_id"] == position_id:
+                    return True
+            except Exception:
+                pass
+            try:
+                meta = json.loads(str(metadata_json))
+                if isinstance(meta.get("position_id"), str) and meta["position_id"] == position_id:
+                    return True
+                if isinstance(meta.get("signal_metadata", {}).get("position_id"), str) and meta["signal_metadata"]["position_id"] == position_id:
+                    return True
+            except Exception:
+                pass
+        return False
+
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.execute(
