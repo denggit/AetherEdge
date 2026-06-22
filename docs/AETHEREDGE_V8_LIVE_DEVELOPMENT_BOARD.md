@@ -71,7 +71,7 @@ V8 不订阅 order_book，只订阅 trades + closed 4H + rangebar aggregate + pr
 - [x] AE-0503 V8 Micro Context
 - [x] AE-0504 V8 Position State
 - [x] AE-0505 V8 Signal Mapper
-- [ ] AE-0506 Readonly Parity Mode
+- [x] AE-0506 Readonly Parity Mode
 - [ ] AE-0507 Live Trading Mode
 
 ## 当前完成范围
@@ -180,7 +180,7 @@ V8 插件位于 strategies/eth_lf_portfolio_v8。
 
 - [x] AE-0504 V8 Position State
 - [x] AE-0505 V8 Signal Mapper
-- [ ] AE-0506 Readonly Parity Mode
+- [x] AE-0506 Readonly Parity Mode
 
 设计结论：
 
@@ -189,4 +189,19 @@ V8 position state 分成 master canonical state 和 exchange leg state。
 account/order event 只能让 master exchange 驱动 canonical state，follower 只更新自己的 leg。
 SignalMapper 将 V8TradeDecision 映射成标准 TradeSignal，quantity 仍然是 base asset。
 Momentum / Bear / Bull engine 类和 PortfolioRouter 钩子已就绪，但完整 LF parity 和 readonly audit 仍在下一包。
+```
+
+
+## Board 5 package 3：Readonly Parity Mode
+
+- [x] AE-0506 Readonly Parity Mode
+- [ ] AE-0507 Momentum V3 / Bear V3 / Bull Reclaim V2 LF 规则迁移
+
+设计结论：
+
+```text
+Readonly parity mode 只读取 CoinBacktest 导出的 signal_audit.csv，不 import CoinBacktest，也不驱动实盘订单。
+对比 key 默认使用 4H bar open_time_ms，因为回测 signal_audit.timestamp 是 4H bar timestamp。
+当前可对比 signal / selected_engine / selected_priority / micro flags / risk scale / micro_filter_action。
+LF 引擎还未迁移，因此现在 parity mode 主要用于验证事件时序、micro context 和后续 engine 迁移后的差异审计。
 ```

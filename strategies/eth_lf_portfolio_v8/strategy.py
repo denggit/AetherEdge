@@ -23,6 +23,7 @@ from strategies.eth_lf_portfolio_v8.domain.position_state import V8PositionState
 from strategies.eth_lf_portfolio_v8.features.buffer import V8FeatureBuffer
 from strategies.eth_lf_portfolio_v8.features.feature_frame import parse_closed_kline, parse_range_aggregate
 from strategies.eth_lf_portfolio_v8.features.micro_context import MicroContextConfig, MicroContextEngine
+from strategies.eth_lf_portfolio_v8.persistence.parity_audit import ReadonlyParityChecker, SignalAuditReference
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
@@ -35,6 +36,7 @@ class V8Config:
     runtime_requirements: Mapping[str, Any]
     micro_context: MicroContextConfig
     global_risk_scale: Decimal
+    readonly_parity: Mapping[str, Any]
 
     @classmethod
     def from_file(cls, path: str | Path = DEFAULT_CONFIG_PATH) -> "V8Config":
@@ -55,6 +57,7 @@ class V8Config:
                 not_aligned_risk_scale=Decimal(str(micro.get("not_aligned_risk_scale", "0.50"))),
             ),
             global_risk_scale=Decimal(str(data.get("risk", {}).get("global_risk_scale", "1.3"))),
+            readonly_parity=data.get("readonly_parity", {}),
         )
 
 
@@ -74,11 +77,28 @@ class Strategy:
         self.router = PortfolioRouter(engines=(MomentumV3Engine(), BearV3OnlyEngine(), BullReclaimV2Engine()))
         self.signal_mapper = V8SignalMapper(SignalMapperConfig(strategy_id=self.config.strategy_id))
         self.bar_ready_events: list[BarReadyContext] = []
+        self.parity_checker = self._build_parity_checker()
+        self.parity_results = []
         self.recovered = False
         self.started = False
 
     def runtime_requirements(self) -> Mapping[str, Any]:
         return dict(self.config.runtime_requirements)
+
+    def _build_parity_checker(self) -> ReadonlyParityChecker | None:
+        cfg = dict(self.config.readonly_parity or {})
+        if not cfg.get("enabled", False):
+            return None
+        reference_path = str(cfg.get("reference_signal_audit_csv") or "").strip()
+        if not reference_path:
+            raise ValueError("readonly_parity.reference_signal_audit_csv is required when enabled")
+        tolerance = Decimal(str(cfg.get("decimal_tolerance", "0.000001")))
+        reference = SignalAuditReference.from_csv(reference_path)
+        return ReadonlyParityChecker(
+            reference,
+            timestamp_key=str(cfg.get("timestamp_key", "open_time_ms")),
+            decimal_tolerance=tolerance,
+        )
 
     async def on_start(self, snapshot: PlatformSnapshot) -> Sequence[TradeSignal]:
         self.started = True
@@ -141,6 +161,8 @@ class Strategy:
                 routed_signal=routed,
             )
             self.bar_ready_events.append(ready)
+            if self.parity_checker is not None:
+                self.parity_results.append(self.parity_checker.compare(ready))
             # No live order is emitted until sizing/stops and LF engine parity are
             # migrated. Signal mapper is delivered and unit-tested separately.
             self.buffer.mark_evaluated(close_time_ms)
