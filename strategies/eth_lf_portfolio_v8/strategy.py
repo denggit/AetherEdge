@@ -520,7 +520,14 @@ class Strategy:
         params = self.engine_params.get(self.position.entry_engine)
         if params is None:
             return []
-        candidate = protected_stop(
+        atr_value = _feature_decimal(context, self.position.entry_engine, "atr")
+        candidates: list[Decimal] = []
+        if atr_value is not None and atr_value > 0:
+            if self.position.side is Side.LONG:
+                candidates.append(context.kline.close - params.trailing_atr_mult * atr_value)
+            elif self.position.side is Side.SHORT:
+                candidates.append(context.kline.close + params.trailing_atr_mult * atr_value)
+        protected = protected_stop(
             first_entry=self.position.first_entry,
             avg_entry=self.position.avg_entry,
             side=self.position.side,
@@ -533,9 +540,18 @@ class Strategy:
             lock_after_3r=params.lock_after_3r,
             lock_3r=params.lock_3r,
         )
+        if protected is not None:
+            candidates.append(protected)
+        if not candidates:
+            return []
+        if self.position.side is Side.LONG:
+            candidate = max(candidates)
+        elif self.position.side is Side.SHORT:
+            candidate = min(candidates)
+        else:
+            return []
         if not is_better_stop(side=self.position.side, current_stop=self.position.stop_price, candidate=candidate):
             return []
-        assert candidate is not None
         self.position.update_stop(candidate)
         exchange_quantities = self._open_leg_quantities()
         target_exchanges = sorted(exchange_quantities)
@@ -546,7 +562,7 @@ class Strategy:
             target_exchanges=target_exchanges,
             quantity=exchange_quantities.get(self.config.data_exchange, self.position.qty),
             stop_price=candidate,
-            reason="V8_PROTECTED_STOP_UPDATE",
+            reason="V8_PROTECTED_TRAILING_STOP_UPDATE",
             bar_close_time_ms=context.kline.close_time_ms,
             exchange_quantities=exchange_quantities,
         )
@@ -896,7 +912,7 @@ def _exchange_quantity_metadata(values: Mapping[str, Decimal]) -> dict[str, str]
 
 def _default_engine_execution_params() -> dict[str, EngineExecutionParams]:
     return {
-        "MOMENTUM_V3": EngineExecutionParams(Decimal("2.2"), Decimal("4.0"), Decimal("0.026"), Decimal("11.0"), 4, Decimal("1.0"), 180, 4),
+        "MOMENTUM_V3": EngineExecutionParams(Decimal("2.2"), Decimal("4.0"), Decimal("0.032"), Decimal("12.0"), 4, Decimal("1.0"), 180, 4),
         "BEAR_V3_ONLY": EngineExecutionParams(Decimal("2.5"), Decimal("4.5"), Decimal("0.022"), Decimal("11.0"), 5, Decimal("1.0"), 360, 8),
         "BULL_RECLAIM_V2": EngineExecutionParams(Decimal("2.2"), Decimal("3.5"), Decimal("0.020"), Decimal("8.0"), 3, Decimal("1.2"), 90, 4, Decimal("0.80"), Decimal("0.05"), Decimal("1.60"), Decimal("0.60"), Decimal("2.60"), Decimal("1.20")),
     }
