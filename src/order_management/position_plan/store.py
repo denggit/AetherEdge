@@ -153,6 +153,47 @@ class SqlitePositionPlanStore:
                 continue
             self.upsert_leg(replace(leg, stop_price=stop_price, stop_order_id=stop_order_id or leg.stop_order_id, stop_client_order_id=stop_client_order_id or leg.stop_client_order_id))
 
+    def clear_leg_order_ids(
+        self,
+        *,
+        position_id: str,
+        exchange: ExchangeName | str,
+        clear_entry_order_id: bool = False,
+        clear_stop_order_id: bool = False,
+    ) -> None:
+        """Explicitly clear order ID fields on a leg.
+
+        The ``upsert_leg`` method uses ``COALESCE(excluded.*, leg_plans.*)``
+        for order-ID columns, so passing ``None`` in an upserted LegPlan will
+        **not** overwrite an existing value.  This method bypasses that by
+        issuing a direct UPDATE … SET … = NULL.
+        """
+        exchange_name = (
+            exchange
+            if isinstance(exchange, ExchangeName)
+            else ExchangeName(str(exchange).strip().lower())
+        )
+        now_ms = int(time.time() * 1000)
+        with self._connect() as conn:
+            if clear_entry_order_id:
+                conn.execute(
+                    """UPDATE leg_plans
+                       SET entry_order_id = NULL,
+                           entry_client_order_id = NULL,
+                           updated_time_ms = ?
+                       WHERE position_id = ? AND exchange = ?""",
+                    (now_ms, position_id, exchange_name.value),
+                )
+            if clear_stop_order_id:
+                conn.execute(
+                    """UPDATE leg_plans
+                       SET stop_order_id = NULL,
+                           stop_client_order_id = NULL,
+                           updated_time_ms = ?
+                       WHERE position_id = ? AND exchange = ?""",
+                    (now_ms, position_id, exchange_name.value),
+                )
+
     def serialize_active_positions(self) -> list[dict[str, Any]]:
         payload: list[dict[str, Any]] = []
         for plan in self.list_active_positions():

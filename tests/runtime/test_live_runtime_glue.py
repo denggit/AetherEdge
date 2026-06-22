@@ -18,7 +18,8 @@ from src.platform import Balance, ExchangeName, LeverageInfo, Order, OrderStatus
 from src.platform.data.models import MarketKline, MarketTrade, TradeSide
 from src.platform.markets import get_market_profile
 from src.platform.snapshot import PlatformSnapshot
-from src.order_management import OrderIntentStatus, SqliteOrderJournalStore
+from src.order_management import OrderIntentStatus, SqliteOrderJournalStore, SqlitePositionPlanStore
+from src.order_management.position_plan.models import LegPlan, LegRole, LegSyncStatus, PositionPlan, PositionPlanStatus
 from src.planner import ExecutionPlanner
 from src.runtime import LiveRuntimeConfig, LiveRuntimeRunner, RuntimeMode, RuntimePhase, StrategyRuntimeRequirements
 from src.runtime.account_sync import RequestThrottle
@@ -1085,3 +1086,86 @@ async def test_live_runtime_skips_backfill_when_available_records_already_suffic
                 MockProv.assert_not_called()
 
     assert runner.stats.warmup_runs >= 1
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Reconciliation integration tests (AE-V9C-LIVE-BOOTSTRAP-012)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+from src.order_management.reconciliation.service import LiveStateReconciliationService
+
+
+@pytest.mark.asyncio
+async def test_runner_has_reconciliation_service_available():
+    """Reconciliation service is lazily available from runner."""
+    strategy = FeatureStrategy()
+    runner = _runner(
+        strategy,
+        services={
+            "recovery_service": FakeRecoveryService(),
+            "snapshot": _snapshot(),
+        },
+        dry_run=True,
+    )
+    svc = runner._get_reconciliation_service()
+    assert svc is not None
+    assert isinstance(svc, LiveStateReconciliationService)
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_stale_plan_cleaned_on_flat_exchange():
+    """Runner reconciles stale plan when all exchanges are flat."""
+    import tempfile
+    from pathlib import Path
+
+    strategy = FeatureStrategy()
+    store = SqlitePositionPlanStore(
+        str(Path(tempfile.mkdtemp()) / "plan.sqlite3")
+    )
+    plan = PositionPlan(
+        position_id="recon-test-1",
+        strategy_id="test",
+        entry_engine="test",
+        side="long",
+        status=PositionPlanStatus.ACTIVE,
+        canonical_stop_price=Decimal("0"),
+        master_exchange=ExchangeName.OKX,
+        master_target_qty_base=Decimal("0.1"),
+    )
+    store.upsert_position(plan)
+    store.upsert_leg(
+        LegPlan(
+            position_id="recon-test-1",
+            exchange=ExchangeName.OKX,
+            role=LegRole.MASTER,
+            target_qty_base=Decimal("0.1"),
+            entry_order_id="okx-order-1",
+            stop_order_id="okx-stop-1",
+            sync_status=LegSyncStatus.OPEN,
+        )
+    )
+
+    recon_svc = LiveStateReconciliationService(
+        position_plan_store=store,
+        order_journal=None,
+        state_store=None,
+    )
+    report = await recon_svc.reconcile_and_apply(
+        (_snapshot(),)
+    )
+
+    assert report.stale_plans_closed >= 1
+    assert len(report.fake_order_refs_found) >= 2
+
+    p = store.get_position("recon-test-1")
+    assert p is not None
+    assert p.status == PositionPlanStatus.CLOSED
+
+    for leg in store.get_legs("recon-test-1"):
+        if leg.entry_order_id:
+            from src.order_management.reconciliation.validation import is_fake_order_id
+            assert not is_fake_order_id(leg.entry_order_id)
+        if leg.stop_order_id:
+            from src.order_management.reconciliation.validation import is_fake_order_id
+            assert not is_fake_order_id(leg.stop_order_id)

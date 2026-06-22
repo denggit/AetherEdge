@@ -700,3 +700,184 @@ async def test_invalid_known_order_refs_do_not_increment_failure_counter():
     assert len(alerts.items) == 0
     # Counter should not have been incremented
     assert service._failures.get("okx", 0) == 0
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Known order ref validation with exchange-specific ID checks (AE-V9C-LIVE-BOOTSTRAP-012)
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_known_ids_filters_fake_exchange_order_ids_from_position_plan():
+    """Position plan legs with fake order IDs (okx-order-1) are marked INVALID_FORMAT."""
+    state = MemoryState()
+    execution = TrackingExecution()
+    account = FakeAccount()
+
+    # Leg with fake OKX order ID
+    store = FakePositionPlanStore(
+        legs=[
+            FakeLeg(
+                position_id="p1",
+                exchange=ExchangeName.OKX,
+                entry_order_id="okx-order-1",
+                entry_client_order_id=None,
+                stop_order_id="okx-stop-1",
+                stop_client_order_id=None,
+            ),
+        ]
+    )
+
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=account, execution=execution, state_store=state),),
+        config=OrderStateRequirement(sync_position=False, sync_open_orders=False, sync_open_stop_orders=False),
+        active_check=lambda: True,
+        position_plan_store=store,
+    )
+
+    results = await service.sync_once()
+
+    # Fake IDs should be skipped — no exchange calls
+    assert results[0].success is True
+    assert len(execution.order_queries) == 0, (
+        f"Expected 0 order queries (fake IDs skipped), got {len(execution.order_queries)}"
+    )
+    assert len(execution.stop_order_queries) == 0, (
+        f"Expected 0 stop order queries (fake IDs skipped), got {len(execution.stop_order_queries)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_known_ids_uses_client_order_id_when_exchange_id_is_fake():
+    """When exchange order_id is fake but client_order_id is valid, use client only."""
+    state = MemoryState()
+    execution = TrackingExecution()
+    account = FakeAccount()
+
+    store = FakePositionPlanStore(
+        legs=[
+            FakeLeg(
+                position_id="p1",
+                exchange=ExchangeName.OKX,
+                entry_order_id="okx-order-1",
+                entry_client_order_id="AEOKOLabc123",
+                stop_order_id="okx-stop-1",
+                stop_client_order_id="AEOKSPxyz789",
+            ),
+        ]
+    )
+
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=account, execution=execution, state_store=state),),
+        config=OrderStateRequirement(sync_position=False, sync_open_orders=False, sync_open_stop_orders=False),
+        active_check=lambda: True,
+        position_plan_store=store,
+    )
+
+    results = await service.sync_once()
+
+    assert results[0].success is True
+    # Should query using client_order_id only (order_id is None)
+    assert len(execution.order_queries) == 1
+    assert execution.order_queries[0].order_id is None
+    assert execution.order_queries[0].client_order_id == "AEOKOLabc123"
+    assert len(execution.stop_order_queries) == 1
+    assert execution.stop_order_queries[0].stop_order_id is None
+    assert execution.stop_order_queries[0].client_order_id == "AEOKSPxyz789"
+
+
+@pytest.mark.asyncio
+async def test_known_ids_skips_binance_fake_order_ids():
+    """Binance fake order IDs (binance-order-1) are filtered out."""
+    state = MemoryState()
+    execution = TrackingExecution()
+    execution.exchange = ExchangeName.BINANCE  # override for Binance
+    account = FakeAccount()
+    account.exchange = ExchangeName.BINANCE  # override for Binance test
+
+    store = FakePositionPlanStore(
+        legs=[
+            FakeLeg(
+                position_id="p1",
+                exchange=ExchangeName.BINANCE,
+                entry_order_id="binance-order-1",
+                entry_client_order_id=None,
+                stop_order_id="binance-stop-1",
+                stop_client_order_id=None,
+            ),
+        ]
+    )
+
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=account, execution=execution, state_store=state),),
+        config=OrderStateRequirement(sync_position=False, sync_open_orders=False, sync_open_stop_orders=False),
+        active_check=lambda: True,
+        position_plan_store=store,
+    )
+
+    results = await service.sync_once()
+    assert len(execution.order_queries) == 0
+    assert len(execution.stop_order_queries) == 0
+
+
+@pytest.mark.asyncio
+async def test_known_ids_detects_okx_1_as_fake():
+    """okx-1 is a fake pattern and should be filtered."""
+    state = MemoryState()
+    execution = TrackingExecution()
+    account = FakeAccount()
+
+    store = FakePositionPlanStore(
+        legs=[
+            FakeLeg(
+                position_id="p1",
+                exchange=ExchangeName.OKX,
+                entry_order_id="okx-1",
+                entry_client_order_id=None,
+            ),
+        ]
+    )
+
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=account, execution=execution, state_store=state),),
+        config=OrderStateRequirement(sync_position=False, sync_open_orders=False, sync_open_stop_orders=False),
+        active_check=lambda: True,
+        position_plan_store=store,
+    )
+
+    results = await service.sync_once()
+    assert len(execution.order_queries) == 0, (
+        f"Expected 0 queries for fake ID 'okx-1', got {len(execution.order_queries)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_known_ids_allows_real_numeric_order_ids():
+    """Real numeric exchange order IDs pass validation and are queried."""
+    state = MemoryState()
+    execution = TrackingExecution()
+    account = FakeAccount()
+
+    store = FakePositionPlanStore(
+        legs=[
+            FakeLeg(
+                position_id="p1",
+                exchange=ExchangeName.OKX,
+                entry_order_id="1234567890",
+                entry_client_order_id="AEOKOLabc123",
+            ),
+        ]
+    )
+
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=account, execution=execution, state_store=state),),
+        config=OrderStateRequirement(sync_position=False, sync_open_orders=False, sync_open_stop_orders=False),
+        active_check=lambda: True,
+        position_plan_store=store,
+    )
+
+    results = await service.sync_once()
+    assert len(execution.order_queries) == 1
+    # Should use the numeric order_id
+    assert execution.order_queries[0].order_id == "1234567890"
+    assert execution.order_queries[0].client_order_id == "AEOKOLabc123"

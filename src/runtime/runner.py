@@ -18,6 +18,7 @@ from src.market_data.warmup.service import KlineWarmupService
 from src.order_management import LegSyncStatus, MasterFollowerExecutionPolicy, MultiExchangeOrderCoordinator, PositionPlanStatus, RepositoryDuplicateOrderGuard, SqliteOrderJournalStore, SqlitePositionPlanStore
 from src.order_management.position_plan.models import LegRole
 from src.order_management.models import ExchangeOrderResult, OrderIntentStatus
+from src.order_management.reconciliation.service import LiveStateReconciliationService
 from src.platform import create_account_client, create_execution_client
 from src.platform.account.events import AccountEvent
 from src.platform.account.ports import AccountClient
@@ -119,6 +120,7 @@ class LiveRuntimeRunner:
         self._order_sync_service = self.services.get("order_sync_service")
         self._request_sync_throttle = self.services.get("request_sync_throttle") or RequestThrottle(min_interval_seconds=0.25)
         self._recovery_service = self.services.get("recovery_service", "__default__")
+        self._reconciliation_service = self.services.get("reconciliation_service", "__default__")
         self._range_bar_store = self.services.get("range_bar_store")
         self._range_bar_builder = self.services.get("range_bar_builder")
         self._range_bar_aggregator = self.services.get("range_bar_aggregator")
@@ -254,16 +256,16 @@ class LiveRuntimeRunner:
         # seconds or the process restarted mid-bucket.
         if self.requirements.range_bars.enabled and self.requirements.trades.enabled:
             if self._rangebar_trust_start_bucket_ms is not None and open_time_ms < self._rangebar_trust_start_bucket_ms:
-                self.context.alerts.emit(
-                    AppAlert(
-                        subject="AetherEdge live-only partial range bucket",
-                        content=(
-                            f"Closed bucket {open_time_ms} started before live trade collection was trusted. "
-                            "V9C will evaluate the 4H signal with micro context unavailable instead of using partial range bars."
-                        ),
-                        severity="warning",
-                    )
-                )
+                # self.context.alerts.emit(
+                #     AppAlert(
+                #         subject="AetherEdge live-only partial range bucket",
+                #         content=(
+                #             f"Closed bucket {open_time_ms} started before live trade collection was trusted. "
+                #             "V9C will evaluate the 4H signal with micro context unavailable instead of using partial range bars."
+                #         ),
+                #         severity="warning",
+                #     )
+                # )
                 unavailable = range_aggregate_unavailable_feature(
                     symbol=self.app_config.symbol,
                     exchange=self.app_config.data_exchange,
@@ -307,6 +309,8 @@ class LiveRuntimeRunner:
         await self._run_warmup()
         self._set_health(RuntimePhase.CATCHING_UP, healthy=True, warmup_complete=True)
         snapshot = await self._run_recovery()
+        # ── State convergence: reconcile exchange truth against local state ──
+        await self._run_reconciliation(snapshot)
         await self._call_on_start(snapshot)
         self._set_health(RuntimePhase.RUNNING, healthy=True, warmup_complete=True, caught_up=True)
         logger.info("Live runtime startup phase completed")
@@ -1064,6 +1068,85 @@ class LiveRuntimeRunner:
             ]
             self._recovery_service = RuntimeRecoveryService(exchange_contexts=contexts, order_journal=self._get_order_journal(), position_plan_store=self._get_position_plan_store())
         return self._recovery_service
+
+    def _get_reconciliation_service(self):
+        if self._reconciliation_service == "__default__":
+            self._reconciliation_service = LiveStateReconciliationService(
+                position_plan_store=self._get_position_plan_store(),
+                order_journal=self._get_order_journal(),
+                state_store=self.context.state_store,
+                alert_sink=self.context.alerts,
+            )
+        return self._reconciliation_service
+
+    async def _run_reconciliation(self, snapshot: PlatformSnapshot) -> None:
+        """Run startup state reconciliation: compare exchange truth against
+        local PositionPlan / LegPlan / order journal state and repair stale
+        artifacts before producers or sync tasks start."""
+        service = self._get_reconciliation_service()
+        if service is None:
+            return
+        snapshots = (snapshot,)
+        logger.info("Startup reconciliation starting | exchanges=%s", snapshot.leverage.exchange.value)
+        report = await service.reconcile_and_apply(snapshots)
+        if report.stale_plans_closed > 0:
+            logger.warning(
+                "Startup reconciliation closed %s stale position plan(s) | "
+                "fake_refs=%s verdict=%s",
+                report.stale_plans_closed,
+                len(report.fake_order_refs_found),
+                report.verdict.value,
+            )
+        if report.fake_order_refs_found:
+            for ref in report.fake_order_refs_found:
+                logger.warning(
+                    "Fake order ref cleaned | position_id=%s exchange=%s "
+                    "field=%s value=%s reason=%s",
+                    ref.position_id,
+                    ref.exchange,
+                    ref.field,
+                    ref.value,
+                    ref.reason,
+                )
+        if report.unresolved_follower_positions > 0:
+            logger.warning(
+                "Startup reconciliation: %s unresolved follower position(s) | "
+                "position_id(s)=%s",
+                report.unresolved_follower_positions,
+                ", ".join(
+                    a.target for a in report.actions
+                    if a.action_type == "set_master_closed_follower_close_required"
+                ),
+            )
+        for alert_dict in report.alerts:
+            self.context.alerts.emit(
+                AppAlert(
+                    subject=alert_dict["subject"],
+                    content=alert_dict["content"],
+                    severity=alert_dict.get("severity", "error"),
+                )
+            )
+        if report.verdict in {
+            "fail_unresolved_follower_position",
+        }:
+            logger.error(
+                "Startup reconciliation failed | verdict=%s issues=%s",
+                report.verdict.value,
+                report.issues,
+            )
+        elif report.stale_plans_closed > 0 or report.fake_order_refs_found:
+            logger.info(
+                "Startup reconciliation passed with cleanup | "
+                "verdict=%s stale_plans_closed=%s fake_refs=%s",
+                report.verdict.value,
+                report.stale_plans_closed,
+                len(report.fake_order_refs_found),
+            )
+        else:
+            logger.info(
+                "Startup reconciliation passed | verdict=%s",
+                report.verdict.value,
+            )
 
     def _get_sync_contexts(self) -> tuple[SyncExchangeContext, ...]:
         if ("execution_clients" in self.services) != ("account_clients" in self.services):

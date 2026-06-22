@@ -6,9 +6,14 @@ import time
 from typing import Any, Callable, Iterable, Mapping
 
 from src.app.alerts import AppAlert
-from src.platform.exchanges.models import Balance, MarginMode, Order, OrderQuery, OrderStatus, StopOrderQuery
+from src.order_management.reconciliation.validation import (
+    is_valid_exchange_order_id,
+    is_valid_client_order_id,
+    resolve_query_params,
+)
+from src.platform.exchanges.models import Balance, ExchangeName, MarginMode, Order, OrderQuery, OrderStatus, StopOrderQuery
 from src.platform.snapshot import PlatformSnapshot
-from src.runtime.account_sync.models import KnownOrderRef, SyncExchangeContext, SyncResult
+from src.runtime.account_sync.models import KnownOrderRef, KnownOrderRefStatus, SyncExchangeContext, SyncResult
 from src.runtime.requirements import AccountStateRequirement, OrderStateRequirement
 from src.utils.log import get_logger
 
@@ -210,6 +215,9 @@ class OrderStateSyncService:
             known_failures: list[str] = []
             skipped_invalid: int = 0
             for ref in self._known_ids(exchange, key="orders"):
+                if ref.status in {KnownOrderRefStatus.INVALID_FORMAT, KnownOrderRefStatus.STALE_RECONCILED}:
+                    skipped_invalid += 1
+                    continue
                 if ref.order_id is None and ref.client_order_id is None:
                     skipped_invalid += 1
                     logger.debug("Skipped invalid known order ref | exchange=%s key=orders", exchange)
@@ -233,6 +241,9 @@ class OrderStateSyncService:
                         exc,
                     )
             for ref in self._known_ids(exchange, key="stop_orders"):
+                if ref.status in {KnownOrderRefStatus.INVALID_FORMAT, KnownOrderRefStatus.STALE_RECONCILED}:
+                    skipped_invalid += 1
+                    continue
                 if ref.order_id is None and ref.client_order_id is None:
                     skipped_invalid += 1
                     logger.debug("Skipped invalid known stop order ref | exchange=%s key=stop_orders", exchange)
@@ -392,15 +403,65 @@ class OrderStateSyncService:
                 else:
                     oid = _clean_order_id(leg.stop_order_id)
                     cid = _clean_order_id(leg.stop_client_order_id)
-                if oid is None and cid is None:
+
+                # ── Exchange-specific validation (Task C + D) ──
+                exchange_enum = ExchangeName(leg.exchange.value)
+                oid_valid = is_valid_exchange_order_id(exchange_enum, oid)
+                cid_valid = is_valid_client_order_id(cid)
+
+                if not oid_valid and not cid_valid:
+                    # Both IDs are invalid — mark INVALID_FORMAT, skip querying
+                    refs.append(
+                        KnownOrderRef(
+                            order_id=None,
+                            client_order_id=None,
+                            status=KnownOrderRefStatus.INVALID_FORMAT,
+                        )
+                    )
                     logger.debug(
-                        "Skipped invalid order ref from position plan | exchange=%s key=%s position_id=%s",
+                        "Known order ref marked INVALID_FORMAT | exchange=%s key=%s "
+                        "position_id=%s entry_order_id=%r stop_order_id=%r",
                         exchange,
                         key,
                         plan.position_id,
+                        _clean_order_id(leg.entry_order_id),
+                        _clean_order_id(leg.stop_order_id),
                     )
                     continue
-                refs.append(KnownOrderRef(order_id=oid, client_order_id=cid))
+
+                if not oid_valid and cid_valid:
+                    # Exchange order ID is fake/non-numeric — use ONLY client_order_id
+                    resolved_oid, resolved_cid = resolve_query_params(
+                        exchange_enum, oid, cid
+                    )
+                    refs.append(
+                        KnownOrderRef(
+                            order_id=resolved_oid,
+                            client_order_id=resolved_cid,
+                            status=KnownOrderRefStatus.ACTIVE,
+                        )
+                    )
+                    logger.debug(
+                        "Known order ref fallback to client_order_id | exchange=%s "
+                        "key=%s position_id=%s resolved_cid=%s",
+                        exchange,
+                        key,
+                        plan.position_id,
+                        resolved_cid,
+                    )
+                    continue
+
+                # Both valid — use resolved params
+                resolved_oid, resolved_cid = resolve_query_params(
+                    exchange_enum, oid, cid
+                )
+                refs.append(
+                    KnownOrderRef(
+                        order_id=resolved_oid,
+                        client_order_id=resolved_cid,
+                        status=KnownOrderRefStatus.ACTIVE,
+                    )
+                )
         # Deduplicate while preserving order
         seen: set[tuple[str | None, str | None]] = set()
         deduped: list[KnownOrderRef] = []

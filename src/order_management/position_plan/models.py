@@ -37,6 +37,7 @@ class LegSyncStatus(str, Enum):
     MANUAL_REQUIRED = "manual_required"
     CLOSED = "closed"
     FOLLOWER_CLOSE_FAILED = "follower_close_failed"
+    STALE_RECONCILED = "stale_reconciled"
 
 
 @dataclass(frozen=True)
