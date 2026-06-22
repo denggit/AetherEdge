@@ -16,6 +16,7 @@ from src.planner import ExecutionPlanner, PlannedExecution, PlannedExecutionActi
 from src.platform.execution import ExecutionClient
 from src.platform.exchanges.models import ExchangeName, Order, OrderRequest, StopMarketOrderRequest
 from src.signals.models import SignalAction
+from src.utils.log import get_logger
 
 
 _MASTER_GATED_PURPOSES = {"normal_entry", "normal_close"}
@@ -24,6 +25,8 @@ _BYPASS_MASTER_PURPOSES = {
     "follower_recovery_topup",
     "follower_close_after_master_close",
 }
+
+logger = get_logger(__name__)
 
 
 class MultiExchangeOrderCoordinator:
@@ -62,6 +65,14 @@ class MultiExchangeOrderCoordinator:
         target_values = {exchange.value for exchange in intent.target_exchanges}
         clients = [client for client in self.clients if client.exchange.value in target_values]
         intent = self._with_execution_metadata(intent, clients=clients, items=plan.items)
+        logger.info(
+            "Order intent planned | intent_id=%s action=%s targets=%s planned_items=%s master_follower=%s",
+            intent.intent_id,
+            intent.signal.action.value,
+            ",".join(exchange.value for exchange in intent.target_exchanges),
+            len(plan.items),
+            self.master_follower_policy is not None,
+        )
         self.repository.save_intent(intent)
         self.repository.update_status(intent_id=intent.intent_id, status=OrderIntentStatus.PLANNED)
         if self.master_follower_policy is not None:
@@ -76,6 +87,27 @@ class MultiExchangeOrderCoordinator:
         self._record_position_plan(intent, results)
         final_status = _final_status(results)
         self.repository.update_status(intent_id=intent.intent_id, status=final_status)
+        ok_count = sum(1 for result in results if result.ok)
+        if final_status is OrderIntentStatus.SUBMITTED:
+            logger.info("Order intent completed | intent_id=%s status=%s ok=%s total=%s", intent.intent_id, final_status.value, ok_count, len(results))
+        elif final_status is OrderIntentStatus.PARTIALLY_SUBMITTED:
+            logger.warning(
+                "Order intent partially completed | intent_id=%s status=%s ok=%s total=%s errors=%s",
+                intent.intent_id,
+                final_status.value,
+                ok_count,
+                len(results),
+                [result.error for result in results if not result.ok],
+            )
+        else:
+            logger.error(
+                "Order intent failed | intent_id=%s status=%s ok=%s total=%s errors=%s",
+                intent.intent_id,
+                final_status.value,
+                ok_count,
+                len(results),
+                [result.error for result in results if not result.ok],
+            )
         if self.master_follower_evaluator is not None:
             decision = self.master_follower_evaluator.evaluate(intent=intent, results=results)
             add_event = getattr(self.repository, "add_event", None)
@@ -205,6 +237,7 @@ class MultiExchangeOrderCoordinator:
         master = client_by_exchange.get(self.master_follower_policy.master_exchange)
         followers = [client_by_exchange[exchange] for exchange in self.master_follower_policy.followers_for(intent.target_exchanges) if exchange in client_by_exchange]
         if master is None:
+            logger.error("Master execution client unavailable | intent_id=%s master=%s", intent.intent_id, self.master_follower_policy.master_exchange.value)
             return [ExchangeOrderResult(exchange=self.master_follower_policy.master_exchange, ok=False, error="master execution client not available")]
 
         master_results = await self._execute_for_client(
@@ -218,6 +251,7 @@ class MultiExchangeOrderCoordinator:
         # creating avoidable orphan follower entries. If an orphan exists from an
         # external/manual flow, the policy evaluator still detects it.
         if not all(result.ok for result in master_results):
+            logger.warning("Master execution failed; followers skipped | intent_id=%s master=%s", intent.intent_id, self.master_follower_policy.master_exchange.value)
             return master_results
         follower_nested = await asyncio.gather(
             *(
@@ -273,6 +307,15 @@ class MultiExchangeOrderCoordinator:
                     break
                 except Exception as exc:
                     last_error = exc
+                    logger.warning(
+                        "Order execution attempt failed | intent_id=%s exchange=%s action=%s attempt=%s max_attempts=%s error=%s",
+                        intent.intent_id,
+                        client.exchange.value,
+                        item.action.value,
+                        attempt + 1,
+                        max_attempts,
+                        exc,
+                    )
                     if attempt < max_attempts - 1 and retry_delay_seconds > 0:
                         await asyncio.sleep(retry_delay_seconds)
             else:

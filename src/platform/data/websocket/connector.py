@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from typing import AsyncIterator
 
+from src.utils.log import get_logger
+
+logger = get_logger(__name__)
+
 
 class WebsocketsConnection:
     def __init__(self, websocket) -> None:
@@ -31,5 +35,6 @@ class WebsocketsConnector:
             raise RuntimeError(
                 "WebSocket streaming requires the 'websockets' package. Install project dependencies first."
             ) from exc
+        logger.info("Opening websocket connection | url=%s", url)
         websocket = await websockets.connect(url, ping_interval=20, ping_timeout=20)
         return WebsocketsConnection(websocket)

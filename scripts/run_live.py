@@ -19,6 +19,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.app import AppConfig, AppRunner, build_app_context
 from src.runtime import LiveRuntimeRunner, RuntimeMode, live_runtime_config_from_app, runtime_mode_from_env
+from src.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 
 async def main() -> None:
@@ -30,6 +33,7 @@ async def main() -> None:
     config = AppConfig.from_env(defaults_path=args.defaults)
     context = build_app_context(config)
     runtime_mode = runtime_mode_from_env(defaults_path=args.defaults)
+    logger.info("Live runner starting | runtime_mode=%s symbol=%s max_events=%s", runtime_mode.value, config.symbol, args.max_events)
     if runtime_mode is RuntimeMode.LIVE_RUNTIME:
         runtime_config = live_runtime_config_from_app(config, defaults_path=args.defaults)
         runner = LiveRuntimeRunner(app_config=config, app_context=context, runtime_config=runtime_config)
@@ -37,7 +41,7 @@ async def main() -> None:
     else:
         runner = AppRunner(config=config, context=context)
         stats = await runner.run_streams(max_market_events=args.max_events)
-    print(stats)
+    logger.info("Live runner stopped | stats=%s", stats)
 
 
 if __name__ == "__main__":

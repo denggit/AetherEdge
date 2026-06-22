@@ -38,6 +38,9 @@ from src.platform.exchanges.models import (
 )
 from src.runtime.config import live_runtime_config_from_app
 from src.signals import SignalAction, TradeSignal
+from src.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -122,13 +125,13 @@ async def main() -> int:
     if args.margin_usdt <= 0 or args.leverage <= 0:
         raise SystemExit("--margin-usdt and --leverage must be positive")
 
-    print("[config] symbol=", app_config.symbol)
-    print("[config] exchanges=", ",".join(exchange.value for exchange in app_config.exchanges))
-    print("[config] data_exchange=", app_config.data_exchange.value)
+    logger.info("Connectivity smoke config | symbol=%s", app_config.symbol)
+    logger.info("Connectivity smoke config | exchanges=%s", ",".join(exchange.value for exchange in app_config.exchanges))
+    logger.info("Connectivity smoke config | data_exchange=%s", app_config.data_exchange.value)
     if runtime_config.master_follower_policy is not None:
-        print("[config] master=", runtime_config.master_follower_policy.master_exchange.value)
-        print("[config] followers=", ",".join(exchange.value for exchange in runtime_config.master_follower_policy.follower_exchanges) or "<none>")
-    print("[config] live_orders=", live)
+        logger.info("Connectivity smoke config | master=%s", runtime_config.master_follower_policy.master_exchange.value)
+        logger.info("Connectivity smoke config | followers=%s", ",".join(exchange.value for exchange in runtime_config.master_follower_policy.follower_exchanges) or "<none>")
+    logger.info("Connectivity smoke config | live_orders=%s", live)
 
     data_feed = create_market_data_feed(
         app_config.data_exchange,
@@ -151,24 +154,37 @@ async def main() -> int:
     if allow_min_notional_round_up and min_base_qty > base_qty:
         max_allowed = requested_notional * (Decimal("1") + args.max_notional_overrun_pct)
         if min_notional_topup <= args.max_min_notional_topup_usdt and rounded_notional <= max_allowed:
-            print(
-                f"[sizing-topup] requested_notional={requested_notional} rounded_notional={rounded_notional} "
-                f"topup={min_notional_topup} reason=min_order_notional"
+            logger.info(
+                "Connectivity smoke sizing topup | requested_notional=%s rounded_notional=%s topup=%s reason=min_order_notional",
+                requested_notional,
+                rounded_notional,
+                min_notional_topup,
             )
             base_qty = min_base_qty
         else:
-            print(
-                f"[warn] min-notional round-up refused: requested_notional={requested_notional}, "
-                f"rounded_notional={rounded_notional}, topup={min_notional_topup}, "
-                f"max_topup={args.max_min_notional_topup_usdt}, max_pct_allowed={max_allowed}"
+            logger.warning(
+                "Connectivity smoke min-notional round-up refused | requested_notional=%s rounded_notional=%s topup=%s max_topup=%s max_pct_allowed=%s",
+                requested_notional,
+                rounded_notional,
+                min_notional_topup,
+                args.max_min_notional_topup_usdt,
+                max_allowed,
             )
     estimated_notional = base_qty * price
-    print(f"[sizing] price={price} requested_notional={requested_notional} base_qty={base_qty} estimated_notional={estimated_notional}")
+    logger.info(
+        "Connectivity smoke sizing | price=%s requested_notional=%s base_qty=%s estimated_notional=%s",
+        price,
+        requested_notional,
+        base_qty,
+        estimated_notional,
+    )
     min_notional_warning = estimated_notional < args.min_order_notional_usdt
     if min_notional_warning:
-        print(
-            f"[warn] estimated_notional={estimated_notional} is below min_order_notional={args.min_order_notional_usdt}. "
-            "Binance may reject. Increase --margin-usdt, raise --max-min-notional-topup-usdt, or pass --no-min-notional-round-up intentionally."
+        logger.warning(
+            "Connectivity smoke estimated_notional below min order notional | estimated_notional=%s min_order_notional=%s hint=%s",
+            estimated_notional,
+            args.min_order_notional_usdt,
+            "Binance may reject. Increase --margin-usdt, raise --max-min-notional-topup-usdt, or pass --no-min-notional-round-up intentionally.",
         )
 
     account_clients = {
@@ -201,7 +217,7 @@ async def main() -> int:
             )
         )
         await _write_report(args.report, report)
-        print(report.to_json())
+        logger.info("Connectivity smoke report | report=%s", report.to_json())
         return 0 if report.ok else 1
 
     if os.getenv("AETHER_DRY_RUN", "true").strip().lower() in {"1", "true", "yes", "on"}:
@@ -221,7 +237,7 @@ async def main() -> int:
             )
         )
         await _write_report(args.report, report)
-        print(report.to_json())
+        logger.info("Connectivity smoke report | report=%s", report.to_json())
         return 1
 
     journal = SqliteOrderJournalStore(args.journal_db)
@@ -323,7 +339,7 @@ async def main() -> int:
                 report.add(StepResult(name="emergency_close", ok=False, error=str(exc)))
 
     await _write_report(args.report, report)
-    print(report.to_json())
+    logger.info("Connectivity smoke report | report=%s", report.to_json())
     return 0 if report.ok else 1
 
 
@@ -380,13 +396,16 @@ async def _step(report: SmokeReport, name: str, exchange: ExchangeName | None, f
     try:
         value = await fn(*args, **kwargs)
         report.add(StepResult(name=name, ok=True, exchange=None if exchange is None else exchange.value, detail=_jsonable(value)))
-        print(f"[ok] {name}" + (f" {exchange.value}" if exchange else ""))
+        logger.info("Connectivity smoke step ok | name=%s exchange=%s", name, None if exchange is None else exchange.value)
         return value
     except Exception as exc:
         ok = bool(soft and _is_expected_noop_error(exc))
         report.add(StepResult(name=name, ok=ok, exchange=None if exchange is None else exchange.value, error=str(exc)))
         label = "warn-ok" if ok else ("warn-fail" if soft else "fail")
-        print(f"[{label}] {name}" + (f" {exchange.value}" if exchange else "") + f": {exc}")
+        if ok or soft:
+            logger.warning("Connectivity smoke step %s | name=%s exchange=%s error=%s", label, name, None if exchange is None else exchange.value, exc)
+        else:
+            logger.error("Connectivity smoke step %s | name=%s exchange=%s error=%s", label, name, None if exchange is None else exchange.value, exc)
         return None
 
 

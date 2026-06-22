@@ -20,6 +20,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.platform import ExchangeName, RuntimeConfig, PlatformRuntime, build_runtime_context
+from src.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 
 async def main() -> None:
@@ -40,15 +43,15 @@ async def main() -> None:
         enable_private_event_stream=not args.no_event_stream,
     )
     runtime = PlatformRuntime(config=config, context=build_runtime_context(config))
+    logger.info("Platform runtime skeleton starting | exchange=%s symbol=%s event_stream=%s", args.exchange, args.symbol, not args.no_event_stream)
     result = await runtime.run(max_account_events=args.max_events)
-    print(
-        {
-            "exchange": args.exchange,
-            "symbol": args.symbol,
-            "snapshots_saved": result.stats.snapshots_saved,
-            "account_events_saved": result.stats.account_events_saved,
-            "handler_errors": result.stats.handler_errors,
-        }
+    logger.info(
+        "Platform runtime skeleton stopped | exchange=%s symbol=%s snapshots_saved=%s account_events_saved=%s handler_errors=%s",
+        args.exchange,
+        args.symbol,
+        result.stats.snapshots_saved,
+        result.stats.account_events_saved,
+        result.stats.handler_errors,
     )
 
 

@@ -38,6 +38,9 @@ from src.runtime import RuntimeMode, live_runtime_config_from_app, runtime_mode_
 from src.runtime.requirements import resolve_strategy_runtime_requirements
 from src.runtime.tasks.scheduler import closed_bar_open_time_ms
 from src.strategy import load_strategy
+from src.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -66,7 +69,12 @@ class PreflightReport:
         msg = f"{prefix} {name}"
         if error:
             msg += f": {error}"
-        print(msg)
+        if status == "fail":
+            logger.error(msg)
+        elif status == "warn":
+            logger.warning(msg)
+        else:
+            logger.info(msg)
 
     def to_json(self) -> str:
         payload = asdict(self)
@@ -105,7 +113,7 @@ async def main() -> int:
     except Exception as exc:
         report.add("load_config_and_strategy", "fail", error=str(exc))
         await _write_report(args.report, report)
-        print(report.to_json())
+        logger.info("V8 live preflight report | report=%s", report.to_json())
         return 1
 
     report.symbol = app.symbol
@@ -133,7 +141,7 @@ async def main() -> int:
     _check_local_rangebar_builder(report, app=app)
 
     await _write_report(args.report, report)
-    print(report.to_json())
+    logger.info("V8 live preflight report | report=%s", report.to_json())
     return 0 if report.ok else 1
 
 

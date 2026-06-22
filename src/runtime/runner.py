@@ -34,6 +34,9 @@ from src.runtime.recovery.service import RecoveryExchangeContext, RuntimeRecover
 from src.runtime.tasks import ClosedBarScheduler, ProducerHealthMonitor, ProducerSupervisor
 from src.runtime.tasks.scheduler import closed_bar_open_time_ms
 from src.signals import TradeSignal
+from src.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -127,16 +130,27 @@ class LiveRuntimeRunner:
         )
 
     async def run(self, *, max_market_events: int | None = None) -> LiveRuntimeStats:
+        logger.info(
+            "Live runtime starting | symbol=%s strategy=%s exchanges=%s data_exchange=%s dry_run=%s max_market_events=%s",
+            self.app_config.symbol,
+            self.app_config.strategy,
+            ",".join(exchange.value for exchange in self.app_config.exchanges),
+            self.app_config.data_exchange.value,
+            self.app_config.dry_run,
+            max_market_events,
+        )
         self.context.alerts.start()
         try:
             await self._startup()
             self._producer_tasks = self._start_producers()
             await self._consume_market_events(max_market_events=max_market_events)
             self._set_health(RuntimePhase.STOPPED, healthy=True)
+            logger.info("Live runtime stopped | stats=%s", self.stats)
             return self.stats
         except Exception as exc:
             self.stats.errors += 1
             self._set_health(RuntimePhase.ERROR, healthy=False, error=str(exc))
+            logger.exception("Live runtime error")
             self.context.alerts.emit(AppAlert(subject="AetherEdge live runtime error", content=str(exc), severity="error"))
             raise
         finally:
@@ -196,6 +210,13 @@ class LiveRuntimeRunner:
             return []
         event = closed_kline_feature(closed_rows[-1])
         self.stats.closed_klines_seen += 1
+        logger.info(
+            "Closed kline detected | symbol=%s interval=%s open_time_ms=%s close_time_ms=%s",
+            self.app_config.symbol,
+            self._closed_bar_interval,
+            closed_rows[-1].open_time_ms,
+            closed_rows[-1].close_time_ms,
+        )
         await self.process_market_feature(event)
         mark_emitted = getattr(self._closed_bar_scheduler, "mark_emitted", None)
         if callable(mark_emitted):
@@ -256,6 +277,7 @@ class LiveRuntimeRunner:
         return events
 
     async def _startup(self) -> None:
+        logger.info("Live runtime startup phase started")
         self._initialize_rangebar_trust_window()
         self._set_health(RuntimePhase.WARMING_UP, healthy=True)
         await self._run_warmup()
@@ -263,6 +285,7 @@ class LiveRuntimeRunner:
         snapshot = await self._run_recovery()
         await self._call_on_start(snapshot)
         self._set_health(RuntimePhase.RUNNING, healthy=True, warmup_complete=True, caught_up=True)
+        logger.info("Live runtime startup phase completed")
 
     def _initialize_rangebar_trust_window(self) -> None:
         if not self.requirements.range_bars.enabled or not self.requirements.trades.enabled:
@@ -319,6 +342,13 @@ class LiveRuntimeRunner:
                 if not result.caught_up:
                     raise LiveRuntimeError(f"closed-kline warmup did not catch up: {len(result.gaps_after)} gaps remain")
                 await self._hydrate_strategy_closed_klines(repository, time_range=TimeRange(start_open, end_open))
+                logger.info(
+                    "Closed-kline warmup completed | interval=%s start_open=%s end_open=%s records_loaded=%s",
+                    self._closed_bar_interval,
+                    start_open,
+                    end_open,
+                    result.records_loaded,
+                )
 
     async def _hydrate_strategy_closed_klines(self, repository, *, time_range: TimeRange) -> None:
         handler = getattr(self.context.strategy, "on_market_feature", None)
@@ -340,6 +370,12 @@ class LiveRuntimeRunner:
         self.stats.recovery_runs += 1
         if not report.ok:
             raise LiveRuntimeError(f"runtime recovery failed: {tuple(report.issues)}")
+        logger.info(
+            "Runtime recovery completed | snapshots=%s strategy_signals=%s issues=%s",
+            len(report.snapshots),
+            len(report.strategy_signals),
+            len(report.issues),
+        )
         if report.strategy_signals:
             await self._execute_signals(report.strategy_signals, source="recovery", event_time_ms=int(time.time() * 1000), metadata={"feature_type": "recovery"})
         if report.snapshots:
@@ -354,16 +390,20 @@ class LiveRuntimeRunner:
             return
         signals = await on_start(snapshot)
         self.stats.on_start_called = True
+        logger.info("Strategy on_start completed | signals=%s", len(signals or ()))
         await self._execute_signals(signals or (), source="on_start", event_time_ms=int(time.time() * 1000))
 
     def _start_producers(self) -> list[asyncio.Task]:
         tasks: list[asyncio.Task] = []
         if self.requirements.trades.enabled and self.requirements.trades.stream_enabled:
+            logger.info("Starting runtime producer | name=trades")
             tasks.append(asyncio.create_task(self._producer_supervisor.run_stream(name="trades", stream=self.context.data.stream_trades(), on_item=self._enqueue_market_event)))
         if self.requirements.order_book.enabled and self.requirements.order_book.stream_enabled:
+            logger.info("Starting runtime producer | name=order_book")
             tasks.append(asyncio.create_task(self._producer_supervisor.run_stream(name="order_book", stream=self.context.data.stream_order_book(), on_item=self._enqueue_market_event)))
         if self.requirements.private_account_stream.enabled:
             for stream in self._get_account_event_streams():
+                logger.info("Starting runtime producer | name=account:%s", stream.exchange.value)
                 tasks.append(asyncio.create_task(self._producer_supervisor.run_stream(name=f"account:{stream.exchange.value}", stream=stream.stream_events(), on_item=self._process_account_event)))
         return tasks
 
@@ -386,6 +426,13 @@ class LiveRuntimeRunner:
         if now_ms - self._last_market_queue_full_alert_ms < 60_000:
             return
         self._last_market_queue_full_alert_ms = now_ms
+        logger.warning(
+            "Market queue full; dropped oldest event | incoming_event_type=%s queue_size=%s maxsize=%s dropped_total=%s",
+            event.event_type.value,
+            self._market_queue.qsize(),
+            self._market_queue.maxsize,
+            self.stats.market_events_dropped,
+        )
         self.context.alerts.emit(
             AppAlert(
                 subject="AetherEdge market queue full",
@@ -469,7 +516,19 @@ class LiveRuntimeRunner:
             self.stats.signals_seen += 1
             if self.app_config.dry_run:
                 self.stats.dry_run_actions += 1
+                logger.info(
+                    "Dry-run signal skipped | action=%s source=%s event_time_ms=%s",
+                    signal.action.value,
+                    source,
+                    event_time_ms,
+                )
                 continue
+            logger.info(
+                "Executing signal | action=%s source=%s event_time_ms=%s",
+                signal.action.value,
+                source,
+                event_time_ms,
+            )
             intent = self._intent_factory.create(signal, source=source, event_time_ms=event_time_ms, metadata=metadata)
             results = await self._get_order_coordinator().execute(intent)
             self._record_order_results(results)
@@ -480,9 +539,16 @@ class LiveRuntimeRunner:
         ok_count = sum(1 for result in results if result.ok)
         if ok_count == len(results) and results:
             self.stats.submitted_intents += 1
+            logger.info("Order intent submitted | exchanges=%s results=%s", ",".join(result.exchange.value for result in results), len(results))
             return
         if ok_count > 0:
             self.stats.partial_failures += 1
+            logger.warning(
+                "Order intent partially failed | ok=%s total=%s errors=%s",
+                ok_count,
+                len(results),
+                [result.error for result in results if not result.ok],
+            )
             self._set_health(
                 RuntimePhase.RUNNING,
                 healthy=False,
@@ -491,6 +557,7 @@ class LiveRuntimeRunner:
             )
         else:
             self.stats.failed_intents += 1
+            logger.error("Order intent failed | total=%s errors=%s", len(results), [result.error for result in results])
             self._set_health(RuntimePhase.RUNNING, healthy=False, error="exchange execution failed")
 
     async def _stop_producers(self) -> None:
@@ -507,6 +574,7 @@ class LiveRuntimeRunner:
         self.stats.producer_failures += sum(1 for item in unhealthy if item.status.value == "failed")
         self.stats.producer_stale += sum(1 for item in unhealthy if item.status.value == "stale")
         message = "; ".join(f"{item.name}:{item.status.value}:{item.error}" for item in unhealthy)
+        logger.error("Runtime producer unhealthy | %s", message)
         raise LiveRuntimeError(f"producer unhealthy: {message}")
 
     def _all_producers_done(self) -> bool:

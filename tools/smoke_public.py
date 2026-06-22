@@ -19,6 +19,9 @@ if str(REPO_ROOT) not in sys.path:
 from src.platform import create_market_data_feed
 from src.platform.config import load_env_config
 from src.platform.exchanges.errors import ExchangeApiError
+from src.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 
 async def main() -> None:
@@ -34,18 +37,17 @@ async def main() -> None:
         ticker = await data.fetch_ticker()
         klines = await data.fetch_klines(interval="1m", limit=2)
     except ExchangeApiError as exc:
-        print(
-            {
-                "exchange": exchange,
-                "symbol": args.symbol,
-                "error": str(exc),
-                "status_code": exc.status_code,
-                "payload": exc.payload,
-                "hint": "If OKX public API returns HTTP 403 while Binance works, test curl/requests from the same server. It is usually HTTP client fingerprint or server IP/geolocation blocking, not API key.",
-            }
+        logger.error(
+            "Public smoke failed | exchange=%s symbol=%s status_code=%s payload=%s hint=%s error=%s",
+            exchange,
+            args.symbol,
+            exc.status_code,
+            exc.payload,
+            "If OKX public API returns HTTP 403 while Binance works, test curl/requests from the same server. It is usually HTTP client fingerprint or server IP/geolocation blocking, not API key.",
+            exc,
         )
         raise SystemExit(1) from exc
-    print({"exchange": exchange, "symbol": args.symbol, "ticker": str(ticker.price), "klines": len(klines)})
+    logger.info("Public smoke ok | exchange=%s symbol=%s ticker=%s klines=%s", exchange, args.symbol, ticker.price, len(klines))
 
 
 if __name__ == "__main__":

@@ -26,6 +26,9 @@ from src.platform.exchanges.models import (
 )
 from src.platform.exchanges.ports import ExchangeExecutionClient
 from src.platform.markets import MarketProfile
+from src.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 
 class ExchangeExecutionService:
@@ -69,6 +72,14 @@ class ExchangeExecutionService:
         normalized = normalize_order_request(request, rule)
         if self._validate_orders:
             self._risk_gate.validate_order(normalized, rule)
+        logger.info(
+            "Placing order | exchange=%s symbol=%s side=%s quantity=%s type=%s",
+            self.exchange.value,
+            normalized.symbol,
+            normalized.side.value,
+            normalized.quantity,
+            normalized.order_type.value,
+        )
         return await self._exchange_client.place_order(normalized)
 
     async def place_stop_market_order(self, request: StopMarketOrderRequest) -> Order:
@@ -78,6 +89,14 @@ class ExchangeExecutionService:
         normalized = normalize_stop_market_order_request(request, rule)
         if self._validate_orders:
             self._risk_gate.validate_stop_market(normalized, rule)
+        logger.info(
+            "Placing stop market order | exchange=%s symbol=%s side=%s quantity=%s trigger_price=%s",
+            self.exchange.value,
+            normalized.symbol,
+            normalized.side.value,
+            normalized.quantity,
+            normalized.trigger_price,
+        )
         return await self._exchange_client.place_stop_market_order(normalized)
 
     async def place_stop_loss_for_position(
@@ -112,19 +131,23 @@ class ExchangeExecutionService:
     async def cancel_order(self, request: CancelOrderRequest) -> Order:
         self._ensure_live_write_allowed("cancel_order")
         self._ensure_bound_symbol(request.symbol)
+        logger.info("Canceling order | exchange=%s symbol=%s order_id=%s client_order_id=%s", self.exchange.value, request.symbol, request.order_id, request.client_order_id)
         return await self._exchange_client.cancel_order(request)
 
     async def cancel_all_orders(self) -> list[Order]:
         self._ensure_live_write_allowed("cancel_all_orders")
+        logger.info("Canceling all orders | exchange=%s symbol=%s", self.exchange.value, self._symbol)
         return await self._exchange_client.cancel_all_orders(self._symbol)
 
     async def cancel_stop_order(self, request: CancelStopOrderRequest) -> Order:
         self._ensure_live_write_allowed("cancel_stop_order")
         self._ensure_bound_symbol(request.symbol)
+        logger.info("Canceling stop order | exchange=%s symbol=%s stop_order_id=%s client_order_id=%s", self.exchange.value, request.symbol, request.stop_order_id, request.client_order_id)
         return await self._exchange_client.cancel_stop_order(request)
 
     async def cancel_all_stop_orders(self) -> list[Order]:
         self._ensure_live_write_allowed("cancel_all_stop_orders")
+        logger.info("Canceling all stop orders | exchange=%s symbol=%s", self.exchange.value, self._symbol)
         return await self._exchange_client.cancel_all_stop_orders(self._symbol)
 
     async def amend_order(self, request: AmendOrderRequest) -> Order:
@@ -134,6 +157,7 @@ class ExchangeExecutionService:
         normalized = normalize_amend_order_request(request, rule)
         if self._validate_orders:
             self._risk_gate.validate_amend(normalized, rule)
+        logger.info("Amending order | exchange=%s symbol=%s order_id=%s client_order_id=%s", self.exchange.value, normalized.symbol, normalized.order_id, normalized.client_order_id)
         return await self._exchange_client.amend_order(normalized)
 
     async def fetch_order_status(self, query: OrderQuery) -> Order:
@@ -183,6 +207,7 @@ class ExchangeExecutionService:
 
     def _ensure_live_write_allowed(self, action: str) -> None:
         if not self._sandbox and not self._live_trading_enabled:
+            logger.warning("Live write blocked | exchange=%s symbol=%s action=%s", self.exchange.value, self._symbol, action)
             raise LiveTradingBlocked(
                 f"{action} blocked: live trading requires AETHER_LIVE_TRADING=true or sandbox=true"
             )

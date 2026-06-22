@@ -39,10 +39,10 @@ klines = await data.fetch_klines(interval="1m", limit=100)
 ticker = await data.fetch_ticker()
 
 async for trade in data.stream_trades():
-    print(trade.price, trade.quantity, trade.side)
+    logger.info("trade price=%s quantity=%s side=%s", trade.price, trade.quantity, trade.side)
 
 async for book in data.stream_order_book():
-    print(book.bids[0], book.asks[0])
+    logger.info("best bid=%s best ask=%s", book.bids[0], book.asks[0])
 ```
 
 带 SQLite 缓存：
@@ -391,9 +391,9 @@ src/platform/markets/profiles/ETH-USDT-PERP.json
 from src.platform import get_market_profile
 
 profile = get_market_profile()
-print(profile.symbol)
-print(profile.raw_symbol("okx"))
-print(profile.contract_value("okx"))
+logger.info("symbol=%s", profile.symbol)
+logger.info("okx_raw_symbol=%s", profile.raw_symbol("okx"))
+logger.info("okx_contract_value=%s", profile.contract_value("okx"))
 ```
 
 绑定不同品种：
@@ -543,7 +543,7 @@ stream = create_account_event_stream("okx")
 
 async for event in stream.stream_events():
     if event.event_type is AccountEventType.ORDER:
-        print(event.order_id, event.order_status, event.filled_quantity)
+        logger.info("order event id=%s status=%s filled=%s", event.order_id, event.order_status, event.filled_quantity)
 ```
 
 统一事件类型：
@@ -784,7 +784,7 @@ report = await reconciler.check()
 
 if not report.ok:
     for issue in report.issues:
-        print(issue.severity, issue.category, issue.message)
+        logger.warning("reconcile issue severity=%s category=%s message=%s", issue.severity, issue.category, issue.message)
 ```
 
 ### 邮件警告
@@ -866,7 +866,7 @@ from src.planner import ExecutionPlanner
 plan = ExecutionPlanner().plan(signal)
 
 for item in plan.items:
-    print(item.action, item.order_request, item.stop_market_request)
+    logger.info("planned action=%s order=%s stop=%s", item.action, item.order_request, item.stop_market_request)
 ```
 
 边界规则：

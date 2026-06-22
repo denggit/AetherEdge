@@ -15,7 +15,6 @@ Python only supervises the live child.
 from __future__ import annotations
 
 import asyncio
-import datetime as dt
 import os
 import shlex
 import signal
@@ -36,13 +35,13 @@ DEFAULT_CHILD_PID_FILE = PROJECT_ROOT / "data" / "run" / "aether_live.pid"
 _running = True
 _child: Optional[subprocess.Popen] = None
 
+from src.utils.log import get_logger
 
-def ts() -> str:
-    return dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+logger = get_logger(__name__)
 
 
 def log(message: str) -> None:
-    print(f"{ts()} | WATCHDOG | {message}", flush=True)
+    logger.info("WATCHDOG | %s", message)
 
 
 def _truthy(value: str | None) -> bool:

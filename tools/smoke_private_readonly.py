@@ -19,6 +19,9 @@ if str(REPO_ROOT) not in sys.path:
 from src.platform import create_account_client, create_execution_client, fetch_platform_snapshot
 from src.platform.config import load_env_config
 from src.platform.exchanges.errors import ExchangeApiError
+from src.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 
 async def main() -> None:
@@ -35,28 +38,26 @@ async def main() -> None:
     try:
         snapshot = await fetch_platform_snapshot(account=account, execution=execution, asset=args.asset)
     except ExchangeApiError as exc:
-        print(
-            {
-                "exchange": exchange,
-                "symbol": args.symbol,
-                "error": str(exc),
-                "status_code": exc.status_code,
-                "payload": exc.payload,
-                "hint": "If this is OKX HTTP 403, first check API key environment mismatch, IP whitelist, and whether your server IP/User-Agent is blocked.",
-            }
+        logger.error(
+            "Private readonly smoke failed | exchange=%s symbol=%s status_code=%s payload=%s hint=%s error=%s",
+            exchange,
+            args.symbol,
+            exc.status_code,
+            exc.payload,
+            "If this is OKX HTTP 403, first check API key environment mismatch, IP whitelist, and whether your server IP/User-Agent is blocked.",
+            exc,
         )
         raise SystemExit(1) from exc
-    print(
-        {
-            "exchange": exchange,
-            "symbol": snapshot.symbol,
-            "available": str(snapshot.balance.available),
-            "positions": len(snapshot.positions),
-            "open_orders": len(snapshot.open_orders),
-            "open_stop_orders": len(snapshot.open_stop_orders),
-            "leverage": str(snapshot.leverage.leverage),
-            "position_mode": snapshot.position_mode.value,
-        }
+    logger.info(
+        "Private readonly smoke ok | exchange=%s symbol=%s available=%s positions=%s open_orders=%s open_stop_orders=%s leverage=%s position_mode=%s",
+        exchange,
+        snapshot.symbol,
+        snapshot.balance.available,
+        len(snapshot.positions),
+        len(snapshot.open_orders),
+        len(snapshot.open_stop_orders),
+        snapshot.leverage.leverage,
+        snapshot.position_mode.value,
     )
 
 

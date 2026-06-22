@@ -8,6 +8,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.app import AppConfig, AppRunner, build_app_context
+from src.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 
 async def main() -> None:
@@ -19,8 +22,9 @@ async def main() -> None:
     config = AppConfig.from_env(defaults_path=args.defaults)
     context = build_app_context(config)
     runner = AppRunner(config=config, context=context)
+    logger.info("Lightweight app runner starting | symbol=%s max_events=%s", config.symbol, args.max_events)
     stats = await runner.run_streams(max_market_events=args.max_events)
-    print(stats)
+    logger.info("Lightweight app runner stopped | stats=%s", stats)
 
 
 if __name__ == "__main__":
