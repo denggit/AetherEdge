@@ -43,7 +43,8 @@ def test_preflight_runtime_config_accepts_v8_requirements(monkeypatch) -> None:
             "trades": {"enabled": True, "stream_enabled": True, "warmup_enabled": True},
             "range_bars": {"enabled": True, "range_pct": "0.002"},
             "order_book": {"enabled": False},
-            "private_account_stream": {"enabled": True},
+            "account_state": {"poll_enabled": True, "poll_interval_seconds": 300},
+            "order_state": {"poll_when_position_enabled": True, "poll_interval_seconds": 20},
         }
     )
     monkeypatch.setenv("AETHER_LIVE_TRADING", "false")

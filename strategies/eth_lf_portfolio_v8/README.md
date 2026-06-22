@@ -49,7 +49,8 @@ The strategy plugin:
   "trades": {"enabled": true, "stream_enabled": true},
   "range_bars": {"enabled": true, "range_pct": "0.002", "aggregate_interval": "4h"},
   "order_book": {"enabled": false},
-  "private_account_stream": {"enabled": true}
+  "account_state": {"poll_enabled": true, "poll_interval_seconds": 300},
+  "order_state": {"poll_when_position_enabled": true, "poll_interval_seconds": 20}
 }
 ```
 

@@ -18,13 +18,13 @@ from src.market_data.warmup.service import KlineWarmupService
 from src.order_management import MasterFollowerExecutionPolicy, MultiExchangeOrderCoordinator, RepositoryDuplicateOrderGuard, SqliteOrderJournalStore, SqlitePositionPlanStore
 from src.order_management.models import ExchangeOrderResult, OrderIntentStatus
 from src.platform import create_account_client, create_execution_client
-from src.platform.account.event_factory import create_account_event_stream
 from src.platform.account.events import AccountEvent
 from src.platform.account.ports import AccountClient
 from src.platform.data.models import MarketEvent, MarketEventType, MarketKline, MarketOrderBook, MarketTicker, MarketTrade
-from src.platform.exchanges.models import ExchangeConfig, ExchangeName
+from src.platform.exchanges.models import ExchangeConfig, ExchangeName, Order, OrderStatus
 from src.platform.execution.ports import ExecutionClient
 from src.platform.snapshot import PlatformSnapshot
+from src.runtime.account_sync import AccountStateSyncService, OrderStateSyncService, RequestThrottle, SyncExchangeContext
 from src.runtime.config import LiveRuntimeConfig, live_runtime_config_from_app
 from src.runtime.features import closed_kline_feature, range_aggregate_feature, range_aggregate_unavailable_feature, range_bar_closed_feature
 from src.runtime.models import RuntimeHealth, RuntimePhase
@@ -34,6 +34,7 @@ from src.runtime.recovery.service import RecoveryExchangeContext, RuntimeRecover
 from src.runtime.tasks import ClosedBarScheduler, ProducerHealthMonitor, ProducerSupervisor
 from src.runtime.tasks.scheduler import closed_bar_open_time_ms
 from src.signals import TradeSignal
+from src.signals.models import SignalAction
 from src.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -92,11 +93,14 @@ class LiveRuntimeRunner:
         self._market_queue: asyncio.Queue[MarketEvent] = asyncio.Queue(maxsize=app_config.market_queue_maxsize)
         self._stop_event = asyncio.Event()
         self._producer_tasks: list[asyncio.Task] = []
+        self._sync_tasks: list[asyncio.Task] = []
         self._execution_clients: tuple[ExecutionClient, ...] | None = None
         self._account_clients: tuple[AccountClient, ...] | None = None
         self._order_journal = self.services.get("order_journal")
         self._position_plan_store = self.services.get("position_plan_store")
         self._order_coordinator = self.services.get("order_coordinator")
+        self._account_sync_service = self.services.get("account_sync_service")
+        self._order_sync_service = self.services.get("order_sync_service")
         self._recovery_service = self.services.get("recovery_service", "__default__")
         self._range_bar_store = self.services.get("range_bar_store")
         self._range_bar_builder = self.services.get("range_bar_builder")
@@ -143,6 +147,7 @@ class LiveRuntimeRunner:
         try:
             await self._startup()
             self._producer_tasks = self._start_producers()
+            self._sync_tasks = self._start_sync_tasks()
             await self._consume_market_events(max_market_events=max_market_events)
             self._set_health(RuntimePhase.STOPPED, healthy=True)
             logger.info("Live runtime stopped | stats=%s", self.stats)
@@ -154,6 +159,7 @@ class LiveRuntimeRunner:
             self.context.alerts.emit(AppAlert(subject="AetherEdge live runtime error", content=str(exc), severity="error"))
             raise
         finally:
+            await self._stop_sync_tasks()
             await self._stop_producers()
             await self.context.alerts.stop()
 
@@ -416,10 +422,14 @@ class LiveRuntimeRunner:
         if self.requirements.order_book.enabled and self.requirements.order_book.stream_enabled:
             logger.info("Starting runtime producer | name=order_book")
             tasks.append(asyncio.create_task(self._producer_supervisor.run_stream(name="order_book", stream=self.context.data.stream_order_book(), on_item=self._enqueue_market_event)))
-        if self.requirements.private_account_stream.enabled:
-            for stream in self._get_account_event_streams():
-                logger.info("Starting runtime producer | name=account:%s", stream.exchange.value)
-                tasks.append(asyncio.create_task(self._producer_supervisor.run_stream(name=f"account:{stream.exchange.value}", stream=stream.stream_events(), on_item=self._process_account_event)))
+        return tasks
+
+    def _start_sync_tasks(self) -> list[asyncio.Task]:
+        tasks: list[asyncio.Task] = []
+        if self.requirements.account_state.poll_enabled:
+            tasks.append(asyncio.create_task(self._get_account_sync_service().run_periodic(self._stop_event)))
+        if self.requirements.order_state.poll_when_position_enabled:
+            tasks.append(asyncio.create_task(self._get_order_sync_service().run_periodic(self._stop_event)))
         return tasks
 
     async def _enqueue_market_event(self, event: MarketEvent) -> None:
@@ -526,6 +536,7 @@ class LiveRuntimeRunner:
         source: str,
         event_time_ms: int | None,
         metadata: Mapping[str, Any] | None = None,
+        feedback_depth: int = 0,
     ) -> None:
         for signal in signals:
             self.stats.signals_seen += 1
@@ -547,6 +558,19 @@ class LiveRuntimeRunner:
             intent = self._intent_factory.create(signal, source=source, event_time_ms=event_time_ms, metadata=metadata)
             results = await self._get_order_coordinator().execute(intent)
             self._record_order_results(results)
+            self._save_order_results(signal, results)
+            if self.requirements.order_state.post_submit_sync_enabled:
+                logger.info("Post-submit order sync started | action=%s source=%s", signal.action.value, source)
+                await self._get_order_sync_service().sync_once(sync_type="post_submit", priority=True)
+            if self.requirements.account_state.post_order_sync_enabled and signal.action in {SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT, SignalAction.CLOSE_LONG, SignalAction.CLOSE_SHORT}:
+                await self._get_account_sync_service().sync_once(sync_type="post_order_account", priority=True)
+            follow_up = await self._process_order_result_feedback(signal=signal, results=results, source=source, event_time_ms=event_time_ms)
+            if follow_up:
+                if feedback_depth >= 5:
+                    logger.error("Order result feedback depth exceeded | action=%s source=%s", signal.action.value, source)
+                    self.context.alerts.emit(AppAlert(subject="AetherEdge order feedback recursion blocked", content=f"action={signal.action.value} source={source}", severity="error"))
+                    continue
+                await self._execute_signals(follow_up, source="order_result_feedback", event_time_ms=event_time_ms, metadata={"parent_source": source}, feedback_depth=feedback_depth + 1)
 
     def _record_order_results(self, results: Sequence[ExchangeOrderResult]) -> None:
         self.stats.order_intents_created += 1
@@ -575,12 +599,58 @@ class LiveRuntimeRunner:
             logger.error("Order intent failed | total=%s errors=%s", len(results), [result.error for result in results])
             self._set_health(RuntimePhase.RUNNING, healthy=False, error="exchange execution failed")
 
+    def _save_order_results(self, signal: TradeSignal, results: Sequence[ExchangeOrderResult]) -> None:
+        save_order = getattr(self.context.state_store, "save_order", None)
+        if not callable(save_order):
+            return
+        is_stop = signal.action in {SignalAction.PLACE_STOP_LOSS_LONG, SignalAction.PLACE_STOP_LOSS_SHORT}
+        for result in results:
+            if not result.ok:
+                continue
+            save_order(
+                Order(
+                    exchange=result.exchange,
+                    symbol=signal.symbol,
+                    raw_symbol=signal.symbol,
+                    order_id=result.order_id,
+                    client_order_id=result.client_order_id,
+                    status=result.status or OrderStatus.UNKNOWN,
+                    side=result.side,
+                    quantity=result.quantity,
+                    filled_quantity=result.filled_quantity,
+                    raw=result.raw,
+                ),
+                is_stop_order=is_stop,
+            )
+
+    async def _process_order_result_feedback(
+        self,
+        *,
+        signal: TradeSignal,
+        results: Sequence[ExchangeOrderResult],
+        source: str,
+        event_time_ms: int | None,
+    ) -> Sequence[TradeSignal]:
+        handler = getattr(self.context.strategy, "on_order_results", None)
+        if not callable(handler):
+            return ()
+        follow_up = await handler(signal=signal, results=results, source=source, event_time_ms=event_time_ms)
+        logger.info("Strategy order results processed | action=%s results=%s follow_up_signals=%s", signal.action.value, len(results), len(follow_up or ()))
+        return follow_up or ()
+
     async def _stop_producers(self) -> None:
         for task in self._producer_tasks:
             task.cancel()
         if self._producer_tasks:
             await asyncio.gather(*self._producer_tasks, return_exceptions=True)
         self._producer_tasks = []
+
+    async def _stop_sync_tasks(self) -> None:
+        for task in self._sync_tasks:
+            task.cancel()
+        if self._sync_tasks:
+            await asyncio.gather(*self._sync_tasks, return_exceptions=True)
+        self._sync_tasks = []
 
     def _raise_on_unhealthy_producer(self) -> None:
         unhealthy = self._producer_supervisor.check()
@@ -594,15 +664,6 @@ class LiveRuntimeRunner:
 
     def _all_producers_done(self) -> bool:
         return bool(self._producer_tasks) and all(task.done() for task in self._producer_tasks)
-
-    def _get_account_event_streams(self):
-        injected = self.services.get("account_event_streams")
-        if injected is not None:
-            return tuple(injected)
-        return tuple(
-            create_account_event_stream(exchange, symbol=self.app_config.symbol, config=ExchangeConfig.from_env(exchange))
-            for exchange in self.app_config.exchanges
-        )
 
     def _get_execution_clients(self) -> tuple[ExecutionClient, ...]:
         if self._execution_clients is None:
@@ -661,6 +722,56 @@ class LiveRuntimeRunner:
             ]
             self._recovery_service = RuntimeRecoveryService(exchange_contexts=contexts, order_journal=self._get_order_journal(), position_plan_store=self._get_position_plan_store())
         return self._recovery_service
+
+    def _get_sync_contexts(self) -> tuple[SyncExchangeContext, ...]:
+        if ("execution_clients" in self.services) != ("account_clients" in self.services):
+            logger.warning("Request sync disabled because execution/account clients were only partially injected")
+            return ()
+        clients = self._get_execution_clients()
+        accounts = self._get_account_clients()
+        return tuple(
+            SyncExchangeContext(account=account, execution=execution, state_store=self.context.state_store)
+            for account, execution in zip(accounts, clients, strict=False)
+        )
+
+    def _get_account_sync_service(self):
+        if self._account_sync_service is None:
+            self._account_sync_service = AccountStateSyncService(
+                contexts=self._get_sync_contexts(),
+                config=self.requirements.account_state,
+                alert_sink=self.context.alerts,
+                throttle=RequestThrottle(min_interval_seconds=0.25),
+            )
+        return self._account_sync_service
+
+    def _get_order_sync_service(self):
+        if self._order_sync_service is None:
+            self._order_sync_service = OrderStateSyncService(
+                contexts=self._get_sync_contexts(),
+                config=self.requirements.order_state,
+                alert_sink=self.context.alerts,
+                throttle=RequestThrottle(min_interval_seconds=0.25),
+                active_check=self._order_sync_active,
+                position_plan_store=self._get_position_plan_store(),
+            )
+        return self._order_sync_service
+
+    def _order_sync_active(self) -> bool:
+        strategy = self.context.strategy
+        position = getattr(strategy, "position", None)
+        if bool(getattr(position, "in_pos", False)):
+            return True
+        if getattr(strategy, "pending_entry", None) is not None:
+            return True
+        store = self._position_plan_store
+        if store is not None and callable(getattr(store, "list_active_positions", None)) and store.list_active_positions():
+            return True
+        list_open = getattr(self.context.state_store, "list_open_orders", None)
+        if callable(list_open):
+            for exchange in self.app_config.exchanges:
+                if list_open(exchange=exchange, symbol=self.app_config.symbol, include_stop_orders=True):
+                    return True
+        return False
 
     def _get_position_plan_store(self):
         if self._position_plan_store is None:

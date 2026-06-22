@@ -389,57 +389,19 @@ async def test_live_runtime_smoke_partial_failure_is_not_silent(tmp_path):
     assert runner.stats.partial_failures == 1
     assert (await runner.health()).healthy is False
 
-class FakeAccountStream:
-    def __init__(self, exchange: ExchangeName, events):
-        self.exchange = exchange
-        self.symbol = "ETH-USDT-PERP"
-        self.events = list(events)
-
-    async def stream_events(self):
-        for event in self.events:
-            yield event
-
-
 @pytest.mark.asyncio
-async def test_private_account_stream_events_are_saved_and_sent_to_strategy(tmp_path):
-    from src.platform.account.events import AccountEvent, AccountEventType
-    from src.platform.exchanges.models import OrderSide, OrderStatus
-
-    class AccountAwareStrategy(FeatureStrategy):
-        async def on_account_event(self, event):
-            self.events.append(f"account:{event.exchange.value}:{event.event_type.value}")
-            return []
-
-    class AccountStateStore(FakeStateStore):
-        def __init__(self):
-            self.events = []
-
-        def save_account_event(self, event):
-            self.events.append(event)
-
-    event = AccountEvent(
-        exchange=ExchangeName.OKX,
-        event_type=AccountEventType.ORDER,
-        symbol="ETH-USDT-PERP",
-        event_time_ms=123,
-        order_id="o1",
-        order_status=OrderStatus.FILLED,
-        side=OrderSide.BUY,
-        quantity=Decimal("0.5"),
-        filled_quantity=Decimal("0.5"),
-    )
+async def test_legacy_private_account_stream_requirement_does_not_start_account_producers(tmp_path):
     cfg = _app_config(dry_run=True, data_streams=())
-    strategy = AccountAwareStrategy()
-    state = AccountStateStore()
+    strategy = FeatureStrategy()
     context = AppContext(
         data=FakeData(),
         execution=object(),
-        state_store=state,
+        state_store=FakeStateStore(),
         strategy=strategy,
         planner=ExecutionPlanner(),
         alerts=AsyncAlertDispatcher(NoopAlertSink()),
     )
-    req = StrategyRuntimeRequirements.from_mapping({"private_account_stream": {"enabled": True}})
+    req = StrategyRuntimeRequirements.from_mapping({"trades": {"enabled": True, "stream_enabled": True}, "private_account_stream": {"enabled": True}})
     runner = LiveRuntimeRunner(
         app_config=cfg,
         app_context=context,
@@ -447,15 +409,16 @@ async def test_private_account_stream_events_are_saved_and_sent_to_strategy(tmp_
         services={
             "runtime_requirements": req,
             "recovery_service": FakeRecoveryService(),
-            "account_event_streams": (FakeAccountStream(ExchangeName.OKX, [event]),),
         },
     )
 
-    stats = await runner.run()
+    tasks = runner._start_producers()
+    runner._producer_tasks = tasks
+    await asyncio.sleep(0)
+    await runner._stop_producers()
 
-    assert stats.account_events_seen == 1
-    assert state.events == [event]
-    assert "account:okx:order" in strategy.events
+    assert len(tasks) == 1
+    assert {item.name for item in runner._producer_monitor.snapshot()} <= {"trades"}
 
 
 @pytest.mark.asyncio
@@ -489,4 +452,3 @@ async def test_closed_bar_poll_emits_unavailable_range_aggregate_for_live_only_p
     assert events[-1].data["context_available"] is False
     assert events[-1].data["incomplete"] is True
     assert strategy.events[-2:] == ["closed_kline", "range_aggregate"]
-

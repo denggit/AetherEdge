@@ -35,8 +35,19 @@
     "order_book": {
       "enabled": false
     },
-    "private_account_stream": {
-      "enabled": true
+    "account_state": {
+      "startup_snapshot_enabled": true,
+      "poll_enabled": true,
+      "poll_interval_seconds": 300,
+      "post_order_sync_enabled": true
+    },
+    "order_state": {
+      "post_submit_sync_enabled": true,
+      "poll_when_position_enabled": true,
+      "poll_interval_seconds": 20,
+      "sync_open_orders": true,
+      "sync_open_stop_orders": true,
+      "sync_position": true
     }
   },
   "micro_context": {

@@ -12,7 +12,8 @@ class StrategyWithMappingRequirements:
             "trades": {"enabled": True, "stream_enabled": True, "warmup_enabled": True},
             "range_bars": {"enabled": True, "range_pct": "0.002", "aggregate_interval": "4h"},
             "order_book": {"enabled": False},
-            "private_account_stream": {"enabled": True},
+            "account_state": {"poll_interval_seconds": 300},
+            "order_state": {"poll_interval_seconds": 20},
         }
 
 
@@ -27,7 +28,9 @@ def test_strategy_runtime_requirements_from_mapping():
     assert req.range_bars.enabled is True
     assert req.range_bars.range_pct == Decimal("0.002")
     assert req.order_book.enabled is False
-    assert req.private_account_stream.enabled is True
+    assert req.private_account_stream.enabled is False
+    assert req.account_state.poll_interval_seconds == 300
+    assert req.order_state.poll_interval_seconds == 20
 
 
 def test_resolve_requirements_prefers_strategy_over_legacy_streams():
@@ -35,7 +38,7 @@ def test_resolve_requirements_prefers_strategy_over_legacy_streams():
 
     assert req.trades.enabled is True
     assert req.order_book.enabled is False
-    assert req.private_account_stream.enabled is True
+    assert req.private_account_stream.enabled is False
 
 
 def test_legacy_data_streams_fallback_only_when_strategy_has_no_requirements():

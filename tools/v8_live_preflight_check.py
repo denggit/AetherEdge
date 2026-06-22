@@ -176,9 +176,24 @@ def _check_runtime_config(report: PreflightReport, *, app: AppConfig, runtime_mo
         "range_pct": str(requirements.range_bars.range_pct),
         "order_book": requirements.order_book.enabled,
         "private_account_stream": requirements.private_account_stream.enabled,
+        "account_state_poll": requirements.account_state.poll_enabled,
+        "account_state_poll_interval_seconds": requirements.account_state.poll_interval_seconds,
+        "order_state_poll_when_position": requirements.order_state.poll_when_position_enabled,
+        "order_state_poll_interval_seconds": requirements.order_state.poll_interval_seconds,
     }
-    if not requirements.closed_kline.enabled or requirements.closed_kline.interval.lower() != "4h" or not requirements.trades.stream_enabled or not requirements.range_bars.enabled or requirements.order_book.enabled or not requirements.private_account_stream.enabled:
-        report.add("v8_runtime_requirements", "fail", detail=req_detail, error="V8 requirements must be closed 4H + live trades + range bars + private account stream, without order_book")
+    if (
+        not requirements.closed_kline.enabled
+        or requirements.closed_kline.interval.lower() != "4h"
+        or not requirements.trades.stream_enabled
+        or not requirements.range_bars.enabled
+        or requirements.order_book.enabled
+        or requirements.private_account_stream.enabled
+        or not requirements.account_state.poll_enabled
+        or requirements.account_state.poll_interval_seconds != 300
+        or not requirements.order_state.poll_when_position_enabled
+        or requirements.order_state.poll_interval_seconds != 20
+    ):
+        report.add("v8_runtime_requirements", "fail", detail=req_detail, error="V8 requirements must be closed 4H + live trades + range bars + request account/order sync, without order_book/private account stream")
     else:
         report.add("v8_runtime_requirements", "ok", detail=req_detail)
 

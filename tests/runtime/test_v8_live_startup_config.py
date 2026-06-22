@@ -53,4 +53,6 @@ def test_v8_live_env_loads_strategy_and_runtime_roles(tmp_path) -> None:
     assert req["trades"]["stream_enabled"] is True
     assert "warmup_enabled" not in req["trades"]
     assert req["range_bars"]["enabled"] is True
-    assert req["private_account_stream"]["enabled"] is True
+    assert "private_account_stream" not in req
+    assert req["account_state"]["poll_interval_seconds"] == 300
+    assert req["order_state"]["poll_interval_seconds"] == 20

@@ -76,7 +76,9 @@ def test_v8_runtime_requirements_do_not_subscribe_order_book() -> None:
     assert req["trades"]["stream_enabled"] is True
     assert req["range_bars"]["range_pct"] == "0.002"
     assert req["order_book"]["enabled"] is False
-    assert req["private_account_stream"]["enabled"] is True
+    assert "private_account_stream" not in req
+    assert req["account_state"]["poll_interval_seconds"] == 300
+    assert req["order_state"]["poll_interval_seconds"] == 20
 
 
 @pytest.mark.asyncio
@@ -133,7 +135,8 @@ def _ctx(event: MarketFeatureEvent):
 from dataclasses import dataclass
 from src.platform.account.events import AccountEvent, AccountEventType
 from src.platform.exchanges.models import OrderSide, OrderStatus
-from src.signals import SignalAction
+from src.order_management.models import ExchangeOrderResult
+from src.signals import SignalAction, TradeSignal
 from strategies.eth_lf_portfolio_v8.domain.models import BarReadyContext, EngineSignal, RoutedSignal, V8DecisionType, V8TradeDecision
 from strategies.eth_lf_portfolio_v8.domain.position_state import V8PositionState
 from strategies.eth_lf_portfolio_v8.engines.router import PortfolioRouter
@@ -490,6 +493,68 @@ async def test_strategy_places_master_and_follower_stop_after_fills() -> None:
     assert follower_stop[0].metadata["target_exchanges"] == ["binance"]
     assert follower_stop[1].trigger_price == Decimal("1978.0")
     assert follower_stop[1].metadata["target_exchanges"] == ["binance"]
+
+
+@pytest.mark.asyncio
+async def test_strategy_order_result_feedback_replaces_private_stream_for_entry_fills() -> None:
+    strategy = Strategy()
+    await strategy.on_start(_snapshot())
+    strategy.router = PortfolioRouter(engines=(_StaticEngine(name="MOMENTUM_V3", priority=150, side=Side.LONG),))
+    strategy.feature_builder = _FakeFeatureBuilder(atr="10")
+    close_time_ms = 1_700_000_000_000
+    await strategy.on_market_feature(_closed_kline(close_time_ms))
+    open_signals = await strategy.on_market_feature(_range_aggregate(close_time_ms, imbalance="0.1", close_pos="0.8"))
+
+    follow_up = await strategy.on_order_results(
+        signal=open_signals[0],
+        source="request_sync",
+        event_time_ms=close_time_ms + 1,
+        results=[
+            ExchangeOrderResult(exchange=ExchangeName.OKX, ok=True, order_id="m1", status=OrderStatus.FILLED, side=OrderSide.BUY, quantity=Decimal("0.1"), filled_quantity=Decimal("0.1"), avg_fill_price=Decimal("2000")),
+            ExchangeOrderResult(exchange=ExchangeName.BINANCE, ok=True, order_id="f1", status=OrderStatus.FILLED, side=OrderSide.BUY, quantity=Decimal("0.1"), filled_quantity=Decimal("0.1"), avg_fill_price=Decimal("2001")),
+        ],
+    )
+
+    assert [signal.action for signal in follow_up] == [
+        SignalAction.CANCEL_ALL_STOP_ORDERS,
+        SignalAction.PLACE_STOP_LOSS_LONG,
+        SignalAction.CANCEL_ALL_STOP_ORDERS,
+        SignalAction.PLACE_STOP_LOSS_LONG,
+    ]
+    assert follow_up[1].metadata["target_exchanges"] == ["okx"]
+    assert follow_up[3].metadata["target_exchanges"] == ["binance"]
+    assert follow_up[3].trigger_price == Decimal("1978.0")
+
+
+@pytest.mark.asyncio
+async def test_strategy_order_result_feedback_master_close_triggers_follower_close() -> None:
+    strategy = Strategy()
+    await strategy.on_start(_snapshot())
+    strategy.position.open_master(side=Side.LONG, entry_time_ms=1, avg_entry=Decimal("2000"), qty=Decimal("0.1"), stop_price=Decimal("1978"), entry_engine="MOMENTUM_V3", position_id="p1")
+    strategy.position.mark_leg_open(exchange="okx", avg_fill_price=Decimal("2000"), base_qty=Decimal("0.1"))
+    strategy.position.mark_leg_open(exchange="binance", avg_fill_price=Decimal("2001"), base_qty=Decimal("0.1"))
+    close_signal = TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.CLOSE_LONG, quantity=Decimal("0.1"), metadata={"target_exchanges": ["okx", "binance"]})
+
+    follow_up = await strategy.on_order_results(
+        signal=close_signal,
+        source="request_sync",
+        event_time_ms=2,
+        results=[ExchangeOrderResult(exchange=ExchangeName.OKX, ok=True, order_id="close-m", status=OrderStatus.FILLED, side=OrderSide.SELL, quantity=Decimal("0.1"), filled_quantity=Decimal("0.1"), avg_fill_price=Decimal("2010"))],
+    )
+
+    assert len(follow_up) == 1
+    assert follow_up[0].action is SignalAction.CLOSE_LONG
+    assert follow_up[0].metadata["target_exchanges"] == ["binance"]
+
+
+@pytest.mark.asyncio
+async def test_strategy_order_result_feedback_stop_and_cancel_do_not_recurse() -> None:
+    strategy = Strategy()
+    stop_signal = TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.PLACE_STOP_LOSS_LONG, quantity=Decimal("0.1"), trigger_price=Decimal("1900"))
+    cancel_signal = TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.CANCEL_ALL_STOP_ORDERS)
+
+    assert await strategy.on_order_results(signal=stop_signal, results=[], source="request_sync", event_time_ms=1) == []
+    assert await strategy.on_order_results(signal=cancel_signal, results=[], source="request_sync", event_time_ms=1) == []
 
 
 @pytest.mark.asyncio

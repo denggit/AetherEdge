@@ -65,9 +65,13 @@ class _FakeData:
 class _FakeStateStore:
     def __init__(self) -> None:
         self.account_events = []
+        self.orders = []
 
     def save_account_event(self, event):
         self.account_events.append(event)
+
+    def save_order(self, order, *, is_stop_order=False):
+        self.orders.append((order, is_stop_order))
 
 
 class _FakeExecutionClient:
@@ -203,47 +207,16 @@ async def test_v8_live_runtime_routes_entry_and_leg_specific_stops(tmp_path) -> 
     await runner.process_market_feature(_closed_kline(close_time_ms))
     await runner.process_market_feature(_range_aggregate(close_time_ms))
 
-    assert runner.stats.signals_seen == 1
-    assert runner.stats.submitted_intents == 1
+    assert runner.stats.signals_seen == 5
+    assert runner.stats.submitted_intents == 5
     assert len(okx.orders) == 1
     assert len(binance.orders) == 1
-    pending_qty = strategy.pending_entry.quantity  # type: ignore[union-attr]
-    binance_pending_qty = Decimal(str(strategy.pending_entry.quantity)) / Decimal("10")  # type: ignore[union-attr]
-
-    await runner.process_account_event(
-        AccountEvent(
-            exchange=ExchangeName.OKX,
-            event_type=AccountEventType.ORDER,
-            symbol="ETH-USDT-PERP",
-            event_time_ms=close_time_ms + 1,
-            order_status=OrderStatus.FILLED,
-            side=OrderSide.BUY,
-            price=Decimal("2000"),
-            filled_quantity=pending_qty,
-        )
-    )
-
     assert len(okx.stop_orders) == 1
-    assert len(binance.stop_orders) == 0
-    assert okx.stop_orders[0].trigger_price == Decimal("1978.0")
-    assert runner.stats.account_events_seen == 1
-    assert state.account_events[0].exchange is ExchangeName.OKX
-
-    await runner.process_account_event(
-        AccountEvent(
-            exchange=ExchangeName.BINANCE,
-            event_type=AccountEventType.ORDER,
-            symbol="ETH-USDT-PERP",
-            event_time_ms=close_time_ms + 2,
-            order_status=OrderStatus.FILLED,
-            side=OrderSide.BUY,
-            price=Decimal("2001"),
-            filled_quantity=binance_pending_qty,
-        )
-    )
-
     assert len(binance.stop_orders) == 1
+    assert okx.stop_orders[0].trigger_price == Decimal("1978.0")
     assert binance.stop_orders[0].trigger_price == Decimal("1978.0")
+    assert runner.stats.account_events_seen == 0
+    assert state.account_events == []
     import sqlite3
 
     result_count = sqlite3.connect(tmp_path / "journal.sqlite3").execute("SELECT COUNT(*) FROM exchange_order_results").fetchone()[0]

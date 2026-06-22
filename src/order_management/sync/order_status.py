@@ -5,8 +5,13 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
 from src.platform.execution import ExecutionClient
-from src.platform.exchanges.models import Order, OrderQuery, StopOrderQuery
+import asyncio
+
+from src.platform.exchanges.models import Order, OrderQuery, OrderStatus, StopOrderQuery
 from src.planner import PlannedExecution, PlannedExecutionAction
+
+
+_TERMINAL = {OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED}
 
 
 class OrderStatusSynchronizer:
@@ -18,12 +23,17 @@ class OrderStatusSynchronizer:
     in order-management, not in strategies.
     """
 
+    def __init__(self, *, terminal_retry_delays_seconds: tuple[float, ...] = (1.0, 2.0, 3.0)) -> None:
+        self.terminal_retry_delays_seconds = terminal_retry_delays_seconds
+
     async def sync_after_submit(self, *, client: ExecutionClient, item: PlannedExecution, order: Order) -> Order:
         try:
             if item.action is PlannedExecutionAction.PLACE_ORDER:
                 return await self._sync_regular_order(client, order)
             if item.action is PlannedExecutionAction.PLACE_STOP_MARKET_ORDER:
                 return await self._sync_stop_order(client, order)
+            if item.action is PlannedExecutionAction.CANCEL_ALL_STOP_ORDERS:
+                return await self._sync_open_stop_orders_after_cancel(client, order)
         except Exception as exc:
             return _merge_raw(order, {"order_status_sync_error": str(exc)})
         return order
@@ -34,6 +44,11 @@ class OrderStatusSynchronizer:
             return order
         query = OrderQuery(symbol=order.symbol, order_id=order.order_id, client_order_id=order.client_order_id)
         synced = await fetch(query)
+        for delay in self.terminal_retry_delays_seconds:
+            if synced.status in _TERMINAL:
+                break
+            await asyncio.sleep(delay)
+            synced = await fetch(query)
         return _prefer_synced(order, synced, raw_key="synced_order")
 
     async def _sync_stop_order(self, client: ExecutionClient, order: Order) -> Order:
@@ -43,6 +58,13 @@ class OrderStatusSynchronizer:
         query = StopOrderQuery(symbol=order.symbol, stop_order_id=order.order_id, client_order_id=order.client_order_id)
         synced = await fetch(query)
         return _prefer_synced(order, synced, raw_key="synced_stop_order")
+
+    async def _sync_open_stop_orders_after_cancel(self, client: ExecutionClient, order: Order) -> Order:
+        fetch = getattr(client, "fetch_open_stop_orders", None)
+        if not callable(fetch):
+            return order
+        open_stop_orders = await fetch()
+        return _merge_raw(order, {"synced_open_stop_orders": [dict(item.raw) for item in open_stop_orders]})
 
 
 def _prefer_synced(original: Order, synced: Order, *, raw_key: str) -> Order:

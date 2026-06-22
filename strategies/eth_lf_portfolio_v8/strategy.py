@@ -10,6 +10,7 @@ from src.market_data.events import MarketFeatureEvent, MarketFeatureEventType
 from src.platform.account.events import AccountEvent, AccountEventType
 from src.platform.data.models import MarketKline, MarketOrderBook, MarketTicker, MarketTrade
 from src.platform.exchanges.models import OrderSide, OrderStatus, Position, PositionSide
+from src.order_management.models import ExchangeOrderResult
 from src.platform.snapshot import PlatformSnapshot
 from src.signals import SignalAction, TradeSignal
 from src.strategy import StrategyRecoveryContext
@@ -186,6 +187,50 @@ class Strategy:
             signals.extend(follower_close_signals)
         elif self.position.in_pos and not is_master and _is_close_side(event.side, self.position.side):
             self.position.mark_leg_closed(exchange=exchange, sync_status="follower_closed")
+        return signals
+
+    async def on_order_results(
+        self,
+        *,
+        signal: TradeSignal,
+        results: Sequence[ExchangeOrderResult],
+        source: str,
+        event_time_ms: int | None,
+    ) -> Sequence[TradeSignal]:
+        if signal.action in {SignalAction.PLACE_STOP_LOSS_LONG, SignalAction.PLACE_STOP_LOSS_SHORT, SignalAction.CANCEL_ALL_STOP_ORDERS}:
+            return []
+        if signal.action not in {SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT, SignalAction.CLOSE_LONG, SignalAction.CLOSE_SHORT}:
+            return []
+
+        signals: list[TradeSignal] = []
+        for result in results:
+            event = _account_event_from_order_result(signal=signal, result=result, event_time_ms=event_time_ms)
+            if event is None:
+                continue
+            exchange = event.exchange.value
+            is_master = exchange == self.config.data_exchange
+            filled_qty = event.filled_quantity or event.quantity or Decimal("0")
+            if filled_qty <= 0:
+                continue
+
+            if signal.action in {SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT}:
+                if self.pending_entry is not None and _is_entry_side(event.side, self.pending_entry.side):
+                    if is_master:
+                        signals.extend(self._handle_master_entry_fill(event=event, filled_qty=filled_qty))
+                    elif self.position.in_pos:
+                        signals.extend(self._handle_follower_entry_fill(event=event, filled_qty=filled_qty))
+                elif self.position.in_pos and _is_entry_side(event.side, self.position.side) and not is_master:
+                    signals.extend(self._handle_follower_entry_fill(event=event, filled_qty=filled_qty))
+                continue
+
+            if signal.action in {SignalAction.CLOSE_LONG, SignalAction.CLOSE_SHORT}:
+                if self.position.in_pos and is_master and _is_close_side(event.side, self.position.side):
+                    follower_close_signals = self._follower_close_signals_after_master_close(event_time_ms=event.event_time_ms)
+                    self.position.close_master(exit_time_ms=event.event_time_ms)
+                    self.pending_entry = None
+                    signals.extend(follower_close_signals)
+                elif self.position.in_pos and not is_master and _is_close_side(event.side, self.position.side):
+                    self.position.mark_leg_closed(exchange=exchange, sync_status="follower_closed")
         return signals
 
     async def on_market_feature(self, event: MarketFeatureEvent) -> Sequence[TradeSignal]:
@@ -845,6 +890,41 @@ def _is_close_side(order_side: OrderSide | None, position_side: Side) -> bool:
     if position_side is Side.SHORT:
         return order_side is OrderSide.BUY
     return False
+
+
+def _account_event_from_order_result(*, signal: TradeSignal, result: ExchangeOrderResult, event_time_ms: int | None) -> AccountEvent | None:
+    if not result.ok or result.status is not OrderStatus.FILLED:
+        return None
+    price = result.avg_fill_price
+    filled_qty = result.filled_quantity or result.quantity
+    if price is None or filled_qty is None or filled_qty <= 0:
+        return None
+    side = result.side or _signal_order_side(signal.action)
+    if side is None:
+        return None
+    return AccountEvent(
+        exchange=result.exchange,
+        event_type=AccountEventType.ORDER,
+        symbol=signal.symbol,
+        raw_symbol=signal.symbol,
+        event_time_ms=event_time_ms or signal.created_time_ms,
+        order_id=result.order_id,
+        client_order_id=result.client_order_id,
+        order_status=result.status,
+        side=side,
+        price=price,
+        quantity=result.quantity,
+        filled_quantity=filled_qty,
+        raw={**dict(result.raw), "source": "request_order_result"},
+    )
+
+
+def _signal_order_side(action: SignalAction) -> OrderSide | None:
+    if action in {SignalAction.OPEN_LONG, SignalAction.CLOSE_SHORT}:
+        return OrderSide.BUY
+    if action in {SignalAction.OPEN_SHORT, SignalAction.CLOSE_LONG}:
+        return OrderSide.SELL
+    return None
 
 
 def _first_active_position(positions: Sequence[Position]) -> Position | None:
