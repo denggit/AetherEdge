@@ -504,3 +504,138 @@ def test_ae_client_order_ids_not_falsely_detected():
     ]
     for cid in client_ids:
         assert not is_fake_order_id(cid), f"Expected '{cid}' NOT to be detected as fake"
+
+
+# ── Client order ID preservation tests (AE-V9C-LIVE-BOOTSTRAP-013) ──
+
+
+@pytest.mark.asyncio
+async def test_reconcile_fake_ids_with_valid_client_preserves_client_order_id():
+    """Fake exchange order IDs + valid client_order_id → clear only exchange ID,
+    preserve client_order_id for diagnostics and query fallback."""
+    store = _make_store()
+    plan = PositionPlan(
+        position_id="fake-plan-2",
+        strategy_id="test_strategy",
+        entry_engine="test_engine",
+        side="long",
+        status=PositionPlanStatus.ACTIVE,
+        canonical_stop_price=Decimal("0"),
+        master_exchange=ExchangeName.OKX,
+        master_target_qty_base=Decimal("0.1"),
+        master_filled_qty_base=Decimal("0.1"),
+    )
+    store.upsert_position(plan)
+    store.upsert_leg(
+        LegPlan(
+            position_id="fake-plan-2",
+            exchange=ExchangeName.OKX,
+            role=LegRole.MASTER,
+            target_qty_base=Decimal("0.1"),
+            entry_order_id="okx-order-1",
+            entry_client_order_id="AEOKOL210BAA0585046BF3",
+            stop_order_id="okx-stop-1",
+            stop_client_order_id="AEOKSL210BAA0585046BF3",
+            sync_status=LegSyncStatus.OPEN,
+        )
+    )
+
+    # OKX has a real position — so plan should NOT be closed
+    okx_with_pos = _position_snapshot(ExchangeName.OKX, Decimal("0.1"))
+    binance_flat = _flat_snapshot(ExchangeName.BINANCE)
+
+    service = LiveStateReconciliationService(
+        position_plan_store=store, order_journal=None, state_store=None
+    )
+    report = await service.reconcile_and_apply((okx_with_pos, binance_flat))
+
+    # Fake refs should be detected
+    assert len(report.fake_order_refs_found) >= 2
+
+    # Plan should NOT be closed (OKX has position)
+    p = store.get_position("fake-plan-2")
+    assert p is not None
+    assert p.status != PositionPlanStatus.CLOSED
+
+    # Exchange order IDs should be cleared, client_order_ids PRESERVED
+    okx_legs = [leg for leg in store.get_legs("fake-plan-2") if leg.exchange == ExchangeName.OKX]
+    assert len(okx_legs) == 1
+    leg = okx_legs[0]
+    assert leg.entry_order_id is None, f"entry_order_id should be cleared, got {leg.entry_order_id}"
+    assert leg.stop_order_id is None, f"stop_order_id should be cleared, got {leg.stop_order_id}"
+    assert leg.entry_client_order_id == "AEOKOL210BAA0585046BF3", (
+        f"entry_client_order_id should be preserved, got {leg.entry_client_order_id}"
+    )
+    assert leg.stop_client_order_id == "AEOKSL210BAA0585046BF3", (
+        f"stop_client_order_id should be preserved, got {leg.stop_client_order_id}"
+    )
+
+    # Verify the report has the right actions
+    entry_clear_actions = [
+        a for a in report.actions
+        if a.action_type == "clear_fake_entry_order_id"
+        and "fake-plan-2" in a.target
+    ]
+    assert len(entry_clear_actions) >= 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_all_exchanges_flat_clears_all_refs_including_client():
+    """All exchanges flat + stale plan → clear ALL order refs (exchange + client)."""
+    store = _make_store()
+    plan = PositionPlan(
+        position_id="stale-plan-1",
+        strategy_id="test_strategy",
+        entry_engine="test_engine",
+        side="long",
+        status=PositionPlanStatus.ACTIVE,
+        canonical_stop_price=Decimal("0"),
+        master_exchange=ExchangeName.OKX,
+        master_target_qty_base=Decimal("0.1"),
+        master_filled_qty_base=Decimal("0.1"),
+    )
+    store.upsert_position(plan)
+    store.upsert_leg(
+        LegPlan(
+            position_id="stale-plan-1",
+            exchange=ExchangeName.OKX,
+            role=LegRole.MASTER,
+            target_qty_base=Decimal("0.1"),
+            entry_order_id="okx-order-1",
+            entry_client_order_id="AEOKOLabc123",
+            stop_order_id="okx-stop-1",
+            stop_client_order_id="AEOKSPxyz789",
+            sync_status=LegSyncStatus.OPEN,
+        )
+    )
+
+    # Both exchanges flat → all refs should be cleared
+    okx_flat = _flat_snapshot(ExchangeName.OKX)
+    binance_flat = _flat_snapshot(ExchangeName.BINANCE)
+
+    service = LiveStateReconciliationService(
+        position_plan_store=store, order_journal=None, state_store=None
+    )
+    report = await service.reconcile_and_apply((okx_flat, binance_flat))
+
+    # Plan should be closed
+    p = store.get_position("stale-plan-1")
+    assert p is not None
+    assert p.status == PositionPlanStatus.CLOSED
+
+    # ALL refs should be cleared (bulk cleanup)
+    okx_legs = [leg for leg in store.get_legs("stale-plan-1") if leg.exchange == ExchangeName.OKX]
+    assert len(okx_legs) == 1
+    leg = okx_legs[0]
+    assert leg.entry_order_id is None
+    assert leg.entry_client_order_id is None
+    assert leg.stop_order_id is None
+    assert leg.stop_client_order_id is None
+
+    # Verify clear_all_* actions were used
+    assert any(
+        a.action_type == "clear_all_entry_order_refs" for a in report.actions
+    )
+    assert any(
+        a.action_type == "clear_all_stop_order_refs" for a in report.actions
+    )

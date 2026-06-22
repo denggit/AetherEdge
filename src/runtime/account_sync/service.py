@@ -19,7 +19,9 @@ from src.utils.log import get_logger
 
 logger = get_logger(__name__)
 
-_INVALID_ID_VALUES: frozenset[str] = frozenset({"", "none", "null", "nan", "n/a", "na", "undefined"})
+_INVALID_ID_VALUES: frozenset[str] = frozenset(
+    {"", "none", "null", "nan", "n/a", "na", "undefined"}
+)
 
 
 def _clean_order_id(value: object) -> str | None:
@@ -354,10 +356,10 @@ class OrderStateSyncService:
             exchange_payload = payload.get(exchange, {}).get(key, ())
             if not exchange_payload:
                 return ()
-            refs: list[KnownOrderRef] = []
+            raw_refs: list[KnownOrderRef] = []
             for item in exchange_payload:
                 if isinstance(item, dict):
-                    refs.append(
+                    raw_refs.append(
                         KnownOrderRef(
                             order_id=_clean_order_id(item.get("order_id")),
                             client_order_id=_clean_order_id(item.get("client_order_id")),
@@ -367,12 +369,12 @@ class OrderStateSyncService:
                     # (order_id, client_order_id) pair
                     oid = _clean_order_id(item[0]) if len(item) > 0 else None
                     cid = _clean_order_id(item[1]) if len(item) > 1 else None
-                    refs.append(KnownOrderRef(order_id=oid, client_order_id=cid))
+                    raw_refs.append(KnownOrderRef(order_id=oid, client_order_id=cid))
                 else:
                     # Legacy plain string — map to KnownOrderRef.order_id
                     cleaned = _clean_order_id(item)
                     if cleaned is not None:
-                        refs.append(KnownOrderRef(order_id=cleaned))
+                        raw_refs.append(KnownOrderRef(order_id=cleaned))
                     else:
                         logger.debug(
                             "Skipped invalid known order ref | exchange=%s key=%s raw=%r",
@@ -380,6 +382,65 @@ class OrderStateSyncService:
                             key,
                             item,
                         )
+            # ── Exchange-specific validation (same as position_plan_store path) ──
+            refs: list[KnownOrderRef] = []
+            exchange_enum = ExchangeName(exchange)
+            for ref in raw_refs:
+                oid_valid = is_valid_exchange_order_id(exchange_enum, ref.order_id)
+                cid_valid = is_valid_client_order_id(ref.client_order_id)
+
+                if not oid_valid and not cid_valid:
+                    # Both IDs invalid — mark INVALID_FORMAT, skip querying
+                    refs.append(
+                        KnownOrderRef(
+                            order_id=None,
+                            client_order_id=None,
+                            status=KnownOrderRefStatus.INVALID_FORMAT,
+                        )
+                    )
+                    logger.debug(
+                        "Known order ref (callback) marked INVALID_FORMAT | "
+                        "exchange=%s key=%s order_id=%r client_order_id=%r",
+                        exchange,
+                        key,
+                        ref.order_id,
+                        ref.client_order_id,
+                    )
+                    continue
+
+                if not oid_valid and cid_valid:
+                    # Fake/non-numeric exchange order_id + valid client_order_id
+                    # → use ONLY client_order_id, must NOT send fake exchange ID
+                    resolved_oid, resolved_cid = resolve_query_params(
+                        exchange_enum, ref.order_id, ref.client_order_id
+                    )
+                    refs.append(
+                        KnownOrderRef(
+                            order_id=resolved_oid,
+                            client_order_id=resolved_cid,
+                            status=KnownOrderRefStatus.ACTIVE,
+                        )
+                    )
+                    logger.debug(
+                        "Known order ref (callback) fallback to client_order_id | "
+                        "exchange=%s key=%s resolved_cid=%s",
+                        exchange,
+                        key,
+                        resolved_cid,
+                    )
+                    continue
+
+                # Both valid — use resolved params
+                resolved_oid, resolved_cid = resolve_query_params(
+                    exchange_enum, ref.order_id, ref.client_order_id
+                )
+                refs.append(
+                    KnownOrderRef(
+                        order_id=resolved_oid,
+                        client_order_id=resolved_cid,
+                        status=KnownOrderRefStatus.ACTIVE,
+                    )
+                )
             # Deduplicate while preserving order
             seen: set[tuple[str | None, str | None]] = set()
             deduped: list[KnownOrderRef] = []

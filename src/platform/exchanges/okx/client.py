@@ -405,12 +405,26 @@ class OkxExchangeClient:
         )
 
     async def fetch_order_status(self, query: OrderQuery) -> Order:
+        from src.platform.exchanges.order_ids import resolve_order_query_ids
+
         raw_symbol = to_exchange_symbol(self.exchange, query.symbol)
         params: dict[str, Any] = {"instId": raw_symbol}
-        if query.order_id:
-            params["ordId"] = query.order_id
-        if query.client_order_id:
-            params["clOrdId"] = query.client_order_id
+
+        resolved_oid, resolved_cid = resolve_order_query_ids(
+            self.exchange, query.order_id, query.client_order_id
+        )
+        if resolved_oid:
+            params["ordId"] = resolved_oid
+            if resolved_cid:
+                params["clOrdId"] = resolved_cid
+        elif resolved_cid:
+            params["clOrdId"] = resolved_cid
+        else:
+            raise ExchangeConfigError(
+                f"OKX order status requires valid ordId or clOrdId "
+                f"(order_id={query.order_id!r} client_order_id={query.client_order_id!r})"
+            )
+
         payload = await self._request_private("GET", "/api/v5/trade/order", params=params)
         data = _first_data(payload, "OKX order status")
         return _map_okx_order_row(data, symbol=query.symbol, raw_symbol=raw_symbol)
@@ -442,12 +456,26 @@ class OkxExchangeClient:
         return canceled
 
     async def fetch_stop_order_status(self, query: StopOrderQuery) -> Order:
+        from src.platform.exchanges.order_ids import resolve_order_query_ids
+
         raw_symbol = to_exchange_symbol(self.exchange, query.symbol)
         params: dict[str, Any] = {"instId": raw_symbol, "ordType": "conditional"}
-        if query.stop_order_id:
-            params["algoId"] = query.stop_order_id
-        if query.client_order_id:
-            params["algoClOrdId"] = query.client_order_id
+
+        resolved_oid, resolved_cid = resolve_order_query_ids(
+            self.exchange, query.stop_order_id, query.client_order_id
+        )
+        if resolved_oid:
+            params["algoId"] = resolved_oid
+            if resolved_cid:
+                params["algoClOrdId"] = resolved_cid
+        elif resolved_cid:
+            params["algoClOrdId"] = resolved_cid
+        else:
+            raise ExchangeConfigError(
+                f"OKX stop order status requires valid algoId or algoClOrdId "
+                f"(stop_order_id={query.stop_order_id!r} client_order_id={query.client_order_id!r})"
+            )
+
         payload = await self._request_private("GET", "/api/v5/trade/order-algo", params=params)
         data = _first_data(payload, "OKX stop order status")
         return _map_okx_algo_order_row(data, symbol=query.symbol, raw_symbol=raw_symbol)

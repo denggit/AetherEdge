@@ -167,6 +167,11 @@ class SqlitePositionPlanStore:
         for order-ID columns, so passing ``None`` in an upserted LegPlan will
         **not** overwrite an existing value.  This method bypasses that by
         issuing a direct UPDATE … SET … = NULL.
+
+        .. warning::
+           This clears **both** exchange_order_id **and** client_order_id.
+           For active/unresolved plans where the client_order_id is still
+           useful for diagnostics, prefer :meth:`clear_leg_order_refs`.
         """
         exchange_name = (
             exchange
@@ -193,6 +198,58 @@ class SqlitePositionPlanStore:
                        WHERE position_id = ? AND exchange = ?""",
                     (now_ms, position_id, exchange_name.value),
                 )
+
+    def clear_leg_order_refs(
+        self,
+        *,
+        position_id: str,
+        exchange: ExchangeName | str,
+        clear_entry_exchange_order_id: bool = False,
+        clear_entry_client_order_id: bool = False,
+        clear_stop_exchange_order_id: bool = False,
+        clear_stop_client_order_id: bool = False,
+    ) -> None:
+        """Granularly clear specific order-ID fields on a leg.
+
+        Unlike :meth:`clear_leg_order_ids`, this allows selectively clearing
+        only the **exchange** order ID while preserving the **client** order ID
+        (or vice versa).  This is critical when a leg has a fake exchange order
+        ID but a valid client_order_id that must be retained for diagnostics
+        and query fallback.
+
+        For all-flat stale plans use :meth:`clear_leg_order_ids` to wipe
+        everything in one call.
+        """
+        exchange_name = (
+            exchange
+            if isinstance(exchange, ExchangeName)
+            else ExchangeName(str(exchange).strip().lower())
+        )
+        now_ms = int(time.time() * 1000)
+        set_clauses: list[str] = []
+        params: list[object] = []
+
+        if clear_entry_exchange_order_id:
+            set_clauses.append("entry_order_id = NULL")
+        if clear_entry_client_order_id:
+            set_clauses.append("entry_client_order_id = NULL")
+        if clear_stop_exchange_order_id:
+            set_clauses.append("stop_order_id = NULL")
+        if clear_stop_client_order_id:
+            set_clauses.append("stop_client_order_id = NULL")
+
+        if not set_clauses:
+            return
+
+        set_clauses.append("updated_time_ms = ?")
+        params.extend([now_ms, position_id, exchange_name.value])
+
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE leg_plans SET {', '.join(set_clauses)} "
+                "WHERE position_id = ? AND exchange = ?",
+                params,
+            )
 
     def serialize_active_positions(self) -> list[dict[str, Any]]:
         payload: list[dict[str, Any]] = []

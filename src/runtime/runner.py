@@ -75,6 +75,7 @@ FATAL_STARTUP_ERROR_MARKERS = (
     "closed-kline warmup loaded insufficient records",
     "closed-kline warmup did not catch up",
     "startup snapshot is required before live trading",
+    "startup reconciliation missing exchange snapshots",
     "runtime recovery failed",
 )
 
@@ -144,6 +145,7 @@ class LiveRuntimeRunner:
             target_exchanges=self.app_config.exchanges,
         )
         self._last_snapshot: PlatformSnapshot | None = self.services.get("snapshot")
+        self._last_snapshots: tuple[PlatformSnapshot, ...] = ()
         self._last_market_queue_full_alert_ms = 0
         self._follower_close_alert_last_ms: dict[str, int] = {}
         self._health = RuntimeHealth(
@@ -308,10 +310,13 @@ class LiveRuntimeRunner:
         self._set_health(RuntimePhase.WARMING_UP, healthy=True)
         await self._run_warmup()
         self._set_health(RuntimePhase.CATCHING_UP, healthy=True, warmup_complete=True)
-        snapshot = await self._run_recovery()
+        snapshots = await self._run_recovery()
         # ── State convergence: reconcile exchange truth against local state ──
-        await self._run_reconciliation(snapshot)
-        await self._call_on_start(snapshot)
+        #     CRITICAL: must reconcile ALL exchange snapshots, not just one.
+        #     A single-exchange view can miss follower positions and wrongly
+        #     close active PositionPlans (master/follower safety violation).
+        await self._run_reconciliation(snapshots)
+        await self._call_on_start(snapshots[0])
         self._set_health(RuntimePhase.RUNNING, healthy=True, warmup_complete=True, caught_up=True)
         logger.info("Live runtime startup phase completed")
 
@@ -554,12 +559,12 @@ class LiveRuntimeRunner:
                 continue
             await self.process_market_feature(closed_kline_feature(row))
 
-    async def _run_recovery(self) -> PlatformSnapshot:
+    async def _run_recovery(self) -> tuple[PlatformSnapshot, ...]:
         service = self._get_recovery_service()
         if service is None:
             if self._last_snapshot is None:
                 raise LiveRuntimeError("startup snapshot is required before live trading")
-            return self._last_snapshot
+            return (self._last_snapshot,)
         report = await service.recover(strategy=self.context.strategy)
         self.stats.recovery_runs += 1
         if not report.ok:
@@ -573,10 +578,11 @@ class LiveRuntimeRunner:
         if report.strategy_signals:
             await self._execute_signals(report.strategy_signals, source="recovery", event_time_ms=int(time.time() * 1000), metadata={"feature_type": "recovery"})
         if report.snapshots:
-            self._last_snapshot = report.snapshots[0]
-        if self._last_snapshot is None:
+            self._last_snapshots = tuple(report.snapshots)
+            self._last_snapshot = report.snapshots[0]  # backward-compat for on_start / legacy consumers
+        if not self._last_snapshots:
             raise LiveRuntimeError("recovery completed without a startup snapshot")
-        return self._last_snapshot
+        return self._last_snapshots
 
     async def _call_on_start(self, snapshot: PlatformSnapshot) -> None:
         on_start = getattr(self.context.strategy, "on_start", None)
@@ -1079,15 +1085,38 @@ class LiveRuntimeRunner:
             )
         return self._reconciliation_service
 
-    async def _run_reconciliation(self, snapshot: PlatformSnapshot) -> None:
+    async def _run_reconciliation(self, snapshots: tuple[PlatformSnapshot, ...]) -> None:
         """Run startup state reconciliation: compare exchange truth against
         local PositionPlan / LegPlan / order journal state and repair stale
-        artifacts before producers or sync tasks start."""
+        artifacts before producers or sync tasks start.
+
+        CRITICAL: All exchange snapshots MUST be present. Reconciling with
+        only one exchange can miss follower positions on the other exchange
+        and wrongly close active PositionPlans (master/follower safety
+        violation).
+        """
         service = self._get_reconciliation_service()
         if service is None:
             return
-        snapshots = (snapshot,)
-        logger.info("Startup reconciliation starting | exchanges=%s", snapshot.leverage.exchange.value)
+
+        expected = len(self.app_config.exchanges)
+        if len(snapshots) != expected:
+            snapshot_exchanges = sorted(
+                s.leverage.exchange.value if hasattr(s, "leverage") else str(s)
+                for s in snapshots
+            )
+            raise LiveRuntimeError(
+                f"startup reconciliation missing exchange snapshots: "
+                f"expected {expected} exchanges "
+                f"({', '.join(ex.value for ex in self.app_config.exchanges)}), "
+                f"got {len(snapshots)} ({', '.join(snapshot_exchanges) if snapshot_exchanges else 'none'})"
+            )
+
+        exchange_names = ", ".join(
+            s.leverage.exchange.value if hasattr(s, "leverage") else "?"
+            for s in snapshots
+        )
+        logger.info("Startup reconciliation starting | exchanges=%s count=%s", exchange_names, len(snapshots))
         report = await service.reconcile_and_apply(snapshots)
         if report.stale_plans_closed > 0:
             logger.warning(

@@ -318,11 +318,11 @@ class LiveStateReconciliationService:
                         },
                     )
                 )
-                # Clear any order IDs that may be fake
+                # ── All exchanges flat → clear ALL order refs (exchange + client) ──
                 if leg.entry_order_id:
                     report.actions.append(
                         ReconciliationAction(
-                            action_type="clear_fake_entry_order_id",
+                            action_type="clear_all_entry_order_refs",
                             target=f"leg:{plan.position_id}:{leg.exchange.value}",
                             detail={"value": leg.entry_order_id},
                         )
@@ -330,7 +330,7 @@ class LiveStateReconciliationService:
                 if leg.stop_order_id:
                     report.actions.append(
                         ReconciliationAction(
-                            action_type="clear_fake_stop_order_id",
+                            action_type="clear_all_stop_order_refs",
                             target=f"leg:{plan.position_id}:{leg.exchange.value}",
                             detail={"value": leg.stop_order_id},
                         )
@@ -354,7 +354,7 @@ class LiveStateReconciliationService:
                     if s.leverage.exchange == exchange_name
                 )
                 if exchange_flat:
-                    # Exchange flat, safe to close plan
+                    # Exchange flat, safe to close plan — clear ALL refs
                     if not any(
                         a.action_type == "close_stale_plan" and a.target == plan_ref
                         for a in report.actions
@@ -372,7 +372,8 @@ class LiveStateReconciliationService:
                         )
                         report.stale_plans_closed += 1
                 else:
-                    # Exchange has position, clear only the fake ID
+                    # Exchange has position — clear only the fake exchange ID,
+                    # PRESERVE client_order_id for diagnostics and query fallback.
                     report.actions.append(
                         ReconciliationAction(
                             action_type=f"clear_fake_{fake.field}",
@@ -587,13 +588,51 @@ class LiveStateReconciliationService:
             elif action.action_type in (
                 "clear_fake_entry_order_id",
                 "clear_fake_stop_order_id",
+                "clear_fake_entry_exchange_order_id",
+                "clear_fake_stop_exchange_order_id",
             ):
+                # ── Granular: clear exchange order ID only, preserve client_order_id ──
                 parts = action.target.split(":")
                 if len(parts) < 3:
                     continue
                 _, position_id, exchange_str = parts
-                clear_entry = action.action_type == "clear_fake_entry_order_id"
-                clear_stop = action.action_type == "clear_fake_stop_order_id"
+                is_entry = action.action_type in (
+                    "clear_fake_entry_order_id",
+                    "clear_fake_entry_exchange_order_id",
+                )
+                is_stop = action.action_type in (
+                    "clear_fake_stop_order_id",
+                    "clear_fake_stop_exchange_order_id",
+                )
+
+                store.clear_leg_order_refs(
+                    position_id=position_id,
+                    exchange=ExchangeName(exchange_str),
+                    clear_entry_exchange_order_id=is_entry,
+                    clear_stop_exchange_order_id=is_stop,
+                    # client_order_id is deliberately preserved
+                )
+                logger.warning(
+                    "Startup reconciliation: cleared fake exchange order ID "
+                    "(client_order_id preserved) | "
+                    "position_id=%s exchange=%s field=%s value=%s",
+                    position_id,
+                    exchange_str,
+                    "entry_order_id" if is_entry else "stop_order_id",
+                    action.detail.get("fake_value", "unknown"),
+                )
+
+            elif action.action_type in (
+                "clear_all_entry_order_refs",
+                "clear_all_stop_order_refs",
+            ):
+                # ── Bulk: clear both exchange AND client order IDs (stale plans) ──
+                parts = action.target.split(":")
+                if len(parts) < 3:
+                    continue
+                _, position_id, exchange_str = parts
+                clear_entry = action.action_type == "clear_all_entry_order_refs"
+                clear_stop = action.action_type == "clear_all_stop_order_refs"
 
                 store.clear_leg_order_ids(
                     position_id=position_id,
@@ -602,12 +641,11 @@ class LiveStateReconciliationService:
                     clear_stop_order_id=clear_stop,
                 )
                 logger.warning(
-                    "Startup reconciliation: cleared fake order ID | "
-                    "position_id=%s exchange=%s field=%s value=%s",
+                    "Startup reconciliation: cleared all order refs (bulk) | "
+                    "position_id=%s exchange=%s field=%s",
                     position_id,
                     exchange_str,
-                    "entry_order_id" if clear_entry else "stop_order_id",
-                    action.detail.get("fake_value", "unknown"),
+                    "entry" if clear_entry else "stop",
                 )
 
             elif action.action_type == "set_master_closed_follower_close_required":

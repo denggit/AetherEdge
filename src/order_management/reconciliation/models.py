@@ -25,8 +25,12 @@ class ReconciliationAction:
     # Values:
     #   close_stale_plan
     #   mark_leg_stale
-    #   clear_fake_entry_order_id
-    #   clear_fake_stop_order_id
+    #   clear_fake_entry_order_id              → clears exchange order_id only (preserves client)
+    #   clear_fake_stop_order_id               → clears exchange order_id only (preserves client)
+    #   clear_fake_entry_exchange_order_id     → explicit exchange-order-id-only clear
+    #   clear_fake_stop_exchange_order_id      → explicit exchange-order-id-only clear
+    #   clear_all_entry_order_refs             → clears both entry order_id + entry client_order_id
+    #   clear_all_stop_order_refs              → clears both stop order_id + stop client_order_id
     #   set_master_closed_follower_close_required
     #   block_new_entries_alert
     #   journal_event

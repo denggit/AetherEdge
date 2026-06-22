@@ -219,12 +219,26 @@ class BinanceExchangeClient:
         return _map_binance_order(payload, symbol=request.symbol, raw_symbol=raw_symbol)
 
     async def fetch_order_status(self, query: OrderQuery) -> Order:
+        from src.platform.exchanges.order_ids import resolve_order_query_ids
+
         raw_symbol = to_exchange_symbol(self.exchange, query.symbol)
         params: dict[str, Any] = {"symbol": raw_symbol}
-        if query.order_id:
-            params["orderId"] = query.order_id
-        if query.client_order_id:
-            params["origClientOrderId"] = query.client_order_id
+
+        resolved_oid, resolved_cid = resolve_order_query_ids(
+            self.exchange, query.order_id, query.client_order_id
+        )
+        if resolved_oid:
+            params["orderId"] = resolved_oid
+            if resolved_cid:
+                params["origClientOrderId"] = resolved_cid
+        elif resolved_cid:
+            params["origClientOrderId"] = resolved_cid
+        else:
+            raise ExchangeConfigError(
+                f"Binance order status requires valid orderId or origClientOrderId "
+                f"(order_id={query.order_id!r} client_order_id={query.client_order_id!r})"
+            )
+
         payload = await self._request_signed("GET", "/fapi/v1/order", params=params)
         return _map_binance_order(payload, symbol=query.symbol, raw_symbol=raw_symbol)
 
@@ -250,12 +264,26 @@ class BinanceExchangeClient:
         ]
 
     async def fetch_stop_order_status(self, query: StopOrderQuery) -> Order:
+        from src.platform.exchanges.order_ids import resolve_order_query_ids
+
         raw_symbol = to_exchange_symbol(self.exchange, query.symbol)
         params: dict[str, Any] = {"symbol": raw_symbol}
-        if query.stop_order_id:
-            params["algoId"] = query.stop_order_id
-        if query.client_order_id:
-            params["clientAlgoId"] = query.client_order_id
+
+        resolved_oid, resolved_cid = resolve_order_query_ids(
+            self.exchange, query.stop_order_id, query.client_order_id
+        )
+        if resolved_oid:
+            params["algoId"] = resolved_oid
+            if resolved_cid:
+                params["clientAlgoId"] = resolved_cid
+        elif resolved_cid:
+            params["clientAlgoId"] = resolved_cid
+        else:
+            raise ExchangeConfigError(
+                f"Binance stop order status requires valid algoId or clientAlgoId "
+                f"(stop_order_id={query.stop_order_id!r} client_order_id={query.client_order_id!r})"
+            )
+
         payload = await self._request_signed("GET", "/fapi/v1/algoOrder", params=params)
         return _map_binance_algo_order(payload, symbol=query.symbol, raw_symbol=raw_symbol)
 

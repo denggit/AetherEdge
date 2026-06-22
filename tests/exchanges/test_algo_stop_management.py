@@ -28,7 +28,7 @@ def test_okx_stop_order_query_open_and_cancel_interfaces():
                 "data": [
                     {
                         "instId": "ETH-USDT-SWAP",
-                        "algoId": "a1",
+                        "algoId": "11111",
                         "algoClOrdId": "sl1",
                         "state": "live",
                         "side": "sell",
@@ -42,7 +42,7 @@ def test_okx_stop_order_query_open_and_cancel_interfaces():
                 "data": [
                     {
                         "instId": "ETH-USDT-SWAP",
-                        "algoId": "a2",
+                        "algoId": "22222",
                         "state": "live",
                         "side": "buy",
                         "slTriggerPx": "3200",
@@ -50,21 +50,21 @@ def test_okx_stop_order_query_open_and_cancel_interfaces():
                     }
                 ],
             },
-            {"code": "0", "data": [{"algoId": "a1", "algoClOrdId": "sl1", "sCode": "0"}]},
+            {"code": "0", "data": [{"algoId": "11111", "algoClOrdId": "sl1", "sCode": "0"}]},
         ]
     )
     client = create_exchange_client("okx", ExchangeConfig(api_key="k", api_secret="s", passphrase="p"), http_client=http)
 
-    order = asyncio.run(client.fetch_stop_order_status(StopOrderQuery(symbol="ETH-USDT-PERP", stop_order_id="a1")))
+    order = asyncio.run(client.fetch_stop_order_status(StopOrderQuery(symbol="ETH-USDT-PERP", stop_order_id="11111")))
     open_orders = asyncio.run(client.fetch_open_stop_orders("ETH-USDT-PERP"))
-    canceled = asyncio.run(client.cancel_stop_order(CancelStopOrderRequest(symbol="ETH-USDT-PERP", stop_order_id="a1", client_order_id="sl1")))
+    canceled = asyncio.run(client.cancel_stop_order(CancelStopOrderRequest(symbol="ETH-USDT-PERP", stop_order_id="11111", client_order_id="sl1")))
 
     assert http.calls[0]["url"].endswith("/api/v5/trade/order-algo")
-    assert http.calls[0]["params"] == {"instId": "ETH-USDT-SWAP", "ordType": "conditional", "algoId": "a1"}
+    assert http.calls[0]["params"] == {"instId": "ETH-USDT-SWAP", "ordType": "conditional", "algoId": "11111"}
     assert http.calls[1]["url"].endswith("/api/v5/trade/orders-algo-pending")
     assert http.calls[1]["params"]["ordType"] == "conditional"
     assert http.calls[2]["url"].endswith("/api/v5/trade/cancel-algos")
-    assert http.calls[2]["json_body"] == [{"instId": "ETH-USDT-SWAP", "algoId": "a1", "algoClOrdId": "sl1"}]
+    assert http.calls[2]["json_body"] == [{"instId": "ETH-USDT-SWAP", "algoId": "11111", "algoClOrdId": "sl1"}]
     assert order.status is OrderStatus.NEW
     assert open_orders[0].price == Decimal("3200")
     assert canceled.status is OrderStatus.CANCELED
@@ -76,12 +76,12 @@ def test_okx_cancel_all_stop_orders_fetches_then_cancels_each_algo_order():
             {
                 "code": "0",
                 "data": [
-                    {"instId": "ETH-USDT-SWAP", "algoId": "a1", "state": "live"},
-                    {"instId": "ETH-USDT-SWAP", "algoId": "a2", "state": "live"},
+                    {"instId": "ETH-USDT-SWAP", "algoId": "11111", "state": "live"},
+                    {"instId": "ETH-USDT-SWAP", "algoId": "22222", "state": "live"},
                 ],
             },
-            {"code": "0", "data": [{"algoId": "a1", "sCode": "0"}]},
-            {"code": "0", "data": [{"algoId": "a2", "sCode": "0"}]},
+            {"code": "0", "data": [{"algoId": "11111", "sCode": "0"}]},
+            {"code": "0", "data": [{"algoId": "22222", "sCode": "0"}]},
         ]
     )
     client = create_exchange_client("okx", ExchangeConfig(api_key="k", api_secret="s", passphrase="p"), http_client=http)

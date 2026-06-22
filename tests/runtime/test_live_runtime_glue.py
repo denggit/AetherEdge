@@ -40,14 +40,14 @@ def _feature_requirements():
     })
 
 
-def _snapshot() -> PlatformSnapshot:
+def _snapshot(exchange: ExchangeName = ExchangeName.OKX) -> PlatformSnapshot:
     return PlatformSnapshot(
         symbol="ETH-USDT-PERP",
-        balance=Balance(exchange=ExchangeName.OKX, asset="USDT", total=Decimal("1000"), available=Decimal("1000")),
+        balance=Balance(exchange=exchange, asset="USDT", total=Decimal("1000"), available=Decimal("1000")),
         positions=[],
         open_orders=[],
         open_stop_orders=[],
-        leverage=LeverageInfo(exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP", raw_symbol="ETH-USDT-SWAP", leverage=Decimal("1")),
+        leverage=LeverageInfo(exchange=exchange, symbol="ETH-USDT-PERP", raw_symbol="ETH-USDT-SWAP", leverage=Decimal("1")),
         position_mode=PositionMode.ONE_WAY,
     )
 
@@ -172,7 +172,11 @@ class FakeRecoveryService:
         recover = getattr(strategy, "recover", None)
         if callable(recover):
             await recover(object())
-        return RecoveryReport(ok=self.ok, snapshots=(_snapshot(),), issues=() if self.ok else ("bad",))
+        return RecoveryReport(
+            ok=self.ok,
+            snapshots=(_snapshot(ExchangeName.OKX), _snapshot(ExchangeName.BINANCE)),
+            issues=() if self.ok else ("bad",),
+        )
 
 
 class FakeExecutionClient:
@@ -1169,3 +1173,55 @@ async def test_reconciliation_stale_plan_cleaned_on_flat_exchange():
         if leg.stop_order_id:
             from src.order_management.reconciliation.validation import is_fake_order_id
             assert not is_fake_order_id(leg.stop_order_id)
+
+
+# ── Multi-snapshot reconciliation tests (AE-V9C-LIVE-BOOTSTRAP-013) ──
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_receives_all_snapshots():
+    """Runner passes ALL exchange snapshots to reconciliation, not just one."""
+    strategy = FeatureStrategy()
+    runner = _runner(
+        strategy,
+        services={"recovery_service": FakeRecoveryService()},
+        dry_run=True,
+    )
+
+    # _run_recovery should return a tuple with both OKX and Binance snapshots
+    snapshots = await runner._run_recovery()
+    assert len(snapshots) == 2, f"Expected 2 snapshots, got {len(snapshots)}"
+    assert {s.leverage.exchange for s in snapshots} == {ExchangeName.OKX, ExchangeName.BINANCE}
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_missing_snapshot_raises():
+    """Runner raises LiveRuntimeError when snapshot count doesn't match configured exchanges."""
+    strategy = FeatureStrategy()
+    runner = _runner(
+        strategy,
+        services={"recovery_service": FakeRecoveryService()},
+        dry_run=True,
+    )
+
+    # Pass only 1 snapshot when 2 are expected
+    with pytest.raises(LiveRuntimeError, match="missing exchange snapshots"):
+        await runner._run_reconciliation((_snapshot(ExchangeName.OKX),))
+
+
+@pytest.mark.asyncio
+async def test_runner_recovery_stores_last_snapshots():
+    """Runner stores all snapshots in _last_snapshots for diagnostics."""
+    strategy = FeatureStrategy()
+    runner = _runner(
+        strategy,
+        services={"recovery_service": FakeRecoveryService()},
+        dry_run=True,
+    )
+
+    snapshots = await runner._run_recovery()
+    assert runner._last_snapshots == snapshots
+    assert len(runner._last_snapshots) == 2
+    # Backward compat: _last_snapshot still points to first
+    assert runner._last_snapshot is not None
+    assert runner._last_snapshot == snapshots[0]
