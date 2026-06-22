@@ -73,6 +73,7 @@ V8 不订阅 order_book，只订阅 trades + closed 4H + rangebar aggregate + pr
 - [x] AE-0505 V8 Signal Mapper
 - [ ] AE-0506 Live Signal Engine
 - [ ] AE-0507 Live Trading Mode
+- [x] AE-0508 V8 Live Signal Output
 
 ## 当前完成范围
 
@@ -189,4 +190,37 @@ V8 position state 分成 master canonical state 和 exchange leg state。
 account/order event 只能让 master exchange 驱动 canonical state，follower 只更新自己的 leg。
 SignalMapper 将 V8TradeDecision 映射成标准 TradeSignal，quantity 仍然是 base asset。
 Momentum / Bear / Bull engine 类和 PortfolioRouter 钩子已就绪；下一包直接迁移实盘信号规则。
+```
+
+
+## Board 5 package 3：Live LF Engine Signal Rules
+
+- [x] AE-0507 Momentum V3 / Bear V3 / Bull Reclaim V2 LF 规则迁移
+- [x] AE-0508 V8 Live Signal Output
+
+设计结论：
+
+```text
+已把 Momentum V3、Bear V3 Only、Bull Reclaim V2 的 feature/signal 规则迁移进 AetherEdge 插件。
+所有 1D / 1W regime 仍然 shift(1)，4H rolling channel 仍然 rolling(...).shift(1)。
+live feature builder 每次只用目标 4H bar 及之前的数据，避免 backlog 场景下未来 bar 泄露。
+PortfolioRouter 已按 Momentum > Bear > Bull 优先级从 live features 选出最终 routed signal。
+当前包仍不下单；下一包把 routed signal + sizing + stop 组合成真正 TradeSignal。
+```
+
+
+## Board 5 package 4：V8 Live Signal Output
+
+- [x] AE-0508 V8 Live Signal Output
+- [ ] AE-0509 V8 Add / Stop Update / Full Position Lifecycle
+
+设计结论：
+
+```text
+V8 插件现在可以把 routed LF signal 转成 OPEN_LONG / OPEN_SHORT TradeSignal。
+初始 open 信号只开仓，不立即放 stop；stop 等 master exchange 实际成交回报后，用真实成交价计算。
+master 成交后只给 master 挂 stop；follower 成交后使用同一个 master canonical stop price 给 follower 挂 stop。
+active position 下支持基于 entry_engine exit channel / opposite routed signal 输出 reduce-only close。
+quantity 仍为 base asset，OKX/Binance native quantity 转换继续由 order_management 负责。
+下一包补完整加仓、stop update、max hold、cooldown 与持久化恢复。
 ```

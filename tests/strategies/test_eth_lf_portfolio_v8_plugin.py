@@ -7,7 +7,7 @@ import pytest
 from src.market_data.events import MarketFeatureEvent, MarketFeatureEventType
 from src.platform import ExchangeName
 from src.strategy.loader import load_strategy
-from strategies.eth_lf_portfolio_v8.domain.models import Side
+from strategies.eth_lf_portfolio_v8.domain.models import ClosedKlineContext, Side
 from strategies.eth_lf_portfolio_v8.features.micro_context import MicroContextConfig, MicroContextEngine
 from strategies.eth_lf_portfolio_v8.strategy import Strategy
 
@@ -320,3 +320,199 @@ async def test_strategy_router_flow_records_routed_signal_without_emitting_order
     assert ready.micro.signal_side is Side.LONG
     assert ready.micro.contra is True
     assert ready.final_entry_risk_scale == Decimal("0.650")
+
+from strategies.eth_lf_portfolio_v8.features.live_features import V8LiveFeatureBuilder
+from strategies.eth_lf_portfolio_v8.engines.momentum_v3 import MomentumV3Engine
+from strategies.eth_lf_portfolio_v8.engines.bear_v3 import BearV3OnlyEngine
+from strategies.eth_lf_portfolio_v8.engines.bull_reclaim_v2 import BullReclaimV2Engine
+
+
+def test_v8_live_feature_builder_truncates_future_bars() -> None:
+    klines = _synthetic_klines(950)
+    target_close = sorted(klines)[900]
+    builder = V8LiveFeatureBuilder()
+
+    with_future = builder.build_latest(klines, target_close_time_ms=target_close)
+    without_future = builder.build_latest({k: v for k, v in klines.items() if k <= target_close}, target_close_time_ms=target_close)
+
+    assert with_future.momentum == without_future.momentum
+    assert with_future.bear == without_future.bear
+    assert with_future.bull == without_future.bull
+
+
+def test_v8_engines_emit_from_feature_rows() -> None:
+    close_time_ms = 1_700_000_000_000
+    kline = _ctx_kline(_closed_kline(close_time_ms))
+    aggregate = _ctx(_range_aggregate(close_time_ms))
+    micro = MicroContextEngine(MicroContextConfig(mode="soft")).evaluate(signal_side=Side.FLAT, aggregate=aggregate)
+    context = BarReadyContext(
+        kline=kline,
+        range_aggregate=aggregate,
+        micro=micro,
+        global_risk_scale=Decimal("1.3"),
+        engine_features={
+            "momentum": {"signal": 1, "risk_mult": 1.2, "quality_mult": 0.5, "long_signal": True},
+            "bear": {"signal": -1, "risk_mult": 1.1, "quality_mult": 1.3, "short_signal": True},
+            "bull": {"signal": 1, "risk_mult": 0.8, "quality_mult": 1.0, "long_signal": True},
+        },
+    )
+
+    momentum = MomentumV3Engine().evaluate(context)
+    bear = BearV3OnlyEngine().evaluate(context)
+    bull = BullReclaimV2Engine().evaluate(context)
+
+    assert momentum is not None and momentum.side is Side.LONG and momentum.engine == "MOMENTUM_V3"
+    assert momentum.risk_mult == Decimal("1.2")
+    assert bear is not None and bear.side is Side.SHORT and bear.engine == "BEAR_V3_ONLY"
+    assert bull is not None and bull.side is Side.LONG and bull.engine == "BULL_RECLAIM_V2"
+
+
+def _synthetic_klines(count: int) -> dict[int, object]:
+    out = {}
+    start_open_ms = 1_600_000_000_000
+    step = 4 * 60 * 60 * 1000
+    price = Decimal("1000")
+    for i in range(count):
+        open_time = start_open_ms + i * step
+        close_time = open_time + step
+        drift = Decimal(i) * Decimal("0.4")
+        open_price = price + drift
+        close_price = open_price + Decimal("1")
+        out[close_time] = ClosedKlineContext(
+            symbol="ETH-USDT-PERP",
+            exchange="okx",
+            timeframe="4h",
+            open_time_ms=open_time,
+            close_time_ms=close_time,
+            open=open_price,
+            high=close_price + Decimal("5"),
+            low=open_price - Decimal("5"),
+            close=close_price,
+            volume=Decimal("1000") + Decimal(i),
+            quote_volume=None,
+        )
+    return out
+
+
+def _ctx_kline(event: MarketFeatureEvent):
+    from strategies.eth_lf_portfolio_v8.features.feature_frame import parse_closed_kline
+
+    return parse_closed_kline(event)
+
+from src.platform.exchanges.models import Balance, LeverageInfo, MarginMode, PositionMode
+from src.platform.snapshot import PlatformSnapshot
+
+
+class _FakeFeatureBuilder:
+    def __init__(self, *, atr="10", exit_long=False):
+        self.atr = atr
+        self.exit_long = exit_long
+
+    def build_latest(self, klines, *, target_close_time_ms):
+        from strategies.eth_lf_portfolio_v8.features.live_features import V8EngineFeatureRows
+
+        return V8EngineFeatureRows(
+            momentum={"atr": self.atr, "long_exit_channel": self.exit_long, "short_exit_channel": False},
+            bear={"atr": self.atr, "short_exit_channel": False},
+            bull={"atr": self.atr, "long_exit_channel": self.exit_long},
+        )
+
+
+@pytest.mark.asyncio
+async def test_strategy_emits_live_open_signal_from_routed_engine() -> None:
+    strategy = Strategy()
+    await strategy.on_start(_snapshot())
+    strategy.router = PortfolioRouter(engines=(_StaticEngine(name="MOMENTUM_V3", priority=150, side=Side.LONG),))
+    strategy.feature_builder = _FakeFeatureBuilder(atr="10")
+    close_time_ms = 1_700_000_000_000
+
+    await strategy.on_market_feature(_closed_kline(close_time_ms))
+    signals = await strategy.on_market_feature(_range_aggregate(close_time_ms, imbalance="0.1", close_pos="0.8"))
+
+    assert len(signals) == 1
+    signal = signals[0]
+    assert signal.action is SignalAction.OPEN_LONG
+    assert signal.quantity is not None and signal.quantity > 0
+    assert signal.metadata["engine"] == "MOMENTUM_V3"
+    assert signal.metadata["await_master_fill_before_stop"] is True
+    assert strategy.pending_entry is not None
+
+
+@pytest.mark.asyncio
+async def test_strategy_places_master_and_follower_stop_after_fills() -> None:
+    strategy = Strategy()
+    await strategy.on_start(_snapshot())
+    strategy.router = PortfolioRouter(engines=(_StaticEngine(name="MOMENTUM_V3", priority=150, side=Side.LONG),))
+    strategy.feature_builder = _FakeFeatureBuilder(atr="10")
+    close_time_ms = 1_700_000_000_000
+    await strategy.on_market_feature(_closed_kline(close_time_ms))
+    await strategy.on_market_feature(_range_aggregate(close_time_ms, imbalance="0.1", close_pos="0.8"))
+
+    master_stop = await strategy.on_account_event(
+        AccountEvent(
+            exchange=ExchangeName.OKX,
+            event_type=AccountEventType.ORDER,
+            symbol="ETH-USDT-PERP",
+            event_time_ms=close_time_ms + 1,
+            order_status=OrderStatus.FILLED,
+            side=OrderSide.BUY,
+            price=Decimal("2000"),
+            filled_quantity=Decimal("0.1"),
+        )
+    )
+    assert len(master_stop) == 1
+    assert master_stop[0].action is SignalAction.PLACE_STOP_LOSS_LONG
+    assert master_stop[0].trigger_price == Decimal("1978.0")
+    assert master_stop[0].metadata["target_exchanges"] == ["okx"]
+
+    follower_stop = await strategy.on_account_event(
+        AccountEvent(
+            exchange=ExchangeName.BINANCE,
+            event_type=AccountEventType.ORDER,
+            symbol="ETH-USDT-PERP",
+            event_time_ms=close_time_ms + 2,
+            order_status=OrderStatus.FILLED,
+            side=OrderSide.BUY,
+            price=Decimal("2001"),
+            filled_quantity=Decimal("0.1"),
+        )
+    )
+    assert len(follower_stop) == 1
+    assert follower_stop[0].trigger_price == Decimal("1978.0")
+    assert follower_stop[0].metadata["target_exchanges"] == ["binance"]
+
+
+@pytest.mark.asyncio
+async def test_strategy_emits_close_signal_for_active_position_on_exit_channel() -> None:
+    strategy = Strategy()
+    await strategy.on_start(_snapshot())
+    strategy.position.open_master(
+        side=Side.LONG,
+        entry_time_ms=1,
+        avg_entry=Decimal("2000"),
+        qty=Decimal("0.1"),
+        stop_price=Decimal("1978"),
+        entry_engine="MOMENTUM_V3",
+    )
+    strategy.router = PortfolioRouter(engines=(_StaticEngine(name="none", priority=0, side=Side.FLAT),))
+    strategy.feature_builder = _FakeFeatureBuilder(atr="10", exit_long=True)
+    close_time_ms = 1_700_100_000_000
+
+    await strategy.on_market_feature(_closed_kline(close_time_ms))
+    signals = await strategy.on_market_feature(_range_aggregate(close_time_ms))
+
+    assert len(signals) == 1
+    assert signals[0].action is SignalAction.CLOSE_LONG
+    assert signals[0].metadata["reduce_only"] is True
+
+
+def _snapshot() -> PlatformSnapshot:
+    return PlatformSnapshot(
+        symbol="ETH-USDT-PERP",
+        balance=Balance(exchange=ExchangeName.OKX, asset="USDT", total=Decimal("1000"), available=Decimal("1000")),
+        positions=[],
+        open_orders=[],
+        open_stop_orders=[],
+        leverage=LeverageInfo(exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP", raw_symbol="ETH-USDT-SWAP", leverage=Decimal("10"), margin_mode=MarginMode.ISOLATED),
+        position_mode=PositionMode.ONE_WAY,
+    )

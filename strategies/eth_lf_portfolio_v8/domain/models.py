@@ -104,6 +104,7 @@ class BarReadyContext:
     micro: MicroDecision
     global_risk_scale: Decimal
     routed_signal: RoutedSignal = field(default_factory=RoutedSignal.flat)
+    engine_features: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
     @property
     def final_entry_risk_scale(self) -> Decimal:
