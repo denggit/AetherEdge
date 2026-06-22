@@ -10,6 +10,7 @@ from src.app import AppConfig, AppContext, AsyncAlertDispatcher, NoopAlertSink
 from src.market_data.derived import RangeBarAggregator, RangeBarBuilder
 from src.market_data.events import MarketFeatureEventType
 from src.market_data.models import RangeBar, TimeRange
+from src.market_data.storage import SqliteTradeStore
 from src.platform import Balance, ExchangeName, LeverageInfo, Order, OrderStatus, PositionMode
 from src.platform.data.models import MarketKline, MarketTrade, TradeSide
 from src.platform.markets import get_market_profile
@@ -71,14 +72,15 @@ class FakeData:
 
     async def fetch_klines(self, *, interval, limit=100, start_time_ms=None, end_time_ms=None, use_cache=True, oldest_first=False):
         self.requested_open_times.append(start_time_ms)
+        open_times = [start_time_ms] if start_time_ms is not None else [H4, 2 * H4]
         return [
             MarketKline(
                 exchange=ExchangeName.OKX,
                 symbol="ETH-USDT-PERP",
                 raw_symbol="ETH-USDT-SWAP",
                 interval=interval,
-                open_time_ms=start_time_ms,
-                close_time_ms=start_time_ms + H4 - 1,
+                open_time_ms=open_time,
+                close_time_ms=open_time + H4 - 1,
                 open=Decimal("100"),
                 high=Decimal("110"),
                 low=Decimal("90"),
@@ -86,6 +88,7 @@ class FakeData:
                 volume=Decimal("10"),
                 is_closed=True,
             )
+            for open_time in open_times
         ]
 
     async def stream_trades(self):
@@ -251,6 +254,55 @@ async def test_closed_bar_poll_uses_buffer_and_only_emits_closed_kline():
     assert early[0].data["open_time_ms"] == H4
     assert closed[0].data["open_time_ms"] == 2 * H4
     assert all(event.data["is_closed"] for event in [*early, *closed] if event.type_value == "closed_kline")
+
+
+@pytest.mark.asyncio
+async def test_closed_bar_poll_backfills_rangebar_gap_before_aggregate(tmp_path):
+    strategy = FeatureStrategy()
+    data = FakeData()
+    trade_store = SqliteTradeStore(tmp_path / "market.sqlite3")
+    range_store = MemoryRangeBarStore()
+
+    class GapFillFeed:
+        def __init__(self):
+            self.calls = []
+
+        async def fetch_trades(self, *, symbol, start_time_ms=None, end_time_ms=None, limit=1000, oldest_first=True):
+            self.calls.append((start_time_ms, end_time_ms))
+            return [
+                MarketTrade(exchange=ExchangeName.OKX, symbol=symbol, raw_symbol="ETH-USDT-SWAP", price=Decimal("100"), quantity=Decimal("1"), side=TradeSide.BUY, trade_time_ms=2 * H4 + 1_000),
+                MarketTrade(exchange=ExchangeName.OKX, symbol=symbol, raw_symbol="ETH-USDT-SWAP", price=Decimal("100.2"), quantity=Decimal("1"), side=TradeSide.SELL, trade_time_ms=2 * H4 + 2_000),
+            ]
+
+    req = StrategyRuntimeRequirements.from_mapping({
+        "closed_kline": {"enabled": True, "interval": "4h", "close_buffer_ms": 60000},
+        "trades": {"enabled": True, "stream_enabled": True, "warmup_enabled": True},
+        "range_bars": {"enabled": True, "range_pct": "0.002", "aggregate_interval": "4h"},
+    })
+    feed = GapFillFeed()
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": req,
+            "historical_trade_feed": feed,
+            "trade_store": trade_store,
+            "range_bar_store": range_store,
+            "range_bar_builder": RangeBarBuilder(range_pct=Decimal("0.002"), contract_value=Decimal("0.1")),
+            "range_bar_aggregator": RangeBarAggregator(),
+        },
+        dry_run=True,
+    )
+
+    events = await runner.poll_closed_bar_once(now_ms=12 * 60 * 60_000 + 60_000)
+
+    assert any(event.event_type is MarketFeatureEventType.RANGE_AGGREGATE for event in events)
+    assert feed.calls
+    assert range_store.rows
+    covered = trade_store.coverage_ranges(symbol="ETH-USDT-PERP", time_range=TimeRange(2 * H4, 3 * H4 - 1), source="historical_current_bucket")
+    assert covered == [TimeRange(2 * H4, 3 * H4 - 1)]
 
 
 @pytest.mark.asyncio

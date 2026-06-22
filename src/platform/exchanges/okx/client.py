@@ -34,6 +34,7 @@ from src.platform.exchanges.models import (
     StopMarketOrderRequest,
     StopOrderQuery,
     Ticker,
+    Trade,
     TimeInForce,
     TriggerPriceType,
 )
@@ -79,7 +80,7 @@ class OkxExchangeClient:
         oldest_first: bool = False,
     ) -> list[Kline]:
         raw_symbol = to_exchange_symbol(self.exchange, symbol)
-        params: dict[str, Any] = {"instId": raw_symbol, "bar": interval, "limit": limit}
+        params: dict[str, Any] = {"instId": raw_symbol, "bar": _map_okx_interval(interval), "limit": limit}
         if start_time_ms is not None:
             params["after"] = start_time_ms
         if end_time_ms is not None:
@@ -102,6 +103,57 @@ class OkxExchangeClient:
             time_ms=_optional_int(data.get("ts")),
             raw=data,
         )
+
+    async def fetch_trades(
+        self,
+        symbol: str,
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 1000,
+        oldest_first: bool = True,
+    ) -> list[Trade]:
+        raw_symbol = to_exchange_symbol(self.exchange, symbol)
+        page_limit = min(max(int(limit or 100), 1), 100)
+        max_pages = int(__import__("os").getenv("OKX_HISTORY_TRADES_MAX_PAGES", "200"))
+        params: dict[str, Any] = {"instId": raw_symbol, "limit": page_limit}
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        cursor: str | None = None
+        for _ in range(max_pages):
+            page_params = dict(params)
+            if cursor:
+                page_params["after"] = cursor
+            payload = await self._request_public("GET", "/api/v5/market/history-trades", params=page_params)
+            data = list(payload.get("data", []))
+            if not data:
+                break
+            new_rows = []
+            for row in data:
+                trade_id = str(row.get("tradeId") or "")
+                if trade_id and trade_id in seen:
+                    continue
+                if trade_id:
+                    seen.add(trade_id)
+                ts = _optional_int(row.get("ts"))
+                if ts is not None and end_time_ms is not None and ts > end_time_ms:
+                    continue
+                if ts is not None and start_time_ms is not None and ts < start_time_ms:
+                    continue
+                new_rows.append(row)
+            rows.extend(new_rows)
+            times = [_optional_int(row.get("ts")) for row in data]
+            min_time = min((ts for ts in times if ts is not None), default=None)
+            if start_time_ms is not None and min_time is not None and min_time < start_time_ms:
+                break
+            if len(rows) >= limit:
+                break
+            cursor = str(data[-1].get("tradeId") or "")
+            if not cursor:
+                break
+        trades = [_map_okx_trade(row, symbol=symbol, raw_symbol=raw_symbol) for row in rows]
+        trades.sort(key=lambda row: ((row.trade_time_ms or row.event_time_ms or 0), row.trade_id or ""), reverse=not oldest_first)
+        return trades[:limit]
 
     async def fetch_instrument_rule(self, symbol: str) -> InstrumentRule:
         raw_symbol = to_exchange_symbol(self.exchange, symbol)
@@ -487,6 +539,36 @@ class OkxExchangeClient:
 def _okx_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
+
+
+def _map_okx_interval(interval: str) -> str:
+    value = str(interval).strip()
+    upper_map = {"1h": "1H", "2h": "2H", "4h": "4H", "6h": "6H", "12h": "12H"}
+    day_map = {"1d": "1D", "2d": "2D", "3d": "3D", "1w": "1W", "1mth": "1M"}
+    lowered = value.lower()
+    if lowered in upper_map:
+        return upper_map[lowered]
+    if lowered in day_map:
+        return day_map[lowered]
+    return value
+
+
+def _map_okx_trade(row: Mapping[str, Any], *, symbol: str, raw_symbol: str) -> Trade:
+    side_value = str(row.get("side") or "").lower()
+    side = OrderSide.BUY if side_value == "buy" else OrderSide.SELL if side_value == "sell" else None
+    ts = _optional_int(row.get("ts"))
+    return Trade(
+        exchange=ExchangeName.OKX,
+        symbol=symbol,
+        raw_symbol=raw_symbol,
+        price=_decimal(row.get("px"), field="px"),
+        quantity=_decimal(row.get("sz"), field="sz"),
+        side=side,
+        trade_id=str(row.get("tradeId")) if row.get("tradeId") is not None else None,
+        event_time_ms=ts,
+        trade_time_ms=ts,
+        raw=row,
+    )
 
 def _map_okx_kline(row: list[Any], *, symbol: str, raw_symbol: str, interval: str) -> Kline:
     if len(row) < 6:

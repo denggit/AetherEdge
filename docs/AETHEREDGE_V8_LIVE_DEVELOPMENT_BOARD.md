@@ -298,3 +298,52 @@ V8 插件现在支持完整持仓周期第一版：
 8. 最近 closed 4H K线可拉取。
 9. 本地 range bar builder 可用。
 ```
+
+
+## Board 5 package 9：V8 Preflight Kline Fetch Fix
+
+- [x] AE-0513 V8 Preflight Latest Closed 4H Kline Fix
+
+设计结论：
+
+```text
+修复 preflight 和 live runtime 获取 latest closed 4H K线的方式。
+之前用 start_time_ms=end_time_ms=open_time_ms 做精确查询，OKX market/candles 可能返回空。
+现在改为拉最近多根 4H K线，再按 expected open_time_ms 过滤目标已闭合 K线。
+这同时修复 tools/v8_live_preflight_check.py 和 LiveRuntimeRunner.poll_closed_bar_once。
+```
+
+
+## Board 5 package 10：OKX 4H Kline Interval Mapping Fix
+
+- [x] AE-0514 OKX 4H Kline Interval Mapping Fix
+
+设计结论：
+
+```text
+修复 OKX public candles 对 normalized interval 的兼容问题。
+AetherEdge 内部统一使用 4h，但 OKX REST candles 需要 4H。
+OKX adapter 现在会把 1h/2h/4h 等转换为 1H/2H/4H，同时不影响 Binance 的 4h。
+这解决 preflight latest_closed_4h_kline 返回 rows=0 的常见原因。
+```
+
+## Board 5 package 11：Current 4H RangeBar Warmup
+
+- [x] AE-0515 Current 4H Trade Backfill for RangeBar Warmup
+
+设计结论：
+
+```text
+修复中途重启时当前 4H range aggregate 不完整的问题。
+1. V8 trades.warmup_enabled=true。
+2. live_runtime 启动时计算当前 open 4H bucket：bucket_start -> now。
+3. 使用 data feed 的 fetch_trades 补当前 bucket trades，并写入 SqliteTradeStore。
+4. TradeStore 使用 trade_coverage 表记录已覆盖区间，重启后跳过已覆盖部分，避免每次重复下载。
+5. 使用本地 trades 重建 current bucket range bars，并写入 SqliteRangeBarStore。
+6. RangeBarBuilder 启动时会用已持久化 range bars seed bar_id 序号，避免重启后 bar_id 冲突覆盖。
+7. 如果没有 historical trade feed 且本地 coverage 不完整，runtime fail fast，不允许带着不完整 micro context 静默启动。
+8. 只补当前 4H bucket，不下载多年 trades；多年历史仍只 warmup 4H K线。
+9. 为避免 startup warmup 到 websocket producer 启动之间的秒级 race，runtime 在每次发出 closed 4H range aggregate 前，会对该 4H bucket 再做一次 trades coverage catch-up。
+10. 因此即使启动/补数据花了几十秒，只要历史 trades API 能覆盖，最终用于信号的 closed 4H range aggregate 仍会先补齐再发给策略。
+```
+

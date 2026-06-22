@@ -12,8 +12,9 @@ from src.app.alerts import AppAlert
 from src.market_data.derived import RangeBarAggregator, RangeBarBuilder
 from src.market_data.events import MarketFeatureEvent
 from src.market_data.models import MarketDataSet, RangeBar, TimeRange, WarmupRequest
-from src.market_data.storage import SqliteKlineStore, SqliteRangeBarStore
+from src.market_data.storage import SqliteKlineStore, SqliteRangeBarStore, SqliteTradeStore
 from src.market_data.warmup.gap_detector import interval_to_ms
+from src.market_data.warmup.current_rangebar import CurrentRangeBarWarmupService
 from src.market_data.warmup.service import KlineWarmupService
 from src.order_management import MasterFollowerExecutionPolicy, MultiExchangeOrderCoordinator, RepositoryDuplicateOrderGuard, SqliteOrderJournalStore
 from src.order_management.models import ExchangeOrderResult, OrderIntentStatus
@@ -94,6 +95,7 @@ class LiveRuntimeRunner:
         self._order_coordinator = self.services.get("order_coordinator")
         self._recovery_service = self.services.get("recovery_service", "__default__")
         self._range_bar_store = self.services.get("range_bar_store")
+        self._trade_store = self.services.get("trade_store")
         self._range_bar_builder = self.services.get("range_bar_builder")
         self._range_bar_aggregator = self.services.get("range_bar_aggregator")
         self._producer_monitor: ProducerHealthMonitor = self.services.get("producer_monitor") or ProducerHealthMonitor()
@@ -183,9 +185,7 @@ class LiveRuntimeRunner:
             return []
         rows = await self.context.data.fetch_klines(
             interval=self._closed_bar_interval,
-            limit=2,
-            start_time_ms=open_time_ms,
-            end_time_ms=open_time_ms,
+            limit=10,
             use_cache=True,
             oldest_first=True,
         )
@@ -196,6 +196,15 @@ class LiveRuntimeRunner:
         self.stats.closed_klines_seen += 1
         await self.process_market_feature(event)
         features = [event]
+        # Before producing the range aggregate for a just-closed 4H bar, close
+        # any gap between startup warmup and the live websocket stream. This
+        # avoids silently missing trades if startup/backfill took several
+        # seconds or the process restarted mid-bucket.
+        if self.requirements.range_bars.enabled and self.requirements.trades.enabled and self.requirements.trades.warmup_enabled:
+            await self._run_rangebar_warmup_for_range(
+                TimeRange(open_time_ms, open_time_ms + self._closed_bar_interval_ms - 1),
+                fail_if_incomplete=True,
+            )
         features.extend(await self.emit_range_aggregate_for_bucket(open_time_ms))
         return features
 
@@ -269,8 +278,46 @@ class LiveRuntimeRunner:
                 self.stats.warmup_runs += 1
                 if not result.caught_up:
                     raise LiveRuntimeError(f"closed-kline warmup did not catch up: {len(result.gaps_after)} gaps remain")
-        if self.requirements.trades.enabled and self.requirements.trades.warmup_enabled and "trade_warmup_service" not in self.services and "warmup_services" not in self.services:
-            raise LiveRuntimeError("trade warmup is required but no historical trade warmup service was provided")
+        if self.requirements.range_bars.enabled and self.requirements.trades.enabled and self.requirements.trades.warmup_enabled:
+            await self._run_current_rangebar_warmup()
+
+    async def _run_current_rangebar_warmup(self) -> None:
+        now_ms = int(time.time() * 1000)
+        bucket_start_ms = (now_ms // self._closed_bar_interval_ms) * self._closed_bar_interval_ms
+        if now_ms <= bucket_start_ms:
+            return
+        await self._run_rangebar_warmup_for_range(TimeRange(bucket_start_ms, now_ms), fail_if_incomplete=now_ms - bucket_start_ms > 60_000)
+
+    async def _run_rangebar_warmup_for_range(self, time_range: TimeRange, *, fail_if_incomplete: bool) -> None:
+        trade_store = self._get_trade_store()
+        range_store = self._get_range_bar_store()
+        profile = self.context.data.market_profile
+        contract_value = profile.contract_value(self.app_config.data_exchange) or Decimal("1")
+        historical_feed = self.services.get("historical_trade_feed")
+        if historical_feed is None and hasattr(self.context.data, "fetch_trades"):
+            historical_feed = self.context.data
+        service = self.services.get("current_rangebar_warmup_service") or CurrentRangeBarWarmupService(
+            trade_repository=trade_store,
+            trade_coverage_repository=trade_store,
+            range_bar_repository=range_store,
+            historical_trade_feed=historical_feed,
+            range_pct=self._range_pct,
+            contract_value=contract_value,
+            batch_limit=int(os.getenv("AETHER_TRADE_WARMUP_BATCH_LIMIT", "1000")),
+        )
+        result = await service.warmup(symbol=self.app_config.symbol, time_range=time_range)
+        self.stats.warmup_runs += 1
+        self.stats.range_bars_closed += result.range_bars_saved
+        bars = range_store.load(
+            symbol=self.app_config.symbol,
+            range_pct=str(self._range_pct),
+            time_range=time_range,
+        )
+        seed = getattr(self._get_range_bar_builder(), "seed_from_bars", None)
+        if callable(seed):
+            seed(bars)
+        if fail_if_incomplete and not result.caught_up:
+            raise LiveRuntimeError("range-bar trade warmup did not catch up; historical trade feed or local coverage is incomplete")
 
     async def _run_recovery(self) -> PlatformSnapshot:
         service = self._get_recovery_service()
@@ -503,6 +550,11 @@ class LiveRuntimeRunner:
             contract_value = profile.contract_value(self.app_config.data_exchange) or Decimal("1")
             self._range_bar_builder = RangeBarBuilder(range_pct=self._range_pct, contract_value=contract_value)
         return self._range_bar_builder
+
+    def _get_trade_store(self):
+        if self._trade_store is None:
+            self._trade_store = SqliteTradeStore()
+        return self._trade_store
 
     def _get_range_bar_store(self):
         if self._range_bar_store is None:

@@ -64,6 +64,13 @@ class RangeBarBuilder:
             return None
         return self._close_bar(self.active, end_time_ms=self.active.last_time_ms)
 
+    def seed_from_bars(self, bars) -> None:
+        """Seed per-day sequence counters from persisted bars after restart."""
+        for bar in bars:
+            day = str(int(bar.bar_id) // _BAR_ID_MULT)
+            seq = int(bar.bar_id) % _BAR_ID_MULT
+            self._day_seq[day] = max(self._day_seq.get(day, 0), seq)
+
     def _new_bar(self, *, symbol: str, time_ms: int, price: Decimal) -> _ActiveRangeBar:
         day = datetime.fromtimestamp(time_ms / 1000, tz=UTC).strftime("%Y%m%d")
         seq = self._day_seq.get(day, 0) + 1

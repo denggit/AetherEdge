@@ -150,13 +150,14 @@ def _check_runtime_config(report: PreflightReport, *, app: AppConfig, runtime_mo
         "closed_kline_interval": requirements.closed_kline.interval,
         "trades": requirements.trades.enabled,
         "trades_stream": requirements.trades.stream_enabled,
+        "trades_warmup": requirements.trades.warmup_enabled,
         "range_bars": requirements.range_bars.enabled,
         "range_pct": str(requirements.range_bars.range_pct),
         "order_book": requirements.order_book.enabled,
         "private_account_stream": requirements.private_account_stream.enabled,
     }
-    if not requirements.closed_kline.enabled or requirements.closed_kline.interval.lower() != "4h" or not requirements.trades.stream_enabled or not requirements.range_bars.enabled or requirements.order_book.enabled or not requirements.private_account_stream.enabled:
-        report.add("v8_runtime_requirements", "fail", detail=req_detail, error="V8 requirements must be closed 4H + trades + range bars + private account stream, without order_book")
+    if not requirements.closed_kline.enabled or requirements.closed_kline.interval.lower() != "4h" or not requirements.trades.stream_enabled or not requirements.trades.warmup_enabled or not requirements.range_bars.enabled or requirements.order_book.enabled or not requirements.private_account_stream.enabled:
+        report.add("v8_runtime_requirements", "fail", detail=req_detail, error="V8 requirements must be closed 4H + trades stream/warmup + range bars + private account stream, without order_book")
     else:
         report.add("v8_runtime_requirements", "ok", detail=req_detail)
 
@@ -261,9 +262,7 @@ async def _check_latest_closed_kline(report: PreflightReport, *, app: AppConfig,
         )
         rows = await data_feed.fetch_klines(
             interval=runtime.closed_bar_interval,
-            limit=2,
-            start_time_ms=open_time_ms,
-            end_time_ms=open_time_ms,
+            limit=10,
             use_cache=False,
             oldest_first=True,
         )

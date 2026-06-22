@@ -17,7 +17,7 @@
     "trades": {
       "enabled": true,
       "stream_enabled": true,
-      "warmup_enabled": false
+      "warmup_enabled": true
     },
     "range_bars": {
       "enabled": true,

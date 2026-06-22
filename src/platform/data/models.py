@@ -5,7 +5,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Mapping, Sequence
 
-from src.platform.exchanges.models import ExchangeName, Kline, Ticker
+from src.platform.exchanges.models import ExchangeName, Kline, Ticker, Trade
 
 
 class MarketEventType(str, Enum):
@@ -137,4 +137,26 @@ def market_ticker_from_exchange(ticker: Ticker) -> MarketTicker:
         time_ms=ticker.time_ms,
         source=MarketDataSource.REST,
         raw=ticker.raw,
+    )
+
+
+def market_trade_from_exchange(trade: Trade) -> MarketTrade:
+    side = TradeSide.UNKNOWN
+    if trade.side is not None:
+        if trade.side.value == "buy":
+            side = TradeSide.BUY
+        elif trade.side.value == "sell":
+            side = TradeSide.SELL
+    return MarketTrade(
+        exchange=trade.exchange,
+        symbol=trade.symbol,
+        raw_symbol=trade.raw_symbol,
+        price=trade.price,
+        quantity=trade.quantity,
+        side=side,
+        trade_id=trade.trade_id,
+        event_time_ms=trade.event_time_ms,
+        trade_time_ms=trade.trade_time_ms,
+        source=MarketDataSource.REST,
+        raw=trade.raw,
     )

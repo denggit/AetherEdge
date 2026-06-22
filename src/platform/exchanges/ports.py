@@ -21,6 +21,7 @@ from src.platform.exchanges.models import (
     StopMarketOrderRequest,
     StopOrderQuery,
     Ticker,
+    Trade,
 )
 
 
@@ -63,6 +64,17 @@ class ExchangeMarketDataClient(ExchangeIdentity, Protocol):
         ...
 
     async def fetch_ticker(self, symbol: str) -> Ticker:
+        ...
+
+    async def fetch_trades(
+        self,
+        symbol: str,
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 1000,
+        oldest_first: bool = True,
+    ) -> list[Trade]:
         ...
 
     async def fetch_instrument_rule(self, symbol: str) -> InstrumentRule:

@@ -10,6 +10,7 @@ from src.platform.data.models import (
     MarketTrade,
     market_kline_from_exchange,
     market_ticker_from_exchange,
+    market_trade_from_exchange,
 )
 from src.platform.data.storage import MarketDataStore
 from src.platform.data.websocket.ports import OrderBookStream, TradeStream
@@ -88,6 +89,26 @@ class RestMarketDataFeed:
     async def fetch_ticker(self) -> MarketTicker:
         ticker = await self._exchange_client.fetch_ticker(self._symbol)
         return market_ticker_from_exchange(ticker)
+
+    async def fetch_trades(
+        self,
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 1000,
+        oldest_first: bool = True,
+    ) -> list[MarketTrade]:
+        fetch = getattr(self._exchange_client, "fetch_trades", None)
+        if not callable(fetch):
+            raise NotImplementedError(f"Historical trades are not supported for {self.exchange.value}")
+        rows = await fetch(
+            self._symbol,
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+            limit=limit,
+            oldest_first=oldest_first,
+        )
+        return [market_trade_from_exchange(row) for row in rows]
 
     async def stream_trades(self) -> AsyncIterator[MarketTrade]:
         if self._trade_stream is None:

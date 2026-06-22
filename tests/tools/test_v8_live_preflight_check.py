@@ -40,7 +40,7 @@ def test_preflight_runtime_config_accepts_v8_requirements(monkeypatch) -> None:
     req = StrategyRuntimeRequirements.from_mapping(
         {
             "closed_kline": {"enabled": True, "interval": "4h"},
-            "trades": {"enabled": True, "stream_enabled": True},
+            "trades": {"enabled": True, "stream_enabled": True, "warmup_enabled": True},
             "range_bars": {"enabled": True, "range_pct": "0.002"},
             "order_book": {"enabled": False},
             "private_account_stream": {"enabled": True},

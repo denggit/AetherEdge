@@ -157,6 +157,21 @@ class Ticker:
     raw: Mapping[str, Any] = field(default_factory=dict)
 
 
+
+@dataclass(frozen=True)
+class Trade:
+    exchange: ExchangeName
+    symbol: str
+    raw_symbol: str
+    price: Decimal
+    quantity: Decimal
+    side: OrderSide | None = None
+    trade_id: str | None = None
+    event_time_ms: int | None = None
+    trade_time_ms: int | None = None
+    raw: Mapping[str, Any] = field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class Balance:
     exchange: ExchangeName

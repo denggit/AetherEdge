@@ -9,5 +9,5 @@ data/
 *.db
 *.sqlite
 *.sqlite3
-.env
+/.env
 /.agents/

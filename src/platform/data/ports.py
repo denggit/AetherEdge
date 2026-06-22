@@ -37,6 +37,16 @@ class MarketDataFeed(Protocol):
     async def fetch_ticker(self) -> MarketTicker:
         ...
 
+    async def fetch_trades(
+        self,
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 1000,
+        oldest_first: bool = True,
+    ) -> list[MarketTrade]:
+        ...
+
     def stream_trades(self) -> AsyncIterator[MarketTrade]:
         ...
 
