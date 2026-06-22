@@ -611,7 +611,7 @@ async def test_live_runtime_fails_when_closed_kline_warmup_loads_zero_records():
 
     with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
         MockSvc.return_value.warmup = AsyncMock(return_value=zero)
-        with pytest.raises(LiveRuntimeError, match="zero records"):
+        with pytest.raises(LiveRuntimeError, match="insufficient records"):
             await runner._run_requirement_warmup()
 
 
@@ -692,3 +692,111 @@ def test_closed_kline_requirement_min_records_configurable():
         "closed_kline": {"enabled": True, "interval": "4h", "warmup_days": 365, "min_records": 1000},
     })
     assert req.closed_kline.min_records == 1000
+
+
+def _high_min_warmup_requirements() -> StrategyRuntimeRequirements:
+    return StrategyRuntimeRequirements(
+        closed_kline=ClosedKlineRequirement(enabled=True, interval="4h", warmup_days=30, min_records=1000),
+    )
+
+
+def _few_records_warmup_result(request: WarmupRequest | None = None) -> WarmupResult:
+    if request is None:
+        request = WarmupRequest(
+            symbol="ETH-USDT-PERP",
+            dataset=MarketDataSet.KLINES,
+            interval="4h",
+            time_range=TimeRange(0, H4),
+        )
+    return WarmupResult(
+        request=request,
+        gaps_before=(),
+        gaps_after=(),
+        records_loaded=5,
+        caught_up=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_live_runtime_fails_when_closed_kline_warmup_below_min_records():
+    """Live mode (dry_run=False) must raise when warmup loads fewer records than min_records."""
+    strategy = FeatureStrategy()
+    data = FakeData()
+    req = _high_min_warmup_requirements()
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": req,
+            "kline_store": FakeKlineStore(),
+        },
+        dry_run=False,
+    )
+    few = _few_records_warmup_result()  # records_loaded=5, min_records=1000
+
+    with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
+        MockSvc.return_value.warmup = AsyncMock(return_value=few)
+        with pytest.raises(LiveRuntimeError, match="insufficient records"):
+            await runner._run_requirement_warmup()
+
+
+@pytest.mark.asyncio
+async def test_dry_run_allows_closed_kline_warmup_below_min_records_with_warning():
+    """Dry-run mode must NOT raise when warmup is below min_records (warning only)."""
+    strategy = FeatureStrategy()
+    data = FakeData()
+    req = _high_min_warmup_requirements()
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": req,
+            "kline_store": FakeKlineStore(),
+        },
+        dry_run=True,
+    )
+    few = _few_records_warmup_result()  # records_loaded=5, min_records=1000
+
+    with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
+        MockSvc.return_value.warmup = AsyncMock(return_value=few)
+        # Must NOT raise
+        await runner._run_requirement_warmup()
+
+    # Verify warmup was recorded
+    assert runner.stats.warmup_runs >= 1
+
+
+@pytest.mark.asyncio
+async def test_closed_kline_min_records_is_enforced_by_runtime():
+    """Runtime actually uses min_records from requirements to block live startup."""
+    strategy = FeatureStrategy()
+    data = FakeData()
+    # min_records=1000 but only 5 records loaded
+    req = _high_min_warmup_requirements()
+
+    runner = _runner(
+        strategy,
+        data=data,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": req,
+            "kline_store": FakeKlineStore(),
+        },
+        dry_run=False,
+    )
+    few = _few_records_warmup_result()
+
+    with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
+        MockSvc.return_value.warmup = AsyncMock(return_value=few)
+        with pytest.raises(LiveRuntimeError) as exc_info:
+            await runner._run_requirement_warmup()
+    error_msg = str(exc_info.value)
+    assert "insufficient records" in error_msg
+    assert "1000" in error_msg or "min_records" in error_msg.lower()

@@ -373,26 +373,31 @@ class LiveRuntimeRunner:
                     end_open,
                     result.records_loaded,
                 )
-                # ── Fail fast when warmup loaded zero records ──────────────────
-                if result.records_loaded <= 0:
+                # ── Fail fast when warmup loaded fewer records than required ──
+                min_records = max(1, int(self.requirements.closed_kline.min_records or 1))
+                if result.records_loaded < min_records:
                     dry_run = self.app_config.dry_run
                     if dry_run:
                         logger.warning(
-                            "Closed-kline warmup loaded zero records — continuing in dry-run mode | "
-                            "interval=%s warmup_days=%s",
+                            "Closed-kline warmup loaded fewer records than required — continuing in dry-run mode | "
+                            "interval=%s warmup_days=%s records_loaded=%s min_records=%s",
                             self._closed_bar_interval,
                             self.requirements.closed_kline.warmup_days,
+                            result.records_loaded,
+                            min_records,
                         )
                         self.context.alerts.emit(
                             AppAlert(
-                                subject="AetherEdge closed-kline warmup empty",
+                                subject="AetherEdge closed-kline warmup below minimum records",
                                 content=(
                                     f"symbol={self.app_config.symbol}\n"
                                     f"interval={self._closed_bar_interval}\n"
                                     f"warmup_days={self.requirements.closed_kline.warmup_days}\n"
                                     f"records_loaded={result.records_loaded}\n"
+                                    f"min_records={min_records}\n"
                                     f"start_open={start_open}\n"
                                     f"end_open={end_open}\n"
+                                    f"dry_run={dry_run}\n"
                                 ),
                                 severity="warning",
                             )
@@ -406,15 +411,18 @@ class LiveRuntimeRunner:
                                     f"interval={self._closed_bar_interval}\n"
                                     f"warmup_days={self.requirements.closed_kline.warmup_days}\n"
                                     f"records_loaded={result.records_loaded}\n"
+                                    f"min_records={min_records}\n"
                                     f"start_open={start_open}\n"
                                     f"end_open={end_open}\n"
+                                    f"dry_run={dry_run}\n"
                                 ),
                                 severity="error",
                             )
                         )
                         raise LiveRuntimeError(
-                            f"closed-kline warmup loaded zero records "
-                            f"(symbol={self.app_config.symbol} interval={self._closed_bar_interval})"
+                            f"closed-kline warmup loaded insufficient records "
+                            f"(symbol={self.app_config.symbol} interval={self._closed_bar_interval} "
+                            f"records_loaded={result.records_loaded} min_records={min_records})"
                         )
 
     async def _hydrate_strategy_closed_klines(self, repository, *, time_range: TimeRange) -> None:

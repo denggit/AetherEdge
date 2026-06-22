@@ -586,3 +586,117 @@ async def test_known_order_ref_dataclass():
     ref2 = KnownOrderRef()
     assert ref2.order_id is None
     assert ref2.client_order_id is None
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Known order status failure counter and alert tests
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_known_order_status_failures_increment_failure_counter_and_alert():
+    """Consecutive known order status fetch failures accumulate and alert at threshold."""
+    state = MemoryState()
+    alerts = MemoryAlerts()
+    account = FakeAccount()
+
+    def known() -> dict[str, Any]:
+        return {
+            "okx": {
+                "orders": ["bad-order"],
+                "stop_orders": [],
+            }
+        }
+
+    # First sync — known order fetch fails
+    execution1 = TrackingExecution(fail_on="bad-order")
+    service1 = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=account, execution=execution1, state_store=state),),
+        config=OrderStateRequirement(
+            sync_position=False,
+            sync_open_orders=False,
+            sync_open_stop_orders=False,
+            consecutive_failure_alert_threshold=2,
+        ),
+        active_check=lambda: True,
+        known_order_ids=known,
+        alert_sink=alerts,
+    )
+    result1 = await service1.sync_once()
+
+    assert result1[0].success is False
+    assert "known_order_status_failures" in result1[0].metadata
+    assert result1[0].metadata["consecutive_failures"] == 1
+    # No alert yet (threshold=2)
+    assert len(alerts.items) == 0
+
+    # Second sync — known order fetch fails again
+    state2 = MemoryState()
+    execution2 = TrackingExecution(fail_on="bad-order")
+    service2 = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=account, execution=execution2, state_store=state2),),
+        config=OrderStateRequirement(
+            sync_position=False,
+            sync_open_orders=False,
+            sync_open_stop_orders=False,
+            consecutive_failure_alert_threshold=2,
+        ),
+        active_check=lambda: True,
+        known_order_ids=known,
+        alert_sink=alerts,
+    )
+    # Copy the failure counter from service1
+    service2._failures = dict(service1._failures)
+
+    result2 = await service2.sync_once()
+
+    assert result2[0].success is False
+    assert result2[0].metadata["consecutive_failures"] == 2
+    # Alert emitted at threshold=2
+    assert len(alerts.items) == 1
+    alert = alerts.items[0]
+    assert alert.subject == "AetherEdge order sync known order status failures"
+    assert alert.severity == "error"
+    assert "exchange=okx" in alert.content.lower() or "okx" in alert.content
+    assert "2" in alert.content  # consecutive_failures
+
+
+@pytest.mark.asyncio
+async def test_invalid_known_order_refs_do_not_increment_failure_counter():
+    """Invalid order refs are skipped and do NOT increase the failure counter."""
+    state = MemoryState()
+    alerts = MemoryAlerts()
+    execution = TrackingExecution()
+    account = FakeAccount()
+
+    def known() -> dict[str, Any]:
+        return {
+            "okx": {
+                "orders": ["", "None", "null"],
+                "stop_orders": ["", "None", "null"],
+            }
+        }
+
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=account, execution=execution, state_store=state),),
+        config=OrderStateRequirement(
+            sync_position=False,
+            sync_open_orders=False,
+            sync_open_stop_orders=False,
+            consecutive_failure_alert_threshold=2,
+        ),
+        active_check=lambda: True,
+        known_order_ids=known,
+        alert_sink=alerts,
+    )
+
+    # Sync twice — all refs are invalid, no exchange calls, no failures
+    await service.sync_once()
+    await service.sync_once()
+
+    assert len(execution.order_queries) == 0
+    assert len(execution.stop_order_queries) == 0
+    # No alerts because no failures
+    assert len(alerts.items) == 0
+    # Counter should not have been incremented
+    assert service._failures.get("okx", 0) == 0

@@ -255,24 +255,55 @@ class OrderStateSyncService:
                         ref.client_order_id,
                         exc,
                     )
-            self._failures[exchange] = 0
-            success = len(known_failures) == 0
-            meta: dict[str, Any] = {}
             if known_failures:
-                meta["known_order_status_failures"] = known_failures
-            if skipped_invalid > 0:
-                meta["skipped_invalid_order_refs"] = skipped_invalid
-            result = _result(exchange, sync_type, request_count, start, success, metadata=meta)
-            logger.info(
-                "Order state synced | exchange=%s sync_type=%s request_count=%s duration_ms=%s success=%s known_failures=%s skipped_invalid=%s",
-                result.exchange,
-                result.sync_type,
-                result.request_count,
-                result.duration_ms,
-                result.success,
-                len(known_failures),
-                skipped_invalid,
-            )
+                failures = self._failures.get(exchange, 0) + 1
+                self._failures[exchange] = failures
+                meta: dict[str, Any] = {"consecutive_failures": failures, "known_order_status_failures": known_failures}
+                if skipped_invalid > 0:
+                    meta["skipped_invalid_order_refs"] = skipped_invalid
+                result = _result(exchange, sync_type, request_count, start, False, metadata=meta)
+                logger.warning(
+                    "Order state synced with known order failures | exchange=%s sync_type=%s request_count=%s duration_ms=%s success=%s known_failures=%s skipped_invalid=%s consecutive_failures=%s",
+                    result.exchange,
+                    result.sync_type,
+                    result.request_count,
+                    result.duration_ms,
+                    result.success,
+                    len(known_failures),
+                    skipped_invalid,
+                    failures,
+                )
+                if failures >= self.config.consecutive_failure_alert_threshold:
+                    _emit(
+                        self.alert_sink,
+                        AppAlert(
+                            subject="AetherEdge order sync known order status failures",
+                            content=(
+                                f"exchange={exchange}\n"
+                                f"sync_type={sync_type}\n"
+                                f"consecutive_failures={failures}\n"
+                                f"known_order_status_failures={known_failures}\n"
+                                f"skipped_invalid_order_refs={skipped_invalid}\n"
+                                f"request_count={request_count}\n"
+                            ),
+                            severity="error",
+                        ),
+                    )
+            else:
+                self._failures[exchange] = 0
+                meta: dict[str, Any] = {}
+                if skipped_invalid > 0:
+                    meta["skipped_invalid_order_refs"] = skipped_invalid
+                result = _result(exchange, sync_type, request_count, start, True, metadata=meta)
+                logger.info(
+                    "Order state synced | exchange=%s sync_type=%s request_count=%s duration_ms=%s success=%s skipped_invalid=%s",
+                    result.exchange,
+                    result.sync_type,
+                    result.request_count,
+                    result.duration_ms,
+                    result.success,
+                    skipped_invalid,
+                )
             logger.info("Position plan reconciled | exchange=%s sync_type=%s", exchange, sync_type)
             return result
         except Exception as exc:
