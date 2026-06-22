@@ -15,7 +15,7 @@ from src.market_data.models import MarketDataSet, RangeBar, TimeRange, WarmupReq
 from src.market_data.storage import SqliteKlineStore, SqliteRangeBarStore
 from src.market_data.warmup.gap_detector import interval_to_ms
 from src.market_data.warmup.service import KlineWarmupService
-from src.order_management import MultiExchangeOrderCoordinator, RepositoryDuplicateOrderGuard, SqliteOrderJournalStore
+from src.order_management import MasterFollowerExecutionPolicy, MultiExchangeOrderCoordinator, RepositoryDuplicateOrderGuard, SqliteOrderJournalStore
 from src.order_management.models import ExchangeOrderResult, OrderIntentStatus
 from src.platform import create_account_client, create_execution_client
 from src.platform.account.event_factory import create_account_event_stream
@@ -475,6 +475,11 @@ class LiveRuntimeRunner:
                 repository=journal,
                 planner=self.context.planner,
                 duplicate_guard=RepositoryDuplicateOrderGuard(journal),
+                master_follower_policy=(
+                    None
+                    if self.runtime_config.master_follower_policy is None
+                    else MasterFollowerExecutionPolicy.from_config(self.runtime_config.master_follower_policy)
+                ),
             )
         return self._order_coordinator
 

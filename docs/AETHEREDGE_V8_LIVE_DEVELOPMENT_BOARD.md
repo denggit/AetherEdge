@@ -140,3 +140,21 @@ Binance 成功但 OKX 失败：这是 orphan follower，告警，等待人工宽
 价差超过阈值只发 alert，不自动解决。
 下单后必须查询订单真实状态，记录真实 avg_fill_price / filled_quantity / fee / fee_asset。
 ```
+
+## Master / Follower configuration note
+
+The master/follower relationship is runtime configuration, not a hard-coded
+architecture rule. The current recommended deployment can be expressed as:
+
+```text
+AETHER_DATA_EXCHANGE=okx
+AETHER_EXCHANGES=okx,binance
+AETHER_MASTER_EXCHANGE=okx
+AETHER_FOLLOWER_EXCHANGES=binance
+```
+
+If `AETHER_MASTER_EXCHANGE` is omitted, live runtime uses
+`AETHER_DATA_EXCHANGE` as master. If `AETHER_FOLLOWER_EXCHANGES` is omitted,
+followers default to `AETHER_EXCHANGES` excluding the master. Reversing the
+relationship, for example `AETHER_MASTER_EXCHANGE=binance` and
+`AETHER_FOLLOWER_EXCHANGES=okx`, should require only env/config changes.

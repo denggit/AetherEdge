@@ -9,6 +9,7 @@ from src.order_management.master_follower import (
     MasterFollowerDecision,
     MasterFollowerDecisionStatus,
     MasterFollowerExecutionPolicy,
+    MasterFollowerPolicyConfig,
     MasterFollowerPolicyEvaluator,
     RetryPolicy,
 )
@@ -35,6 +36,7 @@ __all__ = [
     "MasterFollowerDecision",
     "MasterFollowerDecisionStatus",
     "MasterFollowerExecutionPolicy",
+    "MasterFollowerPolicyConfig",
     "MasterFollowerPolicyEvaluator",
     "RetryPolicy",
 ]

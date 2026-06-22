@@ -25,8 +25,15 @@ def _intent() -> OrderIntent:
     return OrderIntent(intent_id="mf-intent", strategy_id="v8", signal=signal, target_exchanges=(ExchangeName.OKX, ExchangeName.BINANCE))
 
 
+def _policy() -> MasterFollowerExecutionPolicy:
+    return MasterFollowerExecutionPolicy(
+        master_exchange=ExchangeName.OKX,
+        follower_exchanges=(ExchangeName.BINANCE,),
+    )
+
+
 def test_policy_keeps_master_when_follower_fails() -> None:
-    decision = MasterFollowerPolicyEvaluator().evaluate(
+    decision = MasterFollowerPolicyEvaluator(_policy()).evaluate(
         intent=_intent(),
         results=(
             ExchangeOrderResult(exchange=ExchangeName.OKX, ok=True, avg_fill_price=Decimal("2500")),
@@ -41,7 +48,7 @@ def test_policy_keeps_master_when_follower_fails() -> None:
 
 
 def test_policy_orphan_follower_when_master_fails() -> None:
-    decision = MasterFollowerPolicyEvaluator().evaluate(
+    decision = MasterFollowerPolicyEvaluator(_policy()).evaluate(
         intent=_intent(),
         results=(
             ExchangeOrderResult(exchange=ExchangeName.OKX, ok=False, error="okx failed"),
@@ -56,7 +63,7 @@ def test_policy_orphan_follower_when_master_fails() -> None:
 
 
 def test_policy_price_deviation_alert_only() -> None:
-    decision = MasterFollowerPolicyEvaluator().evaluate(
+    decision = MasterFollowerPolicyEvaluator(_policy()).evaluate(
         intent=_intent(),
         results=(
             ExchangeOrderResult(exchange=ExchangeName.OKX, ok=True, avg_fill_price=Decimal("2500")),
@@ -114,7 +121,11 @@ async def test_master_follower_coordinator_retries_follower_without_closing_mast
     repo = SqliteOrderJournalStore(tmp_path / "journal.sqlite3")
     okx = FollowerFailsTwiceClient(ExchangeName.OKX)
     binance = FollowerFailsTwiceClient(ExchangeName.BINANCE, fail_times=2)
-    policy = MasterFollowerExecutionPolicy(follower_entry_retry=RetryPolicy(max_attempts=3, retry_delay_seconds=0))
+    policy = MasterFollowerExecutionPolicy(
+        master_exchange=ExchangeName.OKX,
+        follower_exchanges=(ExchangeName.BINANCE,),
+        follower_entry_retry=RetryPolicy(max_attempts=3, retry_delay_seconds=0),
+    )
     coordinator = MultiExchangeOrderCoordinator(clients=[okx, binance], repository=repo, master_follower_policy=policy)
 
     results = await coordinator.execute(_intent())

@@ -5,6 +5,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Mapping, Sequence
 
+from src.order_management.master_follower.config import MasterFollowerPolicyConfig, RetryPolicy
 from src.order_management.models import ExchangeOrderResult, OrderIntent
 from src.platform.exchanges.models import ExchangeName
 
@@ -18,27 +19,16 @@ class MasterFollowerDecisionStatus(str, Enum):
 
 
 @dataclass(frozen=True)
-class RetryPolicy:
-    max_attempts: int = 3
-    retry_delay_seconds: float = 0.0
-
-    def __post_init__(self) -> None:
-        if self.max_attempts < 1:
-            raise ValueError("max_attempts must be >= 1")
-        if self.retry_delay_seconds < 0:
-            raise ValueError("retry_delay_seconds must be >= 0")
-
-
-@dataclass(frozen=True)
 class MasterFollowerExecutionPolicy:
-    """OKX-data master / follower exchange execution policy.
+    """Master/follower exchange execution policy.
 
-    The master exchange defines strategy state. Followers try to mirror the
-    master, but follower failures do not force master exits.
+    The master exchange defines strategy state. Followers try to mirror the master,
+    but follower failures do not force master exits. The concrete exchange roles
+    must come from app/runtime configuration rather than this generic policy.
     """
 
-    master_exchange: ExchangeName = ExchangeName.OKX
-    follower_exchanges: tuple[ExchangeName, ...] = (ExchangeName.BINANCE,)
+    master_exchange: ExchangeName
+    follower_exchanges: tuple[ExchangeName, ...] = ()
     same_stop_price_as_master: bool = True
     entry_deviation_alert_pct: Decimal = Decimal("0.005")
     follower_entry_retry: RetryPolicy = field(default_factory=RetryPolicy)
@@ -46,6 +36,49 @@ class MasterFollowerExecutionPolicy:
     manual_grace_seconds_after_master_fail: int = 1800
     close_orphan_follower_after_grace: bool = True
     do_not_rejoin_mid_position_after_follower_desync: bool = True
+
+    @classmethod
+    def from_config(cls, config: MasterFollowerPolicyConfig) -> "MasterFollowerExecutionPolicy":
+        return cls(
+            master_exchange=config.master_exchange,
+            follower_exchanges=config.follower_exchanges,
+            entry_deviation_alert_pct=config.entry_deviation_alert_pct,
+            follower_entry_retry=config.follower_entry_retry,
+            master_entry_retry=config.master_entry_retry,
+            manual_grace_seconds_after_master_fail=config.manual_grace_seconds_after_master_fail,
+            close_orphan_follower_after_grace=config.close_orphan_follower_after_grace,
+            do_not_rejoin_mid_position_after_follower_desync=config.do_not_rejoin_mid_position_after_follower_desync,
+        )
+
+    @classmethod
+    def from_env(
+        cls,
+        *,
+        app_exchanges: tuple[ExchangeName, ...],
+        data_exchange: ExchangeName,
+        env: Mapping[str, str] | None = None,
+    ) -> "MasterFollowerExecutionPolicy":
+        return cls.from_config(
+            MasterFollowerPolicyConfig.from_env(
+                app_exchanges=app_exchanges,
+                data_exchange=data_exchange,
+                env=env,
+            )
+        )
+
+    def __post_init__(self) -> None:
+        followers: list[ExchangeName] = []
+        seen: set[ExchangeName] = set()
+        for exchange in self.follower_exchanges:
+            if exchange is self.master_exchange or exchange in seen:
+                continue
+            seen.add(exchange)
+            followers.append(exchange)
+        object.__setattr__(self, "follower_exchanges", tuple(followers))
+        if self.entry_deviation_alert_pct < 0:
+            raise ValueError("entry_deviation_alert_pct must be >= 0")
+        if self.manual_grace_seconds_after_master_fail < 0:
+            raise ValueError("manual_grace_seconds_after_master_fail must be >= 0")
 
     def followers_for(self, target_exchanges: Sequence[ExchangeName]) -> tuple[ExchangeName, ...]:
         targets = set(target_exchanges)
@@ -65,8 +98,8 @@ class MasterFollowerDecision:
 
 
 class MasterFollowerPolicyEvaluator:
-    def __init__(self, policy: MasterFollowerExecutionPolicy | None = None) -> None:
-        self.policy = policy or MasterFollowerExecutionPolicy()
+    def __init__(self, policy: MasterFollowerExecutionPolicy) -> None:
+        self.policy = policy
 
     def evaluate(self, *, intent: OrderIntent, results: Sequence[ExchangeOrderResult]) -> MasterFollowerDecision:
         by_exchange = {result.exchange: result for result in results}

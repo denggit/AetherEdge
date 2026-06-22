@@ -7,8 +7,25 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from src.app import AppConfig
+from src.order_management import MasterFollowerPolicyConfig
 from src.platform.config import load_env_config
 from src.runtime.models import RuntimeMode
+
+
+MASTER_FOLLOWER_ENV_KEYS = frozenset(
+    {
+        "AETHER_MASTER_EXCHANGE",
+        "AETHER_FOLLOWER_EXCHANGES",
+        "AETHER_ENTRY_DEVIATION_ALERT_PCT",
+        "AETHER_FOLLOWER_ENTRY_MAX_ATTEMPTS",
+        "AETHER_FOLLOWER_ENTRY_RETRY_DELAY_SECONDS",
+        "AETHER_MASTER_ENTRY_MAX_ATTEMPTS",
+        "AETHER_MASTER_ENTRY_RETRY_DELAY_SECONDS",
+        "AETHER_MASTER_FAIL_MANUAL_GRACE_SECONDS",
+        "AETHER_CLOSE_ORPHAN_FOLLOWER_AFTER_GRACE",
+        "AETHER_DO_NOT_REJOIN_MID_POSITION_AFTER_FOLLOWER_DESYNC",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -24,6 +41,7 @@ class LiveRuntimeConfig:
     closed_bar_buffer_ms: int = 60_000
     range_pct: Decimal = Decimal("0.002")
     producer_stale_timeout_ms: int = 60_000
+    master_follower_policy: MasterFollowerPolicyConfig | None = None
 
     @property
     def symbol(self) -> str:
@@ -51,6 +69,7 @@ def live_runtime_config_from_app(
 ) -> LiveRuntimeConfig:
     defaults = _load_defaults(defaults_path)
     env = load_env_config(env_file, environ=environ)
+    master_follower_env = _master_follower_env(env, env_file=env_file, environ=environ)
     return LiveRuntimeConfig(
         app=app_config,
         mode=RuntimeMode(str(env.get("AETHER_RUNTIME_MODE", defaults.get("runtime_mode", RuntimeMode.LEGACY_APP.value))).strip().lower()),
@@ -61,6 +80,11 @@ def live_runtime_config_from_app(
         closed_bar_buffer_ms=int(env.get("AETHER_CLOSED_BAR_BUFFER_MS", defaults.get("closed_bar_buffer_ms", 60_000))),
         range_pct=Decimal(str(env.get("AETHER_RANGE_PCT", defaults.get("range_pct", "0.002")))),
         producer_stale_timeout_ms=int(env.get("AETHER_PRODUCER_STALE_TIMEOUT_MS", defaults.get("producer_stale_timeout_ms", 60_000))),
+        master_follower_policy=MasterFollowerPolicyConfig.from_env(
+            app_exchanges=app_config.exchanges,
+            data_exchange=app_config.data_exchange,
+            env=master_follower_env,
+        ),
     )
 
 
@@ -73,3 +97,28 @@ def _load_defaults(path: str | Path) -> dict[str, Any]:
 
 def _bool(value: Any) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _master_follower_env(
+    env: Mapping[str, str],
+    *,
+    env_file: str | Path | None,
+    environ: Mapping[str, str] | None,
+) -> dict[str, str]:
+    """Keep injected runtime-config tests from inheriting project role config.
+
+    ``load_env_config`` intentionally reads the project ``.env`` and overlays
+    the provided mapping. That is correct for production. For callers passing a
+    synthetic ``environ`` without an explicit ``env_file`` (mostly tests), the
+    app config object is already authoritative for exchanges, so stale project
+    master/follower variables should not leak into the derived runtime config.
+    """
+
+    values = dict(env)
+    if environ is None or env_file is not None:
+        return values
+
+    for key in MASTER_FOLLOWER_ENV_KEYS:
+        values.pop(key, None)
+    values.update({str(key): str(value) for key, value in environ.items() if str(key) in MASTER_FOLLOWER_ENV_KEYS})
+    return values
