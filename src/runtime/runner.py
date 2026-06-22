@@ -16,6 +16,7 @@ from src.market_data.storage import SqliteKlineStore, SqliteRangeBarStore
 from src.market_data.warmup.gap_detector import interval_to_ms
 from src.market_data.warmup.service import KlineWarmupService
 from src.order_management import LegSyncStatus, MasterFollowerExecutionPolicy, MultiExchangeOrderCoordinator, PositionPlanStatus, RepositoryDuplicateOrderGuard, SqliteOrderJournalStore, SqlitePositionPlanStore
+from src.order_management.position_plan.models import LegRole
 from src.order_management.models import ExchangeOrderResult, OrderIntentStatus
 from src.platform import create_account_client, create_execution_client
 from src.platform.account.events import AccountEvent
@@ -439,37 +440,91 @@ class LiveRuntimeRunner:
         await asyncio.sleep(30)
         while not stop_event.is_set():
             try:
-                store = self._position_plan_store
-                if store is None:
-                    return
-                strategy = self.context.strategy
-                for plan in store.list_active_positions():
-                    if plan.status != PositionPlanStatus.MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED:
-                        continue
-                    for leg in store.get_legs(plan.position_id):
-                        if leg.exchange == plan.master_exchange:
-                            continue
-                        if leg.sync_status == LegSyncStatus.FOLLOWER_CLOSE_FAILED:
-                            logger.warning(
-                                "Unresolved follower close detected | position_id=%s exchange=%s sync_status=%s",
-                                plan.position_id,
-                                leg.exchange.value,
-                                leg.sync_status.value,
-                            )
-                            if hasattr(strategy, "position") and hasattr(strategy.position, "in_pos"):
-                                continue
-                            if hasattr(strategy, "_follower_close_signals_after_master_close"):
-                                signals = strategy._follower_close_signals_after_master_close(event_time_ms=None, only_exchanges=[leg.exchange.value])
-                                if signals:
-                                    logger.info(
-                                        "Auto-triggering follower close retry | position_id=%s exchange=%s",
-                                        plan.position_id,
-                                        leg.exchange.value,
-                                    )
-                                    await self._execute_signals(signals, source="follower_close_periodic_check", event_time_ms=None, metadata={"trigger": "periodic_follower_close_check"})
+                signals = self._build_unresolved_follower_close_signals()
+                if signals:
+                    logger.info(
+                        "Auto-triggering follower close retry for %s unresolved follower(s)",
+                        len(signals),
+                    )
+                    await self._execute_signals(
+                        signals,
+                        source="follower_close_periodic_check",
+                        event_time_ms=None,
+                        metadata={"trigger": "periodic_follower_close_check"},
+                    )
             except Exception as exc:
                 logger.error("Periodic follower close check error | error=%s", exc)
             await _jittered_sleep(stop_event, 60)
+
+    def _build_unresolved_follower_close_signals(self) -> list[TradeSignal]:
+        """Build standard TradeSignals for follower legs that still need closing.
+
+        Scans PositionPlanStore for MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED plans
+        and constructs follower-only close signals from the stored leg data.
+        This is an order-lifecycle safety net — it does not depend on any
+        strategy private method.
+        """
+        store = self._position_plan_store
+        if store is None:
+            return []
+        signals: list[TradeSignal] = []
+        for plan in store.list_active_positions():
+            if plan.status != PositionPlanStatus.MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED:
+                continue
+            for leg in store.get_legs(plan.position_id):
+                if leg.exchange == plan.master_exchange:
+                    continue
+                if leg.role not in {LegRole.FOLLOWER, "follower"}:
+                    continue
+                if leg.sync_status == LegSyncStatus.CLOSED:
+                    continue
+                # Determine quantity: prefer filled_qty_base, fall back to target_qty_base.
+                qty = leg.filled_qty_base if leg.filled_qty_base > Decimal("0") else leg.target_qty_base
+                if qty <= Decimal("0"):
+                    logger.warning(
+                        "Unresolved follower close skipped — zero quantity | position_id=%s exchange=%s",
+                        plan.position_id,
+                        leg.exchange.value,
+                    )
+                    continue
+                action = SignalAction.CLOSE_LONG if plan.side == "long" else SignalAction.CLOSE_SHORT
+                signals.append(
+                    TradeSignal(
+                        symbol=self.app_config.symbol,
+                        action=action,
+                        quantity=qty,
+                        reason="PERIODIC_MASTER_CLOSED_CLOSE_FOLLOWER",
+                        metadata={
+                            "target_exchanges": [leg.exchange.value],
+                            "reduce_only": True,
+                            "execution_purpose": "follower_close_after_master_close",
+                            "position_id": plan.position_id,
+                            "strategy_id": plan.strategy_id,
+                            "master_already_closed": True,
+                            "close_required_reason": "master_closed_follower_not_closed",
+                            "trigger": "periodic_follower_close_check",
+                        },
+                    )
+                )
+                logger.warning(
+                    "Unresolved follower close detected | position_id=%s exchange=%s sync_status=%s qty=%s",
+                    plan.position_id,
+                    leg.exchange.value,
+                    leg.sync_status.value if hasattr(leg.sync_status, "value") else str(leg.sync_status),
+                    str(qty),
+                )
+        return signals
+
+    def _has_unresolved_follower_close(self) -> bool:
+        """Return True when at least one position plan has unresolved follower
+        close after master close, blocking new entries."""
+        store = self._position_plan_store
+        if store is None:
+            return False
+        for plan in store.list_active_positions():
+            if plan.status == PositionPlanStatus.MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED:
+                return True
+        return False
 
     async def _enqueue_market_event(self, event: MarketEvent) -> None:
         if self._market_queue.full():
@@ -588,6 +643,28 @@ class LiveRuntimeRunner:
                     event_time_ms,
                 )
                 continue
+            # ── Entry guard: block new OPEN signals while any follower close
+            #     is still unresolved after master close. ──
+            if signal.action in {SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT}:
+                purpose = str(signal.metadata.get("execution_purpose", "") if signal.metadata else "").strip().lower()
+                if purpose not in {"follower_recovery_topup"} and self._has_unresolved_follower_close():
+                    logger.warning(
+                        "Blocking new entry — unresolved follower close after master close detected | action=%s source=%s",
+                        signal.action.value,
+                        source,
+                    )
+                    self.context.alerts.emit(
+                        AppAlert(
+                            subject="AetherEdge entry blocked due to unresolved follower close",
+                            severity="warning",
+                            content=(
+                                f"action={signal.action.value}\n"
+                                f"source={source}\n"
+                                f"reason=unresolved_follower_close_after_master_close\n"
+                            ),
+                        )
+                    )
+                    continue
             logger.info(
                 "Executing signal | action=%s source=%s event_time_ms=%s",
                 signal.action.value,
@@ -643,20 +720,31 @@ class LiveRuntimeRunner:
         purpose = str(signal.metadata.get("execution_purpose", "") if signal.metadata else "").strip().lower()
         if purpose != "follower_close_after_master_close":
             return
-        all_failed = all(not result.ok for result in results) if results else True
-        if not all_failed:
-            return
         now_ms = int(time.time() * 1000)
         position_id = str(signal.metadata.get("position_id", "unknown")) if signal.metadata else "unknown"
-        for result in results:
-            if result.ok:
+        target_exchanges = signal.metadata.get("target_exchanges", []) if signal.metadata else []
+        # Check every targeted follower exchange independently. A single
+        # filled result does not excuse another follower that is still open.
+        for exchange_name in target_exchanges:
+            exchange_str = str(exchange_name.value if hasattr(exchange_name, "value") else exchange_name).strip().lower()
+            matched = [r for r in results if r.exchange.value == exchange_str]
+            result = matched[0] if matched else None
+            is_failure = (
+                result is None
+                or not result.ok
+                or result.status is not OrderStatus.FILLED
+                or result.filled_quantity is None
+                or result.filled_quantity <= Decimal("0")
+            )
+            if not is_failure:
                 continue
-            throttle_key = f"{position_id}:{result.exchange.value}"
+            throttle_key = f"{position_id}:{exchange_str}"
             last_ms = self._follower_close_alert_last_ms.get(throttle_key, 0)
             if now_ms - last_ms < 60_000:
                 continue
             self._follower_close_alert_last_ms[throttle_key] = now_ms
-            attempts = result.raw.get("attempts", 0) if isinstance(result.raw, dict) else 0
+            attempts = result.raw.get("attempts", 0) if result is not None and isinstance(result.raw, dict) else 0
+            error_str = result.error if result is not None and result.error else ("missing result" if result is None else "not filled")
             self.context.alerts.emit(
                 AppAlert(
                     subject="AetherEdge follower close failed after master close",
@@ -665,14 +753,16 @@ class LiveRuntimeRunner:
                         f"strategy_id={signal.metadata.get('strategy_id', 'unknown') if signal.metadata else 'unknown'}\n"
                         f"position_id={position_id}\n"
                         f"master_exchange={self.app_config.data_exchange.value}\n"
-                        f"follower_exchange={result.exchange.value}\n"
+                        f"follower_exchange={exchange_str}\n"
                         f"symbol={signal.symbol}\n"
                         f"side={signal.action.value}\n"
                         f"quantity={str(signal.quantity)}\n"
-                        f"order_id={result.order_id or 'N/A'}\n"
-                        f"client_order_id={result.client_order_id or 'N/A'}\n"
+                        f"status={result.status.value if result is not None and result.status else 'N/A'}\n"
+                        f"filled_quantity={str(result.filled_quantity) if result is not None and result.filled_quantity is not None else 'N/A'}\n"
+                        f"order_id={result.order_id if result is not None else 'N/A'}\n"
+                        f"client_order_id={result.client_order_id if result is not None else 'N/A'}\n"
                         f"attempts={attempts}\n"
-                        f"error={result.error or 'unknown'}\n"
+                        f"error={error_str}\n"
                         f"timestamp={now_ms}\n"
                     ),
                 )
@@ -680,8 +770,8 @@ class LiveRuntimeRunner:
             logger.error(
                 "Follower close failed after master close | position_id=%s exchange=%s error=%s attempts=%s",
                 position_id,
-                result.exchange.value,
-                result.error,
+                exchange_str,
+                error_str,
                 attempts,
             )
 

@@ -397,9 +397,15 @@ async def test_order_sync_remains_active_when_master_closed_follower_unresolved(
 
 
 @pytest.mark.asyncio
-async def test_runtime_alerts_when_follower_close_fails_after_master_close(tmp_path) -> None:
-    """Alert emitted when follower_close_after_master_close fails after all retry attempts."""
+async def test_runtime_auto_alerts_when_follower_close_after_master_close_fails(tmp_path) -> None:
+    """Runtime _execute_signals → coordinator retry 3× fails → _check_follower_close_failure
+    → context.alerts.emit().  No manual alert emission."""
     from src.app.alerts import AppAlert, AsyncAlertDispatcher
+    from src.order_management import SqlitePositionPlanStore
+    from src.order_management.position_plan.models import (
+        LegPlan, LegRole, LegSyncStatus, PositionPlan, PositionPlanStatus,
+    )
+    from src.runtime.orders import LiveOrderIntentFactory
 
     captured: list[AppAlert] = []
 
@@ -409,8 +415,46 @@ async def test_runtime_alerts_when_follower_close_fails_after_master_close(tmp_p
 
     sink = _CaptureSink()
     alerts = AsyncAlertDispatcher(sink)
+    alerts.start()
 
     repo = SqliteOrderJournalStore(tmp_path / "journal.sqlite3")
+    plan_store = SqlitePositionPlanStore(tmp_path / "plan.sqlite3")
+    position_id = "p-alert-real-1"
+
+    # Pre-create position plan with master CLOSED, follower still open.
+    plan_store.upsert_position(
+        PositionPlan(
+            position_id=position_id,
+            strategy_id="eth_lf_portfolio_v8",
+            entry_engine="MOMENTUM_V3",
+            side="long",
+            status=PositionPlanStatus.MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED,
+            canonical_stop_price=None,
+            master_exchange=ExchangeName.OKX,
+            master_target_qty_base=Decimal("0.1"),
+            master_filled_qty_base=Decimal("0.1"),
+        )
+    )
+    plan_store.upsert_leg(
+        LegPlan(
+            position_id=position_id,
+            exchange=ExchangeName.OKX,
+            role=LegRole.MASTER,
+            target_qty_base=Decimal("0.1"),
+            filled_qty_base=Decimal("0.1"),
+            sync_status=LegSyncStatus.CLOSED,
+        )
+    )
+    plan_store.upsert_leg(
+        LegPlan(
+            position_id=position_id,
+            exchange=ExchangeName.BINANCE,
+            role=LegRole.FOLLOWER,
+            target_qty_base=Decimal("0.1"),
+            filled_qty_base=Decimal("0"),
+            sync_status=LegSyncStatus.FOLLOWER_CLOSE_FAILED,
+        )
+    )
 
     class _AlwaysFailsClient:
         def __init__(self, exchange: ExchangeName) -> None:
@@ -442,7 +486,41 @@ async def test_runtime_alerts_when_follower_close_fails_after_master_close(tmp_p
         follower_exchanges=(ExchangeName.BINANCE,),
         follower_close_retry=RetryPolicy(max_attempts=3, retry_delay_seconds=0),
     )
-    coordinator = MultiExchangeOrderCoordinator(clients=[binance], repository=repo, master_follower_policy=policy)
+    coordinator = MultiExchangeOrderCoordinator(
+        clients=[binance], repository=repo, master_follower_policy=policy,
+        position_plan_store=plan_store,
+    )
+
+    strategy = Strategy()
+    await strategy.on_start(_snapshot())
+
+    cfg = _app_config(dry_run=False)
+    runner = LiveRuntimeRunner(
+        app_config=cfg,
+        app_context=AppContext(
+            data=_FakeData(),
+            execution=object(),
+            state_store=_FakeStateStore(),
+            strategy=strategy,
+            planner=ExecutionPlanner(),
+            alerts=alerts,
+        ),
+        runtime_config=LiveRuntimeConfig(app=cfg, mode=RuntimeMode.LIVE_RUNTIME, warmup_enabled=False),
+        services={
+            "runtime_requirements": StrategyRuntimeRequirements.from_mapping({}),
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "execution_clients": (_FakeExecutionClient(ExchangeName.OKX), binance),
+            "account_clients": (_FakeAccountClient(ExchangeName.OKX), _FakeAccountClient(ExchangeName.BINANCE)),
+            "order_journal": repo,
+            "order_coordinator": coordinator,
+            "position_plan_store": plan_store,
+            "intent_factory": LiveOrderIntentFactory(
+                strategy_id=cfg.strategy,
+                target_exchanges=(ExchangeName.BINANCE,),
+            ),
+        },
+    )
 
     close_signal = TradeSignal(
         symbol="ETH-USDT-PERP",
@@ -451,45 +529,268 @@ async def test_runtime_alerts_when_follower_close_fails_after_master_close(tmp_p
         metadata={
             "execution_purpose": "follower_close_after_master_close",
             "target_exchanges": ["binance"],
-            "position_id": "p-alert-1",
+            "position_id": position_id,
             "strategy_id": "eth_lf_portfolio_v8",
         },
     )
-    intent = OrderIntent(intent_id="fc-alert", strategy_id="v8", signal=close_signal, target_exchanges=(ExchangeName.BINANCE,))
 
-    alerts.start()
-    results = await coordinator.execute(intent)
+    # Real path: execute signal → coordinator retries 3× and fails →
+    # _check_follower_close_failure() → context.alerts.emit()
+    await runner._execute_signals(
+        [close_signal], source="test", event_time_ms=1_000,
+    )
 
     assert binance.attempts == 3
-    assert not results[0].ok
+    await asyncio.sleep(0.2)
 
-    # Verify alert can be emitted for this failure scenario
-    alerts.emit(
-        AppAlert(
-            subject="AetherEdge follower close failed after master close",
-            severity="error",
-            content=(
-                "strategy_id=eth_lf_portfolio_v8\n"
-                "position_id=p-alert-1\n"
-                "master_exchange=okx\n"
-                "follower_exchange=binance\n"
-                "symbol=ETH-USDT-PERP\n"
-                "side=close_long\n"
-                "quantity=0.1\n"
-                "order_id=N/A\n"
-                "client_order_id=N/A\n"
-                "attempts=3\n"
-                "error=simulated exchange error\n"
-                "timestamp=0\n"
-            ),
+    # Alert must be emitted by the runtime, not manually.
+    follower_close_alerts = [
+        a for a in captured
+        if a.subject == "AetherEdge follower close failed after master close"
+    ]
+    assert len(follower_close_alerts) >= 1
+    alert = follower_close_alerts[0]
+    assert alert.severity == "error"
+    assert "p-alert-real-1" in alert.content
+    assert "binance" in alert.content
+    assert "attempts=3" in alert.content
+
+    await alerts.stop()
+
+
+@pytest.mark.asyncio
+async def test_periodic_follower_close_check_builds_retry_signal_for_unresolved_follower(tmp_path) -> None:
+    """_build_unresolved_follower_close_signals constructs correct TradeSignal
+    for unresolved follower legs without calling any strategy private method."""
+    from src.order_management import (
+        LegPlan, LegRole, LegSyncStatus, PositionPlan, PositionPlanStatus,
+        SqlitePositionPlanStore,
+    )
+
+    plan_store = SqlitePositionPlanStore(tmp_path / "plan.sqlite3")
+    position_id = "p-periodic-1"
+
+    plan_store.upsert_position(
+        PositionPlan(
+            position_id=position_id,
+            strategy_id="eth_lf_portfolio_v8",
+            entry_engine="MOMENTUM_V3",
+            side="long",
+            status=PositionPlanStatus.MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED,
+            canonical_stop_price=None,
+            master_exchange=ExchangeName.OKX,
+            master_target_qty_base=Decimal("0.1"),
+            master_filled_qty_base=Decimal("0.1"),
+        )
+    )
+    plan_store.upsert_leg(
+        LegPlan(
+            position_id=position_id,
+            exchange=ExchangeName.OKX,
+            role=LegRole.MASTER,
+            target_qty_base=Decimal("0.1"),
+            filled_qty_base=Decimal("0.1"),
+            sync_status=LegSyncStatus.CLOSED,
+        )
+    )
+    plan_store.upsert_leg(
+        LegPlan(
+            position_id=position_id,
+            exchange=ExchangeName.BINANCE,
+            role=LegRole.FOLLOWER,
+            target_qty_base=Decimal("0.08"),
+            filled_qty_base=Decimal("0"),
+            sync_status=LegSyncStatus.FOLLOWER_CLOSE_FAILED,
         )
     )
 
-    await asyncio.sleep(0.2)
-    await alerts.stop()
+    strategy = Strategy()
+    await strategy.on_start(_snapshot())
+    cfg = _app_config(dry_run=False)
+    runner = LiveRuntimeRunner(
+        app_config=cfg,
+        app_context=AppContext(
+            data=_FakeData(),
+            execution=object(),
+            state_store=_FakeStateStore(),
+            strategy=strategy,
+            planner=ExecutionPlanner(),
+            alerts=AsyncAlertDispatcher(NoopAlertSink()),
+        ),
+        runtime_config=LiveRuntimeConfig(app=cfg, mode=RuntimeMode.LIVE_RUNTIME, warmup_enabled=False),
+        services={
+            "runtime_requirements": StrategyRuntimeRequirements.from_mapping({}),
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "position_plan_store": plan_store,
+        },
+    )
 
-    assert len(captured) >= 1
-    alert = captured[0]
-    assert alert.subject == "AetherEdge follower close failed after master close"
-    assert alert.severity == "error"
-    assert "follower close failed after master close" in alert.subject.lower()
+    signals = runner._build_unresolved_follower_close_signals()
+
+    assert len(signals) == 1
+    signal = signals[0]
+    assert signal.action is SignalAction.CLOSE_LONG
+    assert signal.quantity == Decimal("0.08")  # target_qty_base used since filled_qty_base is 0
+    assert signal.metadata["target_exchanges"] == ["binance"]
+    assert signal.metadata["execution_purpose"] == "follower_close_after_master_close"
+    assert signal.metadata["position_id"] == position_id
+    assert signal.metadata["master_already_closed"] is True
+    assert signal.metadata["reduce_only"] is True
+    assert signal.metadata["trigger"] == "periodic_follower_close_check"
+
+
+@pytest.mark.asyncio
+async def test_periodic_follower_close_check_skips_already_closed_leg(tmp_path) -> None:
+    """_build_unresolved_follower_close_signals skips follower legs already CLOSED."""
+    from src.order_management import (
+        LegPlan, LegRole, LegSyncStatus, PositionPlan, PositionPlanStatus,
+        SqlitePositionPlanStore,
+    )
+
+    plan_store = SqlitePositionPlanStore(tmp_path / "plan.sqlite3")
+    position_id = "p-periodic-closed-1"
+
+    plan_store.upsert_position(
+        PositionPlan(
+            position_id=position_id,
+            strategy_id="eth_lf_portfolio_v8",
+            entry_engine="MOMENTUM_V3",
+            side="short",
+            status=PositionPlanStatus.MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED,
+            canonical_stop_price=None,
+            master_exchange=ExchangeName.OKX,
+            master_target_qty_base=Decimal("0.1"),
+            master_filled_qty_base=Decimal("0.1"),
+        )
+    )
+    plan_store.upsert_leg(
+        LegPlan(
+            position_id=position_id,
+            exchange=ExchangeName.OKX,
+            role=LegRole.MASTER,
+            target_qty_base=Decimal("0.1"),
+            filled_qty_base=Decimal("0.1"),
+            sync_status=LegSyncStatus.CLOSED,
+        )
+    )
+    plan_store.upsert_leg(
+        LegPlan(
+            position_id=position_id,
+            exchange=ExchangeName.BINANCE,
+            role=LegRole.FOLLOWER,
+            target_qty_base=Decimal("0.1"),
+            filled_qty_base=Decimal("0.1"),
+            sync_status=LegSyncStatus.CLOSED,  # already closed
+        )
+    )
+
+    strategy = Strategy()
+    await strategy.on_start(_snapshot())
+    cfg = _app_config(dry_run=False)
+    runner = LiveRuntimeRunner(
+        app_config=cfg,
+        app_context=AppContext(
+            data=_FakeData(),
+            execution=object(),
+            state_store=_FakeStateStore(),
+            strategy=strategy,
+            planner=ExecutionPlanner(),
+            alerts=AsyncAlertDispatcher(NoopAlertSink()),
+        ),
+        runtime_config=LiveRuntimeConfig(app=cfg, mode=RuntimeMode.LIVE_RUNTIME, warmup_enabled=False),
+        services={
+            "runtime_requirements": StrategyRuntimeRequirements.from_mapping({}),
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "position_plan_store": plan_store,
+        },
+    )
+
+    signals = runner._build_unresolved_follower_close_signals()
+    assert signals == []  # follower already CLOSED, nothing to retry
+
+
+@pytest.mark.asyncio
+async def test_entry_blocked_when_unresolved_follower_close_exists(tmp_path) -> None:
+    """_has_unresolved_follower_close() blocks OPEN signals when
+    MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED plans exist."""
+    from src.order_management import (
+        LegPlan, LegRole, LegSyncStatus, PositionPlan, PositionPlanStatus,
+        SqlitePositionPlanStore,
+    )
+
+    plan_store = SqlitePositionPlanStore(tmp_path / "plan.sqlite3")
+    position_id = "p-block-entry-1"
+
+    plan_store.upsert_position(
+        PositionPlan(
+            position_id=position_id,
+            strategy_id="eth_lf_portfolio_v8",
+            entry_engine="MOMENTUM_V3",
+            side="long",
+            status=PositionPlanStatus.MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED,
+            canonical_stop_price=None,
+            master_exchange=ExchangeName.OKX,
+            master_target_qty_base=Decimal("0.1"),
+            master_filled_qty_base=Decimal("0.1"),
+        )
+    )
+
+    strategy = Strategy()
+    await strategy.on_start(_snapshot())
+    cfg = _app_config(dry_run=False)
+    runner = LiveRuntimeRunner(
+        app_config=cfg,
+        app_context=AppContext(
+            data=_FakeData(),
+            execution=object(),
+            state_store=_FakeStateStore(),
+            strategy=strategy,
+            planner=ExecutionPlanner(),
+            alerts=AsyncAlertDispatcher(NoopAlertSink()),
+        ),
+        runtime_config=LiveRuntimeConfig(app=cfg, mode=RuntimeMode.LIVE_RUNTIME, warmup_enabled=False),
+        services={
+            "runtime_requirements": StrategyRuntimeRequirements.from_mapping({}),
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "position_plan_store": plan_store,
+        },
+    )
+
+    assert runner._has_unresolved_follower_close() is True
+
+    # Without unresolved plans, the guard should be clear.
+    plan_store.upsert_position(
+        PositionPlan(
+            position_id=position_id,
+            strategy_id="eth_lf_portfolio_v8",
+            entry_engine="MOMENTUM_V3",
+            side="long",
+            status=PositionPlanStatus.CLOSED,
+            canonical_stop_price=None,
+            master_exchange=ExchangeName.OKX,
+            master_target_qty_base=Decimal("0.1"),
+            master_filled_qty_base=Decimal("0.1"),
+        )
+    )
+    assert runner._has_unresolved_follower_close() is False
+
+
+def test_runtime_does_not_call_strategy_private_follower_close_method() -> None:
+    """src/runtime/runner.py must not call _follower_close_signals_after_master_close."""
+    runner_path = __file__.replace("\\", "/").replace(
+        "tests/runtime/test_v8_live_runtime_integration.py",
+        "src/runtime/runner.py",
+    )
+    import os
+    if not os.path.exists(runner_path):
+        # Try relative to project root.
+        import pathlib
+        project_root = pathlib.Path(__file__).resolve().parent.parent.parent
+        runner_path = str(project_root / "src" / "runtime" / "runner.py")
+    content = open(runner_path, encoding="utf-8").read()
+    assert "_follower_close_signals_after_master_close" not in content, (
+        "runner.py must not call strategy._follower_close_signals_after_master_close"
+    )

@@ -14,7 +14,7 @@ from src.order_management.master_follower import MasterFollowerExecutionPolicy, 
 from src.order_management.sync import OrderStatusSynchronizer, extract_avg_fill_price, extract_fee
 from src.planner import ExecutionPlanner, PlannedExecution, PlannedExecutionAction
 from src.platform.execution import ExecutionClient
-from src.platform.exchanges.models import ExchangeName, Order, OrderRequest, StopMarketOrderRequest
+from src.platform.exchanges.models import ExchangeName, Order, OrderRequest, OrderStatus, StopMarketOrderRequest
 from src.signals.models import SignalAction
 from src.utils.log import get_logger
 
@@ -245,8 +245,11 @@ class MultiExchangeOrderCoordinator:
             for exchange in intent.target_exchanges:
                 result = by_exchange.get(exchange)
                 if result is None:
+                    self.position_plan_store.update_leg_sync_status(
+                        position_id=position_id, exchange=exchange, sync_status=LegSyncStatus.FOLLOWER_CLOSE_FAILED,
+                    )
                     continue
-                if result.ok:
+                if _result_is_filled(result):
                     self.position_plan_store.update_leg_sync_status(
                         position_id=position_id, exchange=exchange, sync_status=LegSyncStatus.CLOSED,
                     )
@@ -259,19 +262,34 @@ class MultiExchangeOrderCoordinator:
 
         if purpose == "normal_close":
             master_result = by_exchange.get(master_exchange)
-            if master_result is not None and master_result.ok:
+            if master_result is not None and _result_is_filled(master_result):
                 self.position_plan_store.update_leg_sync_status(
                     position_id=position_id, exchange=master_exchange, sync_status=LegSyncStatus.CLOSED,
+                )
+            elif master_result is not None:
+                # Master close was attempted but not filled — leave leg status
+                # unchanged so the runtime can retry or alert.
+                logger.warning(
+                    "Master close result not filled | position_id=%s exchange=%s status=%s filled_qty=%s",
+                    position_id,
+                    master_exchange.value,
+                    master_result.status.value if master_result.status else "unknown",
+                    str(master_result.filled_quantity or Decimal("0")),
                 )
             for exchange in intent.target_exchanges:
                 if exchange == master_exchange:
                     continue
                 result = by_exchange.get(exchange)
-                if result is not None and result.ok:
+                if result is not None and _result_is_filled(result):
                     self.position_plan_store.update_leg_sync_status(
                         position_id=position_id, exchange=exchange, sync_status=LegSyncStatus.CLOSED,
                     )
-                elif result is not None and not result.ok:
+                elif result is not None:
+                    self.position_plan_store.update_leg_sync_status(
+                        position_id=position_id, exchange=exchange, sync_status=LegSyncStatus.FOLLOWER_CLOSE_FAILED,
+                    )
+                else:
+                    # Follower close result is missing entirely — mark failed.
                     self.position_plan_store.update_leg_sync_status(
                         position_id=position_id, exchange=exchange, sync_status=LegSyncStatus.FOLLOWER_CLOSE_FAILED,
                     )
@@ -604,6 +622,17 @@ def _optional_decimal(value) -> Decimal | None:
     if value in (None, ""):
         return None
     return Decimal(str(value))
+
+
+def _result_is_filled(result: ExchangeOrderResult) -> bool:
+    """A close/entry result is only considered truly filled when the exchange
+    confirms FILLED status AND a positive filled quantity."""
+    return (
+        result.ok
+        and result.status is OrderStatus.FILLED
+        and result.filled_quantity is not None
+        and result.filled_quantity > Decimal("0")
+    )
 
 
 def _result_filled_base(result: ExchangeOrderResult, *, fallback: Decimal) -> Decimal:
