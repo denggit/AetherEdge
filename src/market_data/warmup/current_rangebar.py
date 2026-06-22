@@ -75,7 +75,11 @@ class CurrentRangeBarWarmupService:
         closed = []
         for trade in trades:
             closed.extend(builder.on_trade(trade))
-        saved = self.range_bar_repository.save(closed)
+        replace_range = getattr(self.range_bar_repository, "replace_range", None)
+        if callable(replace_range):
+            saved = replace_range(symbol=symbol, range_pct=str(self.range_pct), time_range=time_range, rows=closed)
+        else:
+            saved = self.range_bar_repository.save(closed)
         return CurrentRangeBarWarmupResult(
             symbol=symbol,
             time_range=time_range,

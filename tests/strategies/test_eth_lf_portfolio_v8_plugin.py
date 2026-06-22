@@ -620,3 +620,62 @@ def _snapshot() -> PlatformSnapshot:
         leverage=LeverageInfo(exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP", raw_symbol="ETH-USDT-SWAP", leverage=Decimal("10"), margin_mode=MarginMode.ISOLATED),
         position_mode=PositionMode.ONE_WAY,
     )
+
+
+@pytest.mark.asyncio
+async def test_strategy_close_signal_uses_open_leg_quantities_by_exchange() -> None:
+    strategy = Strategy()
+    await strategy.on_start(_snapshot())
+    strategy.position.open_master(
+        side=Side.LONG,
+        entry_time_ms=1,
+        avg_entry=Decimal("2000"),
+        qty=Decimal("0.10"),
+        stop_price=Decimal("1978"),
+        entry_engine="MOMENTUM_V3",
+    )
+    strategy.position.mark_leg_open(exchange="okx", avg_fill_price=Decimal("2000"), base_qty=Decimal("0.10"))
+    strategy.position.mark_leg_open(exchange="binance", avg_fill_price=Decimal("2001"), base_qty=Decimal("0.005"))
+    strategy.router = PortfolioRouter(engines=(_StaticEngine(name="none", priority=0, side=Side.FLAT),))
+    strategy.feature_builder = _FakeFeatureBuilder(atr="10", exit_long=True)
+    close_time_ms = 1_700_100_000_000
+
+    await strategy.on_market_feature(_closed_kline(close_time_ms))
+    signals = await strategy.on_market_feature(_range_aggregate(close_time_ms))
+
+    assert len(signals) == 1
+    assert signals[0].action is SignalAction.CLOSE_LONG
+    assert signals[0].metadata["target_exchanges"] == ["binance", "okx"]
+    assert signals[0].metadata["exchange_quantities_base"] == {"okx": "0.10", "binance": "0.005"}
+    assert signals[0].quantity == Decimal("0.10")
+
+
+@pytest.mark.asyncio
+async def test_strategy_protected_stop_update_uses_open_leg_quantities_by_exchange() -> None:
+    strategy = Strategy()
+    await strategy.on_start(_snapshot())
+    close_time_ms = 1_700_000_000_000
+    strategy.position.open_master(
+        side=Side.LONG,
+        entry_time_ms=close_time_ms - 4 * 60 * 60 * 1000,
+        avg_entry=Decimal("100"),
+        qty=Decimal("0.10"),
+        stop_price=Decimal("90"),
+        entry_engine="MOMENTUM_V3",
+        units=4,
+    )
+    strategy.position.mark_leg_open(exchange="okx", avg_fill_price=Decimal("100"), base_qty=Decimal("0.10"))
+    strategy.position.mark_leg_open(exchange="binance", avg_fill_price=Decimal("100"), base_qty=Decimal("0.005"))
+    strategy.router = PortfolioRouter(engines=(_StaticEngine(name="none", priority=0, side=Side.FLAT),))
+    strategy.feature_builder = _FakeFeatureBuilder(atr="10")
+
+    await strategy.on_market_feature(_closed_kline(close_time_ms))
+    signals = await strategy.on_market_feature(_range_aggregate(close_time_ms))
+
+    assert len(signals) == 2
+    assert signals[0].action is SignalAction.CANCEL_ALL_STOP_ORDERS
+    assert signals[0].metadata["target_exchanges"] == ["binance", "okx"]
+    assert signals[1].action is SignalAction.PLACE_STOP_LOSS_LONG
+    assert signals[1].metadata["target_exchanges"] == ["binance", "okx"]
+    assert signals[1].metadata["exchange_quantities_base"] == {"okx": "0.10", "binance": "0.005"}
+    assert signals[1].quantity == Decimal("0.10")

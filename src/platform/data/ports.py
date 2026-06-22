@@ -40,6 +40,7 @@ class MarketDataFeed(Protocol):
     async def fetch_trades(
         self,
         *,
+        symbol: str | None = None,
         start_time_ms: int | None = None,
         end_time_ms: int | None = None,
         limit: int = 1000,

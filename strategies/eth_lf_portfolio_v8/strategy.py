@@ -115,6 +115,8 @@ class Strategy:
         self.signal_mapper = V8SignalMapper(SignalMapperConfig(strategy_id=self.config.strategy_id))
         self.engine_params = _default_engine_execution_params()
         self.equity: Decimal | None = None
+        self.exchange_equity: dict[str, Decimal] = {}
+        self.recovery_manual_required = False
         self.pending_entry: PendingEntryPlan | None = None
         self.bar_ready_events: list[BarReadyContext] = []
         self.recovery_alerts: list[str] = []
@@ -126,15 +128,19 @@ class Strategy:
 
     async def on_start(self, snapshot: PlatformSnapshot) -> Sequence[TradeSignal]:
         self.started = True
-        self.equity = snapshot.balance.available if snapshot.balance.available > 0 else snapshot.balance.total
+        balance = snapshot.balance.available if snapshot.balance.available > 0 else snapshot.balance.total
+        self.equity = balance
+        self.exchange_equity[snapshot.balance.exchange.value] = balance
         return []
 
     async def recover(self, context: StrategyRecoveryContext) -> Sequence[TradeSignal]:
         self.recovered = True
         for snapshot in context.snapshots:
+            balance = snapshot.balance.available if snapshot.balance.available > 0 else snapshot.balance.total
+            if balance > 0:
+                self.exchange_equity[snapshot.balance.exchange.value] = balance
             if snapshot.balance.exchange.value == self.config.data_exchange:
-                self.equity = snapshot.balance.available if snapshot.balance.available > 0 else snapshot.balance.total
-                break
+                self.equity = balance
         plans = tuple(context.metadata.get("active_position_plans", ()) if context.metadata else ())
         return self._recover_position_from_plans(snapshots=context.snapshots, plans=plans)
 
@@ -230,7 +236,7 @@ class Strategy:
         return signals
 
     def _signals_from_ready_context(self, context: BarReadyContext) -> list[TradeSignal]:
-        if not self.started or self.equity is None:
+        if not self.started or self.equity is None or self.recovery_manual_required:
             return []
         if self.position.in_pos:
             return self._position_lifecycle_signals(context)
@@ -254,15 +260,16 @@ class Strategy:
             entry_price=estimated_entry,
             risk_per_coin=atr_value * params.initial_atr_mult,
         )
-        qty = self._unit_qty(
+        exchange_quantities = self._entry_exchange_quantities(
             params=params,
             entry_price=estimated_entry,
             stop_price=estimated_stop,
             risk_mult=routed.risk_mult,
             quality_mult=routed.quality_mult,
             micro_entry_risk_scale=context.micro.entry_risk_scale,
-            current_qty=Decimal("0"),
+            current_by_exchange={},
         )
+        qty = exchange_quantities.get(self.config.data_exchange, Decimal("0"))
         if qty <= 0:
             return []
         position_id = f"v9c-{context.kline.close_time_ms}-{routed.engine}-{routed.side.name.lower()}"
@@ -301,6 +308,8 @@ class Strategy:
                     "await_master_fill_before_stop": True,
                     "execution_purpose": "normal_entry",
                     "position_id": position_id,
+                    "target_exchanges": sorted(exchange_quantities),
+                    "exchange_quantities_base": _exchange_quantity_metadata(exchange_quantities),
                 },
             )
         )
@@ -326,15 +335,23 @@ class Strategy:
         if not exit_channel and not opposite and not max_hold:
             return None
         reason = "V8_CHANNEL_EXIT" if exit_channel else "V8_OPPOSITE_SIGNAL_EXIT" if opposite else "V8_MAX_HOLD_EXIT"
+        exchange_quantities = self._open_leg_quantities()
+        quantity = exchange_quantities.get(self.config.data_exchange, self.position.qty)
         return V8TradeDecision(
             decision_type=V8DecisionType.CLOSE,
             side=self.position.side,
             symbol=self.config.symbol,
-            quantity=self.position.qty,
+            quantity=quantity,
             engine=self.position.entry_engine,
             reason=reason,
             bar_close_time_ms=context.kline.close_time_ms,
-            metadata={"reduce_only": True, "execution_purpose": "normal_close", "position_id": self.position.position_id},
+            metadata={
+                "reduce_only": True,
+                "execution_purpose": "normal_close",
+                "position_id": self.position.position_id,
+                "target_exchanges": sorted(exchange_quantities),
+                "exchange_quantities_base": _exchange_quantity_metadata(exchange_quantities),
+            },
         )
 
     def _add_signal_if_needed(self, context: BarReadyContext) -> list[TradeSignal]:
@@ -356,15 +373,17 @@ class Strategy:
         estimated_entry = context.kline.close
         stop_dist = max(params.initial_atr_mult * atr_value, self.position.risk_per_coin)
         estimated_stop = initial_stop_from_risk(side=self.position.side, entry_price=estimated_entry, risk_per_coin=stop_dist)
-        qty = self._unit_qty(
+        current_by_exchange = self._open_leg_quantities()
+        exchange_quantities = self._entry_exchange_quantities(
             params=params,
             entry_price=estimated_entry,
             stop_price=estimated_stop,
             risk_mult=context.routed_signal.risk_mult,
             quality_mult=context.routed_signal.quality_mult,
             micro_entry_risk_scale=Decimal("1"),
-            current_qty=self.position.qty,
+            current_by_exchange=current_by_exchange,
         )
+        qty = exchange_quantities.get(self.config.data_exchange, Decimal("0"))
         if qty <= 0:
             return []
         position_id = self.position.position_id or f"v9c-add-{context.kline.close_time_ms}-{self.position.entry_engine}-{self.position.side.name.lower()}"
@@ -400,6 +419,8 @@ class Strategy:
                     "micro_entry_risk_scale_applied": False,
                     "execution_purpose": "normal_entry",
                     "position_id": position_id,
+                    "target_exchanges": sorted(exchange_quantities),
+                    "exchange_quantities_base": _exchange_quantity_metadata(exchange_quantities),
                 },
             )
         )
@@ -427,15 +448,18 @@ class Strategy:
             return []
         assert candidate is not None
         self.position.update_stop(candidate)
-        target_exchanges = sorted(self.position.open_legs)
+        exchange_quantities = self._open_leg_quantities()
+        target_exchanges = sorted(exchange_quantities)
         if not target_exchanges:
             target_exchanges = [self.config.data_exchange]
+            exchange_quantities = {self.config.data_exchange: self.position.qty}
         return self._replace_stop_signals(
             target_exchanges=target_exchanges,
-            quantity=self.position.qty,
+            quantity=exchange_quantities.get(self.config.data_exchange, self.position.qty),
             stop_price=candidate,
             reason="V8_PROTECTED_STOP_UPDATE",
             bar_close_time_ms=context.kline.close_time_ms,
+            exchange_quantities=exchange_quantities,
         )
 
     def _handle_master_entry_fill(self, *, event: AccountEvent, filled_qty: Decimal) -> list[TradeSignal]:
@@ -580,17 +604,18 @@ class Strategy:
         if side is Side.FLAT:
             return
         entry_price = master.entry_price or Decimal("1")
-        fallback_stop = entry_price * (Decimal("0.99") if side is Side.LONG else Decimal("1.01"))
-        self.position.open_master(
-            side=side,
-            entry_time_ms=0,
-            avg_entry=entry_price,
-            qty=abs(master.quantity),
-            stop_price=fallback_stop,
-            entry_engine="unknown",
-            position_id=None,
-        )
+        self.position.in_pos = True
+        self.position.side = side
+        self.position.entry_time_ms = 0
+        self.position.first_entry = entry_price
+        self.position.avg_entry = entry_price
+        self.position.qty = abs(master.quantity)
+        self.position.units = 1
+        self.position.entry_engine = "unknown"
+        self.position.stop_price = None
+        self.position.risk_per_coin = None
         self.position.mark_leg_open(exchange=self.config.data_exchange, avg_fill_price=entry_price, base_qty=abs(master.quantity), sync_status="master_active_plan_unknown")
+        self.recovery_manual_required = True
         self.recovery_alerts.append("master_active_plan_unknown_manual_required")
 
     def _recover_master_closed_with_active_plan(self, *, snapshots: Mapping[str, PlatformSnapshot], plan_payload: Mapping[str, Any]) -> list[TradeSignal]:
@@ -637,7 +662,8 @@ class Strategy:
             },
         )
 
-    def _replace_stop_signals(self, *, target_exchanges: list[str], quantity: Decimal, stop_price: Decimal, reason: str, bar_close_time_ms: int | None) -> list[TradeSignal]:
+    def _replace_stop_signals(self, *, target_exchanges: list[str], quantity: Decimal, stop_price: Decimal, reason: str, bar_close_time_ms: int | None, exchange_quantities: Mapping[str, Decimal] | None = None) -> list[TradeSignal]:
+        exchange_quantities = dict(exchange_quantities or {})
         cancel = TradeSignal(
             symbol=self.config.symbol,
             action=SignalAction.CANCEL_ALL_STOP_ORDERS,
@@ -663,6 +689,7 @@ class Strategy:
                     "stop_price_source": "master_canonical",
                     "execution_purpose": "stop_sync",
                     "position_id": self.position.position_id,
+                    **({"exchange_quantities_base": _exchange_quantity_metadata(exchange_quantities)} if exchange_quantities else {}),
                 },
             )
         )[0]
@@ -692,6 +719,47 @@ class Strategy:
                 )
             )
         return signals
+
+    def _entry_exchange_quantities(
+        self,
+        *,
+        params: EngineExecutionParams,
+        entry_price: Decimal,
+        stop_price: Decimal,
+        risk_mult: Decimal,
+        quality_mult: Decimal,
+        micro_entry_risk_scale: Decimal,
+        current_by_exchange: Mapping[str, Decimal],
+    ) -> dict[str, Decimal]:
+        quantities: dict[str, Decimal] = {}
+        exchanges = set(self.exchange_equity) | {self.config.data_exchange}
+        for exchange in sorted(exchanges):
+            equity = self.exchange_equity.get(exchange)
+            if equity is None or equity <= 0:
+                if exchange == self.config.data_exchange and self.equity is not None:
+                    equity = self.equity
+                else:
+                    continue
+            qty = V8RiskSizer(RiskSizingConfig(risk_pct=params.unit_risk_per_trade, max_total_notional_mult=params.max_total_notional_mult)).unit_qty(
+                equity=equity,
+                entry_price=entry_price,
+                stop_price=stop_price,
+                risk_mult=risk_mult,
+                quality_mult=quality_mult,
+                micro_entry_risk_scale=micro_entry_risk_scale,
+                global_risk_scale=self.config.global_risk_scale,
+                current_qty=current_by_exchange.get(exchange, Decimal("0")),
+            )
+            if qty > 0:
+                quantities[exchange] = qty
+        return quantities
+
+    def _open_leg_quantities(self) -> dict[str, Decimal]:
+        quantities = {exchange: leg.base_qty for exchange, leg in self.position.open_legs.items() if leg.base_qty > 0}
+        if self.config.data_exchange not in quantities and self.position.qty > 0:
+            quantities[self.config.data_exchange] = self.position.qty
+        return quantities
+
 
     def _unit_qty(
         self,
@@ -726,6 +794,10 @@ class Strategy:
         if last_exit is None:
             return True
         return (current_close_time_ms - last_exit) >= _max_cooldown_bars(self.engine_params) * FOUR_HOURS_MS
+
+
+def _exchange_quantity_metadata(values: Mapping[str, Decimal]) -> dict[str, str]:
+    return {str(exchange): str(quantity) for exchange, quantity in values.items() if quantity > 0}
 
 
 def _default_engine_execution_params() -> dict[str, EngineExecutionParams]:

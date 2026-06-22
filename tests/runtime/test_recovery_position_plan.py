@@ -116,6 +116,8 @@ def test_recovery_active_master_without_plan_is_manual_required_not_flattened():
     assert signals == []
     assert strategy.position.in_pos is True
     assert strategy.position.legs["okx"].sync_status == "master_active_plan_unknown"
+    assert strategy.position.stop_price is None
+    assert strategy.recovery_manual_required is True
     assert "master_active_plan_unknown_manual_required" in strategy.recovery_alerts
 
 

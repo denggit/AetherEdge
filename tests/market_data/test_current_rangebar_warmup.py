@@ -66,3 +66,45 @@ async def test_current_rangebar_warmup_downloads_persists_and_reuses_coverage(tm
     assert len(bars) == 1
     assert bars[0].buy_notional == Decimal("10.0")
     assert bars[0].sell_notional == Decimal("10.02")
+
+
+def _range_bar(bar_id: int, start_ms: int, end_ms: int) -> object:
+    from src.market_data.models import RangeBar
+
+    return RangeBar(
+        symbol="ETH-USDT-PERP",
+        range_pct=Decimal("0.002"),
+        bar_id=bar_id,
+        start_time_ms=start_ms,
+        end_time_ms=end_ms,
+        open=Decimal("100"),
+        high=Decimal("101"),
+        low=Decimal("99"),
+        close=Decimal("100.5"),
+        volume=Decimal("1"),
+        buy_notional=Decimal("100"),
+        sell_notional=Decimal("0"),
+        trade_count=1,
+    )
+
+
+def test_replace_range_removes_stale_rebuilt_bucket_bars(tmp_path) -> None:
+    store = SqliteRangeBarStore(tmp_path / "market.sqlite3")
+    time_range = TimeRange(1_000, 4_000)
+    store.save([
+        _range_bar(1, 1_000, 2_000),
+        _range_bar(2, 2_001, 3_000),
+        _range_bar(3, 3_001, 3_500),
+    ])
+
+    saved = store.replace_range(
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+        time_range=time_range,
+        rows=[_range_bar(1, 1_000, 2_500)],
+    )
+
+    assert saved == 1
+    rows = store.load(symbol="ETH-USDT-PERP", range_pct="0.002", time_range=time_range)
+    assert [row.bar_id for row in rows] == [1]
+    assert rows[0].end_time_ms == 2_500

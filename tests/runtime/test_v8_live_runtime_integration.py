@@ -172,6 +172,7 @@ async def test_v8_live_runtime_routes_entry_and_leg_specific_stops(tmp_path) -> 
     strategy.router = PortfolioRouter(engines=(_StaticEngine(name="MOMENTUM_V3", priority=150, side=Side.LONG),))
     strategy.feature_builder = _FakeFeatureBuilder()
     await strategy.on_start(_snapshot())
+    strategy.exchange_equity["binance"] = Decimal("100")
 
     okx = _FakeExecutionClient(ExchangeName.OKX)
     binance = _FakeExecutionClient(ExchangeName.BINANCE)
@@ -207,6 +208,7 @@ async def test_v8_live_runtime_routes_entry_and_leg_specific_stops(tmp_path) -> 
     assert len(okx.orders) == 1
     assert len(binance.orders) == 1
     pending_qty = strategy.pending_entry.quantity  # type: ignore[union-attr]
+    binance_pending_qty = Decimal(str(strategy.pending_entry.quantity)) / Decimal("10")  # type: ignore[union-attr]
 
     await runner.process_account_event(
         AccountEvent(
@@ -236,7 +238,7 @@ async def test_v8_live_runtime_routes_entry_and_leg_specific_stops(tmp_path) -> 
             order_status=OrderStatus.FILLED,
             side=OrderSide.BUY,
             price=Decimal("2001"),
-            filled_quantity=pending_qty,
+            filled_quantity=binance_pending_qty,
         )
     )
 

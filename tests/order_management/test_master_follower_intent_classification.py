@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from src.order_management import MasterFollowerExecutionPolicy, MultiExchangeOrderCoordinator, OrderIntent, SqliteOrderJournalStore
+from src.order_management import MasterFollowerExecutionPolicy, MultiExchangeOrderCoordinator, OrderIntent, SqliteOrderJournalStore, SqlitePositionPlanStore
 from src.platform import ExchangeName, Order, OrderStatus
 from src.platform.exchanges.models import OrderSide, OrderType
 from src.signals import SignalAction, TradeSignal
@@ -95,3 +95,36 @@ async def test_normal_entry_still_runs_master_first_then_followers(tmp_path) -> 
     assert [item.exchange for item in results] == [ExchangeName.OKX, ExchangeName.BINANCE]
     assert len(okx.orders) == 1
     assert len(binance.orders) == 1
+
+
+@pytest.mark.asyncio
+async def test_position_plan_uses_entry_time_exchange_quantity_targets(tmp_path) -> None:
+    okx = _Client(ExchangeName.OKX)
+    binance = _Client(ExchangeName.BINANCE)
+    plan_store = SqlitePositionPlanStore(tmp_path / "plans.sqlite3")
+    coordinator = MultiExchangeOrderCoordinator(
+        clients=[okx, binance],
+        repository=SqliteOrderJournalStore(tmp_path / "j.sqlite3"),
+        master_follower_policy=_policy(),
+        position_plan_store=plan_store,
+    )
+    signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.OPEN_LONG,
+        quantity=Decimal("1.2"),
+        metadata={
+            "execution_purpose": "normal_entry",
+            "position_id": "p-per-exchange",
+            "engine": "BULL_RECLAIM_V2",
+            "exchange_quantities_base": {"okx": "1.2", "binance": "0.3"},
+        },
+    )
+    intent = OrderIntent(intent_id="i-entry-plan", strategy_id="v9c", signal=signal, target_exchanges=(ExchangeName.OKX, ExchangeName.BINANCE))
+
+    await coordinator.execute(intent)
+
+    legs = {leg.exchange: leg for leg in plan_store.get_legs("p-per-exchange")}
+    assert legs[ExchangeName.OKX].target_qty_base == Decimal("1.2")
+    assert legs[ExchangeName.BINANCE].target_qty_base == Decimal("0.3")
+    assert okx.orders[0].quantity == Decimal("1.2")
+    assert binance.orders[0].quantity == Decimal("0.3")

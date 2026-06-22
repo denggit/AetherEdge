@@ -14,7 +14,7 @@ from src.order_management.master_follower import MasterFollowerExecutionPolicy, 
 from src.order_management.sync import OrderStatusSynchronizer, extract_avg_fill_price, extract_fee
 from src.planner import ExecutionPlanner, PlannedExecution, PlannedExecutionAction
 from src.platform.execution import ExecutionClient
-from src.platform.exchanges.models import Order, OrderRequest, StopMarketOrderRequest
+from src.platform.exchanges.models import ExchangeName, Order, OrderRequest, StopMarketOrderRequest
 from src.signals.models import SignalAction
 
 
@@ -118,6 +118,7 @@ class MultiExchangeOrderCoordinator:
         entry_engine = str(signal.metadata.get("engine") or (existing.entry_engine if existing else "unknown")) if signal.metadata else (existing.entry_engine if existing else "unknown")
         stop_price = _optional_decimal(signal.metadata.get("estimated_initial_stop") if signal.metadata else None)
         if existing is None:
+            master_target_qty = _signal_exchange_quantity(signal, master_exchange, fallback=Decimal("0")) if master_exchange in intent.target_exchanges else Decimal("0")
             self.position_plan_store.upsert_position(
                 PositionPlan(
                     position_id=position_id,
@@ -127,27 +128,30 @@ class MultiExchangeOrderCoordinator:
                     status=PositionPlanStatus.ACTIVE,
                     canonical_stop_price=stop_price,
                     master_exchange=master_exchange,
-                    master_target_qty_base=signal.quantity if master_exchange in intent.target_exchanges else Decimal("0"),
+                    master_target_qty_base=master_target_qty,
                     master_filled_qty_base=Decimal("0"),
                     metadata={"intent_id": intent.intent_id},
                 )
             )
             for exchange in intent.target_exchanges:
                 role = LegRole.MASTER if exchange is master_exchange else LegRole.FOLLOWER
+                target_qty = _signal_exchange_quantity(signal, exchange, fallback=signal.quantity)
                 self.position_plan_store.upsert_leg(
                     LegPlan(
                         position_id=position_id,
                         exchange=exchange,
                         role=role,
-                        target_qty_base=signal.quantity,
+                        target_qty_base=target_qty,
                         sync_status=LegSyncStatus.PLANNED,
                     )
                 )
         elif purpose != "follower_recovery_topup":
             for exchange in intent.target_exchanges:
-                self.position_plan_store.add_to_leg_target(position_id=position_id, exchange=exchange, delta_target_qty_base=signal.quantity)
+                delta_qty = _signal_exchange_quantity(signal, exchange, fallback=signal.quantity)
+                self.position_plan_store.add_to_leg_target(position_id=position_id, exchange=exchange, delta_target_qty_base=delta_qty)
             if master_exchange in intent.target_exchanges:
-                self.position_plan_store.upsert_position(replace(existing, master_target_qty_base=existing.master_target_qty_base + signal.quantity))
+                master_delta = _signal_exchange_quantity(signal, master_exchange, fallback=signal.quantity)
+                self.position_plan_store.upsert_position(replace(existing, master_target_qty_base=existing.master_target_qty_base + master_delta))
         by_exchange = {result.exchange: result for result in results}
         for exchange in intent.target_exchanges:
             result = by_exchange.get(exchange)
@@ -157,7 +161,8 @@ class MultiExchangeOrderCoordinator:
             if leg is None:
                 continue
             if result.ok:
-                filled = signal.quantity if result.filled_quantity is None else _result_filled_base(result, fallback=signal.quantity)
+                target_qty = _signal_exchange_quantity(signal, exchange, fallback=signal.quantity)
+                filled = target_qty if result.filled_quantity is None else min(target_qty, _result_filled_base(result, fallback=target_qty))
                 self.position_plan_store.upsert_leg(
                     replace(
                         leg,
@@ -262,7 +267,7 @@ class MultiExchangeOrderCoordinator:
             last_error: Exception | None = None
             for attempt in range(max_attempts):
                 try:
-                    order = await self._execute_item(client, item, client_order_id=client_order_id)
+                    order = await self._execute_item(client, item, intent=intent, client_order_id=client_order_id)
                     synced = await self.order_status_synchronizer.sync_after_submit(client=client, item=item, order=order)
                     results.append(_order_to_result(synced, attempts=attempt + 1))
                     break
@@ -282,16 +287,16 @@ class MultiExchangeOrderCoordinator:
                 )
         return results
 
-    async def _execute_item(self, client: ExecutionClient, item: PlannedExecution, *, client_order_id: str) -> Order:
+    async def _execute_item(self, client: ExecutionClient, item: PlannedExecution, *, intent: OrderIntent, client_order_id: str) -> Order:
         if item.action is PlannedExecutionAction.PLACE_ORDER:
             if item.order_request is None:
                 raise ValueError("order_request is required")
-            request = self._convert_order_for_client(client, item.order_request)
+            request = self._convert_order_for_client(client, _with_exchange_quantity(item.order_request, intent=intent, exchange=client.exchange))
             return await client.place_order(_with_order_client_id(request, client_order_id))
         if item.action is PlannedExecutionAction.PLACE_STOP_MARKET_ORDER:
             if item.stop_market_request is None:
                 raise ValueError("stop_market_request is required")
-            request = self._convert_stop_for_client(client, item.stop_market_request)
+            request = self._convert_stop_for_client(client, _with_exchange_quantity(item.stop_market_request, intent=intent, exchange=client.exchange))
             return await client.place_stop_market_order(_with_stop_client_id(request, client_order_id))
         if item.action is PlannedExecutionAction.CANCEL_ALL_ORDERS:
             orders = await client.cancel_all_orders()
@@ -305,7 +310,7 @@ class MultiExchangeOrderCoordinator:
         conversions: list[dict[str, object]] = []
         for client in clients:
             for sequence, item in enumerate(items):
-                conversion = self._preview_conversion(client, item)
+                conversion = self._preview_conversion(client, item, intent=intent)
                 if conversion:
                     conversion["sequence"] = sequence
                     conversion["action"] = item.action.value
@@ -321,21 +326,23 @@ class MultiExchangeOrderCoordinator:
         }
         return replace(intent, metadata=metadata)
 
-    def _preview_conversion(self, client: ExecutionClient, item: PlannedExecution) -> dict[str, object] | None:
+    def _preview_conversion(self, client: ExecutionClient, item: PlannedExecution, *, intent: OrderIntent) -> dict[str, object] | None:
         profile = _client_market_profile(client)
         if profile is None:
             return None
         try:
             if item.action is PlannedExecutionAction.PLACE_ORDER and item.order_request is not None:
+                request = _with_exchange_quantity(item.order_request, intent=intent, exchange=client.exchange)
                 _, conversion = self.quantity_converter.convert_order_request(
-                    item.order_request,
+                    request,
                     exchange=client.exchange,
                     market_profile=profile,
                 )
                 return conversion.metadata()
             if item.action is PlannedExecutionAction.PLACE_STOP_MARKET_ORDER and item.stop_market_request is not None:
+                request = _with_exchange_quantity(item.stop_market_request, intent=intent, exchange=client.exchange)
                 _, conversion = self.quantity_converter.convert_stop_market_request(
-                    item.stop_market_request,
+                    request,
                     exchange=client.exchange,
                     market_profile=profile,
                 )
@@ -365,6 +372,46 @@ class MultiExchangeOrderCoordinator:
             market_profile=profile,
         )
         return converted
+
+
+def _signal_exchange_quantities(signal) -> dict[ExchangeName, Decimal]:
+    raw = signal.metadata.get("exchange_quantities_base") if signal.metadata else None
+    if raw is None:
+        raw = signal.metadata.get("per_exchange_quantity_base") if signal.metadata else None
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[ExchangeName, Decimal] = {}
+    for key, value in raw.items():
+        try:
+            exchange = key if isinstance(key, ExchangeName) else ExchangeName(str(key).strip().lower())
+            qty = Decimal(str(value))
+        except Exception:
+            continue
+        if qty > 0:
+            out[exchange] = qty
+    return out
+
+
+def _signal_exchange_quantity(signal, exchange: ExchangeName, *, fallback: Decimal | None) -> Decimal:
+    quantities = _signal_exchange_quantities(signal)
+    value = quantities.get(exchange)
+    if value is not None and value > 0:
+        return value
+    if fallback is None:
+        return Decimal("0")
+    return fallback
+
+
+def _with_exchange_quantity(request, *, intent: OrderIntent, exchange: ExchangeName):
+    quantity = getattr(request, "quantity", None)
+    if quantity is None:
+        return request
+    override = _signal_exchange_quantities(intent.signal).get(exchange)
+    if override is None or override <= 0:
+        return request
+    return replace(request, quantity=override)
 
 
 def _with_order_client_id(request: OrderRequest, client_order_id: str) -> OrderRequest:

@@ -42,6 +42,47 @@ class SqliteRangeBarStore:
             )
         return len(rows)
 
+
+    def replace_range(self, *, symbol: str, range_pct: str, time_range: TimeRange, rows: Sequence[RangeBar]) -> int:
+        """Replace all range bars whose end time falls inside ``time_range``.
+
+        Current-bucket warmup can rebuild a bucket from a more complete trade
+        set after restart/catch-up. A plain upsert can leave stale higher
+        ``bar_id`` rows behind when the rebuilt bucket contains fewer bars, so
+        bucket rebuilds need delete-then-insert semantics.
+        """
+        pct = _normalize_decimal_text(Decimal(str(range_pct)))
+        with self._connect() as conn:
+            conn.execute(
+                """
+                DELETE FROM range_bars
+                WHERE symbol = ? AND range_pct = ? AND end_time_ms BETWEEN ? AND ?
+                """,
+                (symbol, pct, time_range.start_time_ms, time_range.end_time_ms),
+            )
+            if rows:
+                conn.executemany(
+                    """
+                    INSERT INTO range_bars (
+                        symbol, range_pct, bar_id, start_time_ms, end_time_ms,
+                        open, high, low, close, volume, buy_notional, sell_notional, trade_count
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(symbol, range_pct, bar_id) DO UPDATE SET
+                        start_time_ms=excluded.start_time_ms,
+                        end_time_ms=excluded.end_time_ms,
+                        open=excluded.open,
+                        high=excluded.high,
+                        low=excluded.low,
+                        close=excluded.close,
+                        volume=excluded.volume,
+                        buy_notional=excluded.buy_notional,
+                        sell_notional=excluded.sell_notional,
+                        trade_count=excluded.trade_count
+                    """,
+                    [_range_bar_params(row) for row in rows],
+                )
+        return len(rows)
+
     def load(self, *, symbol: str, range_pct: str, time_range: TimeRange) -> list[RangeBar]:
         pct = _normalize_decimal_text(Decimal(str(range_pct)))
         with self._connect() as conn:

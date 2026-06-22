@@ -93,11 +93,14 @@ class RestMarketDataFeed:
     async def fetch_trades(
         self,
         *,
+        symbol: str | None = None,
         start_time_ms: int | None = None,
         end_time_ms: int | None = None,
         limit: int = 1000,
         oldest_first: bool = True,
     ) -> list[MarketTrade]:
+        if symbol is not None and symbol != self._symbol:
+            raise ValueError(f"data feed is bound to {self._symbol}, got {symbol}")
         fetch = getattr(self._exchange_client, "fetch_trades", None)
         if not callable(fetch):
             raise NotImplementedError(f"Historical trades are not supported for {self.exchange.value}")
