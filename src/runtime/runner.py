@@ -18,13 +18,16 @@ from src.market_data.warmup.service import KlineWarmupService
 from src.order_management import LegSyncStatus, MasterFollowerExecutionPolicy, MultiExchangeOrderCoordinator, PositionPlanStatus, RepositoryDuplicateOrderGuard, SqliteOrderJournalStore, SqlitePositionPlanStore
 from src.order_management.position_plan.models import LegRole
 from src.order_management.models import ExchangeOrderResult, OrderIntentStatus
+from src.order_management.quantity import NativeQuantityConverter
 from src.order_management.reconciliation.service import LiveStateReconciliationService
+from src.order_management.safety import RecoveryExitOrderValidator, is_bot_owned_order
 from src.platform import create_account_client, create_execution_client
 from src.platform.account.events import AccountEvent
 from src.platform.account.ports import AccountClient
 from src.platform.data.models import MarketEvent, MarketEventType, MarketKline, MarketOrderBook, MarketTicker, MarketTrade
-from src.platform.exchanges.models import ExchangeConfig, ExchangeName, Order, OrderStatus
+from src.platform.exchanges.models import ExchangeConfig, ExchangeName, Order, OrderStatus, Position, PositionSide
 from src.platform.execution.ports import ExecutionClient
+from src.platform.markets import get_market_profile
 from src.platform.snapshot import PlatformSnapshot
 from src.runtime.account_sync import AccountStateSyncService, OrderStateSyncService, RequestThrottle, SyncExchangeContext
 from src.runtime.config import LiveRuntimeConfig, live_runtime_config_from_app
@@ -41,6 +44,7 @@ from src.runtime.startup_catchup import (
 )
 from src.runtime.orders import LiveOrderIntentFactory
 from src.runtime.recovery.service import RecoveryExchangeContext, RuntimeRecoveryService
+from src.runtime.recovery.models import RecoveryReport
 from src.runtime.tasks import ClosedBarScheduler, ProducerHealthMonitor, ProducerSupervisor
 from src.runtime.tasks.scheduler import closed_bar_open_time_ms
 from src.signals import TradeSignal
@@ -788,12 +792,22 @@ class LiveRuntimeRunner:
         self.stats.recovery_runs += 1
         if not report.ok:
             raise LiveRuntimeError(f"runtime recovery failed: {tuple(report.issues)}")
+        # ── Check strategy recovery blocking state ────────────────────────
+        strategy = self.context.strategy
+        if getattr(strategy, "recovery_blocking_manual_required", False):
+            alerts = getattr(strategy, "recovery_alerts", [])
+            raise LiveRuntimeError(
+                f"runtime recovery blocking manual required: "
+                f"alerts={alerts}"
+            )
         logger.info(
             "Runtime recovery completed | snapshots=%s strategy_signals=%s issues=%s",
             len(report.snapshots),
             len(report.strategy_signals),
             len(report.issues),
         )
+        # ── Validate recovery protection postcondition ────────────────────
+        self._validate_recovery_protection_postcondition(report)
         if report.strategy_signals:
             await self._execute_signals(report.strategy_signals, source="recovery", event_time_ms=int(time.time() * 1000), metadata={"feature_type": "recovery"})
         if report.snapshots:
@@ -802,6 +816,129 @@ class LiveRuntimeRunner:
         if not self._last_snapshots:
             raise LiveRuntimeError("recovery completed without a startup snapshot")
         return self._last_snapshots
+
+    def _validate_recovery_protection_postcondition(self, report: RecoveryReport) -> None:
+        """Verify every active exchange position has protective stop coverage.
+
+        After strategy recovery, for every active position on the master exchange
+        (or any open leg), one of the following MUST be true:
+
+        1. A bot-owned valid protective stop already exists on the exchange.
+        2. The recovery generated a PLACE_STOP_LOSS signal.
+        3. The strategy marked recovery_blocking_manual_required (checked earlier).
+
+        If none of these hold, the runtime MUST NOT proceed — an active position
+        without a protective stop is an unacceptable risk.
+        """
+        strategy = self.context.strategy
+        # Already fatal via blocking check — skip postcondition.
+        if getattr(strategy, "recovery_blocking_manual_required", False):
+            return
+
+        strategy_id = getattr(getattr(strategy, "config", None), "strategy_id", "")
+        strategy_position = getattr(strategy, "position", None)
+        position_id = getattr(strategy_position, "position_id", None) if strategy_position is not None else None
+        canonical_stop_price = getattr(strategy_position, "stop_price", None) if strategy_position is not None else None
+
+        market_profile = get_market_profile(self.app_config.symbol)
+        converter = NativeQuantityConverter()
+        validator = RecoveryExitOrderValidator(quantity_converter=converter)
+
+        # Collect PLACE_STOP_LOSS signals from recovery for fast lookup.
+        place_stop_exchanges: set[str] = set()
+        for signal in report.strategy_signals:
+            if signal.action not in {SignalAction.PLACE_STOP_LOSS_LONG, SignalAction.PLACE_STOP_LOSS_SHORT}:
+                continue
+            if signal.metadata:
+                targets = signal.metadata.get("target_exchanges", [])
+                if isinstance(targets, (list, tuple)):
+                    for t in targets:
+                        place_stop_exchanges.add(str(t).strip().lower())
+
+        master_exchange_str = self.app_config.data_exchange.value
+
+        for snapshot in report.snapshots:
+            exchange_name = snapshot.balance.exchange
+            exchange_str = exchange_name.value if hasattr(exchange_name, "value") else str(exchange_name)
+
+            # Determine whether this exchange holds a position we must protect.
+            active_pos = _first_active_position(getattr(snapshot, "positions", ()) or ())
+            if active_pos is None:
+                continue
+
+            # Only protect master + open legs. Follower-only positions where master
+            # is already closed are handled by reconciliation, not by stop sync.
+            is_master = exchange_str == master_exchange_str
+            is_open_leg = (
+                strategy_position is not None
+                and getattr(strategy_position, "in_pos", False)
+                and exchange_str in getattr(strategy_position, "open_legs", {})
+            )
+            if not is_master and not is_open_leg:
+                continue
+
+            # ── Check 1: existing bot-owned valid stop ──────────────────
+            if canonical_stop_price is not None:
+                pos_side = _position_side_from_quantity(active_pos.quantity)
+                if pos_side is not None:
+                    try:
+                        validation = validator.validate_stop_orders(
+                            exchange=exchange_name,
+                            symbol=self.app_config.symbol,
+                            strategy_id=strategy_id,
+                            position_id=position_id,
+                            position_side=pos_side,
+                            position_mode=snapshot.position_mode,
+                            current_position_native_quantity=abs(active_pos.quantity),
+                            canonical_stop_price=canonical_stop_price,
+                            open_stop_orders=getattr(snapshot, "open_stop_orders", ()) or (),
+                            open_orders=getattr(snapshot, "open_orders", ()) or (),
+                            market_profile=market_profile,
+                        )
+                        if validation.should_keep_existing_stop:
+                            continue
+                    except Exception:
+                        pass
+
+            # ── Check 2: recovery generated PLACE_STOP_LOSS for this exchange ──
+            if exchange_str in place_stop_exchanges:
+                continue
+
+            # ── Check 3: any bot-owned active stop as fallback ──
+            if self._has_any_bot_owned_active_stop(snapshot, strategy_id, position_id):
+                logger.warning(
+                    "Recovery protection postcondition: bot-owned stop found but not "
+                    "fully validated | exchange=%s — proceeding with caution",
+                    exchange_str,
+                )
+                continue
+
+            # ── Postcondition FAILED ─────────────────────────────────────
+            open_stop_orders = getattr(snapshot, "open_stop_orders", ()) or ()
+            raise LiveRuntimeError(
+                "recovery protection postcondition failed: "
+                "active position without bot-owned valid stop or recovery stop signal | "
+                f"exchange={exchange_str} "
+                f"symbol={snapshot.symbol} "
+                f"position_side={_position_side_label(active_pos)} "
+                f"position_qty={active_pos.quantity} "
+                f"open_stop_orders={len(open_stop_orders)} "
+                f"bot_owned_valid_stop=false "
+                f"place_stop_signal=false "
+                f"canonical_stop_price={canonical_stop_price} "
+                f"strategy_recovery_blocking_manual_required=false"
+            )
+
+    def _has_any_bot_owned_active_stop(self, snapshot, strategy_id: str, position_id: str | None) -> bool:
+        """Lightweight check: does the snapshot contain at least one bot-owned
+        stop order that is still active (NEW / PARTIALLY_FILLED)?"""
+        active_statuses = {OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED}
+        for order in getattr(snapshot, "open_stop_orders", ()) or ():
+            if order.status not in active_statuses:
+                continue
+            if is_bot_owned_order(order=order, strategy_id=strategy_id, position_id=position_id):
+                return True
+        return False
 
     async def _call_on_start(self, snapshot: PlatformSnapshot) -> None:
         on_start = getattr(self.context.strategy, "on_start", None)
@@ -2201,6 +2338,30 @@ def _is_trade_at_or_before(event: MarketEvent, close_time_ms: int) -> bool:
         return False
     event_ms = _event_time_ms(event)
     return event_ms is not None and event_ms <= close_time_ms
+
+
+def _first_active_position(positions: Sequence[Position]) -> Position | None:
+    for pos in positions:
+        if pos.quantity != 0:
+            return pos
+    return None
+
+
+def _position_side_from_quantity(quantity: Decimal) -> PositionSide | None:
+    if quantity > 0:
+        return PositionSide.LONG
+    if quantity < 0:
+        return PositionSide.SHORT
+    return None
+
+
+def _position_side_label(position: Position) -> str:
+    side = _position_side_from_quantity(position.quantity)
+    if side is PositionSide.LONG:
+        return "long"
+    if side is PositionSide.SHORT:
+        return "short"
+    return "flat"
 
 
 async def _jittered_sleep(stop_event: asyncio.Event, interval_seconds: float) -> None:

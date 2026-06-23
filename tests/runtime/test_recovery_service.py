@@ -253,6 +253,364 @@ def _stop_order(*, order_id: str, quantity: Decimal, client_order_id: str = "pos
     )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Runtime recovery postcondition tests (8.3–8.6)
+# ══════════════════════════════════════════════════════════════════════════════
+
+import pytest
+from unittest.mock import MagicMock, patch
+
+from src.app import AppContext
+from src.order_management.safety import RecoveryExitOrderValidator, is_bot_owned_order
+from src.platform.exchanges.models import OrderSide, PositionMode
+from src.platform.markets import get_market_profile
+from src.platform.snapshot import PlatformSnapshot
+from src.runtime.runner import LiveRuntimeError, LiveRuntimeRunner, _first_active_position, _position_side_from_quantity, _position_side_label
+from src.runtime.recovery.models import RecoveryReport
+
+
+def _minimal_runner(
+    *,
+    strategy=None,
+    symbol: str = "ETH-USDT-PERP",
+    data_exchange=ExchangeName.OKX,
+) -> LiveRuntimeRunner:
+    """Build a LiveRuntimeRunner with just enough state for postcondition checks.
+
+    Uses aggressive patching to bypass the heavy __init__ path — only
+    ``app_config`` and ``context.strategy`` are real; everything else is
+    mocked.
+    """
+    from src.app import AppConfig
+
+    app_config = AppConfig(
+        symbol=symbol,
+        exchanges=(ExchangeName.OKX, ExchangeName.BINANCE),
+        data_exchange=data_exchange,
+        strategy="strategies.eth_lf_portfolio_v8:Strategy",
+        data_streams=("trades",),
+        state_db_path=":memory:",
+        market_queue_maxsize=100,
+        signal_queue_maxsize=100,
+        alert_queue_maxsize=100,
+        dry_run=True,
+        enable_email_alerts=False,
+    )
+
+    # Bypass the entire __init__ and only set the attributes the
+    # postcondition method actually reads.
+    runner = LiveRuntimeRunner.__new__(LiveRuntimeRunner)
+    runner.app_config = app_config
+    runner.context = MagicMock()
+    runner.context.strategy = strategy if strategy is not None else _FakeStrategy()
+    runner.stats = MagicMock()
+    runner.services = {}
+    runner._market_queue = MagicMock()
+    runner._stop_event = MagicMock()
+    runner._producer_tasks = []
+    runner._sync_tasks = []
+    runner._health = MagicMock()
+    runner._heartbeat_service = MagicMock()
+    runner._producer_monitor = MagicMock()
+    runner._producer_supervisor = MagicMock()
+    runner._closed_bar_scheduler = MagicMock()
+    runner._closed_bar_interval = "4h"
+    runner._closed_bar_interval_ms = 14400000
+    runner._closed_bar_buffer_ms = 5000
+    runner._range_pct = Decimal("0.002")
+    runner._range_aggregate_interval = "4h"
+    runner._last_snapshot = None
+    runner._last_snapshots = ()
+    runner._execution_clients = None
+    runner._account_clients = None
+    runner._order_journal = None
+    runner._position_plan_store = None
+    runner._order_coordinator = None
+    runner._account_sync_service = None
+    runner._order_sync_service = None
+    runner._request_sync_throttle = MagicMock()
+    runner._recovery_service = "__default__"
+    runner._reconciliation_service = "__default__"
+    runner._range_bar_store = None
+    runner._range_bar_builder = None
+    runner._range_bar_aggregator = None
+    runner._intent_factory = MagicMock()
+    runner.requirements = MagicMock()
+    runner.requirements.closed_kline = MagicMock()
+    runner.requirements.closed_kline.enabled = True
+    runner.requirements.closed_kline.interval = "4h"
+    runner.requirements.closed_kline.warmup_days = 0
+    runner.requirements.trades = MagicMock()
+    runner.requirements.trades.enabled = False
+    runner.requirements.range_bars = MagicMock()
+    runner.requirements.range_bars.enabled = False
+    runner.requirements.order_book = MagicMock()
+    runner.requirements.order_book.enabled = False
+    runner.runtime_config = MagicMock()
+    runner.runtime_config.warmup_enabled = False
+    runner.runtime_config.mode = MagicMock()
+    runner.runtime_config.mode.value = "live_runtime"
+    runner.runtime_config.closed_bar_interval = "4h"
+    runner.runtime_config.closed_bar_buffer_ms = 5000
+    runner.runtime_config.range_pct = Decimal("0.002")
+    runner.runtime_config.scheduler_poll_seconds = 1
+    runner.runtime_config.master_follower_policy = None
+    runner.runtime_config.startup_catchup = MagicMock()
+    runner.runtime_config.startup_catchup.enabled = False
+    runner.runtime_config.producer_stale_timeout_ms = 60000
+    return runner
+
+
+class _FakeStrategy:
+    """Minimal strategy stub for postcondition tests."""
+    recovery_blocking_manual_required = False
+
+
+def _recovery_report(*, snapshots=(), strategy_signals=()) -> RecoveryReport:
+    return RecoveryReport(
+        ok=True,
+        snapshots=tuple(snapshots),
+        strategy_signals=tuple(strategy_signals),
+    )
+
+
+def _position(exchange: ExchangeName, qty: str) -> Position:
+    return Position(
+        exchange=exchange,
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP" if exchange is ExchangeName.OKX else "ETHUSDT",
+        side=PositionSide.BOTH,
+        quantity=Decimal(qty),
+        entry_price=Decimal("2000"),
+    )
+
+
+class TestRecoveryProtectionPostcondition:
+    """8.4, 8.5, 8.6: Runtime recovery protection postcondition validation."""
+
+    def test_active_position_without_stop_or_signal_raises(self):
+        """8.4: active position + no stop + no signal → LiveRuntimeError."""
+        strategy = MagicMock()
+        strategy.recovery_blocking_manual_required = False
+        strategy.config = MagicMock()
+        strategy.config.strategy_id = "test_strategy"
+        strategy.position = MagicMock()
+        strategy.position.in_pos = True
+        strategy.position.position_id = "pos-1"
+        strategy.position.stop_price = Decimal("1719.40")
+        strategy.position.open_legs = {"okx": MagicMock()}
+
+        snapshot = _custom_snapshot(
+            ExchangeName.OKX,
+            positions=[_position(ExchangeName.OKX, "-2.82")],
+            open_stop_orders=[],
+        )
+        report = _recovery_report(snapshots=(snapshot,), strategy_signals=())
+
+        runner = _minimal_runner(strategy=strategy)
+
+        with pytest.raises(LiveRuntimeError, match="recovery protection postcondition failed"):
+            runner._validate_recovery_protection_postcondition(report)
+
+    def test_active_position_with_valid_bot_stop_passes_without_signal(self):
+        """8.5: active position + valid bot stop → no signal needed, postcondition passes."""
+        strategy = MagicMock()
+        strategy.recovery_blocking_manual_required = False
+        strategy.config = MagicMock()
+        strategy.config.strategy_id = "test_strategy"
+        strategy.position = MagicMock()
+        strategy.position.in_pos = True
+        strategy.position.position_id = "pos-1"
+        strategy.position.stop_price = Decimal("1719.40")
+        strategy.position.open_legs = {"okx": MagicMock()}
+
+        valid_stop = Order(
+            exchange=ExchangeName.OKX,
+            symbol="ETH-USDT-PERP",
+            raw_symbol="ETH-USDT-SWAP",
+            order_id="okx-valid-stop",
+            client_order_id="pos-1-stop",
+            status=OrderStatus.NEW,
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            price=Decimal("1719.40"),
+            quantity=Decimal("2.82"),
+            raw={"reduceOnly": "true"},
+        )
+        snapshot = _custom_snapshot(
+            ExchangeName.OKX,
+            positions=[_position(ExchangeName.OKX, "-2.82")],
+            open_stop_orders=[valid_stop],
+        )
+        report = _recovery_report(snapshots=(snapshot,), strategy_signals=())
+
+        runner = _minimal_runner(strategy=strategy)
+        # Should not raise
+        runner._validate_recovery_protection_postcondition(report)
+
+    def test_manual_stop_does_not_satisfy_postcondition_without_signal(self):
+        """8.6: manual stop only → not bot-owned → postcondition fails."""
+        strategy = MagicMock()
+        strategy.recovery_blocking_manual_required = False
+        strategy.config = MagicMock()
+        strategy.config.strategy_id = "test_strategy"
+        strategy.position = MagicMock()
+        strategy.position.in_pos = True
+        strategy.position.position_id = "pos-1"
+        strategy.position.stop_price = Decimal("1719.40")
+        strategy.position.open_legs = {"okx": MagicMock()}
+
+        manual_stop = Order(
+            exchange=ExchangeName.OKX,
+            symbol="ETH-USDT-PERP",
+            raw_symbol="ETH-USDT-SWAP",
+            order_id="manual-1",
+            client_order_id="user-manual-stop",
+            status=OrderStatus.NEW,
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            price=Decimal("1719.40"),
+            quantity=Decimal("2.0"),
+            raw={"reduceOnly": "true"},
+        )
+        snapshot = _custom_snapshot(
+            ExchangeName.OKX,
+            positions=[_position(ExchangeName.OKX, "-2.82")],
+            open_stop_orders=[manual_stop],
+        )
+        report = _recovery_report(snapshots=(snapshot,), strategy_signals=())
+
+        runner = _minimal_runner(strategy=strategy)
+
+        with pytest.raises(LiveRuntimeError, match="recovery protection postcondition failed"):
+            runner._validate_recovery_protection_postcondition(report)
+
+    def test_manual_stop_with_place_stop_signal_satisfies_postcondition(self):
+        """Manual stop + recovery PLACE_STOP_LOSS signal → postcondition passes."""
+        strategy = MagicMock()
+        strategy.recovery_blocking_manual_required = False
+        strategy.config = MagicMock()
+        strategy.config.strategy_id = "test_strategy"
+        strategy.position = MagicMock()
+        strategy.position.in_pos = True
+        strategy.position.position_id = "pos-1"
+        strategy.position.stop_price = Decimal("1719.40")
+        strategy.position.open_legs = {"okx": MagicMock()}
+
+        manual_stop = Order(
+            exchange=ExchangeName.OKX,
+            symbol="ETH-USDT-PERP",
+            raw_symbol="ETH-USDT-SWAP",
+            order_id="manual-1",
+            client_order_id="user-manual-stop",
+            status=OrderStatus.NEW,
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            price=Decimal("1719.40"),
+            quantity=Decimal("2.0"),
+            raw={"reduceOnly": "true"},
+        )
+        snapshot = _custom_snapshot(
+            ExchangeName.OKX,
+            positions=[_position(ExchangeName.OKX, "-2.82")],
+            open_stop_orders=[manual_stop],
+        )
+        place_signal = TradeSignal(
+            symbol="ETH-USDT-PERP",
+            action=SignalAction.PLACE_STOP_LOSS_SHORT,
+            quantity=Decimal("0.282"),
+            trigger_price=Decimal("1719.40"),
+            metadata={"target_exchanges": ["okx"]},
+        )
+        report = _recovery_report(snapshots=(snapshot,), strategy_signals=(place_signal,))
+
+        runner = _minimal_runner(strategy=strategy)
+        # Should not raise — place_stop signal satisfies postcondition
+        runner._validate_recovery_protection_postcondition(report)
+
+    def test_blocking_flag_skips_postcondition(self):
+        """When recovery_blocking_manual_required is True, postcondition is skipped."""
+        strategy = MagicMock()
+        strategy.recovery_blocking_manual_required = True  # blocking
+
+        snapshot = _custom_snapshot(
+            ExchangeName.OKX,
+            positions=[_position(ExchangeName.OKX, "-2.82")],
+            open_stop_orders=[],
+        )
+        report = _recovery_report(snapshots=(snapshot,), strategy_signals=())
+
+        runner = _minimal_runner(strategy=strategy)
+        # Should not raise — blocking flag bypasses postcondition
+        runner._validate_recovery_protection_postcondition(report)
+
+    def test_flat_snapshot_passes_postcondition(self):
+        """No active position → postcondition passes."""
+        strategy = MagicMock()
+        strategy.recovery_blocking_manual_required = False
+
+        snapshot = _custom_snapshot(
+            ExchangeName.OKX,
+            positions=[_position(ExchangeName.OKX, "0")],
+            open_stop_orders=[],
+        )
+        report = _recovery_report(snapshots=(snapshot,), strategy_signals=())
+
+        runner = _minimal_runner(strategy=strategy)
+        # Should not raise
+        runner._validate_recovery_protection_postcondition(report)
+
+    def test_postcondition_error_message_contains_diagnostics(self):
+        """Error message includes exchange, symbol, position_side, qty, stop info."""
+        strategy = MagicMock()
+        strategy.recovery_blocking_manual_required = False
+        strategy.config = MagicMock()
+        strategy.config.strategy_id = "test_strategy"
+        strategy.position = MagicMock()
+        strategy.position.in_pos = True
+        strategy.position.position_id = "pos-1"
+        strategy.position.stop_price = Decimal("1719.40")
+        strategy.position.open_legs = {"okx": MagicMock()}
+
+        snapshot = _custom_snapshot(
+            ExchangeName.OKX,
+            positions=[_position(ExchangeName.OKX, "-2.82")],
+            open_stop_orders=[],
+        )
+        report = _recovery_report(snapshots=(snapshot,), strategy_signals=())
+
+        runner = _minimal_runner(strategy=strategy)
+
+        with pytest.raises(LiveRuntimeError) as exc_info:
+            runner._validate_recovery_protection_postcondition(report)
+
+        msg = str(exc_info.value)
+        assert "recovery protection postcondition failed" in msg
+        assert "okx" in msg
+        assert "ETH-USDT-PERP" in msg
+        assert "bot_owned_valid_stop=false" in msg
+        assert "place_stop_signal=false" in msg
+
+
+def _custom_snapshot(
+    exchange: ExchangeName,
+    *,
+    positions: list[Position],
+    open_stop_orders: list[Order] | None = None,
+    open_orders: list[Order] | None = None,
+    position_mode: PositionMode = PositionMode.ONE_WAY,
+) -> PlatformSnapshot:
+    return PlatformSnapshot(
+        symbol="ETH-USDT-PERP",
+        balance=Balance(exchange=exchange, asset="USDT", total=Decimal("10000"), available=Decimal("10000")),
+        positions=positions,
+        open_orders=open_orders or [],
+        open_stop_orders=open_stop_orders or [],
+        leverage=LeverageInfo(exchange=exchange, symbol="ETH-USDT-PERP", raw_symbol="ETH-USDT-SWAP" if exchange is ExchangeName.OKX else "ETHUSDT", leverage=Decimal("3")),
+        position_mode=position_mode,
+    )
+
+
 def _active_short_plan_store(path) -> SqlitePositionPlanStore:
     store = SqlitePositionPlanStore(path)
     store.upsert_position(

@@ -419,7 +419,17 @@ def _check_recovery_start_state(
         }
     )
     if validation.has_unknown_exit_orders or validation.unsupported_bot_exit_orders:
-        report.add("recovery_start", "fail", detail=detail, error="unknown_stop_blocks_recovery")
+        # ── Blocking only when unknown stops prevent precise cancel of
+        #     invalid bot stops or when unsupported bot exit orders exist ──
+        if validation.has_invalid_bot_owned_stop or validation.unsupported_bot_exit_orders:
+            report.add("recovery_start", "fail", detail=detail, error="unknown_stop_blocks_recovery")
+            return
+        # ── Non-blocking: unknown/manual stop exists but bot can place its
+        #     own valid stop alongside. ──
+        if validation.should_place_new_stop:
+            report.add("recovery_start", "warn", detail=detail, error="unknown_manual_stop_exists_bot_stop_will_be_placed")
+            return
+        report.add("recovery_start", "warn", detail=detail, error="unknown_manual_stop_exists")
         return
     if validation.should_keep_existing_stop:
         report.add("recovery_start", "ok", detail=detail)

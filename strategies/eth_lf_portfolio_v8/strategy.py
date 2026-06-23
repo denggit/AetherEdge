@@ -125,6 +125,7 @@ class Strategy:
         self.equity: Decimal | None = None
         self.exchange_equity: dict[str, Decimal] = {}
         self.recovery_manual_required = False
+        self.recovery_blocking_manual_required = False
         self.pending_entry: PendingEntryPlan | None = None
         self.bar_ready_events: list[BarReadyContext] = []
         self.last_decision_audit: dict[str, Any] | None = None
@@ -978,7 +979,9 @@ class Strategy:
         self.position.risk_per_coin = None
         self.position.mark_leg_open(exchange=self.config.data_exchange, avg_fill_price=entry_price, base_qty=qty, native_qty=native_qty, sync_status="master_active_plan_unknown")
         self.recovery_manual_required = True
+        self.recovery_blocking_manual_required = True
         self.recovery_alerts.append("master_active_plan_unknown_manual_required")
+        self.recovery_alerts.append("active_master_without_position_plan_blocking")
 
     def _recover_master_closed_with_active_plan(self, *, snapshots: Mapping[str, PlatformSnapshot], plan_payload: Mapping[str, Any]) -> list[TradeSignal]:
         plan = dict(plan_payload.get("position", {}))
@@ -1031,12 +1034,15 @@ class Strategy:
                 else "place_new_stop"
             )
             logger.info("Recovery exit order validation | %s", check.log_fields(action=action))
+        # ── Non-blocking: unknown/manual stop exists but bot can place its own ──
+        #     valid stop alongside. Alert the operator but do NOT block startup.
         if validation.unknown_exit_orders:
-            self.recovery_manual_required = True
             for order in validation.unknown_exit_orders:
                 self.recovery_alerts.append(f"unknown_exit_order_manual_required:{exchange}:{order.order_id or order.client_order_id or 'unknown'}")
+        # ── Blocking: unsupported bot exit orders (take-profit / trailing) ──
         if validation.unsupported_bot_exit_orders:
             self.recovery_manual_required = True
+            self.recovery_blocking_manual_required = True
             for order in validation.unsupported_bot_exit_orders:
                 self.recovery_alerts.append(f"unsupported_take_profit_or_trailing_manual_required:{exchange}:{order.order_id or order.client_order_id or 'unknown'}")
         if validation.should_keep_existing_stop:
@@ -1052,7 +1058,9 @@ class Strategy:
                 action,
             )
             if validation.has_unknown_exit_orders:
+                # ── Blocking: unknown stop prevents precise cancel of invalid bot stops ──
                 self.recovery_manual_required = True
+                self.recovery_blocking_manual_required = True
                 self.recovery_alerts.append(f"critical_recovery_exit_order_manual_required:{exchange}:unknown_stop_blocks_cancel_all")
                 logger.critical(
                     "Recovery exit order manual required | reason=unknown_stop_blocks_cancel_all exchange=%s position_id=%s invalid_bot_stop_count=%s unknown_stop_count=%s",
@@ -1110,8 +1118,8 @@ class Strategy:
                 bot_owned_stops.append(order)
             else:
                 unknown_stops.append(order)
+        # ── Non-blocking: alert operator about unknown/manual stops on missing follower ──
         for order in unknown_stops:
-            self.recovery_manual_required = True
             self.recovery_alerts.append(f"unknown_exit_order_manual_required:{exchange}:{order.order_id or order.client_order_id or 'unknown'}")
             logger.info(
                 "Recovery exit order validation | exchange=%s symbol=%s position_side=None position_mode=%s current_position_base_quantity=0 current_position_native_quantity=0 canonical_stop_price=None existing_order_id=%s existing_client_order_id=%s valid=false invalid_reason=follower_missing_unknown_stop action=alert_manual_required",
@@ -1124,7 +1132,9 @@ class Strategy:
         if not bot_owned_stops:
             return []
         if unknown_stops:
+            # ── Blocking: unknown stops prevent precise cancel of bot stops ──
             self.recovery_manual_required = True
+            self.recovery_blocking_manual_required = True
             self.recovery_alerts.append(f"critical_recovery_exit_order_manual_required:{exchange}:unknown_stop_blocks_cancel_all")
             logger.critical(
                 "Recovery exit order manual required | reason=unknown_stop_blocks_cancel_all exchange=%s position_id=%s invalid_bot_stop_count=%s unknown_stop_count=%s",

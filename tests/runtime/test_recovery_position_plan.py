@@ -186,7 +186,9 @@ def test_recovery_active_master_without_plan_is_manual_required_not_flattened():
     assert strategy.position.legs["okx"].sync_status == "master_active_plan_unknown"
     assert strategy.position.stop_price is None
     assert strategy.recovery_manual_required is True
+    assert strategy.recovery_blocking_manual_required is True
     assert "master_active_plan_unknown_manual_required" in strategy.recovery_alerts
+    assert "active_master_without_position_plan_blocking" in strategy.recovery_alerts
 
 
 def test_recovery_reverse_follower_is_manual_required_without_topup():
@@ -394,7 +396,9 @@ def test_recovery_valid_bot_stop_plus_unknown_manual_stop_alerts_but_keeps_bot_s
     )
 
     assert signals == []
-    assert strategy.recovery_manual_required is True
+    # ── Non-blocking: valid bot stop exists, unknown manual stop is just an alert ──
+    assert strategy.recovery_manual_required is False
+    assert strategy.recovery_blocking_manual_required is False
     assert any(alert.startswith("unknown_exit_order_manual_required:okx") for alert in strategy.recovery_alerts)
 
 
@@ -682,7 +686,9 @@ def test_recovery_unknown_manual_stop_does_not_suppress_bot_stop_resync():
 
     assert [signal.action for signal in signals] == [SignalAction.PLACE_STOP_LOSS_SHORT]
     assert signals[0].metadata["target_exchanges"] == ["okx"]
-    assert strategy.recovery_manual_required is True
+    # ── Non-blocking: unknown manual stop does not prevent bot stop placement ──
+    assert strategy.recovery_manual_required is False
+    assert strategy.recovery_blocking_manual_required is False
     assert any(alert.startswith("unknown_exit_order_manual_required:okx") for alert in strategy.recovery_alerts)
 
 
@@ -700,7 +706,9 @@ def test_recovery_active_master_without_plan_remains_manual_required():
     assert signals == []
     assert strategy.position.in_pos is True
     assert strategy.recovery_manual_required is True
+    assert strategy.recovery_blocking_manual_required is True
     assert "master_active_plan_unknown_manual_required" in strategy.recovery_alerts
+    assert "active_master_without_position_plan_blocking" in strategy.recovery_alerts
 
 
 def test_recovery_active_master_without_plan_still_manual_required():
@@ -710,5 +718,178 @@ def test_recovery_active_master_without_plan_still_manual_required():
 
     assert signals == []
     assert strategy.recovery_manual_required is True
+    assert strategy.recovery_blocking_manual_required is True
     assert not any(signal.action in {SignalAction.PLACE_STOP_LOSS_LONG, SignalAction.PLACE_STOP_LOSS_SHORT} for signal in signals)
     assert not any(signal.action in {SignalAction.CLOSE_LONG, SignalAction.CLOSE_SHORT} for signal in signals)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# New tests — Recovery protection postcondition (8.x series)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_recovery_active_master_without_plan_sets_blocking_flag():
+    """8.3: active position + no plan → blocking manual required, runtime must fatal."""
+    strategy = Strategy()
+
+    signals = asyncio.run(_recover(
+        strategy,
+        okx_positions=[_position(ExchangeName.OKX, PositionSide.SHORT, "-2.82")],
+        binance_positions=[],
+        plans=[],
+    ))
+
+    assert signals == []
+    assert strategy.recovery_manual_required is True
+    assert strategy.recovery_blocking_manual_required is True
+    assert "active_master_without_position_plan_blocking" in strategy.recovery_alerts
+
+
+def test_recovery_unknown_manual_stop_with_active_plan_places_bot_stop_non_blocking():
+    """8.1: active position + manual stop + active plan → place bot stop, non-blocking."""
+    strategy = Strategy()
+    okx_snapshot = _custom_snapshot(
+        ExchangeName.OKX,
+        positions=[_position(ExchangeName.OKX, PositionSide.BOTH, "-2.82")],
+        open_stop_orders=[
+            _stop(ExchangeName.OKX, side=OrderSide.BUY, price="1719.40", quantity="2.0",
+                  client_order_id="user-manual-stop", order_id="manual-1", reduce_only=True),
+        ],
+    )
+    binance_snapshot = _custom_snapshot(ExchangeName.BINANCE, positions=[])
+
+    signals = asyncio.run(_recover_with_snapshots(
+        strategy,
+        snapshots=(okx_snapshot, binance_snapshot),
+        plans=[_active_plan("0", side="short", stop_price="1719.40", master_qty="0.282")],
+    ))
+
+    # Must generate PLACE_STOP_LOSS_SHORT signal
+    assert [signal.action for signal in signals] == [SignalAction.PLACE_STOP_LOSS_SHORT]
+    place = signals[0]
+    assert place.quantity == Decimal("0.282")
+    assert place.trigger_price == Decimal("1719.40")
+    assert place.metadata["target_exchanges"] == ["okx"]
+
+    # Non-blocking: manual stop is just an alert
+    assert strategy.recovery_manual_required is False
+    assert strategy.recovery_blocking_manual_required is False
+    assert any("unknown_exit_order_manual_required:okx" in alert for alert in strategy.recovery_alerts)
+
+
+def test_recovery_manual_stop_quantity_not_bot_owned_uses_base_quantity():
+    """8.7: new stop quantity = 0.282 ETH, native = 2.82 contracts, not 28.2."""
+    strategy = Strategy()
+    okx_snapshot = _custom_snapshot(
+        ExchangeName.OKX,
+        positions=[_position(ExchangeName.OKX, PositionSide.BOTH, "-2.82")],
+        open_stop_orders=[
+            _stop(ExchangeName.OKX, side=OrderSide.BUY, price="1719.40", quantity="2.0",
+                  client_order_id="user-manual-stop", reduce_only=True),
+        ],
+    )
+    binance_snapshot = _custom_snapshot(ExchangeName.BINANCE, positions=[])
+
+    signals = asyncio.run(_recover_with_snapshots(
+        strategy,
+        snapshots=(okx_snapshot, binance_snapshot),
+        plans=[_active_plan("0", side="short", stop_price="1719.40", master_qty="0.282")],
+    ))
+
+    place = signals[0]
+    assert place.quantity == Decimal("0.282")
+    converted = NativeQuantityConverter().convert_quantity(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        base_quantity=place.quantity,
+        market_profile=get_market_profile("ETH-USDT-PERP"),
+    )
+    assert converted.native_quantity == Decimal("2.82")
+    assert converted.native_quantity != Decimal("28.2")
+
+
+def test_recovery_active_position_no_stop_places_bot_stop():
+    """8.2: active position + no stop + active plan → PLACE_STOP_LOSS generated."""
+    strategy = Strategy()
+    okx_snapshot = _custom_snapshot(
+        ExchangeName.OKX,
+        positions=[_position(ExchangeName.OKX, PositionSide.BOTH, "-2.82")],
+        open_stop_orders=[],
+    )
+    binance_snapshot = _custom_snapshot(ExchangeName.BINANCE, positions=[])
+
+    signals = asyncio.run(_recover_with_snapshots(
+        strategy,
+        snapshots=(okx_snapshot, binance_snapshot),
+        plans=[_active_plan("0", side="short", stop_price="1719.40", master_qty="0.282")],
+    ))
+
+    assert [signal.action for signal in signals] == [SignalAction.PLACE_STOP_LOSS_SHORT]
+    assert signals[0].quantity == Decimal("0.282")
+    assert signals[0].trigger_price == Decimal("1719.40")
+    assert strategy.recovery_manual_required is False
+
+
+def test_recovery_valid_bot_stop_no_signals_needed():
+    """8.5: active position + valid bot stop → strategy_signals can be 0."""
+    strategy = Strategy()
+    okx_snapshot = _custom_snapshot(
+        ExchangeName.OKX,
+        positions=[_position(ExchangeName.OKX, PositionSide.BOTH, "-2.82")],
+        open_stop_orders=[
+            _stop(ExchangeName.OKX, side=OrderSide.BUY, price="1719.40", quantity="2.82",
+                  client_order_id="pos-1-stop", reduce_only=True),
+        ],
+    )
+    binance_snapshot = _custom_snapshot(ExchangeName.BINANCE, positions=[])
+
+    signals = asyncio.run(_recover_with_snapshots(
+        strategy,
+        snapshots=(okx_snapshot, binance_snapshot),
+        plans=[_active_plan("0", side="short", stop_price="1719.40", master_qty="0.282")],
+    ))
+
+    assert signals == []
+    assert strategy.position.in_pos is True
+    assert strategy.position.stop_price == Decimal("1719.40")
+
+
+def test_recovery_side_mismatch_sets_blocking():
+    """Side mismatch → falls through to _recover_active_master_without_plan → blocking."""
+    strategy = Strategy()
+    okx_snapshot = _custom_snapshot(
+        ExchangeName.OKX,
+        positions=[_position(ExchangeName.OKX, PositionSide.BOTH, "-2.82")],
+        open_stop_orders=[],
+    )
+    binance_snapshot = _custom_snapshot(ExchangeName.BINANCE, positions=[])
+
+    signals = asyncio.run(_recover_with_snapshots(
+        strategy,
+        snapshots=(okx_snapshot, binance_snapshot),
+        plans=[_active_plan("0", side="long", stop_price="1719.40", master_qty="0.282")],
+    ))
+
+    assert signals == []
+    assert strategy.recovery_blocking_manual_required is True
+    assert "master_active_plan_side_mismatch_manual_required" in strategy.recovery_alerts
+
+
+def test_recovery_missing_canonical_stop_sets_blocking():
+    """Missing canonical_stop_price → blocking."""
+    strategy = Strategy()
+    okx_snapshot = _custom_snapshot(
+        ExchangeName.OKX,
+        positions=[_position(ExchangeName.OKX, PositionSide.BOTH, "-2.82")],
+        open_stop_orders=[],
+    )
+    binance_snapshot = _custom_snapshot(ExchangeName.BINANCE, positions=[])
+
+    signals = asyncio.run(_recover_with_snapshots(
+        strategy,
+        snapshots=(okx_snapshot, binance_snapshot),
+        plans=[_active_plan("0", side="short", stop_price="", master_qty="0.282")],
+    ))
+
+    assert signals == []
+    assert strategy.recovery_blocking_manual_required is True
+    assert "master_active_plan_missing_canonical_stop_manual_required" in strategy.recovery_alerts
