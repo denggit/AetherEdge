@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+import tools.v9c_signal_parity_check as parity
 from tools.v9c_signal_parity_check import (
     FINGERPRINT_FILENAME,
     MISMATCH_CONTEXT_FILENAME,
@@ -16,7 +17,9 @@ from tools.v9c_signal_parity_check import (
     SUMMARY_FILENAME,
     build_range_context_from_rf_columns,
     build_parser,
+    build_signal_mismatch_context,
     compare_signal_audits,
+    detect_feature_warmup,
     main,
     replay_aetheredge_signal_audit,
     strategy_fingerprint,
@@ -72,6 +75,81 @@ def test_compare_signal_audits_detects_selected_engine_mismatch() -> None:
     assert result.mismatches.iloc[0]["field"] == "selected_engine"
     assert result.mismatches.iloc[0]["category"] == "action_critical"
     assert result.mismatch_fields == {"selected_engine": 1}
+
+
+def test_detect_feature_warmup_finds_first_valid_row() -> None:
+    ae_df = pd.DataFrame(
+        [
+            {
+                "timestamp": "2023-01-01 00:00:00",
+                "atr": None,
+                "atr_pct": None,
+                "adx": None,
+                "momentum_long_exit_channel": None,
+                "momentum_short_exit_channel": None,
+                "bull_long_exit_channel": None,
+            },
+            {
+                "timestamp": "2023-01-01 04:00:00",
+                "atr": None,
+                "atr_pct": None,
+                "adx": None,
+                "momentum_long_exit_channel": None,
+                "momentum_short_exit_channel": None,
+                "bull_long_exit_channel": None,
+            },
+            {
+                "timestamp": "2023-01-01 08:00:00",
+                "atr": 10.0,
+                "atr_pct": 0.01,
+                "adx": 25.0,
+                "momentum_long_exit_channel": None,
+                "momentum_short_exit_channel": None,
+                "bull_long_exit_channel": 100.0,
+            },
+        ]
+    )
+
+    result = detect_feature_warmup(ae_df)
+
+    assert result["first_valid_ae_feature_index"] == 2
+    assert result["first_valid_ae_feature_timestamp"] == "2023-01-01 08:00:00"
+    assert result["recommended_skip_warmup_bars"] == 2
+    assert result["ae_feature_invalid_rows"] == 2
+    assert result["ae_feature_valid_rows"] == 1
+
+
+def test_detect_feature_warmup_handles_no_valid_rows() -> None:
+    ae_df = pd.DataFrame(
+        [
+            {
+                "timestamp": "2023-01-01 00:00:00",
+                "atr": None,
+                "atr_pct": None,
+                "adx": None,
+                "momentum_long_exit_channel": None,
+                "momentum_short_exit_channel": None,
+                "bull_long_exit_channel": None,
+            },
+            {
+                "timestamp": "2023-01-01 04:00:00",
+                "atr": 10.0,
+                "atr_pct": 0.01,
+                "adx": 25.0,
+                "momentum_long_exit_channel": None,
+                "momentum_short_exit_channel": None,
+                "bull_long_exit_channel": None,
+            },
+        ]
+    )
+
+    result = detect_feature_warmup(ae_df)
+
+    assert result["first_valid_ae_feature_index"] is None
+    assert result["first_valid_ae_feature_timestamp"] is None
+    assert result["recommended_skip_warmup_bars"] == len(ae_df)
+    assert result["ae_feature_valid_rows"] == 0
+    assert result["ae_feature_invalid_rows"] == len(ae_df)
 
 
 def test_compare_signal_audits_respects_float_tolerance() -> None:
@@ -169,6 +247,7 @@ def test_parser_exposes_logging_options() -> None:
 
     assert "--log-every-rows" in help_text
     assert "--quiet" in help_text
+    assert "--auto-skip-feature-warmup" in help_text
 
 
 def test_replay_logs_progress(caplog) -> None:
@@ -233,6 +312,11 @@ def test_cli_writes_expected_outputs(tmp_path: Path) -> None:
     summary = json.loads((out_dir / SUMMARY_FILENAME).read_text(encoding="utf-8"))
     assert summary["coin_rows"] == 1
     assert summary["aetheredge_rows"] == 1
+    assert summary["requested_skip_warmup_bars"] == 0
+    assert summary["effective_skip_warmup_bars"] == 0
+    assert summary["skip_warmup_bars"] == 0
+    assert summary["auto_skip_feature_warmup"] is False
+    assert "feature_warmup" in summary
 
 
 def test_cli_writes_signal_mismatch_context_csv(tmp_path: Path) -> None:
@@ -279,6 +363,99 @@ def test_cli_quiet_still_prints_summary(tmp_path: Path, capsys) -> None:
     assert summary["aetheredge_rows"] == 1
 
 
+def test_auto_skip_feature_warmup_uses_max_requested_and_recommended(tmp_path: Path, monkeypatch) -> None:
+    coin_audit = tmp_path / "coin_signal_audit.csv"
+    out_dir = tmp_path / "out"
+    _three_row_coin_audit_df(rf_bar_count=0).to_csv(coin_audit, index=False)
+    monkeypatch.setattr(
+        parity,
+        "detect_feature_warmup",
+        lambda _df: {
+            "first_valid_ae_feature_index": 2,
+            "first_valid_ae_feature_timestamp": "2023-01-01 12:00:00",
+            "recommended_skip_warmup_bars": 2,
+            "ae_feature_valid_rows": 1,
+            "ae_feature_invalid_rows": 2,
+        },
+    )
+
+    exit_code = main(
+        [
+            "--coin-audit",
+            str(coin_audit),
+            "--out-dir",
+            str(out_dir),
+            "--skip-warmup-bars",
+            "1",
+            "--auto-skip-feature-warmup",
+            "--log-every-rows",
+            "0",
+        ]
+    )
+
+    assert exit_code == 0
+    summary = json.loads((out_dir / SUMMARY_FILENAME).read_text(encoding="utf-8"))
+    assert summary["requested_skip_warmup_bars"] == 1
+    assert summary["effective_skip_warmup_bars"] == 2
+    assert summary["skip_warmup_bars"] == 2
+    assert summary["auto_skip_feature_warmup"] is True
+    assert summary["feature_warmup"]["recommended_skip_warmup_bars"] == 2
+
+
+def test_without_auto_skip_uses_requested_skip(tmp_path: Path, monkeypatch) -> None:
+    coin_audit = tmp_path / "coin_signal_audit.csv"
+    out_dir = tmp_path / "out"
+    _three_row_coin_audit_df(rf_bar_count=0).to_csv(coin_audit, index=False)
+    monkeypatch.setattr(
+        parity,
+        "detect_feature_warmup",
+        lambda _df: {
+            "first_valid_ae_feature_index": 2,
+            "first_valid_ae_feature_timestamp": "2023-01-01 12:00:00",
+            "recommended_skip_warmup_bars": 2,
+            "ae_feature_valid_rows": 1,
+            "ae_feature_invalid_rows": 2,
+        },
+    )
+
+    exit_code = main(
+        [
+            "--coin-audit",
+            str(coin_audit),
+            "--out-dir",
+            str(out_dir),
+            "--skip-warmup-bars",
+            "1",
+            "--log-every-rows",
+            "0",
+        ]
+    )
+
+    assert exit_code == 0
+    summary = json.loads((out_dir / SUMMARY_FILENAME).read_text(encoding="utf-8"))
+    assert summary["requested_skip_warmup_bars"] == 1
+    assert summary["effective_skip_warmup_bars"] == 1
+    assert summary["skip_warmup_bars"] == 1
+    assert summary["auto_skip_feature_warmup"] is False
+    assert summary["feature_warmup"]["recommended_skip_warmup_bars"] == 2
+
+
+def test_mismatch_context_marks_warmup_invalid() -> None:
+    coin_df = _three_row_coin_audit_df(signal=1)
+    ae_df = _three_row_coin_audit_df(signal=0)
+    result = compare_signal_audits(coin_df, ae_df, skip_warmup_bars=0)
+
+    context = build_signal_mismatch_context(
+        coin_df,
+        ae_df,
+        result,
+        recommended_skip_warmup_bars=2,
+    )
+
+    assert int(context.iloc[0]["row_index"]) == 0
+    assert context.iloc[0]["warmup_invalid"] is True
+
+
 def _coin_audit_df(**overrides) -> pd.DataFrame:
     row = {
         "timestamp": "2023-01-01 04:00:00",
@@ -309,3 +486,12 @@ def _coin_audit_df(**overrides) -> pd.DataFrame:
     }
     row.update(overrides)
     return pd.DataFrame([row])
+
+
+def _three_row_coin_audit_df(**overrides) -> pd.DataFrame:
+    rows = []
+    for timestamp in ["2023-01-01 04:00:00", "2023-01-01 08:00:00", "2023-01-01 12:00:00"]:
+        row_overrides = dict(overrides)
+        row_overrides["timestamp"] = timestamp
+        rows.append(_coin_audit_df(**row_overrides))
+    return pd.concat(rows, ignore_index=True)

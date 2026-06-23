@@ -70,6 +70,18 @@ REPLAY_DIAGNOSTIC_COLUMNS = [
 
 AUDIT_COLUMNS = list(REQUIRED_COLUMNS) + REPLAY_DIAGNOSTIC_COLUMNS
 
+FEATURE_WARMUP_REQUIRED_COLUMNS = [
+    "atr",
+    "atr_pct",
+    "adx",
+]
+
+FEATURE_WARMUP_ENGINE_COLUMNS = [
+    "momentum_long_exit_channel",
+    "momentum_short_exit_channel",
+    "bull_long_exit_channel",
+]
+
 ACTION_CRITICAL_FIELDS = [
     "signal",
     "selected_engine",
@@ -162,6 +174,45 @@ def validate_coin_audit_columns(df: pd.DataFrame) -> None:
     missing = [column for column in REQUIRED_COLUMNS if column not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
+
+
+def detect_feature_warmup(aetheredge_df: pd.DataFrame) -> dict[str, Any]:
+    required_valid = pd.Series(True, index=aetheredge_df.index)
+    for column in FEATURE_WARMUP_REQUIRED_COLUMNS:
+        if column not in aetheredge_df.columns:
+            required_valid &= False
+            continue
+        required_valid &= aetheredge_df[column].notna()
+
+    engine_valid = pd.Series(False, index=aetheredge_df.index)
+    for column in FEATURE_WARMUP_ENGINE_COLUMNS:
+        if column in aetheredge_df.columns:
+            engine_valid |= aetheredge_df[column].notna()
+
+    feature_valid = required_valid & engine_valid
+    valid_positions = [idx for idx, is_valid in enumerate(feature_valid.tolist()) if bool(is_valid)]
+    valid_rows = int(feature_valid.sum())
+    invalid_rows = int(len(aetheredge_df) - valid_rows)
+    if not valid_positions:
+        return {
+            "first_valid_ae_feature_index": None,
+            "first_valid_ae_feature_timestamp": None,
+            "recommended_skip_warmup_bars": int(len(aetheredge_df)),
+            "ae_feature_valid_rows": 0,
+            "ae_feature_invalid_rows": int(len(aetheredge_df)),
+        }
+
+    first_valid_position = int(valid_positions[0])
+    timestamp = None
+    if "timestamp" in aetheredge_df.columns:
+        timestamp = _timestamp_string(aetheredge_df.iloc[first_valid_position]["timestamp"])
+    return {
+        "first_valid_ae_feature_index": first_valid_position,
+        "first_valid_ae_feature_timestamp": timestamp,
+        "recommended_skip_warmup_bars": first_valid_position,
+        "ae_feature_valid_rows": valid_rows,
+        "ae_feature_invalid_rows": invalid_rows,
+    }
 
 
 def timestamp_to_open_close_ms(timestamp: Any) -> tuple[int, int]:
@@ -477,13 +528,21 @@ def write_outputs(
     aetheredge_df: pd.DataFrame,
     compare_result: CompareResult,
     tolerance: float,
-    skip_warmup_bars: int,
+    requested_skip_warmup_bars: int,
+    effective_skip_warmup_bars: int,
+    auto_skip_feature_warmup: bool,
+    feature_warmup: Mapping[str, Any],
     fingerprint: Mapping[str, Any],
 ) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     aetheredge_df.to_csv(out_dir / REPLAY_AUDIT_FILENAME, index=False)
     compare_result.mismatches.to_csv(out_dir / MISMATCH_FILENAME, index=False)
-    context_df = build_signal_mismatch_context(coin_df, aetheredge_df, compare_result)
+    context_df = build_signal_mismatch_context(
+        coin_df,
+        aetheredge_df,
+        compare_result,
+        recommended_skip_warmup_bars=feature_warmup.get("recommended_skip_warmup_bars"),
+    )
     context_df.to_csv(out_dir / MISMATCH_CONTEXT_FILENAME, index=False)
     Path(out_dir / FINGERPRINT_FILENAME).write_text(json.dumps(fingerprint, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
     summary = {
@@ -493,7 +552,11 @@ def write_outputs(
         "coin_rows": int(len(coin_df)),
         "aetheredge_rows": int(len(aetheredge_df)),
         "joined_rows": compare_result.joined_rows,
-        "skip_warmup_bars": int(skip_warmup_bars),
+        "skip_warmup_bars": int(effective_skip_warmup_bars),
+        "requested_skip_warmup_bars": int(requested_skip_warmup_bars),
+        "effective_skip_warmup_bars": int(effective_skip_warmup_bars),
+        "auto_skip_feature_warmup": bool(auto_skip_feature_warmup),
+        "feature_warmup": dict(feature_warmup),
         "compared_rows": compare_result.compared_rows,
         "action_critical_mismatch_count": compare_result.action_critical_mismatch_count,
         "signal_scoped_mismatch_count": compare_result.signal_scoped_mismatch_count,
@@ -514,9 +577,13 @@ def build_signal_mismatch_context(
     coin_df: pd.DataFrame,
     aetheredge_df: pd.DataFrame,
     compare_result: CompareResult,
+    *,
+    recommended_skip_warmup_bars: int | None = None,
 ) -> pd.DataFrame:
     columns = [
         "timestamp",
+        "row_index",
+        "warmup_invalid",
         "coin_signal",
         "ae_signal",
         "coin_selected_engine",
@@ -575,6 +642,8 @@ def build_signal_mismatch_context(
         if field not in aetheredge_context_df.columns:
             aetheredge_context_df[field] = None
     joined = pd.merge(coin_context_df, aetheredge_context_df, on="timestamp", how="inner", suffixes=("_coin", "_aetheredge"))
+    joined = joined.reset_index(drop=True)
+    joined["row_index"] = joined.index
     joined = joined[joined["timestamp"].isin(action_timestamps)]
 
     rows: list[dict[str, Any]] = []
@@ -583,9 +652,16 @@ def build_signal_mismatch_context(
         if match.empty:
             continue
         row = match.iloc[0]
+        row_index = int(row["row_index"])
         rows.append(
             {
                 "timestamp": row["timestamp"],
+                "row_index": row_index,
+                "warmup_invalid": (
+                    False
+                    if recommended_skip_warmup_bars is None
+                    else bool(row_index < int(recommended_skip_warmup_bars))
+                ),
                 "coin_signal": _get_joined_value(row, "signal", "coin"),
                 "ae_signal": _get_joined_value(row, "signal", "aetheredge"),
                 "coin_selected_engine": _get_joined_value(row, "selected_engine", "coin"),
@@ -629,7 +705,10 @@ def build_signal_mismatch_context(
                 "ae_bull_long_exit_channel": _get_joined_value(row, "bull_long_exit_channel", "aetheredge"),
             }
         )
-    return pd.DataFrame(rows, columns=columns)
+    context = pd.DataFrame(rows, columns=columns)
+    if "warmup_invalid" in context.columns:
+        context["warmup_invalid"] = context["warmup_invalid"].astype(object)
+    return context
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -639,6 +718,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fail-on-mismatch", action="store_true", help="Exit with code 1 when any mismatch is found.")
     parser.add_argument("--tolerance", type=float, default=1e-9, help="Floating-point comparison tolerance. Default: 1e-9")
     parser.add_argument("--skip-warmup-bars", type=int, default=250, help="Rows to skip before comparing. Default: 250")
+    parser.add_argument(
+        "--auto-skip-feature-warmup",
+        action="store_true",
+        help="Automatically raise skip_warmup_bars to the first row where AetherEdge replay features are valid.",
+    )
     parser.add_argument("--max-rows", type=int, default=None, help="Replay only the first N rows. Default: all rows")
     parser.add_argument("--log-every-rows", type=int, default=500, help="Print replay/compare progress every N rows. Default: 500")
     parser.add_argument("--quiet", action="store_true", help="Only print warnings/errors and final JSON summary.")
@@ -650,10 +734,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     configure_logging(verbose=not args.quiet)
     logger.info(
-        "V9C signal parity started | coin_audit=%s out_dir=%s skip_warmup_bars=%s tolerance=%s max_rows=%s fail_on_mismatch=%s",
+        "V9C signal parity started | coin_audit=%s out_dir=%s skip_warmup_bars=%s auto_skip_feature_warmup=%s tolerance=%s max_rows=%s fail_on_mismatch=%s",
         args.coin_audit,
         args.out_dir,
         args.skip_warmup_bars,
+        args.auto_skip_feature_warmup,
         args.tolerance,
         args.max_rows,
         args.fail_on_mismatch,
@@ -679,11 +764,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             len(aetheredge_df),
             time.perf_counter() - replay_started,
         )
+        warmup_diag = detect_feature_warmup(aetheredge_df)
+        effective_skip_warmup_bars = args.skip_warmup_bars
+        if args.auto_skip_feature_warmup:
+            recommended = warmup_diag.get("recommended_skip_warmup_bars")
+            if recommended is not None:
+                effective_skip_warmup_bars = max(args.skip_warmup_bars, int(recommended))
+        logger.info(
+            "Feature warmup diagnostics | first_valid_index=%s first_valid_timestamp=%s recommended_skip=%s requested_skip=%s effective_skip=%s auto_skip=%s",
+            warmup_diag["first_valid_ae_feature_index"],
+            warmup_diag["first_valid_ae_feature_timestamp"],
+            warmup_diag["recommended_skip_warmup_bars"],
+            args.skip_warmup_bars,
+            effective_skip_warmup_bars,
+            args.auto_skip_feature_warmup,
+        )
         logger.info(
             "Comparing signal audits | coin_rows=%s aetheredge_rows=%s skip_warmup_bars=%s tolerance=%s",
             len(coin_df),
             len(aetheredge_df),
-            args.skip_warmup_bars,
+            effective_skip_warmup_bars,
             args.tolerance,
         )
         compare_started = time.perf_counter()
@@ -691,7 +791,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             coin_df,
             aetheredge_df,
             tolerance=args.tolerance,
-            skip_warmup_bars=args.skip_warmup_bars,
+            skip_warmup_bars=effective_skip_warmup_bars,
             log_every_rows=args.log_every_rows,
         )
         logger.info(
@@ -710,7 +810,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             aetheredge_df=aetheredge_df,
             compare_result=compare_result,
             tolerance=args.tolerance,
-            skip_warmup_bars=args.skip_warmup_bars,
+            requested_skip_warmup_bars=args.skip_warmup_bars,
+            effective_skip_warmup_bars=effective_skip_warmup_bars,
+            auto_skip_feature_warmup=args.auto_skip_feature_warmup,
+            feature_warmup=warmup_diag,
             fingerprint=strategy_fingerprint(),
         )
         logger.info(
