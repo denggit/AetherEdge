@@ -1,19 +1,28 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from src.order_management.models import OrderIntent
+from src.platform.exchanges.models import ExchangeName, Order, OrderStatus
 from src.platform.account.ports import AccountClient
 from src.platform.execution.ports import ExecutionClient
 from src.platform.snapshot import PlatformSnapshot, fetch_platform_snapshot
 from src.platform.state.ports import StateStore
 from src.reconcile.checker import Reconciler
-from src.reconcile.models import ReconcileReport
+from src.reconcile.models import ReconcileCategory, ReconcileIssue, ReconcileReport
 from src.signals import TradeSignal
 from src.strategy.ports import StrategyRecoveryContext
 from src.runtime.recovery.models import RecoveryReport
+
+logger = logging.getLogger(__name__)
+
+_AUTO_FIXABLE_MISSING_EXCHANGE_CATEGORIES = {
+    ReconcileCategory.MISSING_EXCHANGE_ORDER,
+    ReconcileCategory.MISSING_EXCHANGE_STOP_ORDER,
+}
 
 
 @dataclass(frozen=True)
@@ -55,10 +64,14 @@ class RuntimeRecoveryService:
             snapshot = await fetch_platform_snapshot(account=context.account, execution=context.execution)
             snapshots.append(snapshot)
             context.state_store.save_snapshot(snapshot)
+            self._auto_close_stale_local_orders_from_snapshot(context.state_store, snapshot)
             reconciler = context.reconciler or Reconciler(account=context.account, execution=context.execution, state_store=context.state_store)
             report = await reconciler.check()
+            if self._has_auto_fixable_stale_local_order_issue(report):
+                self._auto_close_stale_local_orders_from_snapshot(context.state_store, snapshot)
+                report = await reconciler.check()
             reconcile_reports.append(report)
-            issues.extend(issue.message for issue in report.issues)
+            issues.extend(issue.message for issue in self._fatal_reconcile_issues(report))
 
         order_intents = self._load_order_intents()
         active_position_plans = self._load_active_position_plans()
@@ -77,8 +90,54 @@ class RuntimeRecoveryService:
             order_intents=order_intents,
             strategy_signals=strategy_signals,
             issues=tuple(issues),
-            metadata={"exchange_contexts": len(self.exchange_contexts), "intent_ids": len(self.intent_ids), "active_position_plans": active_position_plans},
+            metadata={
+                "exchange_contexts": len(self.exchange_contexts),
+                "intent_ids": len(self.intent_ids),
+                "active_position_plans": active_position_plans,
+                "non_fatal_reconcile_issues": tuple(
+                    issue.message
+                    for report in reconcile_reports
+                    for issue in report.issues
+                    if self._is_auto_fixable_stale_local_order_issue(issue)
+                ),
+            },
         )
+
+    def _auto_close_stale_local_orders_from_snapshot(self, state_store: StateStore, snapshot: PlatformSnapshot) -> None:
+        marker = getattr(state_store, "mark_missing_open_orders_closed", None)
+        if not callable(marker):
+            return
+        exchange = snapshot.balance.exchange
+        symbol = snapshot.symbol
+        for is_stop_order, orders, reason in (
+            (False, snapshot.open_orders, "startup_recovery_missing_from_exchange_open_orders"),
+            (True, snapshot.open_stop_orders, "startup_recovery_missing_from_exchange_open_stop_orders"),
+        ):
+            changed = marker(
+                exchange=exchange,
+                symbol=symbol,
+                live_order_keys=_live_order_keys(orders),
+                is_stop_order=is_stop_order,
+                missing_status=OrderStatus.CANCELED,
+                reason=reason,
+            )
+            logger.info(
+                "Startup recovery auto-closed stale local orders | exchange=%s symbol=%s is_stop_order=%s changed=%s reason=%s",
+                exchange.value if isinstance(exchange, ExchangeName) else exchange,
+                symbol,
+                str(is_stop_order).lower(),
+                changed,
+                reason,
+            )
+
+    def _fatal_reconcile_issues(self, report: ReconcileReport) -> tuple[ReconcileIssue, ...]:
+        return tuple(issue for issue in report.issues if not self._is_auto_fixable_stale_local_order_issue(issue))
+
+    def _has_auto_fixable_stale_local_order_issue(self, report: ReconcileReport) -> bool:
+        return any(self._is_auto_fixable_stale_local_order_issue(issue) for issue in report.issues)
+
+    def _is_auto_fixable_stale_local_order_issue(self, issue: ReconcileIssue) -> bool:
+        return issue.category in _AUTO_FIXABLE_MISSING_EXCHANGE_CATEGORIES
 
     def _load_order_intents(self) -> tuple[OrderIntent, ...]:
         if self.order_journal is None or not self.intent_ids:
@@ -121,3 +180,7 @@ class RuntimeRecoveryService:
         )
         result = await recover(context)
         return tuple(result or ())
+
+
+def _live_order_keys(orders: Sequence[Order]) -> set[tuple[str | None, str | None]]:
+    return {(order.order_id, order.client_order_id) for order in orders}

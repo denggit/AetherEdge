@@ -28,12 +28,16 @@ from src.market_data.derived import RangeBarBuilder
 from src.market_data.models import TimeRange
 from src.market_data.storage import SqliteRangeBarStore
 from src.market_data.warmup.gap_detector import interval_to_ms
+from src.order_management.position_plan.store import SqlitePositionPlanStore
+from src.order_management.quantity import NativeQuantityConverter
+from src.order_management.safety import RecoveryExitOrderValidator
 from src.platform import ExchangeName
 from src.platform.account.factory import create_account_client
 from src.platform.data.factory import create_market_data_feed
 from src.platform.data.models import MarketTrade, TradeSide
 from src.platform.execution.factory import create_execution_client
-from src.platform.exchanges.models import ExchangeConfig, MarginMode
+from src.platform.exchanges.models import ExchangeConfig, MarginMode, Position, PositionMode, PositionSide
+from src.platform.markets import get_market_profile
 from src.runtime import RuntimeMode, live_runtime_config_from_app, runtime_mode_from_env
 from src.runtime.requirements import resolve_strategy_runtime_requirements
 from src.runtime.tasks.scheduler import closed_bar_open_time_ms
@@ -93,6 +97,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-file", default=None, help="Optional .env path")
     parser.add_argument("--report", default="data/state/v8_live_preflight_report.json", help="Output JSON report path")
     parser.add_argument("--expect-real-live", action="store_true", help="Fail unless dry_run=false, live_trading=true, and exchange sandbox flags are false")
+    parser.add_argument("--allow-recovery-start", action="store_true", help="Allow existing recoverable live master position/stop state instead of requiring flat start")
+    parser.add_argument("--expect-recovery-live", action="store_true", help="Alias for --allow-recovery-start")
     parser.add_argument("--allow-existing-position", action="store_true", help="Do not fail when positions already exist")
     parser.add_argument("--allow-open-orders", action="store_true", help="Do not fail when open regular/stop orders already exist")
     parser.add_argument("--skip-api", action="store_true", help="Skip exchange REST read checks")
@@ -125,7 +131,17 @@ async def main() -> int:
     _check_local_writable(report, app=app)
 
     if not args.skip_api:
-        await _check_exchange_read_apis(report, app=app, allow_existing_position=args.allow_existing_position, allow_open_orders=args.allow_open_orders)
+        allow_recovery_start = bool(args.allow_recovery_start or args.expect_recovery_live)
+        strategy_id = getattr(getattr(strategy, "config", None), "strategy_id", None)
+        await _check_exchange_read_apis(
+            report,
+            app=app,
+            runtime=runtime,
+            allow_existing_position=args.allow_existing_position or allow_recovery_start,
+            allow_open_orders=args.allow_open_orders or allow_recovery_start,
+            allow_recovery_start=allow_recovery_start,
+            strategy_id=strategy_id,
+        )
         await _check_follower_min_notional_balance(report, app=app, runtime=runtime)
     if not args.skip_kline:
         await _check_latest_closed_kline(report, app=app, runtime=runtime)
@@ -248,7 +264,16 @@ def _check_writable_file(report: PreflightReport, name: str, path: Path) -> None
         report.add(name, "fail", detail={"path": str(path)}, error=str(exc))
 
 
-async def _check_exchange_read_apis(report: PreflightReport, *, app: AppConfig, allow_existing_position: bool, allow_open_orders: bool) -> None:
+async def _check_exchange_read_apis(
+    report: PreflightReport,
+    *,
+    app: AppConfig,
+    runtime,
+    allow_existing_position: bool,
+    allow_open_orders: bool,
+    allow_recovery_start: bool = False,
+    strategy_id: str | None = None,
+) -> None:
     data_feed = create_market_data_feed(
         app.data_exchange,
         symbol=app.symbol,
@@ -258,6 +283,7 @@ async def _check_exchange_read_apis(report: PreflightReport, *, app: AppConfig, 
     )
     await _step(report, "data_exchange_ticker", app.data_exchange, data_feed.fetch_ticker)
 
+    snapshots: dict[ExchangeName, dict[str, Any]] = {}
     for exchange in app.exchanges:
         account = create_account_client(exchange, symbol=app.symbol, config=ExchangeConfig.from_env(exchange))
         execution = create_execution_client(exchange, symbol=app.symbol, config=ExchangeConfig.from_env(exchange))
@@ -267,6 +293,12 @@ async def _check_exchange_read_apis(report: PreflightReport, *, app: AppConfig, 
         mode = await _step(report, "fetch_position_mode", exchange, account.fetch_position_mode)
         open_orders = await _step(report, "fetch_open_orders", exchange, execution.fetch_open_orders)
         open_stop_orders = await _step(report, "fetch_open_stop_orders", exchange, execution.fetch_open_stop_orders)
+        snapshots[exchange] = {
+            "positions": positions or [],
+            "open_orders": open_orders or [],
+            "open_stop_orders": open_stop_orders or [],
+            "position_mode": mode or PositionMode.ONE_WAY,
+        }
 
         if balance is not None:
             available = getattr(balance, "available", Decimal("0"))
@@ -291,6 +323,209 @@ async def _check_exchange_read_apis(report: PreflightReport, *, app: AppConfig, 
             report.add(f"no_open_orders:{exchange.value}", status, detail={"open_orders": open_count, "open_stop_orders": stop_count}, error=None if allow_open_orders else "open regular/stop orders found")
         else:
             report.add(f"no_open_orders:{exchange.value}", "ok")
+
+    if allow_recovery_start:
+        _check_recovery_start_state(
+            report,
+            app=app,
+            runtime=runtime,
+            snapshots=snapshots,
+            strategy_id=strategy_id,
+        )
+
+
+def _check_recovery_start_state(
+    report: PreflightReport,
+    *,
+    app: AppConfig,
+    runtime,
+    snapshots: dict[ExchangeName, dict[str, Any]],
+    strategy_id: str | None,
+) -> None:
+    policy = getattr(runtime, "master_follower_policy", None)
+    master_exchange = getattr(policy, "master_exchange", app.data_exchange)
+    master_snapshot = snapshots.get(master_exchange)
+    if master_snapshot is None:
+        report.add("recovery_start", "fail", error=f"master snapshot missing: {master_exchange.value}")
+        return
+
+    active_master_positions = _active_positions(master_snapshot.get("positions", ()))
+    active_master = active_master_positions[0] if active_master_positions else None
+    active_plans = _load_active_position_plan_payloads(report)
+    active_plan = _find_recovery_plan(active_plans, master_exchange=master_exchange)
+    _check_recoverable_stale_local_orders(report, app=app, snapshots=snapshots)
+
+    if active_master is None:
+        if active_plans:
+            report.add("recovery_start", "warn", detail={"active_plans": len(active_plans)}, error="active plan exists but master has no active position; startup reconciliation should resolve follower/plan state")
+        else:
+            report.add("recovery_start", "ok", detail={"mode": "flat"})
+        return
+
+    detail = {
+        "master_exchange": master_exchange.value,
+        "position": _position_payload(active_master),
+        "active_plans": len(active_plans),
+    }
+    if active_plan is None:
+        report.add("recovery_start", "fail", detail=detail, error="active_position_without_plan")
+        return
+
+    position_payload = dict(active_plan.get("position", {}))
+    canonical_stop = _decimal_or_none(position_payload.get("canonical_stop_price"))
+    detail["position_id"] = position_payload.get("position_id")
+    detail["canonical_stop_price"] = None if canonical_stop is None else str(canonical_stop)
+    if canonical_stop is None:
+        report.add("recovery_start", "fail", detail=detail, error="missing_canonical_stop")
+        return
+
+    plan_side = str(position_payload.get("side") or "").strip().lower()
+    actual_side = _position_side(active_master)
+    detail["plan_side"] = plan_side
+    detail["actual_side"] = None if actual_side is None else actual_side.value
+    if actual_side is None or plan_side not in {"long", "short"}:
+        report.add("recovery_start", "fail", detail=detail, error="reverse_position_manual_required")
+        return
+    if plan_side != actual_side.value:
+        report.add("recovery_start", "fail", detail=detail, error="reverse_position_manual_required")
+        return
+
+    try:
+        market_profile = get_market_profile(app.symbol)
+        validation = RecoveryExitOrderValidator(quantity_converter=NativeQuantityConverter()).validate_stop_orders(
+            exchange=master_exchange,
+            symbol=app.symbol,
+            strategy_id=strategy_id or str(position_payload.get("strategy_id") or ""),
+            position_id=str(position_payload.get("position_id") or ""),
+            position_side=actual_side,
+            position_mode=master_snapshot.get("position_mode") or PositionMode.ONE_WAY,
+            current_position_native_quantity=abs(active_master.quantity),
+            canonical_stop_price=canonical_stop,
+            open_stop_orders=master_snapshot.get("open_stop_orders", ()),
+            open_orders=master_snapshot.get("open_orders", ()),
+            market_profile=market_profile,
+        )
+    except Exception as exc:
+        report.add("recovery_start", "fail", detail=detail, error=str(exc))
+        return
+
+    detail.update(
+        {
+            "valid_bot_stops": len(validation.valid_bot_owned_orders),
+            "invalid_bot_stops": len(validation.invalid_bot_owned_orders),
+            "unknown_exit_orders": len(validation.unknown_exit_orders),
+            "expected_native_quantity": str(validation.expected_native_quantity),
+            "current_position_base_quantity": str(validation.current_position_base_quantity),
+        }
+    )
+    if validation.has_unknown_exit_orders or validation.unsupported_bot_exit_orders:
+        report.add("recovery_start", "fail", detail=detail, error="unknown_stop_blocks_recovery")
+        return
+    if validation.should_keep_existing_stop:
+        report.add("recovery_start", "ok", detail=detail)
+        return
+    if validation.should_place_new_stop:
+        report.add("recovery_start", "warn", detail=detail, error="stop_missing_but_recoverable")
+        return
+    report.add("recovery_start", "warn", detail=detail, error="stop_invalid_but_recoverable")
+
+
+def _load_active_position_plan_payloads(report: PreflightReport) -> list[dict[str, Any]]:
+    try:
+        path = Path(os.getenv("AETHER_POSITION_PLAN_DB", "data/state/aether_position_plan.sqlite3"))
+        store = SqlitePositionPlanStore(path)
+        plans = store.serialize_active_positions()
+        report.add("recovery_position_plan_store", "ok", detail={"path": str(path), "active_plans": len(plans)})
+        return plans
+    except Exception as exc:
+        report.add("recovery_position_plan_store", "fail", error=str(exc))
+        return []
+
+
+def _find_recovery_plan(plans: Iterable[dict[str, Any]], *, master_exchange: ExchangeName) -> dict[str, Any] | None:
+    for item in plans:
+        position = dict(item.get("position", {}))
+        status = str(position.get("status") or "").strip().lower()
+        if status not in {"active", "manual_required", "master_active_plan_unknown"}:
+            continue
+        if str(position.get("master_exchange") or "").strip().lower() == master_exchange.value:
+            return item
+    return None
+
+
+def _check_recoverable_stale_local_orders(report: PreflightReport, *, app: AppConfig, snapshots: dict[ExchangeName, dict[str, Any]]) -> None:
+    path = Path(app.state_db_path)
+    if not path.exists():
+        report.add("recovery_stale_local_orders", "ok", detail={"path": str(path), "state_db_exists": False})
+        return
+    try:
+        total_stale = 0
+        detail: dict[str, Any] = {"path": str(path), "by_exchange": {}}
+        with sqlite3.connect(path) as conn:
+            exists = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='orders'").fetchone()
+            if exists is None:
+                report.add("recovery_stale_local_orders", "ok", detail={"path": str(path), "orders_table_exists": False})
+                return
+            for exchange, snapshot in snapshots.items():
+                live_regular = _order_keys(snapshot.get("open_orders", ()))
+                live_stops = _order_keys(snapshot.get("open_stop_orders", ()))
+                stale_regular = _count_stale_local_open_orders(conn, exchange=exchange, symbol=app.symbol, is_stop_order=False, live_keys=live_regular)
+                stale_stops = _count_stale_local_open_orders(conn, exchange=exchange, symbol=app.symbol, is_stop_order=True, live_keys=live_stops)
+                total_stale += stale_regular + stale_stops
+                detail["by_exchange"][exchange.value] = {"regular": stale_regular, "stop": stale_stops}
+        status = "warn" if total_stale else "ok"
+        report.add("recovery_stale_local_orders", status, detail=detail, error="stale_local_orders_can_be_auto_closed" if total_stale else None)
+    except Exception as exc:
+        report.add("recovery_stale_local_orders", "fail", detail={"path": str(path)}, error=str(exc))
+
+
+def _count_stale_local_open_orders(
+    conn: sqlite3.Connection,
+    *,
+    exchange: ExchangeName,
+    symbol: str,
+    is_stop_order: bool,
+    live_keys: set[tuple[str, str]],
+) -> int:
+    rows = conn.execute(
+        """
+        SELECT COALESCE(order_id, ''), COALESCE(client_order_id, '')
+        FROM orders
+        WHERE exchange = ?
+          AND symbol = ?
+          AND is_stop_order = ?
+          AND status IN ('new', 'partially_filled', 'unknown')
+        """,
+        (exchange.value, symbol, 1 if is_stop_order else 0),
+    ).fetchall()
+    return sum(1 for order_id, client_order_id in rows if (str(order_id or ""), str(client_order_id or "")) not in live_keys)
+
+
+def _order_keys(orders: Iterable[Any]) -> set[tuple[str, str]]:
+    return {(str(getattr(order, "order_id", "") or ""), str(getattr(order, "client_order_id", "") or "")) for order in orders}
+
+
+def _active_positions(positions: Iterable[Position]) -> list[Position]:
+    return [position for position in positions if getattr(position, "quantity", Decimal("0")) != 0]
+
+
+def _position_side(position: Position) -> PositionSide | None:
+    if position.side in {PositionSide.LONG, PositionSide.SHORT}:
+        return position.side
+    if position.quantity > 0:
+        return PositionSide.LONG
+    if position.quantity < 0:
+        return PositionSide.SHORT
+    return None
+
+
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    result = Decimal(str(value))
+    if result <= 0:
+        return None
+    return result
 
 
 async def _check_latest_closed_kline(report: PreflightReport, *, app: AppConfig, runtime) -> None:

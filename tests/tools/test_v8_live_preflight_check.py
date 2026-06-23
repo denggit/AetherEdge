@@ -3,11 +3,14 @@ from __future__ import annotations
 from decimal import Decimal
 
 from src.app import AppConfig
+from src.order_management.position_plan.models import LegPlan, LegRole, LegSyncStatus, PositionPlan, PositionPlanStatus
+from src.order_management.position_plan.store import SqlitePositionPlanStore
 from src.platform import ExchangeName
+from src.platform.exchanges.models import Position, PositionMode, PositionSide
 from src.runtime import RuntimeMode, LiveRuntimeConfig
 from src.runtime.requirements import StrategyRuntimeRequirements
 from src.order_management import MasterFollowerPolicyConfig
-from tools.v8_live_preflight_check import PreflightReport, _check_runtime_config, _check_writable_file
+from tools.v8_live_preflight_check import PreflightReport, _check_recovery_start_state, _check_runtime_config, _check_writable_file
 
 
 def _app() -> AppConfig:
@@ -78,3 +81,105 @@ def test_preflight_writable_file_creates_sqlite_path(tmp_path) -> None:
 
     assert path.exists()
     assert report.checks[-1].status == "ok"
+
+
+def test_preflight_recovery_start_allows_master_position_missing_stop_when_plan_exists(tmp_path, monkeypatch) -> None:
+    app = _app().__class__(**{**_app().__dict__, "state_db_path": str(tmp_path / "state.sqlite3")})
+    runtime = _runtime(app)
+    _write_active_short_plan(tmp_path / "plans.sqlite3")
+    monkeypatch.setenv("AETHER_POSITION_PLAN_DB", str(tmp_path / "plans.sqlite3"))
+    report = PreflightReport(started_time_ms=1)
+
+    _check_recovery_start_state(
+        report,
+        app=app,
+        runtime=runtime,
+        snapshots={
+            ExchangeName.OKX: {
+                "positions": [_short_okx_position()],
+                "open_orders": [],
+                "open_stop_orders": [],
+                "position_mode": PositionMode.ONE_WAY,
+            },
+            ExchangeName.BINANCE: {"positions": [], "open_orders": [], "open_stop_orders": [], "position_mode": PositionMode.ONE_WAY},
+        },
+        strategy_id="eth_lf_portfolio_v9c_reclaim_priority",
+    )
+
+    assert report.ok is True
+    assert any(check.name == "recovery_start" and check.status == "warn" and check.error == "stop_missing_but_recoverable" for check in report.checks)
+
+
+def test_preflight_recovery_start_fails_active_position_without_plan(tmp_path, monkeypatch) -> None:
+    app = _app().__class__(**{**_app().__dict__, "state_db_path": str(tmp_path / "state.sqlite3")})
+    runtime = _runtime(app)
+    monkeypatch.setenv("AETHER_POSITION_PLAN_DB", str(tmp_path / "missing_plans.sqlite3"))
+    report = PreflightReport(started_time_ms=1)
+
+    _check_recovery_start_state(
+        report,
+        app=app,
+        runtime=runtime,
+        snapshots={
+            ExchangeName.OKX: {
+                "positions": [_short_okx_position()],
+                "open_orders": [],
+                "open_stop_orders": [],
+                "position_mode": PositionMode.ONE_WAY,
+            }
+        },
+        strategy_id="eth_lf_portfolio_v9c_reclaim_priority",
+    )
+
+    assert report.ok is False
+    assert any(check.name == "recovery_start" and check.status == "fail" and check.error == "active_position_without_plan" for check in report.checks)
+
+
+def _runtime(app: AppConfig) -> LiveRuntimeConfig:
+    return LiveRuntimeConfig(
+        app=app,
+        mode=RuntimeMode.LIVE_RUNTIME,
+        master_follower_policy=MasterFollowerPolicyConfig.from_env(
+            app_exchanges=app.exchanges,
+            data_exchange=app.data_exchange,
+            env={"AETHER_MASTER_EXCHANGE": "okx", "AETHER_FOLLOWER_EXCHANGES": "binance"},
+        ),
+    )
+
+
+def _short_okx_position() -> Position:
+    return Position(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP",
+        side=PositionSide.BOTH,
+        quantity=Decimal("-2.82"),
+        entry_price=Decimal("1700"),
+    )
+
+
+def _write_active_short_plan(path) -> None:
+    store = SqlitePositionPlanStore(path)
+    store.upsert_position(
+        PositionPlan(
+            position_id="pos-1",
+            strategy_id="eth_lf_portfolio_v9c_reclaim_priority",
+            entry_engine="BULL_RECLAIM_V2",
+            side="short",
+            status=PositionPlanStatus.ACTIVE,
+            canonical_stop_price=Decimal("1719.40"),
+            master_exchange=ExchangeName.OKX,
+            master_target_qty_base=Decimal("0.282"),
+            master_filled_qty_base=Decimal("0.282"),
+        )
+    )
+    store.upsert_leg(
+        LegPlan(
+            position_id="pos-1",
+            exchange=ExchangeName.OKX,
+            role=LegRole.MASTER,
+            target_qty_base=Decimal("0.282"),
+            filled_qty_base=Decimal("0.282"),
+            sync_status=LegSyncStatus.OPEN,
+        )
+    )

@@ -261,6 +261,36 @@ def test_recovery_stop_same_price_but_oversized_is_replaced():
     assert converted.native_quantity == Decimal("2.82")
 
 
+def test_recovery_active_position_without_exchange_stop_places_new_stop():
+    strategy = Strategy()
+    okx_snapshot = _custom_snapshot(
+        ExchangeName.OKX,
+        positions=[_position(ExchangeName.OKX, PositionSide.BOTH, "-2.82")],
+        open_stop_orders=[],
+    )
+    binance_snapshot = _custom_snapshot(ExchangeName.BINANCE, positions=[])
+
+    signals = asyncio.run(
+        _recover_with_snapshots(
+            strategy,
+            snapshots=(okx_snapshot, binance_snapshot),
+            plans=[_active_plan("0", side="short", stop_price="1719.40", master_qty="0.282")],
+        )
+    )
+
+    place = next(signal for signal in signals if signal.action is SignalAction.PLACE_STOP_LOSS_SHORT)
+    assert place.quantity == Decimal("0.282")
+    assert place.trigger_price == Decimal("1719.40")
+    converted = NativeQuantityConverter().convert_quantity(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        base_quantity=place.quantity,
+        market_profile=get_market_profile("ETH-USDT-PERP"),
+    )
+    assert converted.native_quantity == Decimal("2.82")
+    assert converted.native_quantity != Decimal("28.2")
+
+
 def test_recovery_valid_stop_plus_oversized_bot_stop_replaces_all_bot_stops():
     strategy = Strategy()
     okx_snapshot = _custom_snapshot(
@@ -503,6 +533,32 @@ def test_recovery_follower_missing_does_not_place_follower_stop():
     assert "follower_missing_manual_required:binance" in strategy.recovery_alerts
 
 
+def test_recovery_follower_missing_does_not_close_master_when_stop_missing():
+    strategy = Strategy()
+    okx_snapshot = _custom_snapshot(
+        ExchangeName.OKX,
+        positions=[_position(ExchangeName.OKX, PositionSide.BOTH, "-2.82")],
+        open_stop_orders=[],
+    )
+    binance_snapshot = _custom_snapshot(ExchangeName.BINANCE, positions=[])
+
+    signals = asyncio.run(
+        _recover_with_snapshots(
+            strategy,
+            snapshots=(okx_snapshot, binance_snapshot),
+            plans=[_active_plan("0.233", side="short", stop_price="1719.40", master_qty="0.282")],
+        )
+    )
+
+    assert not any(signal.action is SignalAction.CLOSE_SHORT and signal.metadata.get("target_exchanges") == ["okx"] for signal in signals)
+    assert not any(signal.action is SignalAction.CLOSE_LONG and signal.metadata.get("target_exchanges") == ["okx"] for signal in signals)
+    okx_stop = next(signal for signal in signals if signal.action is SignalAction.PLACE_STOP_LOSS_SHORT and signal.metadata.get("target_exchanges") == ["okx"])
+    assert okx_stop.quantity == Decimal("0.282")
+    assert strategy.position.in_pos is True
+    assert strategy.position.legs["okx"].sync_status == "recovered_master"
+    assert strategy.position.legs["binance"].sync_status == "missing"
+
+
 def test_recovery_follower_missing_bot_stop_with_unknown_stop_is_manual_required_or_precisely_cancelled():
     strategy = Strategy()
     okx_snapshot = _custom_snapshot(
@@ -645,3 +701,14 @@ def test_recovery_active_master_without_plan_remains_manual_required():
     assert strategy.position.in_pos is True
     assert strategy.recovery_manual_required is True
     assert "master_active_plan_unknown_manual_required" in strategy.recovery_alerts
+
+
+def test_recovery_active_master_without_plan_still_manual_required():
+    strategy = Strategy()
+
+    signals = asyncio.run(_recover(strategy, okx_positions=[_position(ExchangeName.OKX, PositionSide.LONG, "12")], binance_positions=[], plans=[]))
+
+    assert signals == []
+    assert strategy.recovery_manual_required is True
+    assert not any(signal.action in {SignalAction.PLACE_STOP_LOSS_LONG, SignalAction.PLACE_STOP_LOSS_SHORT} for signal in signals)
+    assert not any(signal.action in {SignalAction.CLOSE_LONG, SignalAction.CLOSE_SHORT} for signal in signals)
