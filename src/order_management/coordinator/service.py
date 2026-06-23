@@ -11,7 +11,7 @@ from src.order_management.position_plan import LegPlan, LegRole, LegSyncStatus, 
 from src.order_management.ports import ClientOrderIdFactory, DuplicateOrderGuard, OrderIntentRepository
 from src.order_management.quantity import NativeQuantityConverter
 from src.order_management.master_follower import MasterFollowerExecutionPolicy, MasterFollowerPolicyEvaluator
-from src.order_management.safety import ExitSafetyError, ExitSafetyGuard, is_exit_action, target_position_side_for_action
+from src.order_management.safety import ExitSafetyError, ExitSafetyGuard, is_exit_action, normalize_exit_request_for_exchange, target_position_side_for_action
 from src.order_management.sync import OrderStatusSynchronizer, extract_avg_fill_price, extract_fee
 from src.planner import ExecutionPlanner, PlannedExecution, PlannedExecutionAction
 from src.platform.execution import ExecutionClient
@@ -628,7 +628,16 @@ class MultiExchangeOrderCoordinator:
             )
             if report is not None:
                 logger.info("Exit safety approved order | %s", report.as_log_fields())
-            return normalized
+            exchange_normalized = normalize_exit_request_for_exchange(
+                exchange=client.exchange,
+                action=action,
+                request=normalized,
+                position_mode=position_mode,
+                safety_report=report,
+            )
+            if exchange_normalized.metadata:
+                _log_exchange_exit_normalization(exchange_normalized.metadata)
+            return exchange_normalized.request  # type: ignore[return-value]
         return _with_position_side_for_mode(request, action=action, exchange=client.exchange, position_mode=position_mode)
 
     async def _normalize_stop_for_client(self, client: ExecutionClient, action: SignalAction, request: StopMarketOrderRequest) -> StopMarketOrderRequest:
@@ -647,7 +656,16 @@ class MultiExchangeOrderCoordinator:
             )
             if report is not None:
                 logger.info("Exit safety approved stop order | %s", report.as_log_fields())
-            return normalized
+            exchange_normalized = normalize_exit_request_for_exchange(
+                exchange=client.exchange,
+                action=action,
+                request=normalized,
+                position_mode=position_mode,
+                safety_report=report,
+            )
+            if exchange_normalized.metadata:
+                _log_exchange_exit_normalization(exchange_normalized.metadata)
+            return exchange_normalized.request  # type: ignore[return-value]
         return _with_position_side_for_mode(request, action=action, exchange=client.exchange, position_mode=position_mode)
 
     async def _position_mode_for_client(self, client: ExecutionClient) -> PositionMode:
@@ -736,6 +754,32 @@ def _client_market_profile(client: ExecutionClient):
         return client.market_profile
     except Exception:
         return None
+
+
+def _log_exchange_exit_normalization(metadata) -> None:
+    if metadata.get("exchange") == "binance" and metadata.get("position_mode") == "hedge":
+        logger.info(
+            "Binance hedge exit request normalized | "
+            "exchange=%s position_mode=%s action=%s position_side=%s side=%s "
+            "base_quantity=%s current_position_base_quantity=%s "
+            "reduce_only_requested=%s reduce_only_sent=%s "
+            "exit_safety_equivalent_reduce_only=%s "
+            "reduce_only_omitted_reason=%s safety_basis=%s",
+            metadata.get("exchange"),
+            metadata.get("position_mode"),
+            metadata.get("action"),
+            metadata.get("position_side"),
+            metadata.get("side"),
+            metadata.get("base_quantity"),
+            metadata.get("current_position_base_quantity"),
+            metadata.get("reduce_only_requested"),
+            metadata.get("reduce_only_sent"),
+            metadata.get("exit_safety_equivalent_reduce_only"),
+            metadata.get("reduce_only_omitted_reason"),
+            metadata.get("safety_basis"),
+        )
+        return
+    logger.info("Exchange exit request normalized | %s", metadata)
 
 
 async def _client_positions(client: ExecutionClient):

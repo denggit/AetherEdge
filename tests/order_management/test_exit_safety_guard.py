@@ -139,6 +139,7 @@ async def test_binance_hedge_open_short_sets_position_side_short() -> None:
     await _execute_one(client, TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.OPEN_SHORT, quantity=Decimal("0.1")))
 
     assert client.orders[0].position_side is PositionSide.SHORT
+    assert client.orders[0].reduce_only is False
 
 
 @pytest.mark.asyncio
@@ -148,68 +149,87 @@ async def test_binance_hedge_open_long_sets_position_side_long() -> None:
     await _execute_one(client, TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.OPEN_LONG, quantity=Decimal("0.1")))
 
     assert client.orders[0].position_side is PositionSide.LONG
+    assert client.orders[0].reduce_only is False
 
 
 @pytest.mark.asyncio
-async def test_binance_hedge_close_short_sets_position_side_short_reduce_only() -> None:
+async def test_binance_hedge_close_short_is_position_side_short_and_exit_safe(caplog) -> None:
     client = SafetyFakeClient(
         ExchangeName.BINANCE,
         position_mode=PositionMode.HEDGE,
-        positions=(_position(ExchangeName.BINANCE, PositionSide.SHORT, Decimal("-0.2")),),
+        positions=(_position(ExchangeName.BINANCE, PositionSide.SHORT, Decimal("-0.233")),),
     )
 
-    await _execute_one(client, TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.CLOSE_SHORT, quantity=Decimal("0.1")))
+    with caplog.at_level("INFO"):
+        results, _ = await _execute_one(client, TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.CLOSE_SHORT, quantity=Decimal("0.233")))
 
+    assert results[0].ok is True
+    assert client.orders[0].side is OrderSide.BUY
     assert client.orders[0].position_side is PositionSide.SHORT
-    assert client.orders[0].reduce_only is True
+    assert client.orders[0].quantity == Decimal("0.233")
+    assert client.orders[0].reduce_only is False
+    assert "Binance hedge exit request normalized" in caplog.text
+    assert "exit_safety_equivalent_reduce_only=True" in caplog.text
+    assert "reduce_only_omitted_reason=binance_hedge_mode_api_constraint" in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_binance_hedge_close_long_sets_position_side_long_reduce_only() -> None:
+async def test_binance_hedge_close_long_is_position_side_long_and_exit_safe() -> None:
     client = SafetyFakeClient(
         ExchangeName.BINANCE,
         position_mode=PositionMode.HEDGE,
-        positions=(_position(ExchangeName.BINANCE, PositionSide.LONG, Decimal("0.2")),),
+        positions=(_position(ExchangeName.BINANCE, PositionSide.LONG, Decimal("0.233")),),
     )
 
-    await _execute_one(client, TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.CLOSE_LONG, quantity=Decimal("0.1")))
+    results, _ = await _execute_one(client, TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.CLOSE_LONG, quantity=Decimal("0.233")))
 
+    assert results[0].ok is True
+    assert client.orders[0].side is OrderSide.SELL
     assert client.orders[0].position_side is PositionSide.LONG
-    assert client.orders[0].reduce_only is True
+    assert client.orders[0].quantity == Decimal("0.233")
+    assert client.orders[0].reduce_only is False
 
 
 @pytest.mark.asyncio
-async def test_binance_hedge_short_stop_sets_position_side_short_reduce_only() -> None:
+async def test_binance_hedge_short_stop_is_position_side_short_and_exit_safe() -> None:
     client = SafetyFakeClient(
         ExchangeName.BINANCE,
         position_mode=PositionMode.HEDGE,
-        positions=(_position(ExchangeName.BINANCE, PositionSide.SHORT, Decimal("-0.2")),),
+        positions=(_position(ExchangeName.BINANCE, PositionSide.SHORT, Decimal("-0.233")),),
     )
 
-    await _execute_one(
+    results, _ = await _execute_one(
         client,
-        TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.PLACE_STOP_LOSS_SHORT, quantity=Decimal("0.1"), trigger_price=Decimal("2100")),
+        TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.PLACE_STOP_LOSS_SHORT, quantity=Decimal("0.233"), trigger_price=Decimal("2100")),
     )
 
+    assert results[0].ok is True
+    assert client.stop_orders[0].side is OrderSide.BUY
     assert client.stop_orders[0].position_side is PositionSide.SHORT
-    assert client.stop_orders[0].reduce_only is True or client.stop_orders[0].close_position is True
+    assert client.stop_orders[0].close_position is True
+    assert client.stop_orders[0].quantity is None
+    assert client.stop_orders[0].reduce_only is False
 
 
 @pytest.mark.asyncio
-async def test_binance_hedge_long_stop_sets_position_side_long_reduce_only() -> None:
+async def test_binance_hedge_long_stop_is_position_side_long_and_exit_safe() -> None:
     client = SafetyFakeClient(
         ExchangeName.BINANCE,
         position_mode=PositionMode.HEDGE,
-        positions=(_position(ExchangeName.BINANCE, PositionSide.LONG, Decimal("0.2")),),
+        positions=(_position(ExchangeName.BINANCE, PositionSide.LONG, Decimal("0.233")),),
     )
 
-    await _execute_one(
+    results, _ = await _execute_one(
         client,
-        TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.PLACE_STOP_LOSS_LONG, quantity=Decimal("0.1"), trigger_price=Decimal("1900")),
+        TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.PLACE_STOP_LOSS_LONG, quantity=Decimal("0.233"), trigger_price=Decimal("1900")),
     )
 
+    assert results[0].ok is True
+    assert client.stop_orders[0].side is OrderSide.SELL
     assert client.stop_orders[0].position_side is PositionSide.LONG
-    assert client.stop_orders[0].reduce_only is True or client.stop_orders[0].close_position is True
+    assert client.stop_orders[0].close_position is True
+    assert client.stop_orders[0].quantity is None
+    assert client.stop_orders[0].reduce_only is False
 
 
 @pytest.mark.asyncio
@@ -333,6 +353,71 @@ async def test_stop_quantity_exceeding_position_is_blocked_before_exchange_submi
     assert any(event.message == "critical_exit_safety_rejected" and event.metadata["severity"] == "CRITICAL" for event in repo.events)
 
 
+@pytest.mark.asyncio
+async def test_binance_hedge_close_short_quantity_exceeding_position_is_rejected() -> None:
+    client = SafetyFakeClient(
+        ExchangeName.BINANCE,
+        position_mode=PositionMode.HEDGE,
+        positions=(_position(ExchangeName.BINANCE, PositionSide.SHORT, Decimal("-0.233")),),
+    )
+
+    results, _ = await _execute_one(
+        client,
+        TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.CLOSE_SHORT, quantity=Decimal("2.33")),
+    )
+
+    assert results[0].ok is False
+    assert "exit_order_quantity_exceeding_position" in (results[0].error or "")
+    assert client.orders == []
+
+
+@pytest.mark.asyncio
+async def test_binance_hedge_short_stop_without_short_position_is_rejected() -> None:
+    client = SafetyFakeClient(
+        ExchangeName.BINANCE,
+        position_mode=PositionMode.HEDGE,
+        positions=(),
+    )
+
+    results, _ = await _execute_one(
+        client,
+        TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.PLACE_STOP_LOSS_SHORT, quantity=Decimal("0.233"), trigger_price=Decimal("2100")),
+    )
+
+    assert results[0].ok is False
+    assert "stop_order_without_existing_position" in (results[0].error or "")
+    assert client.stop_orders == []
+
+
+@pytest.mark.asyncio
+async def test_okx_exit_still_sends_reduce_only_when_supported() -> None:
+    close_client = SafetyFakeClient(
+        ExchangeName.OKX,
+        position_mode=PositionMode.HEDGE,
+        positions=(_position(ExchangeName.OKX, PositionSide.LONG, Decimal("2")),),
+    )
+    stop_client = SafetyFakeClient(
+        ExchangeName.OKX,
+        position_mode=PositionMode.HEDGE,
+        positions=(_position(ExchangeName.OKX, PositionSide.LONG, Decimal("2")),),
+    )
+
+    close_results, _ = await _execute_one(close_client, TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.CLOSE_LONG, quantity=Decimal("0.2")))
+    stop_results, _ = await _execute_one(
+        stop_client,
+        TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.PLACE_STOP_LOSS_LONG, quantity=Decimal("0.2"), trigger_price=Decimal("1900")),
+    )
+
+    assert close_results[0].ok is True
+    assert close_client.orders[0].position_side is PositionSide.LONG
+    assert close_client.orders[0].reduce_only is True
+    assert close_client.orders[0].quantity == Decimal("2")
+    assert stop_results[0].ok is True
+    assert stop_client.stop_orders[0].position_side is PositionSide.LONG
+    assert stop_client.stop_orders[0].reduce_only is True
+    assert stop_client.stop_orders[0].quantity == Decimal("2")
+
+
 def test_exit_order_without_reduce_only_or_close_position_is_rejected() -> None:
     guard = ExitSafetyGuard()
 
@@ -438,7 +523,7 @@ def test_binance_hedge_short_take_profit_sets_position_side_short_reduce_only() 
 
 
 @pytest.mark.asyncio
-async def test_follower_entry_failure_never_closes_master(tmp_path) -> None:
+async def test_follower_entry_failure_still_never_closes_master_after_binance_hedge_reduce_only_patch(tmp_path) -> None:
     repo = MemoryOrderJournal()
     plan_store = SqlitePositionPlanStore(tmp_path / "plans.sqlite3")
     okx = SafetyFakeClient(ExchangeName.OKX, position_mode=PositionMode.ONE_WAY)

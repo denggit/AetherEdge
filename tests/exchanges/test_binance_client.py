@@ -9,6 +9,7 @@ from src.platform.exchanges import (
     OrderSide,
     OrderStatus,
     OrderType,
+    PositionSide,
     create_exchange_client,
 )
 
@@ -101,6 +102,112 @@ def test_binance_place_and_cancel_order_use_same_business_request_model():
     assert http.calls[0]["headers"]["X-MBX-APIKEY"] == "key"
     assert order.status is OrderStatus.NEW
     assert canceled.status is OrderStatus.CANCELED
+
+
+def test_binance_hedge_open_short_sets_position_side_short_without_reduce_only():
+    http = FakeHttpClient(
+        [
+            {
+                "orderId": 124,
+                "clientOrderId": "open-short",
+                "status": "NEW",
+                "side": "SELL",
+                "type": "MARKET",
+                "origQty": "0.233",
+                "executedQty": "0",
+            },
+        ]
+    )
+    client = create_exchange_client("binance", ExchangeConfig(api_key="key", api_secret="secret"), http_client=http)
+
+    asyncio.run(
+        client.place_order(
+            OrderRequest(
+                symbol="ETH-USDT-PERP",
+                side=OrderSide.SELL,
+                order_type=OrderType.MARKET,
+                quantity=Decimal("0.233"),
+                client_order_id="open-short",
+                position_side=PositionSide.SHORT,
+            )
+        )
+    )
+
+    params = http.calls[0]["params"]
+    assert params["side"] == "SELL"
+    assert params["positionSide"] == "SHORT"
+    assert "reduceOnly" not in params
+
+
+def test_binance_hedge_open_long_sets_position_side_long_without_reduce_only():
+    http = FakeHttpClient(
+        [
+            {
+                "orderId": 125,
+                "clientOrderId": "open-long",
+                "status": "NEW",
+                "side": "BUY",
+                "type": "MARKET",
+                "origQty": "0.233",
+                "executedQty": "0",
+            },
+        ]
+    )
+    client = create_exchange_client("binance", ExchangeConfig(api_key="key", api_secret="secret"), http_client=http)
+
+    asyncio.run(
+        client.place_order(
+            OrderRequest(
+                symbol="ETH-USDT-PERP",
+                side=OrderSide.BUY,
+                order_type=OrderType.MARKET,
+                quantity=Decimal("0.233"),
+                client_order_id="open-long",
+                position_side=PositionSide.LONG,
+            )
+        )
+    )
+
+    params = http.calls[0]["params"]
+    assert params["side"] == "BUY"
+    assert params["positionSide"] == "LONG"
+    assert "reduceOnly" not in params
+
+
+def test_binance_hedge_close_short_omits_reduce_only_when_safety_adapter_disabled_it():
+    http = FakeHttpClient(
+        [
+            {
+                "orderId": 126,
+                "clientOrderId": "close-short",
+                "status": "NEW",
+                "side": "BUY",
+                "type": "MARKET",
+                "origQty": "0.233",
+                "executedQty": "0",
+            },
+        ]
+    )
+    client = create_exchange_client("binance", ExchangeConfig(api_key="key", api_secret="secret"), http_client=http)
+
+    asyncio.run(
+        client.place_order(
+            OrderRequest(
+                symbol="ETH-USDT-PERP",
+                side=OrderSide.BUY,
+                order_type=OrderType.MARKET,
+                quantity=Decimal("0.233"),
+                client_order_id="close-short",
+                reduce_only=False,
+                position_side=PositionSide.SHORT,
+            )
+        )
+    )
+
+    params = http.calls[0]["params"]
+    assert params["side"] == "BUY"
+    assert params["positionSide"] == "SHORT"
+    assert "reduceOnly" not in params
 
 
 def test_binance_account_queries_use_usdm_v3_endpoints():

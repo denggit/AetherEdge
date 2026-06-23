@@ -1,7 +1,7 @@
 import asyncio
 from decimal import Decimal
 
-from src.platform import ExchangeConfig, OrderSide, OrderStatus, StopMarketOrderRequest, TriggerPriceType, create_exchange_client
+from src.platform import ExchangeConfig, OrderSide, OrderStatus, PositionSide, StopMarketOrderRequest, TriggerPriceType, create_exchange_client
 
 
 class FakeHttpClient:
@@ -103,4 +103,41 @@ def test_binance_close_position_stop_omits_quantity_and_reduce_only():
     params = http.calls[0]["params"]
     assert params["closePosition"] == "true"
     assert "quantity" not in params
+    assert "reduceOnly" not in params
+
+
+def test_binance_hedge_short_stop_quantity_mode_omits_reduce_only_when_safety_adapter_disabled_it():
+    http = FakeHttpClient(
+        [
+            {
+                "algoId": 789,
+                "clientAlgoId": "sl-short",
+                "algoStatus": "NEW",
+                "side": "BUY",
+                "type": "STOP_MARKET",
+                "triggerPrice": "2100",
+                "quantity": "0.233",
+            }
+        ]
+    )
+    client = create_exchange_client("binance", ExchangeConfig(api_key="k", api_secret="s"), http_client=http)
+
+    asyncio.run(
+        client.place_stop_market_order(
+            StopMarketOrderRequest(
+                symbol="ETH-USDT-PERP",
+                side=OrderSide.BUY,
+                quantity=Decimal("0.233"),
+                trigger_price=Decimal("2100"),
+                client_order_id="sl-short",
+                reduce_only=False,
+                position_side=PositionSide.SHORT,
+            )
+        )
+    )
+
+    params = http.calls[0]["params"]
+    assert params["side"] == "BUY"
+    assert params["positionSide"] == "SHORT"
+    assert params["quantity"] == "0.233"
     assert "reduceOnly" not in params

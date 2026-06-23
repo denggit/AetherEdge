@@ -86,6 +86,12 @@ class ExitSafetyReport:
         }
 
 
+@dataclass(frozen=True)
+class ExchangeExitNormalization:
+    request: OrderRequest | StopMarketOrderRequest
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
 class ExitSafetyGuard:
     def __init__(
         self,
@@ -365,6 +371,89 @@ def target_position_side_for_action(action: SignalAction | str) -> PositionSide 
     if value in _SHORT_EXIT_ACTIONS or value == "open_short":
         return PositionSide.SHORT
     return None
+
+
+def normalize_exit_request_for_exchange(
+    *,
+    exchange: ExchangeName | str,
+    action: SignalAction | str,
+    request: OrderRequest | StopMarketOrderRequest,
+    position_mode: PositionMode,
+    safety_report: ExitSafetyReport | None,
+) -> ExchangeExitNormalization:
+    exchange_name = _exchange_name(exchange)
+    action_value = _action_value(action)
+    if exchange_name.value != "binance" or position_mode is not PositionMode.HEDGE or not is_exit_action(action_value):
+        return ExchangeExitNormalization(request=request)
+    if safety_report is None:
+        raise ExitSafetyError(
+            "exit_safety_report_required_for_binance_hedge_exit",
+            metadata={
+                "exchange": exchange_name.value,
+                "symbol": request.symbol,
+                "action": action_value,
+                "position_mode": position_mode.value,
+            },
+        )
+    if request.position_side not in {PositionSide.LONG, PositionSide.SHORT}:
+        raise ExitSafetyError(
+            "exit_order_position_side_unknown",
+            metadata={
+                "exchange": exchange_name.value,
+                "symbol": request.symbol,
+                "action": action_value,
+                "side": request.side.value,
+                "position_side": None if request.position_side is None else request.position_side.value,
+                "position_mode": position_mode.value,
+            },
+        )
+    if safety_report.base_quantity is not None and safety_report.base_quantity > safety_report.current_position_base_quantity:
+        raise ExitSafetyError(
+            _exceeds_reason(action_value),
+            metadata={
+                "exchange": exchange_name.value,
+                "symbol": request.symbol,
+                "action": action_value,
+                "side": request.side.value,
+                "base_quantity": str(safety_report.base_quantity),
+                "current_position_base_quantity": str(safety_report.current_position_base_quantity),
+                "position_side": request.position_side.value,
+                "position_mode": position_mode.value,
+            },
+        )
+
+    metadata = {
+        "exchange": exchange_name.value,
+        "position_mode": position_mode.value,
+        "action": action_value,
+        "position_side": request.position_side.value,
+        "side": request.side.value,
+        "base_quantity": _decimal_or_none(safety_report.base_quantity),
+        "current_position_base_quantity": _decimal_text(safety_report.current_position_base_quantity),
+        "reduce_only_requested": getattr(request, "reduce_only", False),
+        "reduce_only_sent": False,
+        "exit_safety_equivalent_reduce_only": True,
+        "reduce_only_omitted_reason": "binance_hedge_mode_api_constraint",
+        "safety_basis": "hedge_position_side_plus_local_quantity_guard",
+    }
+    if isinstance(request, StopMarketOrderRequest):
+        use_close_position = (
+            safety_report.base_quantity is not None
+            and safety_report.base_quantity >= safety_report.current_position_base_quantity
+        )
+        if use_close_position:
+            return ExchangeExitNormalization(
+                request=replace(request, quantity=None, reduce_only=False, close_position=True),
+                metadata={**metadata, "close_position_sent": True, "quantity_sent": False},
+            )
+        return ExchangeExitNormalization(
+            request=replace(request, reduce_only=False, close_position=False),
+            metadata={**metadata, "close_position_sent": False, "quantity_sent": request.quantity is not None},
+        )
+    return ExchangeExitNormalization(
+        request=replace(request, reduce_only=False),
+        metadata={**metadata, "close_position_sent": False, "quantity_sent": True},
+    )
 
 
 def _request_position_side(
