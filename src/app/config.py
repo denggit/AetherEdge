@@ -46,7 +46,7 @@ class AppConfig:
             strategy=strategy,
             data_streams=data_streams,
             state_db_path=env.get("AETHER_STATE_DB", str(defaults.get("state_db_path", "data/state/aether_state.sqlite3"))),
-            market_queue_maxsize=int(env.get("AETHER_MARKET_QUEUE_MAXSIZE", defaults.get("market_queue_maxsize", 1000))),
+            market_queue_maxsize=int(env.get("AETHER_MARKET_QUEUE_MAXSIZE", defaults.get("market_queue_maxsize", 50000))),
             signal_queue_maxsize=int(env.get("AETHER_SIGNAL_QUEUE_MAXSIZE", defaults.get("signal_queue_maxsize", 200))),
             alert_queue_maxsize=int(env.get("AETHER_ALERT_QUEUE_MAXSIZE", defaults.get("alert_queue_maxsize", 100))),
             dry_run=_bool(env.get("AETHER_DRY_RUN", defaults.get("dry_run", True))),

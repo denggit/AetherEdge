@@ -106,6 +106,8 @@ class PendingEntryPlan:
 class Strategy:
     """AetherEdge live plugin for ETH LF Portfolio V9C reclaim-first routing."""
 
+    raw_trade_callbacks_enabled = False
+
     def __init__(self, config_path: str | Path | None = None) -> None:
         self.config = V8Config.from_file(config_path or DEFAULT_CONFIG_PATH)
         self.buffer = V8FeatureBuffer()

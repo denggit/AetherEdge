@@ -19,7 +19,7 @@ from src.market_data.models import MarketDataSet, RangeBar, RangeBarAggregate, T
 from src.market_data.storage import SqliteTradeStore
 from src.market_data.warmup.current_rangebar import CurrentRangeBarWarmupResult
 from src.platform import Balance, ExchangeName, LeverageInfo, Order, OrderStatus, PositionMode
-from src.platform.data.models import MarketKline, MarketTrade, TradeSide
+from src.platform.data.models import MarketKline, MarketTicker, MarketTrade, TradeSide
 from src.platform.markets import get_market_profile
 from src.platform.snapshot import PlatformSnapshot
 from src.order_management import OrderIntent, OrderIntentStatus, SqliteOrderJournalStore, SqlitePositionPlanStore
@@ -270,6 +270,29 @@ def _runner(strategy, *, data=None, services=None, dry_run=False, data_streams=(
     if data_streams or "range_bar_builder" in resolved_services or "range_bar_store" in resolved_services:
         resolved_services.setdefault("runtime_requirements", _feature_requirements())
     return LiveRuntimeRunner(app_config=cfg, app_context=context, runtime_config=runtime_config, services=resolved_services)
+
+
+def _trade(*, trade_time_ms: int = 1_000) -> MarketTrade:
+    return MarketTrade(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP",
+        price=Decimal("100"),
+        quantity=Decimal("1"),
+        side=TradeSide.BUY,
+        trade_time_ms=trade_time_ms,
+    )
+
+
+class CountingTradeStrategy(FeatureStrategy):
+    def __init__(self, *, strategy_id: str) -> None:
+        super().__init__()
+        self.config = type("Cfg", (), {"strategy_id": strategy_id})()
+        self.trade_calls = 0
+
+    async def on_trade(self, trade):
+        self.trade_calls += 1
+        return []
 
 
 def _decision_audit(
@@ -2397,3 +2420,177 @@ def test_runner_has_no_startup_catchup_dedupe_todo():
     text = Path("src/runtime/runner.py").read_text(encoding="utf-8")
     assert "TODO: also check OrderJournal" not in text
     assert "TODO: also check OrderJournal / PositionPlan / StateStore for dedup" not in text
+
+
+@pytest.mark.asyncio
+async def test_market_queue_backlog_logs_warning_without_alert_or_drop(caplog):
+    strategy = FeatureStrategy()
+    runner = _runner(strategy, dry_run=True)
+    runner._market_queue = asyncio.Queue(maxsize=50000)
+
+    for i in range(501):
+        runner._market_queue.put_nowait(_trade(trade_time_ms=i))
+
+    caplog.set_level(logging.WARNING)
+    await runner._enqueue_market_event(_trade(trade_time_ms=10_000))
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "Market queue backlog high" in messages
+    assert runner.stats.market_events_dropped == 0
+    alerts = list(runner.context.alerts._queue._queue)  # noqa: SLF001
+    assert all(alert.subject != "AetherEdge market queue full" for alert in alerts)
+
+
+@pytest.mark.asyncio
+async def test_market_queue_full_drops_only_when_maxsize_reached():
+    strategy = FeatureStrategy()
+    runner = _runner(strategy, dry_run=True)
+    runner._market_queue = asyncio.Queue(maxsize=2)
+    runner._market_queue.put_nowait(_trade(trade_time_ms=1))
+    runner._market_queue.put_nowait(_trade(trade_time_ms=2))
+
+    await runner._enqueue_market_event(_trade(trade_time_ms=3))
+
+    assert runner.stats.market_events_dropped == 1
+    alert = runner.context.alerts._queue.get_nowait()  # noqa: SLF001
+    assert alert.subject == "AetherEdge market queue full"
+    assert "dropped_total=1" in alert.content
+    assert "pid=" in alert.content
+    assert "runtime_id=" in alert.content
+
+
+@pytest.mark.asyncio
+async def test_market_queue_full_trade_marks_range_context_degraded():
+    strategy = FeatureStrategy()
+    runner = _runner(strategy, dry_run=True)
+    runner._market_queue = asyncio.Queue(maxsize=2)
+    runner._market_queue.put_nowait(_trade(trade_time_ms=2 * H4 + 1))
+    runner._market_queue.put_nowait(_trade(trade_time_ms=2 * H4 + 2))
+
+    await runner._enqueue_market_event(_trade(trade_time_ms=2 * H4 + 3))
+
+    assert runner._range_context_degraded_buckets[2 * H4] == "market_queue_dropped_trade"
+
+
+@pytest.mark.asyncio
+async def test_degraded_range_bucket_still_allows_closed_kline_decision():
+    strategy = FeatureStrategy()
+    runner = _runner(
+        strategy,
+        data=FakeData(),
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": _feature_requirements(),
+            "range_bar_store": MemoryRangeBarStore(),
+            "range_bar_builder": RangeBarBuilder(range_pct=Decimal("0.002"), contract_value=Decimal("0.1")),
+            "range_bar_aggregator": RangeBarAggregator(),
+        },
+        dry_run=True,
+    )
+    runner._range_context_degraded_buckets[2 * H4] = "market_queue_dropped_trade"
+
+    events = await runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
+
+    assert [event.type_value for event in events] == ["closed_kline", "range_aggregate"]
+    assert events[1].data["context_available"] is False
+    assert events[1].data["incomplete"] is True
+    assert events[1].data["reason"] == "market_queue_dropped_trade"
+    assert not any(
+        event.type_value == "range_aggregate" and event.data.get("context_available", True) is True
+        for event in events
+    )
+    assert "closed_kline" in strategy.events
+
+
+@pytest.mark.asyncio
+async def test_v9c_trade_event_is_range_only_and_skips_on_trade_callback(monkeypatch):
+    strategy = CountingTradeStrategy(strategy_id="eth_lf_portfolio_v9c_reclaim_priority")
+    runner = _runner(strategy, dry_run=True)
+    processed_trades = []
+
+    async def fake_process_trade(event):
+        processed_trades.append(event)
+
+    monkeypatch.setattr(runner, "_process_trade", fake_process_trade)
+
+    await runner.process_market_event(_trade())
+
+    assert len(processed_trades) == 1
+    assert strategy.trade_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_non_v9c_trade_event_still_calls_on_trade_callback(monkeypatch):
+    strategy = CountingTradeStrategy(strategy_id="other_strategy")
+    runner = _runner(strategy, dry_run=True)
+    processed_trades = []
+
+    async def fake_process_trade(event):
+        processed_trades.append(event)
+
+    monkeypatch.setattr(runner, "_process_trade", fake_process_trade)
+
+    await runner.process_market_event(_trade())
+
+    assert len(processed_trades) == 1
+    assert strategy.trade_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_trade_health_update_is_throttled(monkeypatch):
+    strategy = FeatureStrategy()
+    runner = _runner(strategy, dry_run=True)
+    health_calls = []
+
+    def fake_set_health(*args, **kwargs):
+        health_calls.append((args, kwargs))
+
+    monkeypatch.setattr(runner, "_set_health", fake_set_health)
+
+    await runner.process_market_event(_trade(trade_time_ms=1))
+    await runner.process_market_event(_trade(trade_time_ms=2))
+    await runner.process_market_event(_trade(trade_time_ms=3))
+
+    trade_health_calls = len(health_calls)
+    assert trade_health_calls == 1
+
+    await runner.process_market_event(
+        MarketTicker(
+            exchange=ExchangeName.OKX,
+            symbol="ETH-USDT-PERP",
+            raw_symbol="ETH-USDT-SWAP",
+            price=Decimal("100"),
+            time_ms=4,
+        )
+    )
+
+    assert len(health_calls) == trade_health_calls + 1
+
+
+@pytest.mark.asyncio
+async def test_market_consumer_drains_batch(monkeypatch):
+    strategy = FeatureStrategy()
+    runner = _runner(strategy, dry_run=True)
+    runner._market_queue_drain_batch_size = 10
+    for i in range(3):
+        runner._market_queue.put_nowait(_trade(trade_time_ms=i))
+    processed = []
+    producer_health_checks = 0
+
+    async def fake_process_market_event(event):
+        processed.append(event)
+        runner.stats.market_events_seen += 1
+
+    def fake_raise_on_unhealthy_producer():
+        nonlocal producer_health_checks
+        producer_health_checks += 1
+
+    monkeypatch.setattr(runner, "process_market_event", fake_process_market_event)
+    monkeypatch.setattr(runner, "_raise_on_unhealthy_producer", fake_raise_on_unhealthy_producer)
+
+    await runner._consume_market_events(max_market_events=3)
+
+    assert len(processed) == 3
+    assert producer_health_checks == 1
+    assert runner._market_queue.empty()

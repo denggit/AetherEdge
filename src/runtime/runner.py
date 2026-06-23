@@ -165,7 +165,15 @@ class LiveRuntimeRunner:
         )
         self._last_snapshot: PlatformSnapshot | None = self.services.get("snapshot")
         self._last_snapshots: tuple[PlatformSnapshot, ...] = ()
+        self._last_market_queue_full_log_ms = 0
         self._last_market_queue_full_alert_ms = 0
+        self._last_market_queue_backlog_log_ms = 0
+        self._market_queue_backlog_warn_threshold = int(
+            os.getenv("AETHER_MARKET_QUEUE_BACKLOG_WARN_THRESHOLD", "500")
+        )
+        self._market_queue_drain_batch_size = int(os.getenv("AETHER_MARKET_QUEUE_DRAIN_BATCH_SIZE", "1000"))
+        self._last_trade_health_update_ms = 0
+        self._range_context_degraded_buckets: dict[int, str] = {}
         self._follower_close_alert_last_ms: dict[str, int] = {}
         self._health = RuntimeHealth(
             phase=RuntimePhase.CREATED,
@@ -222,19 +230,33 @@ class LiveRuntimeRunner:
 
     async def process_market_event(self, event: MarketEvent) -> None:
         self.stats.market_events_seen += 1
+        is_trade = isinstance(event, MarketTrade) or event.event_type is MarketEventType.TRADE
+        event_ms = _event_time_ms(event)
         hb = getattr(self, "_heartbeat_service", None)
         if hb is not None:
-            hb.note_market_event(_event_time_ms(event))
-        self._set_health(
-            RuntimePhase.RUNNING,
-            healthy=self._health.healthy,
-            last_market_event_time_ms=_event_time_ms(event),
-            metadata={**dict(self._health.metadata), "last_event_type": event.event_type.value},
-        )
-        if isinstance(event, MarketTrade) or event.event_type is MarketEventType.TRADE:
+            hb.note_market_event(event_ms)
+
+        should_update_health = True
+        if is_trade:
+            now_ms = int(time.time() * 1000)
+            should_update_health = now_ms - self._last_trade_health_update_ms >= 1000
+            if should_update_health:
+                self._last_trade_health_update_ms = now_ms
+
+        if should_update_health:
+            self._set_health(
+                RuntimePhase.RUNNING,
+                healthy=self._health.healthy,
+                last_market_event_time_ms=event_ms,
+                metadata={**dict(self._health.metadata), "last_event_type": event.event_type.value},
+            )
+
+        if is_trade:
             await self._process_trade(event)  # type: ignore[arg-type]
+            if self._trade_events_are_range_only():
+                return
         signals = await self._call_strategy_market_event(event)
-        await self._execute_signals(signals, source=event.event_type.value, event_time_ms=_event_time_ms(event))
+        await self._execute_signals(signals, source=event.event_type.value, event_time_ms=event_ms)
 
     async def process_market_feature(self, event: MarketFeatureEvent) -> None:
         self.stats.feature_events_seen += 1
@@ -331,6 +353,22 @@ class LiveRuntimeRunner:
         # avoids silently missing trades if startup/backfill took several
         # seconds or the process restarted mid-bucket.
         if self.requirements.range_bars.enabled and self.requirements.trades.enabled:
+            if open_time_ms in self._range_context_degraded_buckets:
+                reason = self._range_context_degraded_buckets.get(open_time_ms, "range_context_degraded")
+                unavailable = range_aggregate_unavailable_feature(
+                    symbol=self.app_config.symbol,
+                    exchange=self.app_config.data_exchange,
+                    timeframe=self._range_aggregate_interval,
+                    range_pct=self._range_pct,
+                    bucket_start_ms=open_time_ms,
+                    bucket_end_ms=open_time_ms + self._closed_bar_interval_ms - 1,
+                    reference_price=closed_rows[-1].close,
+                    reason=reason,
+                )
+                await self.process_market_feature(unavailable)
+                features.append(unavailable)
+                self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_rows[-1])
+                return features
             if self._rangebar_trust_start_bucket_ms is not None and open_time_ms < self._rangebar_trust_start_bucket_ms:
                 # self.context.alerts.emit(
                 #     AppAlert(
@@ -1313,9 +1351,11 @@ class LiveRuntimeRunner:
         return False
 
     async def _enqueue_market_event(self, event: MarketEvent) -> None:
+        self._maybe_log_market_queue_backlog(event=event)
         if self._market_queue.full():
             self.stats.market_events_dropped += 1
             self._emit_market_queue_full_alert(event)
+            self._mark_range_context_degraded_for_event(event, reason="market_queue_dropped_trade")
             try:
                 self._market_queue.get_nowait()
                 self._market_queue.task_done()
@@ -1323,27 +1363,71 @@ class LiveRuntimeRunner:
                 pass
         await self._market_queue.put(event)
 
+    def _maybe_log_market_queue_backlog(self, *, event: MarketEvent) -> None:
+        qsize = self._market_queue.qsize()
+        threshold = self._market_queue_backlog_warn_threshold
+        if qsize < threshold:
+            return
+
+        now_ms = int(time.time() * 1000)
+        if now_ms - self._last_market_queue_backlog_log_ms < 60_000:
+            return
+
+        self._last_market_queue_backlog_log_ms = now_ms
+        logger.warning(
+            "Market queue backlog high | incoming_event_type=%s queue_size=%s threshold=%s maxsize=%s dropped_total=%s",
+            event.event_type.value,
+            qsize,
+            threshold,
+            self._market_queue.maxsize,
+            self.stats.market_events_dropped,
+        )
+
+    def _mark_range_context_degraded_for_event(self, event: MarketEvent, *, reason: str) -> None:
+        if not isinstance(event, MarketTrade) and event.event_type is not MarketEventType.TRADE:
+            return
+
+        event_ms = _event_time_ms(event)
+        if event_ms is None:
+            event_ms = int(time.time() * 1000)
+
+        bucket_start = (event_ms // self._closed_bar_interval_ms) * self._closed_bar_interval_ms
+        if bucket_start not in self._range_context_degraded_buckets:
+            self._range_context_degraded_buckets[bucket_start] = reason
+            logger.warning(
+                "Range context degraded | reason=%s bucket_start_ms=%s event_time_ms=%s dropped_total=%s",
+                reason,
+                bucket_start,
+                event_ms,
+                self.stats.market_events_dropped,
+            )
+
     def _emit_market_queue_full_alert(self, event: MarketEvent) -> None:
         now_ms = int(time.time() * 1000)
         # Avoid flooding email/alert sinks during a burst, but never drop market
         # data silently.  The closed-bar catch-up path can repair range bars,
         # while this alert tells operators the live stream fell behind.
-        if now_ms - self._last_market_queue_full_alert_ms < 60_000:
+        if now_ms - self._last_market_queue_full_log_ms >= 60_000:
+            self._last_market_queue_full_log_ms = now_ms
+            logger.warning(
+                "Market queue full; dropped oldest event | incoming_event_type=%s queue_size=%s maxsize=%s dropped_total=%s",
+                event.event_type.value,
+                self._market_queue.qsize(),
+                self._market_queue.maxsize,
+                self.stats.market_events_dropped,
+            )
+        if now_ms - self._last_market_queue_full_alert_ms < 300_000:
             return
         self._last_market_queue_full_alert_ms = now_ms
-        logger.warning(
-            "Market queue full; dropped oldest event | incoming_event_type=%s queue_size=%s maxsize=%s dropped_total=%s",
-            event.event_type.value,
-            self._market_queue.qsize(),
-            self._market_queue.maxsize,
-            self.stats.market_events_dropped,
-        )
         self.context.alerts.emit(
             AppAlert(
                 subject="AetherEdge market queue full",
                 content=(
                     f"Dropped oldest market event before enqueueing {event.event_type.value}; "
-                    f"queue_size={self._market_queue.qsize()} maxsize={self._market_queue.maxsize}"
+                    f"queue_size={self._market_queue.qsize()} maxsize={self._market_queue.maxsize}\n"
+                    f"pid={os.getpid()}\n"
+                    f"runtime_id={self.app_config.strategy}::{self.app_config.symbol}\n"
+                    f"dropped_total={self.stats.market_events_dropped}\n"
                 ),
                 severity="error",
             )
@@ -1373,10 +1457,20 @@ class LiveRuntimeRunner:
                 event = await asyncio.wait_for(self._market_queue.get(), timeout=max(self.runtime_config.scheduler_poll_seconds, 0.05))
             except asyncio.TimeoutError:
                 continue
-            try:
-                await self.process_market_event(event)
-            finally:
-                self._market_queue.task_done()
+            events = [event]
+            remaining_capacity = self._market_queue_drain_batch_size - 1
+            if max_market_events is not None:
+                remaining_capacity = min(remaining_capacity, max(0, max_market_events - self.stats.market_events_seen - 1))
+            for _ in range(max(0, remaining_capacity)):
+                try:
+                    events.append(self._market_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            for event in events:
+                try:
+                    await self.process_market_event(event)
+                finally:
+                    self._market_queue.task_done()
             if max_market_events is not None and self.stats.market_events_seen >= max_market_events:
                 break
 
@@ -1408,6 +1502,19 @@ class LiveRuntimeRunner:
         if not callable(handler):
             return ()
         return await handler(event) or ()
+
+    def _trade_events_are_range_only(self) -> bool:
+        strategy = self.context.strategy
+        raw_flag = getattr(strategy, "raw_trade_callbacks_enabled", None)
+        if raw_flag is False:
+            return True
+
+        cfg = getattr(strategy, "config", None)
+        strategy_id = getattr(cfg, "strategy_id", "")
+        if str(strategy_id).lower().startswith("eth_lf_portfolio_v9c"):
+            return True
+
+        return False
 
     async def _execute_signals(
         self,
@@ -1889,7 +1996,6 @@ class LiveRuntimeRunner:
         error: str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> None:
-        self._last_market_queue_full_alert_ms = 0
         self._health = RuntimeHealth(
             phase=phase,
             healthy=self._health.healthy if healthy is None else healthy,
