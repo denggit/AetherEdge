@@ -28,6 +28,7 @@ REPLAY_AUDIT_FILENAME = "aetheredge_v9c_replay_signal_audit.csv"
 MISMATCH_FILENAME = "signal_mismatches.csv"
 SUMMARY_FILENAME = "parity_summary.json"
 FINGERPRINT_FILENAME = "fingerprint.json"
+MISMATCH_CONTEXT_FILENAME = "signal_mismatch_context.csv"
 
 REQUIRED_COLUMNS = [
     "timestamp",
@@ -57,25 +58,41 @@ REQUIRED_COLUMNS = [
     "rf_taker_buy_ratio",
 ]
 
-AUDIT_COLUMNS = list(REQUIRED_COLUMNS)
+REPLAY_DIAGNOSTIC_COLUMNS = [
+    "atr",
+    "atr_pct",
+    "adx",
+    "momentum_long_exit_channel",
+    "momentum_short_exit_channel",
+    "bear_short_exit_channel",
+    "bull_long_exit_channel",
+]
 
-STRICT_COMPARE_FIELDS = [
+AUDIT_COLUMNS = list(REQUIRED_COLUMNS) + REPLAY_DIAGNOSTIC_COLUMNS
+
+ACTION_CRITICAL_FIELDS = [
     "signal",
     "selected_engine",
     "selected_priority",
     "momentum_signal",
     "bear_signal",
     "bull_signal",
+]
+
+SIGNAL_SCOPED_STRICT_FIELDS = [
     "micro_context_available",
     "micro_aligned",
     "micro_contra",
     "micro_filter_action",
 ]
 
-FLOAT_COMPARE_FIELDS = [
+SIGNAL_SCOPED_FLOAT_FIELDS = [
     "risk_mult",
     "quality_mult",
     "micro_entry_risk_scale",
+]
+
+DIAGNOSTIC_FLOAT_FIELDS = [
     "rf_bar_count",
     "rf_micro_return_pct",
     "rf_close_pos",
@@ -99,12 +116,46 @@ def configure_logging(*, verbose: bool = True) -> None:
 class CompareResult:
     mismatches: pd.DataFrame
     mismatch_fields: dict[str, int]
+    action_critical_mismatch_fields: dict[str, int]
+    signal_scoped_mismatch_fields: dict[str, int]
+    diagnostic_mismatch_fields: dict[str, int]
     joined_rows: int
     compared_rows: int
 
     @property
     def mismatch_count(self) -> int:
         return int(len(self.mismatches))
+
+    @property
+    def action_critical_mismatch_count(self) -> int:
+        return _sum_counts(self.action_critical_mismatch_fields)
+
+    @property
+    def signal_scoped_mismatch_count(self) -> int:
+        return _sum_counts(self.signal_scoped_mismatch_fields)
+
+    @property
+    def diagnostic_mismatch_count(self) -> int:
+        return _sum_counts(self.diagnostic_mismatch_fields)
+
+    @property
+    def passed(self) -> bool:
+        return self.action_critical_mismatch_count == 0 and self.signal_scoped_mismatch_count == 0
+
+    @property
+    def first_action_critical_mismatch(self) -> dict[str, Any] | None:
+        if self.mismatches.empty:
+            return None
+        action_mismatches = self.mismatches[self.mismatches["category"] == "action_critical"]
+        if action_mismatches.empty:
+            return None
+        row = action_mismatches.iloc[0]
+        return {
+            "timestamp": row["timestamp"],
+            "field": row["field"],
+            "coin_value": row["coin_value"],
+            "aetheredge_value": row["aetheredge_value"],
+        }
 
 
 def validate_coin_audit_columns(df: pd.DataFrame) -> None:
@@ -262,46 +313,141 @@ def compare_signal_audits(
     compared = joined.iloc[skip_warmup_bars:] if skip_warmup_bars else joined
     mismatches: list[dict[str, Any]] = []
     mismatch_fields: dict[str, int] = {}
+    action_critical_mismatch_fields: dict[str, int] = {}
+    signal_scoped_mismatch_fields: dict[str, int] = {}
+    diagnostic_mismatch_fields: dict[str, int] = {}
     total_rows = len(compared)
     started = time.perf_counter()
 
     for row_idx, (_, row) in enumerate(compared.iterrows(), start=1):
         timestamp = row["timestamp"]
-        for field in STRICT_COMPARE_FIELDS:
+        has_signal = _canonical_int(row["signal_coin"]) != 0 or _canonical_int(row["signal_aetheredge"]) != 0
+        for field in ACTION_CRITICAL_FIELDS:
             coin_value = row[f"{field}_coin"]
             ae_value = row[f"{field}_aetheredge"]
             if _canonical_strict_value(coin_value) != _canonical_strict_value(ae_value):
-                _append_mismatch(mismatches, mismatch_fields, timestamp, field, coin_value, ae_value, None)
-        for field in FLOAT_COMPARE_FIELDS:
-            coin_value = row[f"{field}_coin"]
-            ae_value = row[f"{field}_aetheredge"]
-            coin_float = _optional_float(coin_value)
-            ae_float = _optional_float(ae_value)
-            if coin_float is None or ae_float is None:
-                if coin_float != ae_float:
-                    _append_mismatch(mismatches, mismatch_fields, timestamp, field, coin_value, ae_value, None)
-                continue
-            abs_diff = abs(coin_float - ae_float)
-            if abs_diff > tolerance:
-                _append_mismatch(mismatches, mismatch_fields, timestamp, field, coin_value, ae_value, abs_diff)
+                _append_mismatch(
+                    mismatches,
+                    mismatch_fields,
+                    action_critical_mismatch_fields,
+                    "action_critical",
+                    timestamp,
+                    field,
+                    coin_value,
+                    ae_value,
+                    None,
+                )
+        if has_signal:
+            for field in SIGNAL_SCOPED_STRICT_FIELDS:
+                coin_value = row[f"{field}_coin"]
+                ae_value = row[f"{field}_aetheredge"]
+                if field == "micro_filter_action":
+                    coin_canonical = _canonical_micro_action(coin_value, has_signal=has_signal)
+                    ae_canonical = _canonical_micro_action(ae_value, has_signal=has_signal)
+                else:
+                    coin_canonical = _canonical_strict_value(coin_value)
+                    ae_canonical = _canonical_strict_value(ae_value)
+                if coin_canonical != ae_canonical:
+                    _append_mismatch(
+                        mismatches,
+                        mismatch_fields,
+                        signal_scoped_mismatch_fields,
+                        "signal_scoped",
+                        timestamp,
+                        field,
+                        coin_value,
+                        ae_value,
+                        None,
+                    )
+            for field in SIGNAL_SCOPED_FLOAT_FIELDS:
+                _compare_float_field(
+                    row,
+                    mismatches,
+                    mismatch_fields,
+                    signal_scoped_mismatch_fields,
+                    "signal_scoped",
+                    timestamp,
+                    field,
+                    tolerance,
+                )
+        for field in DIAGNOSTIC_FLOAT_FIELDS:
+            _compare_float_field(
+                row,
+                mismatches,
+                mismatch_fields,
+                diagnostic_mismatch_fields,
+                "diagnostic",
+                timestamp,
+                field,
+                tolerance,
+            )
         if log_every_rows > 0 and (row_idx == 1 or row_idx % log_every_rows == 0 or row_idx == total_rows):
             elapsed = time.perf_counter() - started
             logger.info(
-                "Compare progress | row=%s/%s timestamp=%s mismatches=%s elapsed_sec=%.3f",
+                "Compare progress | row=%s/%s timestamp=%s mismatches=%s action_critical=%s signal_scoped=%s diagnostic=%s elapsed_sec=%.3f",
                 row_idx,
                 total_rows,
                 timestamp,
                 len(mismatches),
+                _sum_counts(action_critical_mismatch_fields),
+                _sum_counts(signal_scoped_mismatch_fields),
+                _sum_counts(diagnostic_mismatch_fields),
                 elapsed,
             )
 
-    mismatch_df = pd.DataFrame(mismatches, columns=["timestamp", "field", "coin_value", "aetheredge_value", "abs_diff"])
+    mismatch_df = pd.DataFrame(mismatches, columns=["timestamp", "category", "field", "coin_value", "aetheredge_value", "abs_diff"])
     return CompareResult(
         mismatches=mismatch_df,
         mismatch_fields=mismatch_fields,
+        action_critical_mismatch_fields=action_critical_mismatch_fields,
+        signal_scoped_mismatch_fields=signal_scoped_mismatch_fields,
+        diagnostic_mismatch_fields=diagnostic_mismatch_fields,
         joined_rows=int(len(joined)),
         compared_rows=int(len(compared)),
     )
+
+
+def _compare_float_field(
+    row: pd.Series,
+    mismatches: list[dict[str, Any]],
+    mismatch_fields: dict[str, int],
+    category_mismatch_fields: dict[str, int],
+    category: str,
+    timestamp: Any,
+    field: str,
+    tolerance: float,
+) -> None:
+    coin_value = row[f"{field}_coin"]
+    ae_value = row[f"{field}_aetheredge"]
+    coin_float = _optional_float(coin_value)
+    ae_float = _optional_float(ae_value)
+    if coin_float is None or ae_float is None:
+        if coin_float != ae_float:
+            _append_mismatch(
+                mismatches,
+                mismatch_fields,
+                category_mismatch_fields,
+                category,
+                timestamp,
+                field,
+                coin_value,
+                ae_value,
+                None,
+            )
+        return
+    abs_diff = abs(coin_float - ae_float)
+    if abs_diff > tolerance:
+        _append_mismatch(
+            mismatches,
+            mismatch_fields,
+            category_mismatch_fields,
+            category,
+            timestamp,
+            field,
+            coin_value,
+            ae_value,
+            abs_diff,
+        )
 
 
 def strategy_fingerprint(strategy: Strategy | None = None) -> dict[str, Any]:
@@ -337,9 +483,11 @@ def write_outputs(
     out_dir.mkdir(parents=True, exist_ok=True)
     aetheredge_df.to_csv(out_dir / REPLAY_AUDIT_FILENAME, index=False)
     compare_result.mismatches.to_csv(out_dir / MISMATCH_FILENAME, index=False)
+    context_df = build_signal_mismatch_context(coin_df, aetheredge_df, compare_result)
+    context_df.to_csv(out_dir / MISMATCH_CONTEXT_FILENAME, index=False)
     Path(out_dir / FINGERPRINT_FILENAME).write_text(json.dumps(fingerprint, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
     summary = {
-        "passed": compare_result.mismatch_count == 0,
+        "passed": compare_result.passed,
         "coin_audit_path": str(coin_audit_path),
         "out_dir": str(out_dir),
         "coin_rows": int(len(coin_df)),
@@ -347,12 +495,141 @@ def write_outputs(
         "joined_rows": compare_result.joined_rows,
         "skip_warmup_bars": int(skip_warmup_bars),
         "compared_rows": compare_result.compared_rows,
+        "action_critical_mismatch_count": compare_result.action_critical_mismatch_count,
+        "signal_scoped_mismatch_count": compare_result.signal_scoped_mismatch_count,
+        "diagnostic_mismatch_count": compare_result.diagnostic_mismatch_count,
         "mismatch_count": compare_result.mismatch_count,
         "mismatch_fields": compare_result.mismatch_fields,
+        "action_critical_mismatch_fields": compare_result.action_critical_mismatch_fields,
+        "signal_scoped_mismatch_fields": compare_result.signal_scoped_mismatch_fields,
+        "diagnostic_mismatch_fields": compare_result.diagnostic_mismatch_fields,
+        "first_action_critical_mismatch": compare_result.first_action_critical_mismatch,
         "tolerance": float(tolerance),
     }
     Path(out_dir / SUMMARY_FILENAME).write_text(json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
     return summary
+
+
+def build_signal_mismatch_context(
+    coin_df: pd.DataFrame,
+    aetheredge_df: pd.DataFrame,
+    compare_result: CompareResult,
+) -> pd.DataFrame:
+    columns = [
+        "timestamp",
+        "coin_signal",
+        "ae_signal",
+        "coin_selected_engine",
+        "ae_selected_engine",
+        "coin_selected_priority",
+        "ae_selected_priority",
+        "coin_momentum_signal",
+        "ae_momentum_signal",
+        "coin_bear_signal",
+        "ae_bear_signal",
+        "coin_bull_signal",
+        "ae_bull_signal",
+        "coin_risk_mult",
+        "ae_risk_mult",
+        "coin_quality_mult",
+        "ae_quality_mult",
+        "coin_micro_context_available",
+        "ae_micro_context_available",
+        "coin_micro_filter_action",
+        "ae_micro_filter_action",
+        "coin_micro_entry_risk_scale",
+        "ae_micro_entry_risk_scale",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "coin_atr",
+        "ae_atr",
+        "coin_atr_pct",
+        "ae_atr_pct",
+        "coin_adx",
+        "ae_adx",
+        "coin_momentum_long_exit_channel",
+        "ae_momentum_long_exit_channel",
+        "coin_momentum_short_exit_channel",
+        "ae_momentum_short_exit_channel",
+        "coin_bear_short_exit_channel",
+        "ae_bear_short_exit_channel",
+        "coin_bull_long_exit_channel",
+        "ae_bull_long_exit_channel",
+    ]
+    if compare_result.mismatches.empty:
+        return pd.DataFrame(columns=columns)
+
+    action_mismatches = compare_result.mismatches[compare_result.mismatches["category"] == "action_critical"]
+    if action_mismatches.empty:
+        return pd.DataFrame(columns=columns)
+
+    action_timestamps = list(dict.fromkeys(action_mismatches["timestamp"].tolist()))
+    coin_context_df = coin_df.copy()
+    aetheredge_context_df = aetheredge_df.copy()
+    for field in REPLAY_DIAGNOSTIC_COLUMNS:
+        if field not in coin_context_df.columns:
+            coin_context_df[field] = None
+        if field not in aetheredge_context_df.columns:
+            aetheredge_context_df[field] = None
+    joined = pd.merge(coin_context_df, aetheredge_context_df, on="timestamp", how="inner", suffixes=("_coin", "_aetheredge"))
+    joined = joined[joined["timestamp"].isin(action_timestamps)]
+
+    rows: list[dict[str, Any]] = []
+    for timestamp in action_timestamps:
+        match = joined[joined["timestamp"] == timestamp]
+        if match.empty:
+            continue
+        row = match.iloc[0]
+        rows.append(
+            {
+                "timestamp": row["timestamp"],
+                "coin_signal": _get_joined_value(row, "signal", "coin"),
+                "ae_signal": _get_joined_value(row, "signal", "aetheredge"),
+                "coin_selected_engine": _get_joined_value(row, "selected_engine", "coin"),
+                "ae_selected_engine": _get_joined_value(row, "selected_engine", "aetheredge"),
+                "coin_selected_priority": _get_joined_value(row, "selected_priority", "coin"),
+                "ae_selected_priority": _get_joined_value(row, "selected_priority", "aetheredge"),
+                "coin_momentum_signal": _get_joined_value(row, "momentum_signal", "coin"),
+                "ae_momentum_signal": _get_joined_value(row, "momentum_signal", "aetheredge"),
+                "coin_bear_signal": _get_joined_value(row, "bear_signal", "coin"),
+                "ae_bear_signal": _get_joined_value(row, "bear_signal", "aetheredge"),
+                "coin_bull_signal": _get_joined_value(row, "bull_signal", "coin"),
+                "ae_bull_signal": _get_joined_value(row, "bull_signal", "aetheredge"),
+                "coin_risk_mult": _get_joined_value(row, "risk_mult", "coin"),
+                "ae_risk_mult": _get_joined_value(row, "risk_mult", "aetheredge"),
+                "coin_quality_mult": _get_joined_value(row, "quality_mult", "coin"),
+                "ae_quality_mult": _get_joined_value(row, "quality_mult", "aetheredge"),
+                "coin_micro_context_available": _get_joined_value(row, "micro_context_available", "coin"),
+                "ae_micro_context_available": _get_joined_value(row, "micro_context_available", "aetheredge"),
+                "coin_micro_filter_action": _get_joined_value(row, "micro_filter_action", "coin"),
+                "ae_micro_filter_action": _get_joined_value(row, "micro_filter_action", "aetheredge"),
+                "coin_micro_entry_risk_scale": _get_joined_value(row, "micro_entry_risk_scale", "coin"),
+                "ae_micro_entry_risk_scale": _get_joined_value(row, "micro_entry_risk_scale", "aetheredge"),
+                "open": _get_unsuffixed_or_joined_value(row, "open"),
+                "high": _get_unsuffixed_or_joined_value(row, "high"),
+                "low": _get_unsuffixed_or_joined_value(row, "low"),
+                "close": _get_unsuffixed_or_joined_value(row, "close"),
+                "volume": _get_unsuffixed_or_joined_value(row, "volume"),
+                "coin_atr": _get_joined_value(row, "atr", "coin"),
+                "ae_atr": _get_joined_value(row, "atr", "aetheredge"),
+                "coin_atr_pct": _get_joined_value(row, "atr_pct", "coin"),
+                "ae_atr_pct": _get_joined_value(row, "atr_pct", "aetheredge"),
+                "coin_adx": _get_joined_value(row, "adx", "coin"),
+                "ae_adx": _get_joined_value(row, "adx", "aetheredge"),
+                "coin_momentum_long_exit_channel": _get_joined_value(row, "momentum_long_exit_channel", "coin"),
+                "ae_momentum_long_exit_channel": _get_joined_value(row, "momentum_long_exit_channel", "aetheredge"),
+                "coin_momentum_short_exit_channel": _get_joined_value(row, "momentum_short_exit_channel", "coin"),
+                "ae_momentum_short_exit_channel": _get_joined_value(row, "momentum_short_exit_channel", "aetheredge"),
+                "coin_bear_short_exit_channel": _get_joined_value(row, "bear_short_exit_channel", "coin"),
+                "ae_bear_short_exit_channel": _get_joined_value(row, "bear_short_exit_channel", "aetheredge"),
+                "coin_bull_long_exit_channel": _get_joined_value(row, "bull_long_exit_channel", "coin"),
+                "ae_bull_long_exit_channel": _get_joined_value(row, "bull_long_exit_channel", "aetheredge"),
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -437,9 +714,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             fingerprint=strategy_fingerprint(),
         )
         logger.info(
-            "Parity outputs written | replay_audit=%s mismatches=%s summary=%s fingerprint=%s",
+            "Parity outputs written | replay_audit=%s mismatches=%s mismatch_context=%s summary=%s fingerprint=%s",
             args.out_dir / REPLAY_AUDIT_FILENAME,
             args.out_dir / MISMATCH_FILENAME,
+            args.out_dir / MISMATCH_CONTEXT_FILENAME,
             args.out_dir / SUMMARY_FILENAME,
             args.out_dir / FINGERPRINT_FILENAME,
         )
@@ -457,7 +735,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             summary["mismatch_count"],
             summary["mismatch_fields"],
         )
-    if args.fail_on_mismatch and summary["mismatch_count"] > 0:
+    if args.fail_on_mismatch and not summary["passed"]:
         logger.warning("Exiting with code 1 because --fail-on-mismatch is set")
         print(json.dumps(summary, sort_keys=True, default=str))
         return 1
@@ -468,6 +746,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _audit_row_from_context(input_row: Mapping[str, Any], context: BarReadyContext) -> dict[str, Any]:
     routed = context.routed_signal
     is_flat = routed.side is Side.FLAT
+    selected_feature_key = _feature_key_for_engine(None if is_flat else routed.engine)
     return {
         "timestamp": _timestamp_string(input_row["timestamp"]),
         "open": input_row["open"],
@@ -494,11 +773,18 @@ def _audit_row_from_context(input_row: Mapping[str, Any], context: BarReadyConte
         "rf_delta_sum": input_row["rf_delta_sum"],
         "rf_imbalance": input_row["rf_imbalance"],
         "rf_taker_buy_ratio": input_row["rf_taker_buy_ratio"],
+        "atr": _engine_feature_value(context.engine_features, selected_feature_key, "atr"),
+        "atr_pct": _engine_feature_value(context.engine_features, selected_feature_key, "atr_pct"),
+        "adx": _engine_feature_value(context.engine_features, selected_feature_key, "adx"),
+        "momentum_long_exit_channel": _engine_feature_value(context.engine_features, "momentum", "long_exit_channel", fallback=False),
+        "momentum_short_exit_channel": _engine_feature_value(context.engine_features, "momentum", "short_exit_channel", fallback=False),
+        "bear_short_exit_channel": _engine_feature_value(context.engine_features, "bear", "short_exit_channel", fallback=False),
+        "bull_long_exit_channel": _engine_feature_value(context.engine_features, "bull", "long_exit_channel", fallback=False),
     }
 
 
 def _validate_aetheredge_audit_columns(df: pd.DataFrame) -> None:
-    missing = [column for column in AUDIT_COLUMNS if column not in df.columns]
+    missing = [column for column in REQUIRED_COLUMNS if column not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
@@ -506,6 +792,8 @@ def _validate_aetheredge_audit_columns(df: pd.DataFrame) -> None:
 def _append_mismatch(
     mismatches: list[dict[str, Any]],
     mismatch_fields: dict[str, int],
+    category_mismatch_fields: dict[str, int],
+    category: str,
     timestamp: Any,
     field: str,
     coin_value: Any,
@@ -515,6 +803,7 @@ def _append_mismatch(
     mismatches.append(
         {
             "timestamp": timestamp,
+            "category": category,
             "field": field,
             "coin_value": coin_value,
             "aetheredge_value": aetheredge_value,
@@ -522,6 +811,7 @@ def _append_mismatch(
         }
     )
     mismatch_fields[field] = mismatch_fields.get(field, 0) + 1
+    category_mismatch_fields[field] = category_mismatch_fields.get(field, 0) + 1
 
 
 def _canonical_strict_value(value: Any) -> Any:
@@ -541,6 +831,22 @@ def _canonical_strict_value(value: Any) -> Any:
     return text.upper() if field_like_engine_value(text) else text
 
 
+def _canonical_micro_action(value: Any, *, has_signal: bool) -> Any:
+    text = _canonical_strict_value(value)
+    if not has_signal and text in {"NEUTRAL", "NO_SIGNAL", "NONE", None}:
+        return "NO_SIGNAL_OR_NEUTRAL"
+    return text
+
+
+def _canonical_int(value: Any) -> int:
+    if _is_missing(value):
+        return 0
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 def field_like_engine_value(value: str) -> bool:
     return value.upper() in {"NONE", "MOMENTUM_V3", "BEAR_V3_ONLY", "BULL_RECLAIM_V2"}
 
@@ -552,6 +858,47 @@ def _engine_signal(row: Mapping[str, Any] | None) -> int:
     if _is_missing(value):
         return 0
     return int(value)
+
+
+def _feature_key_for_engine(engine: str | None) -> str | None:
+    return {"MOMENTUM_V3": "momentum", "BEAR_V3_ONLY": "bear", "BULL_RECLAIM_V2": "bull"}.get(str(engine or "").upper())
+
+
+def _engine_feature_value(engine_features: Mapping[str, Mapping[str, Any]], feature_key: str | None, key: str, *, fallback: bool = True) -> Any:
+    if feature_key is not None:
+        value = engine_features.get(feature_key, {}).get(key)
+        if not _is_missing(value):
+            return value
+    if not fallback:
+        return None
+    for fallback_feature_key in ("momentum", "bear", "bull"):
+        value = engine_features.get(fallback_feature_key, {}).get(key)
+        if not _is_missing(value):
+            return value
+    return None
+
+
+def _get_joined_value(row: pd.Series, field: str, side: str) -> Any:
+    suffixed = f"{field}_{side}"
+    if suffixed in row.index:
+        return _none_if_missing(row[suffixed])
+    if field in row.index:
+        return _none_if_missing(row[field])
+    return None
+
+
+def _get_unsuffixed_or_joined_value(row: pd.Series, field: str) -> Any:
+    if field in row.index:
+        return _none_if_missing(row[field])
+    return _get_joined_value(row, field, "coin")
+
+
+def _none_if_missing(value: Any) -> Any:
+    return None if _is_missing(value) else value
+
+
+def _sum_counts(counts: Mapping[str, int]) -> int:
+    return int(sum(counts.values()))
 
 
 def _strategy_range_pct(strategy: Strategy) -> Decimal:

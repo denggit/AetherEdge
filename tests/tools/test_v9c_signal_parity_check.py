@@ -10,6 +10,7 @@ import pytest
 
 from tools.v9c_signal_parity_check import (
     FINGERPRINT_FILENAME,
+    MISMATCH_CONTEXT_FILENAME,
     MISMATCH_FILENAME,
     REPLAY_AUDIT_FILENAME,
     SUMMARY_FILENAME,
@@ -66,21 +67,92 @@ def test_compare_signal_audits_detects_selected_engine_mismatch() -> None:
     result = compare_signal_audits(coin_df, ae_df, skip_warmup_bars=0)
 
     assert result.mismatch_count == 1
+    assert result.action_critical_mismatch_count == 1
+    assert result.passed is False
     assert result.mismatches.iloc[0]["field"] == "selected_engine"
+    assert result.mismatches.iloc[0]["category"] == "action_critical"
     assert result.mismatch_fields == {"selected_engine": 1}
 
 
 def test_compare_signal_audits_respects_float_tolerance() -> None:
-    coin_df = _coin_audit_df(risk_mult=1.0)
-    ae_df = _coin_audit_df(risk_mult=1.0 + 1e-10)
+    coin_df = _coin_audit_df(signal=1, selected_engine="MOMENTUM_V3", selected_priority=10, risk_mult=1.0)
+    ae_df = _coin_audit_df(signal=1, selected_engine="MOMENTUM_V3", selected_priority=10, risk_mult=1.0 + 1e-10)
 
     within = compare_signal_audits(coin_df, ae_df, tolerance=1e-9, skip_warmup_bars=0)
     assert within.mismatch_count == 0
 
-    ae_df = _coin_audit_df(risk_mult=1.0 + 1e-5)
+    ae_df = _coin_audit_df(signal=1, selected_engine="MOMENTUM_V3", selected_priority=10, risk_mult=1.0 + 1e-5)
     outside = compare_signal_audits(coin_df, ae_df, tolerance=1e-9, skip_warmup_bars=0)
     assert outside.mismatch_count == 1
+    assert outside.signal_scoped_mismatch_count == 1
+    assert outside.passed is False
+    assert outside.mismatches.iloc[0]["category"] == "signal_scoped"
     assert outside.mismatches.iloc[0]["field"] == "risk_mult"
+
+
+def test_no_signal_micro_neutral_vs_no_signal_is_not_action_mismatch() -> None:
+    coin_df = _coin_audit_df(signal=0, micro_filter_action="NEUTRAL", micro_context_available=True)
+    ae_df = _coin_audit_df(signal=0, micro_filter_action="NO_SIGNAL", micro_context_available=False)
+
+    result = compare_signal_audits(coin_df, ae_df, skip_warmup_bars=0)
+
+    assert result.action_critical_mismatch_count == 0
+    assert result.signal_scoped_mismatch_count == 0
+    assert result.passed is True
+
+
+def test_no_signal_risk_quality_mismatch_is_ignored_for_pass_fail() -> None:
+    coin_df = _coin_audit_df(signal=0, risk_mult=1.2, quality_mult=1.1)
+    ae_df = _coin_audit_df(signal=0, risk_mult=1.0, quality_mult=1.0)
+
+    result = compare_signal_audits(coin_df, ae_df, skip_warmup_bars=0)
+
+    assert result.passed is True
+    assert result.signal_scoped_mismatch_count == 0
+
+
+def test_signal_mismatch_is_action_critical() -> None:
+    coin_df = _coin_audit_df(signal=1)
+    ae_df = _coin_audit_df(signal=0)
+
+    result = compare_signal_audits(coin_df, ae_df, skip_warmup_bars=0)
+
+    assert result.action_critical_mismatch_count == 1
+    assert result.passed is False
+    assert result.mismatches.iloc[0]["category"] == "action_critical"
+
+
+def test_selected_engine_mismatch_is_action_critical() -> None:
+    coin_df = _coin_audit_df(signal=1, selected_engine="BULL_RECLAIM_V2", selected_priority=30)
+    ae_df = _coin_audit_df(signal=1, selected_engine="MOMENTUM_V3", selected_priority=30)
+
+    result = compare_signal_audits(coin_df, ae_df, skip_warmup_bars=0)
+
+    assert result.action_critical_mismatch_count == 1
+    assert result.passed is False
+    assert result.mismatches.iloc[0]["category"] == "action_critical"
+
+
+def test_signal_scoped_fields_compare_when_signal_exists() -> None:
+    coin_df = _coin_audit_df(signal=1, selected_engine="MOMENTUM_V3", selected_priority=10, micro_entry_risk_scale=0.5)
+    ae_df = _coin_audit_df(signal=1, selected_engine="MOMENTUM_V3", selected_priority=10, micro_entry_risk_scale=1.0)
+
+    result = compare_signal_audits(coin_df, ae_df, skip_warmup_bars=0)
+
+    assert result.signal_scoped_mismatch_count == 1
+    assert result.passed is False
+    assert result.mismatches.iloc[0]["category"] == "signal_scoped"
+
+
+def test_diagnostic_mismatch_does_not_fail_parity() -> None:
+    coin_df = _coin_audit_df(rf_delta_sum=100.0)
+    ae_df = _coin_audit_df(rf_delta_sum=101.0)
+
+    result = compare_signal_audits(coin_df, ae_df, skip_warmup_bars=0)
+
+    assert result.diagnostic_mismatch_count == 1
+    assert result.passed is True
+    assert result.mismatches.iloc[0]["category"] == "diagnostic"
 
 
 def test_strategy_fingerprint_hash_is_stable() -> None:
@@ -155,11 +227,32 @@ def test_cli_writes_expected_outputs(tmp_path: Path) -> None:
     assert exit_code == 0
     assert (out_dir / REPLAY_AUDIT_FILENAME).exists()
     assert (out_dir / MISMATCH_FILENAME).exists()
+    assert (out_dir / MISMATCH_CONTEXT_FILENAME).exists()
     assert (out_dir / SUMMARY_FILENAME).exists()
     assert (out_dir / FINGERPRINT_FILENAME).exists()
     summary = json.loads((out_dir / SUMMARY_FILENAME).read_text(encoding="utf-8"))
     assert summary["coin_rows"] == 1
     assert summary["aetheredge_rows"] == 1
+
+
+def test_cli_writes_signal_mismatch_context_csv(tmp_path: Path) -> None:
+    coin_audit = tmp_path / "coin_signal_audit.csv"
+    out_dir = tmp_path / "out"
+    _coin_audit_df(rf_bar_count=0).to_csv(coin_audit, index=False)
+
+    exit_code = main(
+        [
+            "--coin-audit",
+            str(coin_audit),
+            "--out-dir",
+            str(out_dir),
+            "--skip-warmup-bars",
+            "0",
+        ]
+    )
+
+    assert exit_code == 0
+    assert (out_dir / MISMATCH_CONTEXT_FILENAME).exists()
 
 
 def test_cli_quiet_still_prints_summary(tmp_path: Path, capsys) -> None:
