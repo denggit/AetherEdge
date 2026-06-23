@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from src.market_data.events import MarketFeatureEvent, MarketFeatureEventType
+from src.order_management.quantity import NativeQuantityConverter
+from src.order_management.safety import RecoveryExitOrderValidator, RecoveryExitValidationResult, is_bot_owned_order
 from src.platform.account.events import AccountEvent, AccountEventType
 from src.platform.data.models import MarketKline, MarketOrderBook, MarketTicker, MarketTrade
-from src.platform.exchanges.models import OrderSide, OrderStatus, Position, PositionSide
+from src.platform.exchanges.models import Order, OrderSide, OrderStatus, Position, PositionSide
+from src.platform.markets import get_market_profile
 from src.order_management.models import ExchangeOrderResult
 from src.platform.snapshot import PlatformSnapshot
 from src.signals import SignalAction, TradeSignal
@@ -31,6 +35,7 @@ from strategies.eth_lf_portfolio_v8.features.micro_context import MicroContextCo
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 FOUR_HOURS_MS = 4 * 60 * 60 * 1000
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -797,7 +802,16 @@ class Strategy:
             self.recovery_alerts.append("master_active_plan_missing_canonical_stop_manual_required")
             self._recover_active_master_without_plan(master)
             return []
-        qty = abs(master.quantity)
+        market_profile = get_market_profile(self.config.symbol)
+        converter = NativeQuantityConverter()
+        validator = RecoveryExitOrderValidator(quantity_converter=converter)
+        master_native_qty = abs(master.quantity)
+        qty = converter.native_to_base_quantity(
+            exchange=master.exchange,
+            symbol=self.config.symbol,
+            native_quantity=master_native_qty,
+            market_profile=market_profile,
+        )
         entry_price = master.entry_price or stop_price
         self.position.open_master(
             side=side,
@@ -808,25 +822,41 @@ class Strategy:
             entry_engine=str(plan.get("entry_engine") or "unknown"),
             position_id=str(plan.get("position_id") or ""),
         )
-        self.position.mark_leg_open(exchange=self.config.data_exchange, avg_fill_price=entry_price, base_qty=qty, sync_status="recovered_master")
+        self.position.mark_leg_open(exchange=self.config.data_exchange, avg_fill_price=entry_price, base_qty=qty, native_qty=master_native_qty, sync_status="recovered_master")
         signals: list[TradeSignal] = []
-        if not _has_stop_at_price(master_snapshot.open_stop_orders, stop_price):
-            signals.extend(
-                self._replace_stop_signals(
-                    target_exchanges=[self.config.data_exchange],
-                    quantity=qty,
-                    stop_price=stop_price,
-                    reason="RECOVERY_MASTER_STOP_SYNC",
-                    bar_close_time_ms=None,
-                )
+        master_validation = validator.validate_stop_orders(
+            exchange=master.exchange,
+            symbol=self.config.symbol,
+            strategy_id=self.config.strategy_id,
+            position_id=self.position.position_id,
+            position_side=_position_side_for_strategy_side(side),
+            position_mode=master_snapshot.position_mode,
+            current_position_native_quantity=master_native_qty,
+            canonical_stop_price=stop_price,
+            open_stop_orders=master_snapshot.open_stop_orders,
+            open_orders=master_snapshot.open_orders,
+            market_profile=market_profile,
+        )
+        signals.extend(
+            self._signals_from_recovery_exit_validation(
+                validation=master_validation,
+                exchange=self.config.data_exchange,
+                quantity=qty,
+                stop_price=stop_price,
+                reason="RECOVERY_MASTER_STOP_SYNC",
             )
+        )
         for leg in legs:
             exchange = str(leg.get("exchange") or "").lower()
             if not exchange or exchange == self.config.data_exchange:
                 continue
             target_qty = _dec_or_zero(leg.get("target_qty_base"))
             follower_snapshot = snapshots.get(exchange)
-            same_qty, reverse_qty = _side_quantities(follower_snapshot.positions if follower_snapshot else [], side)
+            same_qty, same_native_qty, reverse_qty, _reverse_native_qty = _side_quantities_with_native(
+                follower_snapshot.positions if follower_snapshot else [],
+                side,
+                market_profile=market_profile,
+            )
             if reverse_qty > 0:
                 self.position.legs[exchange] = self.position.legs.get(exchange) or self.position.mark_leg_closed(exchange=exchange, sync_status="reverse_position_manual_required")
                 self.position.legs[exchange].sync_status = "reverse_position_manual_required"
@@ -834,15 +864,92 @@ class Strategy:
                 continue
             if same_qty <= 0 and target_qty > 0:
                 self.position.mark_leg_closed(exchange=exchange, sync_status="missing")
+                signals.extend(
+                    self._cleanup_missing_follower_stops(
+                        snapshot=follower_snapshot,
+                        exchange=exchange,
+                        position_id=self.position.position_id,
+                    )
+                )
+                self.recovery_alerts.append(f"follower_missing_manual_required:{exchange}")
                 signals.append(self._follower_topup_signal(exchange=exchange, side=side, quantity=target_qty, plan=plan))
             elif same_qty < target_qty:
-                self.position.mark_leg_open(exchange=exchange, avg_fill_price=entry_price, base_qty=same_qty, sync_status="underfilled")
+                self.position.mark_leg_open(exchange=exchange, avg_fill_price=entry_price, base_qty=same_qty, native_qty=same_native_qty, sync_status="underfilled")
+                if follower_snapshot is not None:
+                    follower_validation = validator.validate_stop_orders(
+                        exchange=follower_snapshot.balance.exchange,
+                        symbol=self.config.symbol,
+                        strategy_id=self.config.strategy_id,
+                        position_id=self.position.position_id,
+                        position_side=_position_side_for_strategy_side(side),
+                        position_mode=follower_snapshot.position_mode,
+                        current_position_native_quantity=same_native_qty,
+                        canonical_stop_price=stop_price,
+                        open_stop_orders=follower_snapshot.open_stop_orders,
+                        open_orders=follower_snapshot.open_orders,
+                        market_profile=market_profile,
+                    )
+                    signals.extend(
+                        self._signals_from_recovery_exit_validation(
+                            validation=follower_validation,
+                            exchange=exchange,
+                            quantity=same_qty,
+                            stop_price=stop_price,
+                            reason="RECOVERY_FOLLOWER_STOP_SYNC",
+                        )
+                    )
                 signals.append(self._follower_topup_signal(exchange=exchange, side=side, quantity=target_qty - same_qty, plan=plan))
             elif same_qty > target_qty and target_qty > 0:
-                self.position.mark_leg_open(exchange=exchange, avg_fill_price=entry_price, base_qty=same_qty, sync_status="overfilled")
+                self.position.mark_leg_open(exchange=exchange, avg_fill_price=entry_price, base_qty=same_qty, native_qty=same_native_qty, sync_status="overfilled")
                 self.recovery_alerts.append(f"follower_overfilled:{exchange}")
+                if follower_snapshot is not None:
+                    follower_validation = validator.validate_stop_orders(
+                        exchange=follower_snapshot.balance.exchange,
+                        symbol=self.config.symbol,
+                        strategy_id=self.config.strategy_id,
+                        position_id=self.position.position_id,
+                        position_side=_position_side_for_strategy_side(side),
+                        position_mode=follower_snapshot.position_mode,
+                        current_position_native_quantity=same_native_qty,
+                        canonical_stop_price=stop_price,
+                        open_stop_orders=follower_snapshot.open_stop_orders,
+                        open_orders=follower_snapshot.open_orders,
+                        market_profile=market_profile,
+                    )
+                    signals.extend(
+                        self._signals_from_recovery_exit_validation(
+                            validation=follower_validation,
+                            exchange=exchange,
+                            quantity=same_qty,
+                            stop_price=stop_price,
+                            reason="RECOVERY_FOLLOWER_STOP_SYNC",
+                        )
+                    )
             elif same_qty > 0:
-                self.position.mark_leg_open(exchange=exchange, avg_fill_price=entry_price, base_qty=same_qty, sync_status="synced")
+                self.position.mark_leg_open(exchange=exchange, avg_fill_price=entry_price, base_qty=same_qty, native_qty=same_native_qty, sync_status="synced")
+                if follower_snapshot is not None:
+                    follower_validation = validator.validate_stop_orders(
+                        exchange=follower_snapshot.balance.exchange,
+                        symbol=self.config.symbol,
+                        strategy_id=self.config.strategy_id,
+                        position_id=self.position.position_id,
+                        position_side=_position_side_for_strategy_side(side),
+                        position_mode=follower_snapshot.position_mode,
+                        current_position_native_quantity=same_native_qty,
+                        canonical_stop_price=stop_price,
+                        open_stop_orders=follower_snapshot.open_stop_orders,
+                        open_orders=follower_snapshot.open_orders,
+                        market_profile=market_profile,
+                    )
+                    signals.extend(
+                        self._signals_from_recovery_exit_validation(
+                            validation=follower_validation,
+                            exchange=exchange,
+                            quantity=same_qty,
+                            stop_price=stop_price,
+                            reason="RECOVERY_FOLLOWER_STOP_SYNC",
+                        )
+                    )
         return signals
 
     def _recover_active_master_without_plan(self, master: Position) -> None:
@@ -850,17 +957,25 @@ class Strategy:
         if side is Side.FLAT:
             return
         entry_price = master.entry_price or Decimal("1")
+        market_profile = get_market_profile(self.config.symbol)
+        native_qty = abs(master.quantity)
+        qty = NativeQuantityConverter().native_to_base_quantity(
+            exchange=master.exchange,
+            symbol=self.config.symbol,
+            native_quantity=native_qty,
+            market_profile=market_profile,
+        )
         self.position.in_pos = True
         self.position.side = side
         self.position.entry_time_ms = 0
         self.position.first_entry = entry_price
         self.position.avg_entry = entry_price
-        self.position.qty = abs(master.quantity)
+        self.position.qty = qty
         self.position.units = 1
         self.position.entry_engine = "unknown"
         self.position.stop_price = None
         self.position.risk_per_coin = None
-        self.position.mark_leg_open(exchange=self.config.data_exchange, avg_fill_price=entry_price, base_qty=abs(master.quantity), sync_status="master_active_plan_unknown")
+        self.position.mark_leg_open(exchange=self.config.data_exchange, avg_fill_price=entry_price, base_qty=qty, native_qty=native_qty, sync_status="master_active_plan_unknown")
         self.recovery_manual_required = True
         self.recovery_alerts.append("master_active_plan_unknown_manual_required")
 
@@ -894,6 +1009,97 @@ class Strategy:
                 self.recovery_alerts.append(f"master_closed_follower_still_open:{exchange}")
         return signals
 
+    def _signals_from_recovery_exit_validation(
+        self,
+        *,
+        validation: RecoveryExitValidationResult,
+        exchange: str,
+        quantity: Decimal,
+        stop_price: Decimal,
+        reason: str,
+    ) -> list[TradeSignal]:
+        signals: list[TradeSignal] = []
+        for check in validation.checks:
+            action = "keep" if check.valid else "cancel_replace" if check.bot_owned else "alert_manual_required"
+            logger.info("Recovery exit order validation | %s", check.log_fields(action=action))
+        if validation.unknown_exit_orders:
+            for order in validation.unknown_exit_orders:
+                self.recovery_alerts.append(f"unknown_exit_order_manual_required:{exchange}:{order.order_id or order.client_order_id or 'unknown'}")
+        if validation.unsupported_bot_exit_orders:
+            for order in validation.unsupported_bot_exit_orders:
+                self.recovery_alerts.append(f"unsupported_take_profit_or_trailing_manual_required:{exchange}:{order.order_id or order.client_order_id or 'unknown'}")
+        if validation.valid:
+            return signals
+        if validation.should_cancel_bot_owned_stops and not validation.unknown_exit_orders:
+            signals.extend(
+                self._replace_stop_signals(
+                    target_exchanges=[exchange],
+                    quantity=quantity,
+                    stop_price=stop_price,
+                    reason=reason,
+                    bar_close_time_ms=None,
+                )
+            )
+            cancel_count = len(validation.bot_owned_invalid_orders)
+        else:
+            signals.extend(
+                self._place_stop_signals(
+                    target_exchanges=[exchange],
+                    quantity=quantity,
+                    stop_price=stop_price,
+                    reason=reason,
+                    bar_close_time_ms=None,
+                )
+            )
+            cancel_count = 0
+        logger.info(
+            "Recovery exit order resync | exchange=%s reason=%s cancel_count=%s new_stop_base_quantity=%s new_stop_native_quantity_preview=%s stop_price=%s",
+            exchange,
+            validation.primary_invalid_reason,
+            cancel_count,
+            quantity,
+            validation.expected_native_quantity,
+            stop_price,
+        )
+        return signals
+
+    def _cleanup_missing_follower_stops(self, *, snapshot: PlatformSnapshot | None, exchange: str, position_id: str | None) -> list[TradeSignal]:
+        if snapshot is None:
+            return []
+        bot_owned_stops: list[Order] = []
+        unknown_stops: list[Order] = []
+        for order in snapshot.open_stop_orders:
+            if order.symbol != self.config.symbol:
+                continue
+            if is_bot_owned_order(order=order, strategy_id=self.config.strategy_id, position_id=position_id):
+                bot_owned_stops.append(order)
+            else:
+                unknown_stops.append(order)
+        for order in unknown_stops:
+            self.recovery_alerts.append(f"unknown_exit_order_manual_required:{exchange}:{order.order_id or order.client_order_id or 'unknown'}")
+            logger.info(
+                "Recovery exit order validation | exchange=%s symbol=%s position_side=None position_mode=%s current_position_base_quantity=0 current_position_native_quantity=0 canonical_stop_price=None existing_order_id=%s existing_client_order_id=%s valid=false invalid_reason=follower_missing_unknown_stop action=alert_manual_required",
+                exchange,
+                self.config.symbol,
+                snapshot.position_mode.value,
+                order.order_id,
+                order.client_order_id,
+            )
+        if not bot_owned_stops or unknown_stops:
+            return []
+        self.recovery_alerts.append(f"no_position_stop_cancelled:{exchange}")
+        logger.info(
+            "Recovery exit order resync | exchange=%s reason=follower_missing_no_position_stop_cancelled cancel_count=%s new_stop_base_quantity=0 new_stop_native_quantity_preview=0 stop_price=None",
+            exchange,
+            len(bot_owned_stops),
+        )
+        return [
+            self._cancel_stop_signal(
+                target_exchanges=[exchange],
+                reason="RECOVERY_FOLLOWER_MISSING_CANCEL_STOP",
+            )
+        ]
+
     def _follower_topup_signal(self, *, exchange: str, side: Side, quantity: Decimal, plan: Mapping[str, Any]) -> TradeSignal:
         return TradeSignal(
             symbol=self.config.symbol,
@@ -909,17 +1115,32 @@ class Strategy:
         )
 
     def _replace_stop_signals(self, *, target_exchanges: list[str], quantity: Decimal, stop_price: Decimal, reason: str, bar_close_time_ms: int | None, exchange_quantities: Mapping[str, Decimal] | None = None) -> list[TradeSignal]:
-        exchange_quantities = dict(exchange_quantities or {})
-        cancel = TradeSignal(
+        return [
+            self._cancel_stop_signal(target_exchanges=target_exchanges, reason=f"{reason}_CANCEL_OLD"),
+            *self._place_stop_signals(
+                target_exchanges=target_exchanges,
+                quantity=quantity,
+                stop_price=stop_price,
+                reason=reason,
+                bar_close_time_ms=bar_close_time_ms,
+                exchange_quantities=exchange_quantities,
+            ),
+        ]
+
+    def _cancel_stop_signal(self, *, target_exchanges: list[str], reason: str) -> TradeSignal:
+        return TradeSignal(
             symbol=self.config.symbol,
             action=SignalAction.CANCEL_ALL_STOP_ORDERS,
-            reason=f"{reason}_CANCEL_OLD",
+            reason=reason,
             metadata={
                 "target_exchanges": target_exchanges,
                 "execution_purpose": "stop_sync",
                 "position_id": self.position.position_id,
             },
         )
+
+    def _place_stop_signals(self, *, target_exchanges: list[str], quantity: Decimal, stop_price: Decimal, reason: str, bar_close_time_ms: int | None, exchange_quantities: Mapping[str, Decimal] | None = None) -> list[TradeSignal]:
+        exchange_quantities = dict(exchange_quantities or {})
         stop = self.signal_mapper.map_decision(
             V8TradeDecision(
                 decision_type=V8DecisionType.PLACE_STOP,
@@ -939,7 +1160,7 @@ class Strategy:
                 },
             )
         )[0]
-        return [cancel, stop]
+        return [stop]
 
     def _follower_close_signals_after_master_close(self, *, event_time_ms: int | None, only_exchanges: list[str] | None = None) -> list[TradeSignal]:
         if not self.position.in_pos or self.position.side is Side.FLAT:
@@ -1235,6 +1456,14 @@ def _side_from_position(position: Position) -> Side:
     return Side.FLAT
 
 
+def _position_side_for_strategy_side(side: Side) -> PositionSide:
+    if side is Side.LONG:
+        return PositionSide.LONG
+    if side is Side.SHORT:
+        return PositionSide.SHORT
+    raise ValueError("strategy side must be long or short")
+
+
 def _side_quantities(positions: Sequence[Position], side: Side) -> tuple[Decimal, Decimal]:
     same = Decimal("0")
     reverse = Decimal("0")
@@ -1248,6 +1477,32 @@ def _side_quantities(positions: Sequence[Position], side: Side) -> tuple[Decimal
         elif pos_side is not Side.FLAT:
             reverse += qty
     return same, reverse
+
+
+def _side_quantities_with_native(positions: Sequence[Position], side: Side, *, market_profile) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+    same_base = Decimal("0")
+    same_native = Decimal("0")
+    reverse_base = Decimal("0")
+    reverse_native = Decimal("0")
+    converter = NativeQuantityConverter()
+    for position in positions:
+        if position.quantity == 0:
+            continue
+        pos_side = _side_from_position(position)
+        native_qty = abs(position.quantity)
+        base_qty = converter.native_to_base_quantity(
+            exchange=position.exchange,
+            symbol=position.symbol or market_profile.symbol,
+            native_quantity=native_qty,
+            market_profile=market_profile,
+        )
+        if pos_side is side:
+            same_base += base_qty
+            same_native += native_qty
+        elif pos_side is not Side.FLAT:
+            reverse_base += base_qty
+            reverse_native += native_qty
+    return same_base, same_native, reverse_base, reverse_native
 
 
 def _has_stop_at_price(orders, stop_price: Decimal) -> bool:
