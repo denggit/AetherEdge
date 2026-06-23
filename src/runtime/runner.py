@@ -346,7 +346,11 @@ class LiveRuntimeRunner:
         closed_rows = [row for row in rows if row.is_closed and row.open_time_ms == open_time_ms]
         if not closed_rows:
             return []
-        event = closed_kline_feature(closed_rows[-1])
+        closed_kline = closed_rows[-1]
+        await self._drain_market_events_before_closed_bar(
+            closed_bar_close_time_ms=closed_kline.close_time_ms,
+        )
+        event = closed_kline_feature(closed_kline)
         self.stats.closed_klines_seen += 1
         await self.process_market_feature(event)
         mark_emitted = getattr(self._closed_bar_scheduler, "mark_emitted", None)
@@ -362,6 +366,16 @@ class LiveRuntimeRunner:
         if self.requirements.range_bars.enabled and self.requirements.trades.enabled:
             if open_time_ms in self._range_context_degraded_buckets:
                 reason = self._range_context_degraded_buckets.get(open_time_ms, "range_context_degraded")
+                logger.warning(
+                    "4H range context unavailable diagnostics | symbol=%s interval=%s bucket_start_ms=%s bucket_end_ms=%s reason=%s trust_start_bucket_ms=%s queue_size=%s",
+                    self.app_config.symbol,
+                    self._closed_bar_interval,
+                    open_time_ms,
+                    open_time_ms + self._closed_bar_interval_ms - 1,
+                    reason,
+                    self._rangebar_trust_start_bucket_ms,
+                    self._market_queue.qsize(),
+                )
                 unavailable = range_aggregate_unavailable_feature(
                     symbol=self.app_config.symbol,
                     exchange=self.app_config.data_exchange,
@@ -369,12 +383,12 @@ class LiveRuntimeRunner:
                     range_pct=self._range_pct,
                     bucket_start_ms=open_time_ms,
                     bucket_end_ms=open_time_ms + self._closed_bar_interval_ms - 1,
-                    reference_price=closed_rows[-1].close,
+                    reference_price=closed_kline.close,
                     reason=reason,
                 )
                 await self.process_market_feature(unavailable)
                 features.append(unavailable)
-                self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_rows[-1])
+                self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_kline)
                 return features
             if self._rangebar_trust_start_bucket_ms is not None and open_time_ms < self._rangebar_trust_start_bucket_ms:
                 # self.context.alerts.emit(
@@ -387,6 +401,24 @@ class LiveRuntimeRunner:
                 #         severity="warning",
                 #     )
                 # )
+                logger.warning(
+                    "Range aggregate unavailable due to mid-bucket live trade collection | symbol=%s interval=%s bucket_start_ms=%s bucket_end_ms=%s trust_start_bucket_ms=%s",
+                    self.app_config.symbol,
+                    self._closed_bar_interval,
+                    open_time_ms,
+                    open_time_ms + self._closed_bar_interval_ms - 1,
+                    self._rangebar_trust_start_bucket_ms,
+                )
+                logger.warning(
+                    "4H range context unavailable diagnostics | symbol=%s interval=%s bucket_start_ms=%s bucket_end_ms=%s reason=%s trust_start_bucket_ms=%s queue_size=%s",
+                    self.app_config.symbol,
+                    self._closed_bar_interval,
+                    open_time_ms,
+                    open_time_ms + self._closed_bar_interval_ms - 1,
+                    "live_trade_collection_started_mid_bucket",
+                    self._rangebar_trust_start_bucket_ms,
+                    self._market_queue.qsize(),
+                )
                 unavailable = range_aggregate_unavailable_feature(
                     symbol=self.app_config.symbol,
                     exchange=self.app_config.data_exchange,
@@ -394,15 +426,15 @@ class LiveRuntimeRunner:
                     range_pct=self._range_pct,
                     bucket_start_ms=open_time_ms,
                     bucket_end_ms=open_time_ms + self._closed_bar_interval_ms - 1,
-                    reference_price=closed_rows[-1].close,
+                    reference_price=closed_kline.close,
                     reason="live_trade_collection_started_mid_bucket",
                 )
                 await self.process_market_feature(unavailable)
                 features.append(unavailable)
-                self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_rows[-1])
+                self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_kline)
                 return features
         features.extend(await self.emit_range_aggregate_for_bucket(open_time_ms))
-        self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_rows[-1])
+        self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_kline)
         return features
 
     async def emit_range_aggregate_for_bucket(self, bucket_start_ms: int) -> list[MarketFeatureEvent]:
@@ -460,6 +492,15 @@ class LiveRuntimeRunner:
             self._rangebar_trust_start_bucket_ms = current_bucket
         else:
             self._rangebar_trust_start_bucket_ms = current_bucket + self._closed_bar_interval_ms
+        logger.info(
+            "Rangebar trust window initialized | symbol=%s interval=%s now_ms=%s current_bucket_ms=%s trust_start_bucket_ms=%s start_lag_tolerance_ms=%s",
+            self.app_config.symbol,
+            self._closed_bar_interval,
+            now_ms,
+            current_bucket,
+            self._rangebar_trust_start_bucket_ms,
+            start_lag_tolerance_ms,
+        )
 
     async def _run_warmup(self) -> None:
         warmup_services = self.services.get("warmup_services") or self.services.get("warmup_service")
@@ -1250,10 +1291,26 @@ class LiveRuntimeRunner:
         tasks: list[asyncio.Task] = []
         if self.requirements.trades.enabled and self.requirements.trades.stream_enabled:
             logger.info("Starting runtime producer | name=trades")
-            tasks.append(asyncio.create_task(self._producer_supervisor.run_stream(name="trades", stream=self.context.data.stream_trades(), on_item=self._enqueue_market_event)))
+            tasks.append(
+                asyncio.create_task(
+                    self._producer_supervisor.run_resilient_stream(
+                        name="trades",
+                        stream_factory=self.context.data.stream_trades,
+                        on_item=self._enqueue_market_event,
+                    )
+                )
+            )
         if self.requirements.order_book.enabled and self.requirements.order_book.stream_enabled:
             logger.info("Starting runtime producer | name=order_book")
-            tasks.append(asyncio.create_task(self._producer_supervisor.run_stream(name="order_book", stream=self.context.data.stream_order_book(), on_item=self._enqueue_market_event)))
+            tasks.append(
+                asyncio.create_task(
+                    self._producer_supervisor.run_resilient_stream(
+                        name="order_book",
+                        stream_factory=self.context.data.stream_order_book,
+                        on_item=self._enqueue_market_event,
+                    )
+                )
+            )
         return tasks
 
     def _start_sync_tasks(self) -> list[asyncio.Task]:
@@ -1451,6 +1508,53 @@ class LiveRuntimeRunner:
             return
         signals = await handler(event)
         await self._execute_signals(signals or (), source=f"account:{event.exchange.value}", event_time_ms=event.event_time_ms)
+
+    async def _drain_market_events_before_closed_bar(
+        self,
+        *,
+        closed_bar_close_time_ms: int,
+        max_events: int = 10_000,
+        max_duration_ms: int = 3_000,
+    ) -> int:
+        queue_size_before = self._market_queue.qsize()
+        started = time.monotonic()
+        processed = 0
+        examined = 0
+        deferred: list[MarketEvent] = []
+        max_duration_seconds = max(float(max_duration_ms), 0.0) / 1000.0
+
+        while examined < max_events:
+            if max_duration_seconds and time.monotonic() - started >= max_duration_seconds:
+                break
+            try:
+                event = self._market_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            examined += 1
+            try:
+                if _is_trade_at_or_before(event, closed_bar_close_time_ms):
+                    await self.process_market_event(event)
+                    processed += 1
+                else:
+                    deferred.append(event)
+            finally:
+                self._market_queue.task_done()
+
+        for event in deferred:
+            await self._market_queue.put(event)
+
+        duration_ms = int((time.monotonic() - started) * 1000)
+        logger.info(
+            "Drained market events before closed-bar decision | close_time_ms=%s processed=%s deferred=%s queue_size_before=%s queue_size_after=%s duration_ms=%s",
+            closed_bar_close_time_ms,
+            processed,
+            len(deferred),
+            queue_size_before,
+            self._market_queue.qsize(),
+            duration_ms,
+        )
+        return processed
 
     async def _consume_market_events(self, *, max_market_events: int | None) -> None:
         while not self._stop_event.is_set():
@@ -2025,6 +2129,13 @@ def _event_time_ms(event: MarketEvent) -> int | None:
     if isinstance(event, MarketTicker):
         return event.time_ms
     return None
+
+
+def _is_trade_at_or_before(event: MarketEvent, close_time_ms: int) -> bool:
+    if not isinstance(event, MarketTrade) and event.event_type is not MarketEventType.TRADE:
+        return False
+    event_ms = _event_time_ms(event)
+    return event_ms is not None and event_ms <= close_time_ms
 
 
 async def _jittered_sleep(stop_event: asyncio.Event, interval_seconds: float) -> None:

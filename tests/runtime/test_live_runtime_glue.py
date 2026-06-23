@@ -243,8 +243,10 @@ class FakeAccountClient:
 class MemoryRangeBarStore:
     def __init__(self) -> None:
         self.rows = []
+        self.save_calls = 0
 
     def save(self, rows):
+        self.save_calls += 1
         self.rows.extend(rows)
         return len(rows)
 
@@ -253,6 +255,61 @@ class MemoryRangeBarStore:
 
     def latest_end_time_ms(self, *, symbol: str, range_pct: str):
         return max((row.end_time_ms for row in self.rows), default=None)
+
+
+class OneTradeRangeBarBuilder:
+    def __init__(self, *, range_pct: Decimal = Decimal("0.002")) -> None:
+        self.range_pct = range_pct
+        self.next_bar_id = 1
+        self.trades: list[MarketTrade] = []
+
+    def on_trade(self, trade: MarketTrade):
+        self.trades.append(trade)
+        time_ms = trade.trade_time_ms if trade.trade_time_ms is not None else trade.event_time_ms
+        if time_ms is None:
+            return ()
+        price = trade.price
+        bar = RangeBar(
+            symbol=trade.symbol,
+            range_pct=self.range_pct,
+            bar_id=self.next_bar_id,
+            start_time_ms=time_ms,
+            end_time_ms=time_ms,
+            open=price,
+            high=price,
+            low=price,
+            close=price,
+            volume=trade.quantity,
+            buy_notional=price * trade.quantity if trade.side is TradeSide.BUY else Decimal("0"),
+            sell_notional=price * trade.quantity if trade.side is TradeSide.SELL else Decimal("0"),
+            trade_count=1,
+        )
+        self.next_bar_id += 1
+        return (bar,)
+
+
+class RangeAuditStrategy(FeatureStrategy):
+    def __init__(self, range_store: MemoryRangeBarStore) -> None:
+        super().__init__()
+        self.range_store = range_store
+
+    async def on_market_feature(self, event):
+        self.events.append(event.type_value)
+        if event.type_value == "closed_kline":
+            rows = self.range_store.load(
+                symbol="ETH-USDT-PERP",
+                range_pct="0.002",
+                time_range=TimeRange(event.data["open_time_ms"], event.data["close_time_ms"]),
+            )
+            self.last_decision_audit = _decision_audit(
+                reason="range_ready" if len(rows) >= 5 else "range_missing",
+                actions=(),
+                range_available=len(rows) >= 5,
+                range_status="ok" if len(rows) >= 5 else "insufficient",
+                range_bar_count=len(rows),
+                range_min_required=5,
+            )
+        return []
 
 
 def _runner(strategy, *, data=None, services=None, dry_run=False, data_streams=()):
@@ -2487,6 +2544,89 @@ async def test_market_queue_full_trade_marks_range_context_degraded():
     await runner._enqueue_market_event(_trade(trade_time_ms=2 * H4 + 3))
 
     assert runner._range_context_degraded_buckets[2 * H4] == "market_queue_dropped_trade"
+
+
+@pytest.mark.asyncio
+async def test_poll_closed_bar_drains_queued_trades_before_range_aggregate():
+    range_store = MemoryRangeBarStore()
+    strategy = RangeAuditStrategy(range_store)
+    runner = _runner(
+        strategy,
+        data=FakeData(),
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": _feature_requirements(),
+            "range_bar_store": range_store,
+            "range_bar_builder": OneTradeRangeBarBuilder(),
+            "range_bar_aggregator": RangeBarAggregator(),
+        },
+        dry_run=True,
+    )
+
+    for offset in range(5):
+        runner._market_queue.put_nowait(_trade(trade_time_ms=2 * H4 + 1_000 + offset))
+
+    events = await runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
+
+    assert range_store.save_calls == 5
+    assert len(range_store.rows) == 5
+    assert strategy.last_decision_audit is not None
+    assert strategy.last_decision_audit["range_available"] is True
+    assert strategy.last_decision_audit["range_status"] == "ok"
+    assert strategy.last_decision_audit["range_bar_count"] >= 5
+    assert [event.type_value for event in events] == ["closed_kline", "range_aggregate"]
+    assert events[-1].data["bar_count"] >= 5
+
+
+@pytest.mark.asyncio
+async def test_drain_market_events_before_closed_bar_defers_future_events(monkeypatch):
+    strategy = FeatureStrategy()
+    runner = _runner(strategy, dry_run=True)
+    past = _trade(trade_time_ms=2 * H4 + 1)
+    future = _trade(trade_time_ms=3 * H4 + 1)
+    runner._market_queue.put_nowait(past)
+    runner._market_queue.put_nowait(future)
+    processed = []
+
+    async def fake_process_market_event(event):
+        processed.append(event)
+
+    monkeypatch.setattr(runner, "process_market_event", fake_process_market_event)
+
+    processed_count = await runner._drain_market_events_before_closed_bar(
+        closed_bar_close_time_ms=3 * H4 - 1,
+    )
+
+    assert processed_count == 1
+    assert processed == [past]
+    assert runner._market_queue.qsize() == 1
+    assert runner._market_queue.get_nowait() is future
+
+
+@pytest.mark.asyncio
+async def test_drain_market_events_before_closed_bar_respects_limits(monkeypatch):
+    strategy = FeatureStrategy()
+    runner = _runner(strategy, dry_run=True)
+    trades = [_trade(trade_time_ms=2 * H4 + i) for i in range(3)]
+    for trade in trades:
+        runner._market_queue.put_nowait(trade)
+    processed = []
+
+    async def fake_process_market_event(event):
+        processed.append(event)
+
+    monkeypatch.setattr(runner, "process_market_event", fake_process_market_event)
+
+    processed_count = await runner._drain_market_events_before_closed_bar(
+        closed_bar_close_time_ms=3 * H4 - 1,
+        max_events=2,
+    )
+
+    assert processed_count == 2
+    assert processed == trades[:2]
+    assert runner._market_queue.qsize() == 1
+    assert runner._market_queue.get_nowait() is trades[2]
 
 
 @pytest.mark.asyncio

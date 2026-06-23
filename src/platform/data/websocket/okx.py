@@ -5,13 +5,26 @@ import json
 from decimal import Decimal
 from typing import Any, AsyncIterator, Mapping
 
+from websockets.exceptions import ConnectionClosed, ConnectionClosedError, ConnectionClosedOK
+
 from src.platform.data.models import MarketOrderBook, MarketTrade, OrderBookLevel, TradeSide
 from src.platform.data.websocket.ports import WebSocketConnector
 from src.platform.exchanges.models import ExchangeName
 from src.platform.exchanges.symbols import to_exchange_symbol
+from src.utils.log import get_logger
 
 OKX_PUBLIC_WS_URL = "wss://ws.okx.com:8443/ws/v5/public"
 OKX_DEMO_PUBLIC_WS_URL = "wss://wspap.okx.com:8443/ws/v5/public?brokerId=9999"
+
+logger = get_logger(__name__)
+
+TRANSIENT_WS_EXCEPTIONS = (
+    ConnectionClosed,
+    ConnectionClosedError,
+    ConnectionClosedOK,
+    asyncio.TimeoutError,
+    OSError,
+)
 
 
 class OkxTradeWebSocketFeed:
@@ -36,18 +49,62 @@ class OkxTradeWebSocketFeed:
     async def stream_trades(self) -> AsyncIterator[MarketTrade]:
         reconnects = 0
         while True:
-            connection = await self._connector.connect(self._url)
+            connection = None
             try:
+                connection = await self._connector.connect(self._url)
                 await connection.send(_okx_subscribe_message(channel="trades", inst_id=self._raw_symbol))
+                logger.info(
+                    "OKX websocket subscribed | channel=trades symbol=%s raw_symbol=%s",
+                    self._symbol,
+                    self._raw_symbol,
+                )
                 async for message in connection:
-                    for trade in self._map_message(message):
+                    trades = self._map_message(message)
+                    if trades:
+                        reconnects = 0
+                    for trade in trades:
                         yield trade
+            except TRANSIENT_WS_EXCEPTIONS as exc:
+                if not self._reconnect:
+                    raise
+                if self._max_reconnects is not None and reconnects >= self._max_reconnects:
+                    logger.exception(
+                        "OKX websocket max reconnects exceeded | channel=trades symbol=%s raw_symbol=%s reconnect_count=%s error=%s",
+                        self._symbol,
+                        self._raw_symbol,
+                        reconnects,
+                        exc,
+                    )
+                    raise
+                reconnects += 1
+                delay = _reconnect_delay(self._reconnect_delay_seconds, reconnects)
+                logger.warning(
+                    "OKX websocket disconnected; reconnecting | channel=trades symbol=%s raw_symbol=%s reconnect_count=%s delay_seconds=%.2f error=%s",
+                    self._symbol,
+                    self._raw_symbol,
+                    reconnects,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+                continue
             finally:
-                await connection.close()
-            if not self._reconnect or (self._max_reconnects is not None and reconnects >= self._max_reconnects):
+                if connection is not None:
+                    try:
+                        await connection.close()
+                    except Exception as exc:  # pragma: no cover - defensive close best effort
+                        logger.debug(
+                            "OKX websocket close failed | channel=trades symbol=%s raw_symbol=%s error=%s",
+                            self._symbol,
+                            self._raw_symbol,
+                            exc,
+                        )
+            if not self._reconnect:
                 break
             reconnects += 1
-            await asyncio.sleep(self._reconnect_delay_seconds)
+            if self._max_reconnects is not None and reconnects > self._max_reconnects:
+                break
+            await asyncio.sleep(_reconnect_delay(self._reconnect_delay_seconds, reconnects))
 
     def _map_message(self, message: str | bytes) -> list[MarketTrade]:
         payload = _decode_json(message)
@@ -85,18 +142,66 @@ class OkxOrderBookWebSocketFeed:
     async def stream_order_book(self) -> AsyncIterator[MarketOrderBook]:
         reconnects = 0
         while True:
-            connection = await self._connector.connect(self._url)
+            connection = None
             try:
+                connection = await self._connector.connect(self._url)
                 await connection.send(_okx_subscribe_message(channel=self._depth_channel, inst_id=self._raw_symbol))
+                logger.info(
+                    "OKX websocket subscribed | channel=%s symbol=%s raw_symbol=%s",
+                    self._depth_channel,
+                    self._symbol,
+                    self._raw_symbol,
+                )
                 async for message in connection:
-                    for order_book in self._map_message(message):
+                    order_books = self._map_message(message)
+                    if order_books:
+                        reconnects = 0
+                    for order_book in order_books:
                         yield order_book
+            except TRANSIENT_WS_EXCEPTIONS as exc:
+                if not self._reconnect:
+                    raise
+                if self._max_reconnects is not None and reconnects >= self._max_reconnects:
+                    logger.exception(
+                        "OKX websocket max reconnects exceeded | channel=%s symbol=%s raw_symbol=%s reconnect_count=%s error=%s",
+                        self._depth_channel,
+                        self._symbol,
+                        self._raw_symbol,
+                        reconnects,
+                        exc,
+                    )
+                    raise
+                reconnects += 1
+                delay = _reconnect_delay(self._reconnect_delay_seconds, reconnects)
+                logger.warning(
+                    "OKX websocket disconnected; reconnecting | channel=%s symbol=%s raw_symbol=%s reconnect_count=%s delay_seconds=%.2f error=%s",
+                    self._depth_channel,
+                    self._symbol,
+                    self._raw_symbol,
+                    reconnects,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+                continue
             finally:
-                await connection.close()
-            if not self._reconnect or (self._max_reconnects is not None and reconnects >= self._max_reconnects):
+                if connection is not None:
+                    try:
+                        await connection.close()
+                    except Exception as exc:  # pragma: no cover - defensive close best effort
+                        logger.debug(
+                            "OKX websocket close failed | channel=%s symbol=%s raw_symbol=%s error=%s",
+                            self._depth_channel,
+                            self._symbol,
+                            self._raw_symbol,
+                            exc,
+                        )
+            if not self._reconnect:
                 break
             reconnects += 1
-            await asyncio.sleep(self._reconnect_delay_seconds)
+            if self._max_reconnects is not None and reconnects > self._max_reconnects:
+                break
+            await asyncio.sleep(_reconnect_delay(self._reconnect_delay_seconds, reconnects))
 
     def _map_message(self, message: str | bytes) -> list[MarketOrderBook]:
         payload = _decode_json(message)
@@ -115,6 +220,10 @@ def _okx_subscribe_message(*, channel: str, inst_id: str) -> str:
         {"op": "subscribe", "args": [{"channel": channel, "instId": inst_id}]},
         separators=(",", ":"),
     )
+
+
+def _reconnect_delay(base_delay_seconds: float, reconnect_count: int) -> float:
+    return min(float(base_delay_seconds) * (2 ** min(max(reconnect_count - 1, 0), 6)), 60.0)
 
 
 def _map_okx_trade(row: Mapping[str, Any], *, symbol: str, raw_symbol: str) -> MarketTrade:
