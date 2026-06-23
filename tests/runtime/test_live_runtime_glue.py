@@ -279,7 +279,9 @@ def _decision_audit(
     selected_engine: str | None = None,
     selected_side: str | None = "flat",
     range_available: bool = True,
+    range_status: str = "ok",
     range_bar_count: int | None = 36,
+    range_min_required: int | None = 5,
     range_imbalance: str | None = "-0.08",
     range_taker_buy_ratio: str | None = "0.46",
     range_close_pos: str | None = "0.42",
@@ -309,7 +311,9 @@ def _decision_audit(
         "micro_entry_risk_scale": "1",
         "micro_action": "skip",
         "range_available": range_available,
+        "range_status": range_status,
         "range_bar_count": range_bar_count,
+        "range_min_required": range_min_required,
         "range_imbalance": range_imbalance,
         "range_taker_buy_ratio": range_taker_buy_ratio,
         "range_close_pos": range_close_pos,
@@ -374,7 +378,9 @@ async def test_poll_closed_bar_logs_4h_decision_summary_no_signal(caplog):
     assert "4H decision completed" in messages
     assert "decision=flat_route" in messages
     assert "range_available=" in messages
+    assert "range_status=" in messages
     assert "range_bar_count=" in messages
+    assert "range_min_required=" in messages
     assert "close_buffer_ms=" in messages
     assert "Closed kline detected" not in messages
 
@@ -396,9 +402,13 @@ async def test_poll_closed_bar_logs_4h_decision_summary_with_signal_and_range_fi
 
     messages = "\n".join(record.getMessage() for record in caplog.records if record.levelno == logging.INFO)
     assert "4H decision completed" in messages
+    assert "decision=entry_signal" in messages
+    assert "decision=pending_entry_exists" not in messages
     assert "actions=open_long" in messages
     assert "selected_engine=BULL_RECLAIM_V2" in messages
+    assert "range_status=" in messages
     assert "range_bar_count=42" in messages
+    assert "range_min_required=" in messages
     assert "Closed kline detected" not in messages
 
 
@@ -409,7 +419,9 @@ async def test_poll_closed_bar_logs_4h_decision_summary_when_range_unavailable(c
         reason="flat_route",
         actions=(),
         range_available=False,
+        range_status="unavailable",
         range_bar_count=None,
+        range_min_required=5,
         range_imbalance=None,
         range_taker_buy_ratio=None,
         range_close_pos=None,
@@ -440,6 +452,8 @@ async def test_poll_closed_bar_logs_4h_decision_summary_when_range_unavailable(c
     messages = "\n".join(record.getMessage() for record in caplog.records if record.levelno == logging.INFO)
     assert "4H decision completed" in messages
     assert "range_available=False" in messages
+    assert "range_status=" in messages
+    assert "range_min_required=" in messages
     assert "Closed kline detected" not in messages
 
 

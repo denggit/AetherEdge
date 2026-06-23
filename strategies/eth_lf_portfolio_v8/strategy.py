@@ -354,6 +354,10 @@ class Strategy:
                     reason = "position_signal"
             else:
                 reason = "position_hold"
+        elif has_open:
+            reason = "entry_signal"
+        elif signals:
+            reason = "non_entry_signal"
         elif self.pending_entry is not None:
             reason = "pending_entry_exists"
         elif not self._cooldown_ok(context.kline.close_time_ms):
@@ -362,13 +366,19 @@ class Strategy:
             reason = "flat_route"
         elif context.micro.entry_risk_scale <= 0:
             reason = "micro_blocked"
-        elif has_open:
-            reason = "entry_signal"
-        elif signals:
-            reason = "non_entry_signal"
 
         aggregate = context.range_aggregate
-        range_available = aggregate is not None and aggregate.bar_count > 0
+        range_min_required = self.config.micro_context.min_range_bars
+        range_bar_count = None if aggregate is None else aggregate.bar_count
+        if aggregate is None:
+            range_available = False
+            range_status = "unavailable"
+        elif aggregate.bar_count < range_min_required:
+            range_available = False
+            range_status = "insufficient"
+        else:
+            range_available = True
+            range_status = "ok"
 
         return {
             "strategy_id": self.config.strategy_id,
@@ -398,7 +408,9 @@ class Strategy:
             "micro_action": context.micro.action,
 
             "range_available": range_available,
-            "range_bar_count": None if not range_available else aggregate.bar_count,
+            "range_status": range_status,
+            "range_bar_count": range_bar_count,
+            "range_min_required": range_min_required,
             "range_imbalance": None if not range_available else str(aggregate.imbalance),
             "range_taker_buy_ratio": None if not range_available else str(aggregate.taker_buy_ratio),
             "range_close_pos": None if not range_available else str(aggregate.close_pos),

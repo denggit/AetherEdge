@@ -270,6 +270,67 @@ def test_v9c_strategy_builds_last_decision_audit_for_open_signal():
     assert audit["selected_side"] == "long"
 
 
+def test_v9c_strategy_decision_audit_open_signal_wins_over_pending_entry():
+    strategy = Strategy()
+    strategy.started = True
+    strategy.equity = Decimal("1000")
+    strategy.pending_entry = object()  # type: ignore[assignment]
+    context = _bar_ready_context(
+        close=Decimal("100"),
+        engine_features={},
+        routed_signal=RoutedSignal(
+            side=Side.LONG,
+            engine="BULL_RECLAIM_V2",
+            priority=10,
+        ),
+    )
+    open_signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.OPEN_LONG,
+        quantity=Decimal("0.1"),
+    )
+
+    audit = strategy._build_decision_audit(context, [open_signal])
+
+    assert audit["reason"] == "entry_signal"
+    assert "open_long" in audit["actions"]
+    assert strategy.pending_entry is not None
+
+
+def test_v9c_strategy_decision_audit_entry_signal_after_pending_entry_set_by_signal_generation(monkeypatch):
+    strategy = Strategy()
+    strategy.started = True
+    strategy.equity = Decimal("1000")
+    context = _bar_ready_context(
+        close=Decimal("100"),
+        engine_features={},
+        routed_signal=RoutedSignal(
+            side=Side.LONG,
+            engine="BULL_RECLAIM_V2",
+            priority=10,
+        ),
+    )
+
+    def fake_signals_from_ready_context(_context):
+        strategy.pending_entry = object()  # type: ignore[assignment]
+        return [
+            TradeSignal(
+                symbol="ETH-USDT-PERP",
+                action=SignalAction.OPEN_LONG,
+                quantity=Decimal("0.1"),
+            )
+        ]
+
+    monkeypatch.setattr(strategy, "_signals_from_ready_context", fake_signals_from_ready_context)
+
+    bar_signals = strategy._signals_from_ready_context(context)
+    audit = strategy._build_decision_audit(context, bar_signals)
+
+    assert strategy.pending_entry is not None
+    assert audit["reason"] == "entry_signal"
+    assert "open_long" in audit["actions"]
+
+
 def test_v9c_strategy_decision_audit_includes_range_bar_fields():
     strategy = Strategy()
     strategy.started = True
@@ -297,11 +358,67 @@ def test_v9c_strategy_decision_audit_includes_range_bar_fields():
     audit = strategy._build_decision_audit(context, [])
 
     assert audit["range_available"] is True
+    assert audit["range_status"] == "ok"
     assert audit["range_bar_count"] == 37
+    assert audit["range_min_required"] == 5
     assert audit["range_imbalance"] is not None
     assert audit["range_taker_buy_ratio"] is not None
     assert audit["range_close_pos"] is not None
     assert audit["range_micro_return_pct"] is not None
+
+
+def test_v9c_strategy_decision_audit_range_status_unavailable():
+    strategy = Strategy()
+    strategy.started = True
+    strategy.equity = Decimal("1000")
+    context = _bar_ready_context(close=Decimal("100"), engine_features={})
+
+    audit = strategy._build_decision_audit(context, [])
+
+    assert audit["range_available"] is False
+    assert audit["range_status"] == "unavailable"
+    assert audit["range_bar_count"] is None
+    assert audit["range_min_required"] == 5
+
+
+def test_v9c_strategy_decision_audit_range_status_insufficient():
+    strategy = Strategy()
+    strategy.started = True
+    strategy.equity = Decimal("1000")
+    context = _bar_ready_context(
+        close=Decimal("100"),
+        engine_features={},
+        range_aggregate=_range_aggregate(bar_count=2),
+    )
+
+    audit = strategy._build_decision_audit(context, [])
+
+    assert audit["range_available"] is False
+    assert audit["range_status"] == "insufficient"
+    assert audit["range_bar_count"] == 2
+    assert audit["range_min_required"] == 5
+    assert audit["range_imbalance"] is None
+    assert audit["range_close_pos"] is None
+
+
+def test_v9c_strategy_decision_audit_range_status_ok():
+    strategy = Strategy()
+    strategy.started = True
+    strategy.equity = Decimal("1000")
+    context = _bar_ready_context(
+        close=Decimal("100"),
+        engine_features={},
+        range_aggregate=_range_aggregate(bar_count=37),
+    )
+
+    audit = strategy._build_decision_audit(context, [])
+
+    assert audit["range_available"] is True
+    assert audit["range_status"] == "ok"
+    assert audit["range_bar_count"] == 37
+    assert audit["range_min_required"] == 5
+    assert audit["range_imbalance"] is not None
+    assert audit["range_close_pos"] is not None
 
 
 def _bar_ready_context(
