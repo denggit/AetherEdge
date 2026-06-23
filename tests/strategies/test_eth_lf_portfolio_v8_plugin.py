@@ -171,6 +171,51 @@ def test_v9c_router_respects_reclaim_first_priority() -> None:
     assert selected.priority == 150
 
 
+def test_v9c_router_applies_portfolio_risk_quality_clips_to_reclaim_and_bear() -> None:
+    router = PortfolioRouter()
+
+    bull = router.select(
+        [
+            EngineSignal(
+                side=Side.LONG,
+                engine="BULL_RECLAIM_V2",
+                priority=150,
+                risk_mult=Decimal("0.25"),
+                quality_mult=Decimal("3.0"),
+            )
+        ]
+    )
+    bear = router.select(
+        [
+            EngineSignal(
+                side=Side.SHORT,
+                engine="BEAR_V3_ONLY",
+                priority=50,
+                risk_mult=Decimal("0.25"),
+                quality_mult=Decimal("3.0"),
+            )
+        ]
+    )
+    momentum = router.select(
+        [
+            EngineSignal(
+                side=Side.LONG,
+                engine="MOMENTUM_V3",
+                priority=100,
+                risk_mult=Decimal("0.25"),
+                quality_mult=Decimal("3.0"),
+            )
+        ]
+    )
+
+    assert bull.risk_mult == Decimal("0.35")
+    assert bull.quality_mult == Decimal("2.20")
+    assert bear.risk_mult == Decimal("0.35")
+    assert bear.quality_mult == Decimal("2.20")
+    assert momentum.risk_mult == Decimal("0.25")
+    assert momentum.quality_mult == Decimal("3.0")
+
+
 def test_v9c_default_engine_priorities_are_reclaim_momentum_bear() -> None:
     assert BullReclaimV2Engine().priority == 150
     assert MomentumV3Engine().priority == 100

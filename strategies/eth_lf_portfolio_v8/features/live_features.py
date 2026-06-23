@@ -61,7 +61,7 @@ class BearV3FeatureConfig:
 
 @dataclass(frozen=True)
 class BullReclaimV2FeatureConfig:
-    min_risk_mult: float = 0.35
+    min_risk_mult: float = 0.25
     max_risk_mult: float = 1.8
     atr_period: int = 20
     adx_period: int = 14

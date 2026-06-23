@@ -243,6 +243,13 @@ def test_v9c_strategy_builds_last_decision_audit_for_no_signal():
 
     assert audit["signal_count"] == 0
     assert audit["reason"] in {"flat_route", "micro_blocked", "no_signal"}
+    assert audit["signal"] == 0
+    assert audit["selected_engine"] == "NONE"
+    assert audit["selected_priority"] == 0
+    assert audit["momentum_signal"] == 0
+    assert audit["bear_signal"] == 0
+    assert audit["bull_signal"] == 0
+    assert "micro_filter_action" in audit
     assert "range_available" in audit
     assert "range_bar_count" in audit
     assert "range_imbalance" in audit
@@ -277,6 +284,10 @@ def test_v9c_strategy_builds_last_decision_audit_for_open_signal():
     assert "open_long" in audit["actions"]
     assert audit["selected_engine"]
     assert audit["selected_side"] == "long"
+    assert audit["signal"] == 1
+    assert audit["selected_priority"] == 10
+    assert audit["risk_mult"] == "1.2"
+    assert audit["quality_mult"] == "0.8"
 
 
 def test_v9c_strategy_decision_audit_open_signal_wins_over_pending_entry():
@@ -374,6 +385,10 @@ def test_v9c_strategy_decision_audit_includes_range_bar_fields():
     assert audit["range_taker_buy_ratio"] is not None
     assert audit["range_close_pos"] is not None
     assert audit["range_micro_return_pct"] is not None
+    assert audit["rf_bar_count"] == 37
+    assert audit["rf_imbalance"] is not None
+    assert audit["rf_taker_buy_ratio"] is not None
+    assert audit["micro_filter_action"] == "allow"
 
 
 def test_v9c_strategy_decision_audit_range_status_unavailable():

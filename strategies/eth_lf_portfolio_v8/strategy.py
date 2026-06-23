@@ -335,6 +335,19 @@ class Strategy:
         signals: Sequence[TradeSignal],
     ) -> dict[str, Any]:
         routed = context.routed_signal
+        is_flat = routed.side is Side.FLAT
+        selected_engine = "NONE" if is_flat else routed.engine
+        selected_feature_key = _feature_key_for_engine(None if is_flat else routed.engine)
+        audit_risk_mult = (
+            _engine_feature_value(context.engine_features, "momentum", "risk_mult")
+            if is_flat
+            else routed.risk_mult
+        )
+        audit_quality_mult = (
+            _engine_feature_value(context.engine_features, "momentum", "quality_mult")
+            if is_flat
+            else routed.quality_mult
+        )
         actions = [signal.action.value for signal in signals]
 
         has_open = any(action in {"open_long", "open_short"} for action in actions)
@@ -398,16 +411,40 @@ class Strategy:
             "position_stop": None if self.position.stop_price is None else str(self.position.stop_price),
             "pending_entry": self.pending_entry is not None,
 
-            "selected_engine": None if routed is None else routed.engine,
-            "selected_side": None if routed is None else _side_label(routed.side),
-            "risk_mult": None if routed is None else str(routed.risk_mult),
-            "quality_mult": None if routed is None else str(routed.quality_mult),
+            "open": str(context.kline.open),
+            "high": str(context.kline.high),
+            "low": str(context.kline.low),
+            "close": str(context.kline.close),
+            "volume": str(context.kline.volume),
+            "signal": int(routed.side.value),
+            "selected_engine": selected_engine,
+            "selected_side": _side_label(routed.side),
+            "selected_priority": 0 if is_flat else int(routed.priority),
+            "risk_mult": str(audit_risk_mult if audit_risk_mult is not None else Decimal("1")),
+            "quality_mult": str(audit_quality_mult if audit_quality_mult is not None else Decimal("1")),
+            "momentum_signal": _engine_signal(context.engine_features.get("momentum")),
+            "bear_signal": _engine_signal(context.engine_features.get("bear")),
+            "bull_signal": _engine_signal(context.engine_features.get("bull")),
+            "momentum_selected": selected_engine == "MOMENTUM_V3",
+            "bear_only": selected_engine == "BEAR_V3_ONLY",
+            "bull_reclaim": selected_engine == "BULL_RECLAIM_V2",
+            "long_signal": routed.side is Side.LONG,
+            "short_signal": routed.side is Side.SHORT,
 
             "micro_context_available": context.micro.context_available,
             "micro_aligned": context.micro.aligned,
             "micro_contra": context.micro.contra,
             "micro_entry_risk_scale": str(context.micro.entry_risk_scale),
+            "micro_filter_action": context.micro.action,
             "micro_action": context.micro.action,
+
+            "atr": _string_or_none(_engine_feature_value(context.engine_features, selected_feature_key, "atr")),
+            "atr_pct": _string_or_none(_engine_feature_value(context.engine_features, selected_feature_key, "atr_pct")),
+            "adx": _string_or_none(_engine_feature_value(context.engine_features, selected_feature_key, "adx")),
+            "momentum_long_exit_channel": _engine_feature_bool_value(context.engine_features, "momentum", "long_exit_channel"),
+            "momentum_short_exit_channel": _engine_feature_bool_value(context.engine_features, "momentum", "short_exit_channel"),
+            "bear_short_exit_channel": _engine_feature_bool_value(context.engine_features, "bear", "short_exit_channel"),
+            "bull_long_exit_channel": _engine_feature_bool_value(context.engine_features, "bull", "long_exit_channel"),
 
             "range_available": range_available,
             "range_status": range_status,
@@ -417,6 +454,12 @@ class Strategy:
             "range_taker_buy_ratio": None if not range_available else str(aggregate.taker_buy_ratio),
             "range_close_pos": None if not range_available else str(aggregate.close_pos),
             "range_micro_return_pct": None if not range_available else str(aggregate.micro_return_pct),
+            "rf_bar_count": range_bar_count,
+            "rf_micro_return_pct": None if aggregate is None else str(aggregate.micro_return_pct),
+            "rf_close_pos": None if aggregate is None else str(aggregate.close_pos),
+            "rf_delta_sum": None if aggregate is None else str(aggregate.delta_notional_sum),
+            "rf_imbalance": None if aggregate is None else str(aggregate.imbalance),
+            "rf_taker_buy_ratio": None if aggregate is None else str(aggregate.taker_buy_ratio),
         }
 
     def _signals_from_ready_context(self, context: BarReadyContext) -> list[TradeSignal]:
@@ -1025,6 +1068,50 @@ def _feature_decimal(context: BarReadyContext, engine: str, key: str) -> Decimal
     if value is None:
         return None
     return Decimal(str(value))
+
+
+def _feature_key_for_engine(engine: str | None) -> str | None:
+    return {"MOMENTUM_V3": "momentum", "BEAR_V3_ONLY": "bear", "BULL_RECLAIM_V2": "bull"}.get(str(engine or "").upper())
+
+
+def _engine_feature_value(
+    engine_features: Mapping[str, Mapping[str, Any]],
+    feature_key: str | None,
+    key: str,
+    *,
+    fallback: bool = True,
+) -> Any:
+    if feature_key is not None:
+        value = engine_features.get(feature_key, {}).get(key)
+        if value is not None:
+            return value
+    if not fallback:
+        return None
+    for fallback_feature_key in ("momentum", "bear", "bull"):
+        value = engine_features.get(fallback_feature_key, {}).get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _engine_signal(row: Mapping[str, Any] | None) -> int:
+    if not row:
+        return 0
+    value = row.get("signal", 0)
+    if value is None:
+        return 0
+    return int(value)
+
+
+def _engine_feature_bool_value(engine_features: Mapping[str, Mapping[str, Any]], feature_key: str, key: str) -> bool:
+    value = _engine_feature_value(engine_features, feature_key, key, fallback=False)
+    if value is None:
+        return False
+    return bool(value)
+
+
+def _string_or_none(value: Any) -> str | None:
+    return None if value is None else str(value)
 
 
 def _entry_engine_exit_channel(context: BarReadyContext, entry_engine: str, side: Side) -> bool:
