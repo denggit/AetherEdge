@@ -79,6 +79,7 @@ FEATURE_WARMUP_REQUIRED_COLUMNS = [
 FEATURE_WARMUP_ENGINE_COLUMNS = [
     "momentum_long_exit_channel",
     "momentum_short_exit_channel",
+    "bear_short_exit_channel",
     "bull_long_exit_channel",
 ]
 

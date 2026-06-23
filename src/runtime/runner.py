@@ -74,6 +74,18 @@ class LiveRuntimeStats:
     market_events_dropped: int = 0
 
 
+@dataclass(frozen=True)
+class MarketQueueDrainResult:
+    processed: int
+    deferred: int
+    examined: int
+    queue_size_before: int
+    queue_size_after: int
+    duration_ms: int
+    hit_event_limit: bool
+    hit_time_limit: bool
+
+
 class LiveRuntimeError(RuntimeError):
     pass
 
@@ -347,9 +359,26 @@ class LiveRuntimeRunner:
         if not closed_rows:
             return []
         closed_kline = closed_rows[-1]
-        await self._drain_market_events_before_closed_bar(
+        drain_result = await self._drain_market_events_before_closed_bar(
             closed_bar_close_time_ms=closed_kline.close_time_ms,
         )
+        if drain_result.hit_event_limit or drain_result.hit_time_limit:
+            self._mark_range_context_degraded_bucket(
+                bucket_start_ms=open_time_ms,
+                reason="market_queue_drain_incomplete_before_closed_bar",
+                event_time_ms=closed_kline.close_time_ms,
+            )
+            logger.warning(
+                "Market queue drain incomplete before closed-bar decision | close_time_ms=%s processed=%s deferred=%s examined=%s queue_size_before=%s queue_size_after=%s hit_event_limit=%s hit_time_limit=%s",
+                closed_kline.close_time_ms,
+                drain_result.processed,
+                drain_result.deferred,
+                drain_result.examined,
+                drain_result.queue_size_before,
+                drain_result.queue_size_after,
+                drain_result.hit_event_limit,
+                drain_result.hit_time_limit,
+            )
         event = closed_kline_feature(closed_kline)
         self.stats.closed_klines_seen += 1
         await self.process_market_feature(event)
@@ -359,10 +388,12 @@ class LiveRuntimeRunner:
         else:
             self._closed_bar_scheduler.last_emitted_open_time_ms = open_time_ms
         features = [event]
-        # Before producing the range aggregate for a just-closed 4H bar, close
-        # any gap between startup warmup and the live websocket stream. This
-        # avoids silently missing trades if startup/backfill took several
-        # seconds or the process restarted mid-bucket.
+        is_mid_bucket_restart = (
+            self.requirements.range_bars.enabled
+            and self.requirements.trades.enabled
+            and self._rangebar_trust_start_bucket_ms is not None
+            and open_time_ms < self._rangebar_trust_start_bucket_ms
+        )
         if self.requirements.range_bars.enabled and self.requirements.trades.enabled:
             if open_time_ms in self._range_context_degraded_buckets:
                 reason = self._range_context_degraded_buckets.get(open_time_ms, "range_context_degraded")
@@ -390,50 +421,64 @@ class LiveRuntimeRunner:
                 features.append(unavailable)
                 self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_kline)
                 return features
-            if self._rangebar_trust_start_bucket_ms is not None and open_time_ms < self._rangebar_trust_start_bucket_ms:
-                # self.context.alerts.emit(
-                #     AppAlert(
-                #         subject="AetherEdge live-only partial range bucket",
-                #         content=(
-                #             f"Closed bucket {open_time_ms} started before live trade collection was trusted. "
-                #             "V9C will evaluate the 4H signal with micro context unavailable instead of using partial range bars."
-                #         ),
-                #         severity="warning",
-                #     )
-                # )
-                logger.warning(
-                    "Range aggregate unavailable due to mid-bucket live trade collection | symbol=%s interval=%s bucket_start_ms=%s bucket_end_ms=%s trust_start_bucket_ms=%s",
-                    self.app_config.symbol,
-                    self._closed_bar_interval,
-                    open_time_ms,
-                    open_time_ms + self._closed_bar_interval_ms - 1,
-                    self._rangebar_trust_start_bucket_ms,
-                )
-                logger.warning(
-                    "4H range context unavailable diagnostics | symbol=%s interval=%s bucket_start_ms=%s bucket_end_ms=%s reason=%s trust_start_bucket_ms=%s queue_size=%s",
-                    self.app_config.symbol,
-                    self._closed_bar_interval,
-                    open_time_ms,
-                    open_time_ms + self._closed_bar_interval_ms - 1,
-                    "live_trade_collection_started_mid_bucket",
-                    self._rangebar_trust_start_bucket_ms,
-                    self._market_queue.qsize(),
-                )
-                unavailable = range_aggregate_unavailable_feature(
-                    symbol=self.app_config.symbol,
-                    exchange=self.app_config.data_exchange,
-                    timeframe=self._range_aggregate_interval,
-                    range_pct=self._range_pct,
-                    bucket_start_ms=open_time_ms,
-                    bucket_end_ms=open_time_ms + self._closed_bar_interval_ms - 1,
-                    reference_price=closed_kline.close,
-                    reason="live_trade_collection_started_mid_bucket",
-                )
-                await self.process_market_feature(unavailable)
-                features.append(unavailable)
+
+        range_events = await self.emit_range_aggregate_for_bucket(open_time_ms)
+        best_range_bar_count = 0
+        min_range_bars = self._get_min_range_bars()
+        if range_events:
+            best_range_bar_count = max((int(event.data.get("bar_count") or 0) for event in range_events), default=0)
+            if not is_mid_bucket_restart or best_range_bar_count >= min_range_bars:
+                if is_mid_bucket_restart:
+                    logger.info(
+                        "Range aggregate loaded despite mid-bucket restart | symbol=%s interval=%s bucket_start_ms=%s bucket_end_ms=%s trust_start_bucket_ms=%s range_bar_count=%s min_range_bars=%s",
+                        self.app_config.symbol,
+                        self._closed_bar_interval,
+                        open_time_ms,
+                        open_time_ms + self._closed_bar_interval_ms - 1,
+                        self._rangebar_trust_start_bucket_ms,
+                        best_range_bar_count,
+                        min_range_bars,
+                    )
+                features.extend(range_events)
                 self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_kline)
                 return features
-        features.extend(await self.emit_range_aggregate_for_bucket(open_time_ms))
+
+        if is_mid_bucket_restart:
+            logger.warning(
+                "Range aggregate unavailable after store load due to mid-bucket live trade collection | symbol=%s interval=%s bucket_start_ms=%s bucket_end_ms=%s trust_start_bucket_ms=%s range_bar_count=%s min_range_bars=%s",
+                self.app_config.symbol,
+                self._closed_bar_interval,
+                open_time_ms,
+                open_time_ms + self._closed_bar_interval_ms - 1,
+                self._rangebar_trust_start_bucket_ms,
+                best_range_bar_count,
+                min_range_bars,
+            )
+            logger.warning(
+                "4H range context unavailable diagnostics | symbol=%s interval=%s bucket_start_ms=%s bucket_end_ms=%s reason=%s trust_start_bucket_ms=%s queue_size=%s",
+                self.app_config.symbol,
+                self._closed_bar_interval,
+                open_time_ms,
+                open_time_ms + self._closed_bar_interval_ms - 1,
+                "live_trade_collection_started_mid_bucket",
+                self._rangebar_trust_start_bucket_ms,
+                self._market_queue.qsize(),
+            )
+            unavailable = range_aggregate_unavailable_feature(
+                symbol=self.app_config.symbol,
+                exchange=self.app_config.data_exchange,
+                timeframe=self._range_aggregate_interval,
+                range_pct=self._range_pct,
+                bucket_start_ms=open_time_ms,
+                bucket_end_ms=open_time_ms + self._closed_bar_interval_ms - 1,
+                reference_price=closed_kline.close,
+                reason="live_trade_collection_started_mid_bucket",
+            )
+            await self.process_market_feature(unavailable)
+            features.append(unavailable)
+            self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_kline)
+            return features
+
         self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_kline)
         return features
 
@@ -1457,13 +1502,16 @@ class LiveRuntimeRunner:
             event_ms = int(time.time() * 1000)
 
         bucket_start = (event_ms // self._closed_bar_interval_ms) * self._closed_bar_interval_ms
-        if bucket_start not in self._range_context_degraded_buckets:
-            self._range_context_degraded_buckets[bucket_start] = reason
+        self._mark_range_context_degraded_bucket(bucket_start_ms=bucket_start, reason=reason, event_time_ms=event_ms)
+
+    def _mark_range_context_degraded_bucket(self, *, bucket_start_ms: int, reason: str, event_time_ms: int | None = None) -> None:
+        if bucket_start_ms not in self._range_context_degraded_buckets:
+            self._range_context_degraded_buckets[bucket_start_ms] = reason
             logger.warning(
                 "Range context degraded | reason=%s bucket_start_ms=%s event_time_ms=%s dropped_total=%s",
                 reason,
-                bucket_start,
-                event_ms,
+                bucket_start_ms,
+                event_time_ms,
                 self.stats.market_events_dropped,
             )
 
@@ -1515,7 +1563,7 @@ class LiveRuntimeRunner:
         closed_bar_close_time_ms: int,
         max_events: int = 10_000,
         max_duration_ms: int = 3_000,
-    ) -> int:
+    ) -> MarketQueueDrainResult:
         queue_size_before = self._market_queue.qsize()
         started = time.monotonic()
         processed = 0
@@ -1544,17 +1592,30 @@ class LiveRuntimeRunner:
         for event in deferred:
             await self._market_queue.put(event)
 
-        duration_ms = int((time.monotonic() - started) * 1000)
+        elapsed_seconds = time.monotonic() - started
+        duration_ms = int(elapsed_seconds * 1000)
+        queue_size_after = self._market_queue.qsize()
+        hit_event_limit = examined >= max_events
+        hit_time_limit = max_duration_seconds > 0 and elapsed_seconds >= max_duration_seconds
         logger.info(
             "Drained market events before closed-bar decision | close_time_ms=%s processed=%s deferred=%s queue_size_before=%s queue_size_after=%s duration_ms=%s",
             closed_bar_close_time_ms,
             processed,
             len(deferred),
             queue_size_before,
-            self._market_queue.qsize(),
+            queue_size_after,
             duration_ms,
         )
-        return processed
+        return MarketQueueDrainResult(
+            processed=processed,
+            deferred=len(deferred),
+            examined=examined,
+            queue_size_before=queue_size_before,
+            queue_size_after=queue_size_after,
+            duration_ms=duration_ms,
+            hit_event_limit=hit_event_limit,
+            hit_time_limit=hit_time_limit,
+        )
 
     async def _consume_market_events(self, *, max_market_events: int | None) -> None:
         while not self._stop_event.is_set():

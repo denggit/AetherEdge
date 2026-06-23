@@ -119,6 +119,30 @@ def test_detect_feature_warmup_finds_first_valid_row() -> None:
     assert result["ae_feature_valid_rows"] == 1
 
 
+def test_detect_feature_warmup_accepts_bear_feature_column() -> None:
+    ae_df = pd.DataFrame(
+        [
+            {
+                "timestamp": "2023-01-01 00:00:00",
+                "atr": 10.0,
+                "atr_pct": 0.01,
+                "adx": 25.0,
+                "momentum_long_exit_channel": None,
+                "momentum_short_exit_channel": None,
+                "bear_short_exit_channel": 100.0,
+                "bull_long_exit_channel": None,
+            },
+        ]
+    )
+
+    result = detect_feature_warmup(ae_df)
+
+    assert result["first_valid_ae_feature_index"] == 0
+    assert result["first_valid_ae_feature_timestamp"] == "2023-01-01 00:00:00"
+    assert result["recommended_skip_warmup_bars"] == 0
+    assert result["ae_feature_valid_rows"] == 1
+
+
 def test_detect_feature_warmup_handles_no_valid_rows() -> None:
     ae_df = pd.DataFrame(
         [

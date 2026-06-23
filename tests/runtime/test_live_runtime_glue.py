@@ -341,6 +341,25 @@ def _trade(*, trade_time_ms: int = 1_000) -> MarketTrade:
     )
 
 
+def _range_bar(*, bar_id: int, start_time_ms: int, end_time_ms: int, price: Decimal | str = Decimal("100")) -> RangeBar:
+    price = Decimal(str(price))
+    return RangeBar(
+        symbol="ETH-USDT-PERP",
+        range_pct=Decimal("0.002"),
+        bar_id=bar_id,
+        start_time_ms=start_time_ms,
+        end_time_ms=end_time_ms,
+        open=price,
+        high=price,
+        low=price,
+        close=price,
+        volume=Decimal("1"),
+        buy_notional=price,
+        sell_notional=Decimal("0"),
+        trade_count=1,
+    )
+
+
 class CountingTradeStrategy(FeatureStrategy):
     def __init__(self, *, strategy_id: str) -> None:
         super().__init__()
@@ -2580,6 +2599,117 @@ async def test_poll_closed_bar_drains_queued_trades_before_range_aggregate():
 
 
 @pytest.mark.asyncio
+async def test_mid_bucket_restart_uses_store_range_aggregate_when_enough_rows():
+    range_store = MemoryRangeBarStore()
+    open_time_ms = 2 * H4
+    for i in range(5):
+        range_store.save([
+            _range_bar(
+                bar_id=i + 1,
+                start_time_ms=open_time_ms + i * 1_000,
+                end_time_ms=open_time_ms + i * 1_000,
+            )
+        ])
+    strategy = RangeAuditStrategy(range_store)
+    runner = _runner(
+        strategy,
+        data=FakeData(),
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": _feature_requirements(),
+            "range_bar_store": range_store,
+            "range_bar_aggregator": RangeBarAggregator(),
+        },
+        dry_run=True,
+    )
+    runner._rangebar_trust_start_bucket_ms = open_time_ms + H4
+
+    events = await runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
+
+    assert [event.type_value for event in events] == ["closed_kline", "range_aggregate"]
+    assert events[-1].data["bar_count"] == 5
+    assert events[-1].data.get("reason") != "live_trade_collection_started_mid_bucket"
+    assert strategy.last_decision_audit["range_available"] is True
+    assert strategy.last_decision_audit["range_status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_mid_bucket_restart_without_store_rows_emits_unavailable():
+    range_store = MemoryRangeBarStore()
+    open_time_ms = 2 * H4
+    strategy = RangeAuditStrategy(range_store)
+    runner = _runner(
+        strategy,
+        data=FakeData(),
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": _feature_requirements(),
+            "range_bar_store": range_store,
+            "range_bar_aggregator": RangeBarAggregator(),
+        },
+        dry_run=True,
+    )
+    runner._rangebar_trust_start_bucket_ms = open_time_ms + H4
+
+    events = await runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
+
+    assert [event.type_value for event in events] == ["closed_kline", "range_aggregate"]
+    assert events[-1].data["context_available"] is False
+    assert events[-1].data["incomplete"] is True
+    assert events[-1].data["reason"] == "live_trade_collection_started_mid_bucket"
+
+
+@pytest.mark.asyncio
+async def test_drain_incomplete_marks_range_context_degraded(monkeypatch):
+    range_store = MemoryRangeBarStore()
+    open_time_ms = 2 * H4
+    for i in range(5):
+        range_store.save([
+            _range_bar(
+                bar_id=i + 1,
+                start_time_ms=open_time_ms + i * 1_000,
+                end_time_ms=open_time_ms + i * 1_000,
+            )
+        ])
+    strategy = RangeAuditStrategy(range_store)
+    runner = _runner(
+        strategy,
+        data=FakeData(),
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": _feature_requirements(),
+            "range_bar_store": range_store,
+            "range_bar_builder": OneTradeRangeBarBuilder(),
+            "range_bar_aggregator": RangeBarAggregator(),
+        },
+        dry_run=True,
+    )
+    runner._market_queue.put_nowait(_trade(trade_time_ms=open_time_ms + 10_000))
+    runner._market_queue.put_nowait(_trade(trade_time_ms=open_time_ms + 11_000))
+    original_drain = runner._drain_market_events_before_closed_bar
+
+    async def limited_drain(*, closed_bar_close_time_ms: int, max_events: int = 10_000, max_duration_ms: int = 3_000):
+        return await original_drain(
+            closed_bar_close_time_ms=closed_bar_close_time_ms,
+            max_events=1,
+            max_duration_ms=max_duration_ms,
+        )
+
+    monkeypatch.setattr(runner, "_drain_market_events_before_closed_bar", limited_drain)
+
+    events = await runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
+
+    assert runner._range_context_degraded_buckets[open_time_ms] == "market_queue_drain_incomplete_before_closed_bar"
+    assert [event.type_value for event in events] == ["closed_kline", "range_aggregate"]
+    assert events[-1].data["context_available"] is False
+    assert events[-1].data["incomplete"] is True
+    assert events[-1].data["reason"] == "market_queue_drain_incomplete_before_closed_bar"
+
+
+@pytest.mark.asyncio
 async def test_drain_market_events_before_closed_bar_defers_future_events(monkeypatch):
     strategy = FeatureStrategy()
     runner = _runner(strategy, dry_run=True)
@@ -2594,11 +2724,11 @@ async def test_drain_market_events_before_closed_bar_defers_future_events(monkey
 
     monkeypatch.setattr(runner, "process_market_event", fake_process_market_event)
 
-    processed_count = await runner._drain_market_events_before_closed_bar(
+    result = await runner._drain_market_events_before_closed_bar(
         closed_bar_close_time_ms=3 * H4 - 1,
     )
 
-    assert processed_count == 1
+    assert result.processed == 1
     assert processed == [past]
     assert runner._market_queue.qsize() == 1
     assert runner._market_queue.get_nowait() is future
@@ -2618,12 +2748,14 @@ async def test_drain_market_events_before_closed_bar_respects_limits(monkeypatch
 
     monkeypatch.setattr(runner, "process_market_event", fake_process_market_event)
 
-    processed_count = await runner._drain_market_events_before_closed_bar(
+    result = await runner._drain_market_events_before_closed_bar(
         closed_bar_close_time_ms=3 * H4 - 1,
         max_events=2,
     )
 
-    assert processed_count == 2
+    assert result.processed == 2
+    assert result.examined == 2
+    assert result.hit_event_limit is True
     assert processed == trades[:2]
     assert runner._market_queue.qsize() == 1
     assert runner._market_queue.get_nowait() is trades[2]
