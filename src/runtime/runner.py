@@ -11,7 +11,7 @@ from src.app import AppConfig, AppContext
 from src.app.alerts import AppAlert
 from src.market_data.derived import RangeBarAggregator, RangeBarBuilder
 from src.market_data.events import MarketFeatureEvent
-from src.market_data.models import MarketDataSet, RangeBar, TimeRange, WarmupRequest
+from src.market_data.models import MarketDataSet, RangeBar, RangeBarAggregate, TimeRange, WarmupRequest
 from src.market_data.storage import SqliteKlineStore, SqliteRangeBarStore
 from src.market_data.warmup.gap_detector import interval_to_ms
 from src.market_data.warmup.service import KlineWarmupService
@@ -422,11 +422,11 @@ class LiveRuntimeRunner:
                 self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_kline)
                 return features
 
-        range_events = await self.emit_range_aggregate_for_bucket(open_time_ms)
         best_range_bar_count = 0
         min_range_bars = self._get_min_range_bars()
-        if range_events:
-            best_range_bar_count = max((int(event.data.get("bar_count") or 0) for event in range_events), default=0)
+        range_aggregates = self._load_range_aggregates_for_bucket(open_time_ms)
+        if range_aggregates:
+            best_range_bar_count = max((int(aggregate.bar_count) for aggregate in range_aggregates), default=0)
             if not is_mid_bucket_restart or best_range_bar_count >= min_range_bars:
                 if is_mid_bucket_restart:
                     logger.info(
@@ -439,7 +439,7 @@ class LiveRuntimeRunner:
                         best_range_bar_count,
                         min_range_bars,
                     )
-                features.extend(range_events)
+                features.extend(await self._emit_range_aggregates(range_aggregates))
                 self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_kline)
                 return features
 
@@ -482,7 +482,7 @@ class LiveRuntimeRunner:
         self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_kline)
         return features
 
-    async def emit_range_aggregate_for_bucket(self, bucket_start_ms: int) -> list[MarketFeatureEvent]:
+    def _load_range_aggregates_for_bucket(self, bucket_start_ms: int) -> list[RangeBarAggregate]:
         store = self._get_range_bar_store()
         rows = store.load(
             symbol=self.app_config.symbol,
@@ -492,15 +492,19 @@ class LiveRuntimeRunner:
         if not rows:
             return []
         aggregates = self._get_range_bar_aggregator().aggregate(rows, bucket_ms=self._closed_bar_interval_ms)
+        return [aggregate for aggregate in aggregates if aggregate.bucket_start_ms == bucket_start_ms]
+
+    async def _emit_range_aggregates(self, aggregates: Sequence[RangeBarAggregate]) -> list[MarketFeatureEvent]:
         events: list[MarketFeatureEvent] = []
         for aggregate in aggregates:
-            if aggregate.bucket_start_ms != bucket_start_ms:
-                continue
             event = range_aggregate_feature(aggregate, exchange=self.app_config.data_exchange, timeframe=self._range_aggregate_interval)
             self.stats.range_aggregates_created += 1
             await self.process_market_feature(event)
             events.append(event)
         return events
+
+    async def emit_range_aggregate_for_bucket(self, bucket_start_ms: int) -> list[MarketFeatureEvent]:
+        return await self._emit_range_aggregates(self._load_range_aggregates_for_bucket(bucket_start_ms))
 
     async def _startup(self) -> None:
         logger.info("Live runtime startup phase started")

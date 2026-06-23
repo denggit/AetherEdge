@@ -292,6 +292,7 @@ class RangeAuditStrategy(FeatureStrategy):
     def __init__(self, range_store: MemoryRangeBarStore) -> None:
         super().__init__()
         self.range_store = range_store
+        self.config = {"micro_context": {"min_range_bars": 5}}
 
     async def on_market_feature(self, event):
         self.events.append(event.type_value)
@@ -2659,6 +2660,124 @@ async def test_mid_bucket_restart_without_store_rows_emits_unavailable():
     assert events[-1].data["context_available"] is False
     assert events[-1].data["incomplete"] is True
     assert events[-1].data["reason"] == "live_trade_collection_started_mid_bucket"
+
+
+@pytest.mark.asyncio
+async def test_mid_bucket_restart_with_insufficient_store_rows_does_not_emit_partial_range_aggregate(monkeypatch):
+    range_store = MemoryRangeBarStore()
+    open_time_ms = 2 * H4
+    for i in range(4):
+        range_store.save([
+            _range_bar(
+                bar_id=i + 1,
+                start_time_ms=open_time_ms + i * 1_000,
+                end_time_ms=open_time_ms + i * 1_000,
+            )
+        ])
+    strategy = RangeAuditStrategy(range_store)
+    runner = _runner(
+        strategy,
+        data=FakeData(),
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": _feature_requirements(),
+            "range_bar_store": range_store,
+            "range_bar_aggregator": RangeBarAggregator(),
+        },
+        dry_run=True,
+    )
+    runner._rangebar_trust_start_bucket_ms = open_time_ms + H4
+    processed_features = []
+    original_process_market_feature = runner.process_market_feature
+
+    async def capture_process_market_feature(event):
+        processed_features.append(event)
+        await original_process_market_feature(event)
+
+    monkeypatch.setattr(runner, "process_market_feature", capture_process_market_feature)
+
+    events = await runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
+
+    assert [event.type_value for event in events] == ["closed_kline", "range_aggregate"]
+    assert events[-1].data["context_available"] is False
+    assert events[-1].data["incomplete"] is True
+    assert events[-1].data["reason"] == "live_trade_collection_started_mid_bucket"
+    partial_aggregates = [
+        event
+        for event in processed_features
+        if event.type_value == "range_aggregate"
+        and event.data.get("context_available", True) is True
+        and event.data.get("bar_count") == 4
+    ]
+    assert partial_aggregates == []
+
+
+@pytest.mark.asyncio
+async def test_non_mid_bucket_emits_range_aggregate_even_when_store_rows_exist():
+    range_store = MemoryRangeBarStore()
+    open_time_ms = 2 * H4
+    for i in range(5):
+        range_store.save([
+            _range_bar(
+                bar_id=i + 1,
+                start_time_ms=open_time_ms + i * 1_000,
+                end_time_ms=open_time_ms + i * 1_000,
+            )
+        ])
+    strategy = RangeAuditStrategy(range_store)
+    runner = _runner(
+        strategy,
+        data=FakeData(),
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": _feature_requirements(),
+            "range_bar_store": range_store,
+            "range_bar_aggregator": RangeBarAggregator(),
+        },
+        dry_run=True,
+    )
+    runner._rangebar_trust_start_bucket_ms = None
+
+    events = await runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
+
+    assert [event.type_value for event in events] == ["closed_kline", "range_aggregate"]
+    assert events[-1].data["bar_count"] == 5
+    assert strategy.last_decision_audit["range_available"] is True
+    assert strategy.last_decision_audit["range_status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_emit_range_aggregate_for_bucket_still_processes_feature():
+    range_store = MemoryRangeBarStore()
+    for i in range(5):
+        range_store.save([
+            _range_bar(
+                bar_id=i + 1,
+                start_time_ms=i * 1_000,
+                end_time_ms=i * 1_000,
+            )
+        ])
+    strategy = FeatureStrategy()
+    runner = _runner(
+        strategy,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": _feature_requirements(),
+            "range_bar_store": range_store,
+            "range_bar_aggregator": RangeBarAggregator(),
+        },
+        dry_run=True,
+    )
+
+    events = await runner.emit_range_aggregate_for_bucket(0)
+
+    assert [event.type_value for event in events] == ["range_aggregate"]
+    assert events[0].data["bar_count"] == 5
+    assert "range_aggregate" in strategy.events
+    assert runner.stats.range_aggregates_created == 1
 
 
 @pytest.mark.asyncio
