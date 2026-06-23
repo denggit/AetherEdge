@@ -195,6 +195,13 @@ class LiveRuntimeRunner:
             self.app_config.dry_run,
             max_market_events,
         )
+        logger.info(
+            "Market queue settings | maxsize=%s backlog_warn_threshold=%s drain_batch_size=%s full_alert_cooldown_seconds=%s",
+            self._market_queue.maxsize,
+            self._market_queue_backlog_warn_threshold,
+            self._market_queue_drain_batch_size,
+            300,
+        )
         self.context.alerts.start()
         try:
             await self._startup()
@@ -1351,7 +1358,6 @@ class LiveRuntimeRunner:
         return False
 
     async def _enqueue_market_event(self, event: MarketEvent) -> None:
-        self._maybe_log_market_queue_backlog(event=event)
         if self._market_queue.full():
             self.stats.market_events_dropped += 1
             self._emit_market_queue_full_alert(event)
@@ -1361,6 +1367,8 @@ class LiveRuntimeRunner:
                 self._market_queue.task_done()
             except asyncio.QueueEmpty:
                 pass
+        else:
+            self._maybe_log_market_queue_backlog(event=event)
         await self._market_queue.put(event)
 
     def _maybe_log_market_queue_backlog(self, *, event: MarketEvent) -> None:

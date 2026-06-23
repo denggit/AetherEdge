@@ -2460,6 +2460,23 @@ async def test_market_queue_full_drops_only_when_maxsize_reached():
 
 
 @pytest.mark.asyncio
+async def test_market_queue_full_logs_full_without_backlog_warning(caplog):
+    strategy = FeatureStrategy()
+    runner = _runner(strategy, dry_run=True)
+    runner._market_queue = asyncio.Queue(maxsize=2)
+    runner._market_queue.put_nowait(_trade(trade_time_ms=1))
+    runner._market_queue.put_nowait(_trade(trade_time_ms=2))
+
+    caplog.set_level(logging.WARNING)
+    await runner._enqueue_market_event(_trade(trade_time_ms=3))
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "Market queue full; dropped oldest event" in messages
+    assert "Market queue backlog high" not in messages
+    assert runner.stats.market_events_dropped == 1
+
+
+@pytest.mark.asyncio
 async def test_market_queue_full_trade_marks_range_context_degraded():
     strategy = FeatureStrategy()
     runner = _runner(strategy, dry_run=True)
@@ -2470,6 +2487,33 @@ async def test_market_queue_full_trade_marks_range_context_degraded():
     await runner._enqueue_market_event(_trade(trade_time_ms=2 * H4 + 3))
 
     assert runner._range_context_degraded_buckets[2 * H4] == "market_queue_dropped_trade"
+
+
+@pytest.mark.asyncio
+async def test_runtime_start_logs_market_queue_settings(caplog, monkeypatch):
+    strategy = FeatureStrategy()
+    runner = _runner(strategy, dry_run=True)
+
+    async def fake_startup():
+        return None
+
+    async def fake_consume_market_events(*, max_market_events):
+        return None
+
+    monkeypatch.setattr(runner, "_startup", fake_startup)
+    monkeypatch.setattr(runner, "_start_producers", lambda: [])
+    monkeypatch.setattr(runner, "_start_sync_tasks", lambda: [])
+    monkeypatch.setattr(runner, "_consume_market_events", fake_consume_market_events)
+
+    caplog.set_level(logging.INFO)
+    await runner.run(max_market_events=0)
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "Market queue settings" in messages
+    assert "maxsize=" in messages
+    assert "backlog_warn_threshold=" in messages
+    assert "drain_batch_size=" in messages
+    assert "full_alert_cooldown_seconds=300" in messages
 
 
 @pytest.mark.asyncio
