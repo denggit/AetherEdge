@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from decimal import Decimal
 from pathlib import Path
 
@@ -13,8 +14,10 @@ from tools.v9c_signal_parity_check import (
     REPLAY_AUDIT_FILENAME,
     SUMMARY_FILENAME,
     build_range_context_from_rf_columns,
+    build_parser,
     compare_signal_audits,
     main,
+    replay_aetheredge_signal_audit,
     strategy_fingerprint,
     timestamp_to_open_close_ms,
     validate_coin_audit_columns,
@@ -88,6 +91,51 @@ def test_strategy_fingerprint_hash_is_stable() -> None:
     assert first["strategy_id"] == "eth_lf_portfolio_v9c_reclaim_priority"
 
 
+def test_parser_exposes_logging_options() -> None:
+    parser = build_parser()
+    help_text = parser.format_help()
+
+    assert "--log-every-rows" in help_text
+    assert "--quiet" in help_text
+
+
+def test_replay_logs_progress(caplog) -> None:
+    df = pd.concat(
+        [
+            _coin_audit_df(timestamp="2023-01-01 04:00:00"),
+            _coin_audit_df(timestamp="2023-01-01 08:00:00"),
+        ],
+        ignore_index=True,
+    )
+    caplog.set_level(logging.INFO, logger="v9c_signal_parity")
+
+    replay_aetheredge_signal_audit(df, log_every_rows=1)
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "Replay progress" in messages
+    assert "row=1/2" in messages
+    assert "row=2/2" in messages
+
+
+def test_compare_logs_progress(caplog) -> None:
+    coin_df = pd.concat(
+        [
+            _coin_audit_df(timestamp="2023-01-01 04:00:00"),
+            _coin_audit_df(timestamp="2023-01-01 08:00:00"),
+        ],
+        ignore_index=True,
+    )
+    ae_df = coin_df.copy()
+    caplog.set_level(logging.INFO, logger="v9c_signal_parity")
+
+    compare_signal_audits(coin_df, ae_df, skip_warmup_bars=0, log_every_rows=1)
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "Compare progress" in messages
+    assert "row=1/2" in messages
+    assert "row=2/2" in messages
+
+
 def test_cli_writes_expected_outputs(tmp_path: Path) -> None:
     coin_audit = tmp_path / "coin_signal_audit.csv"
     out_dir = tmp_path / "out"
@@ -110,6 +158,30 @@ def test_cli_writes_expected_outputs(tmp_path: Path) -> None:
     assert (out_dir / SUMMARY_FILENAME).exists()
     assert (out_dir / FINGERPRINT_FILENAME).exists()
     summary = json.loads((out_dir / SUMMARY_FILENAME).read_text(encoding="utf-8"))
+    assert summary["coin_rows"] == 1
+    assert summary["aetheredge_rows"] == 1
+
+
+def test_cli_quiet_still_prints_summary(tmp_path: Path, capsys) -> None:
+    coin_audit = tmp_path / "coin_signal_audit.csv"
+    out_dir = tmp_path / "out"
+    _coin_audit_df(rf_bar_count=0).to_csv(coin_audit, index=False)
+
+    exit_code = main(
+        [
+            "--coin-audit",
+            str(coin_audit),
+            "--out-dir",
+            str(out_dir),
+            "--skip-warmup-bars",
+            "0",
+            "--quiet",
+        ]
+    )
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    summary = json.loads(out)
     assert summary["coin_rows"] == 1
     assert summary["aetheredge_rows"] == 1
 

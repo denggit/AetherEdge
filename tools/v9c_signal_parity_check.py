@@ -1,6 +1,8 @@
 import argparse
 import asyncio
+import logging
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +20,8 @@ import pandas as pd
 from strategies.eth_lf_portfolio_v8.domain.models import BarReadyContext, ClosedKlineContext, RangeAggregateContext, Side
 from strategies.eth_lf_portfolio_v8.strategy import DEFAULT_CONFIG_PATH, FOUR_HOURS_MS, Strategy
 
+
+logger = logging.getLogger("v9c_signal_parity")
 
 DEFAULT_OUT_DIR = Path("data/parity/v9c_signal")
 REPLAY_AUDIT_FILENAME = "aetheredge_v9c_replay_signal_audit.csv"
@@ -79,6 +83,16 @@ FLOAT_COMPARE_FIELDS = [
     "rf_imbalance",
     "rf_taker_buy_ratio",
 ]
+
+
+def configure_logging(*, verbose: bool = True) -> None:
+    level = logging.INFO if verbose else logging.WARNING
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        force=True,
+    )
+    logger.setLevel(level)
 
 
 @dataclass(frozen=True)
@@ -154,13 +168,20 @@ def build_range_context_from_rf_columns(
     )
 
 
-def replay_aetheredge_signal_audit(coin_df: pd.DataFrame, *, max_rows: int | None = None) -> pd.DataFrame:
+def replay_aetheredge_signal_audit(
+    coin_df: pd.DataFrame,
+    *,
+    max_rows: int | None = None,
+    log_every_rows: int = 500,
+) -> pd.DataFrame:
     coin_df = coin_df.head(max_rows).copy() if max_rows is not None else coin_df.copy()
     validate_coin_audit_columns(coin_df)
     strategy = Strategy()
     rows: list[dict[str, Any]] = []
+    total_rows = len(coin_df)
+    started = time.perf_counter()
 
-    for _, row in coin_df.iterrows():
+    for row_idx, (_, row) in enumerate(coin_df.iterrows(), start=1):
         open_time_ms, close_time_ms = timestamp_to_open_close_ms(row["timestamp"])
         kline = ClosedKlineContext(
             symbol=strategy.config.symbol,
@@ -212,6 +233,17 @@ def replay_aetheredge_signal_audit(coin_df: pd.DataFrame, *, max_rows: int | Non
         strategy.bar_ready_events.append(ready)
 
         rows.append(_audit_row_from_context(row, ready))
+        if log_every_rows > 0 and (row_idx == 1 or row_idx % log_every_rows == 0 or row_idx == total_rows):
+            elapsed = time.perf_counter() - started
+            logger.info(
+                "Replay progress | row=%s/%s timestamp=%s selected_engine=%s signal=%s elapsed_sec=%.3f",
+                row_idx,
+                total_rows,
+                row["timestamp"],
+                rows[-1].get("selected_engine") if rows else None,
+                rows[-1].get("signal") if rows else None,
+                elapsed,
+            )
 
     return pd.DataFrame(rows, columns=AUDIT_COLUMNS)
 
@@ -222,6 +254,7 @@ def compare_signal_audits(
     *,
     tolerance: float = 1e-9,
     skip_warmup_bars: int = 250,
+    log_every_rows: int = 500,
 ) -> CompareResult:
     validate_coin_audit_columns(coin_df)
     _validate_aetheredge_audit_columns(aetheredge_df)
@@ -229,8 +262,10 @@ def compare_signal_audits(
     compared = joined.iloc[skip_warmup_bars:] if skip_warmup_bars else joined
     mismatches: list[dict[str, Any]] = []
     mismatch_fields: dict[str, int] = {}
+    total_rows = len(compared)
+    started = time.perf_counter()
 
-    for _, row in compared.iterrows():
+    for row_idx, (_, row) in enumerate(compared.iterrows(), start=1):
         timestamp = row["timestamp"]
         for field in STRICT_COMPARE_FIELDS:
             coin_value = row[f"{field}_coin"]
@@ -249,6 +284,16 @@ def compare_signal_audits(
             abs_diff = abs(coin_float - ae_float)
             if abs_diff > tolerance:
                 _append_mismatch(mismatches, mismatch_fields, timestamp, field, coin_value, ae_value, abs_diff)
+        if log_every_rows > 0 and (row_idx == 1 or row_idx % log_every_rows == 0 or row_idx == total_rows):
+            elapsed = time.perf_counter() - started
+            logger.info(
+                "Compare progress | row=%s/%s timestamp=%s mismatches=%s elapsed_sec=%.3f",
+                row_idx,
+                total_rows,
+                timestamp,
+                len(mismatches),
+                elapsed,
+            )
 
     mismatch_df = pd.DataFrame(mismatches, columns=["timestamp", "field", "coin_value", "aetheredge_value", "abs_diff"])
     return CompareResult(
@@ -318,24 +363,69 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tolerance", type=float, default=1e-9, help="Floating-point comparison tolerance. Default: 1e-9")
     parser.add_argument("--skip-warmup-bars", type=int, default=250, help="Rows to skip before comparing. Default: 250")
     parser.add_argument("--max-rows", type=int, default=None, help="Replay only the first N rows. Default: all rows")
+    parser.add_argument("--log-every-rows", type=int, default=500, help="Print replay/compare progress every N rows. Default: 500")
+    parser.add_argument("--quiet", action="store_true", help="Only print warnings/errors and final JSON summary.")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    configure_logging(verbose=not args.quiet)
+    logger.info(
+        "V9C signal parity started | coin_audit=%s out_dir=%s skip_warmup_bars=%s tolerance=%s max_rows=%s fail_on_mismatch=%s",
+        args.coin_audit,
+        args.out_dir,
+        args.skip_warmup_bars,
+        args.tolerance,
+        args.max_rows,
+        args.fail_on_mismatch,
+    )
     try:
+        logger.info("Loading CoinBacktest audit | path=%s", args.coin_audit)
         coin_df = pd.read_csv(args.coin_audit)
+        logger.info("CoinBacktest audit loaded | rows=%s columns=%s", len(coin_df), len(coin_df.columns))
         if args.max_rows is not None:
             coin_df = coin_df.head(args.max_rows)
+            logger.info("CoinBacktest audit truncated | max_rows=%s rows=%s", args.max_rows, len(coin_df))
+        logger.info("Validating CoinBacktest audit columns | required=%s", len(REQUIRED_COLUMNS))
         validate_coin_audit_columns(coin_df)
-        aetheredge_df = replay_aetheredge_signal_audit(coin_df)
+        logger.info("CoinBacktest audit columns validated | missing=0")
+        logger.info("AetherEdge V9C replay started | rows=%s", len(coin_df))
+        replay_started = time.perf_counter()
+        aetheredge_df = replay_aetheredge_signal_audit(
+            coin_df,
+            log_every_rows=args.log_every_rows,
+        )
+        logger.info(
+            "AetherEdge V9C replay completed | rows=%s duration_sec=%.3f",
+            len(aetheredge_df),
+            time.perf_counter() - replay_started,
+        )
+        logger.info(
+            "Comparing signal audits | coin_rows=%s aetheredge_rows=%s skip_warmup_bars=%s tolerance=%s",
+            len(coin_df),
+            len(aetheredge_df),
+            args.skip_warmup_bars,
+            args.tolerance,
+        )
+        compare_started = time.perf_counter()
         compare_result = compare_signal_audits(
             coin_df,
             aetheredge_df,
             tolerance=args.tolerance,
             skip_warmup_bars=args.skip_warmup_bars,
+            log_every_rows=args.log_every_rows,
         )
+        logger.info(
+            "Signal audit compare completed | joined_rows=%s compared_rows=%s mismatch_count=%s mismatch_fields=%s duration_sec=%.3f",
+            compare_result.joined_rows,
+            compare_result.compared_rows,
+            compare_result.mismatch_count,
+            compare_result.mismatch_fields,
+            time.perf_counter() - compare_started,
+        )
+        logger.info("Writing parity outputs | out_dir=%s", args.out_dir)
         summary = write_outputs(
             coin_audit_path=args.coin_audit,
             out_dir=args.out_dir,
@@ -346,13 +436,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             skip_warmup_bars=args.skip_warmup_bars,
             fingerprint=strategy_fingerprint(),
         )
+        logger.info(
+            "Parity outputs written | replay_audit=%s mismatches=%s summary=%s fingerprint=%s",
+            args.out_dir / REPLAY_AUDIT_FILENAME,
+            args.out_dir / MISMATCH_FILENAME,
+            args.out_dir / SUMMARY_FILENAME,
+            args.out_dir / FINGERPRINT_FILENAME,
+        )
     except Exception as exc:
+        logger.exception("V9C signal parity failed with exception")
         print(str(exc), file=sys.stderr)
         return 2
 
-    print(json.dumps(summary, sort_keys=True, default=str))
+    if summary["passed"]:
+        logger.info("V9C signal parity passed | compared_rows=%s mismatch_count=0", summary["compared_rows"])
+    else:
+        logger.warning(
+            "V9C signal parity failed | compared_rows=%s mismatch_count=%s mismatch_fields=%s",
+            summary["compared_rows"],
+            summary["mismatch_count"],
+            summary["mismatch_fields"],
+        )
     if args.fail_on_mismatch and summary["mismatch_count"] > 0:
+        logger.warning("Exiting with code 1 because --fail-on-mismatch is set")
+        print(json.dumps(summary, sort_keys=True, default=str))
         return 1
+    print(json.dumps(summary, sort_keys=True, default=str))
     return 0
 
 
