@@ -872,7 +872,8 @@ class Strategy:
                     )
                 )
                 self.recovery_alerts.append(f"follower_missing_manual_required:{exchange}")
-                signals.append(self._follower_topup_signal(exchange=exchange, side=side, quantity=target_qty, plan=plan))
+                if not self.recovery_manual_required:
+                    signals.append(self._follower_topup_signal(exchange=exchange, side=side, quantity=target_qty, plan=plan))
             elif same_qty < target_qty:
                 self.position.mark_leg_open(exchange=exchange, avg_fill_price=entry_price, base_qty=same_qty, native_qty=same_native_qty, sync_status="underfilled")
                 if follower_snapshot is not None:
@@ -1020,17 +1021,47 @@ class Strategy:
     ) -> list[TradeSignal]:
         signals: list[TradeSignal] = []
         for check in validation.checks:
-            action = "keep" if check.valid else "cancel_replace" if check.bot_owned else "alert_manual_required"
+            action = (
+                "cancel_replace"
+                if check.bot_owned and validation.should_cancel_and_replace_bot_stops
+                else "keep"
+                if check.valid
+                else "alert_manual_required"
+                if not check.bot_owned
+                else "place_new_stop"
+            )
             logger.info("Recovery exit order validation | %s", check.log_fields(action=action))
         if validation.unknown_exit_orders:
+            self.recovery_manual_required = True
             for order in validation.unknown_exit_orders:
                 self.recovery_alerts.append(f"unknown_exit_order_manual_required:{exchange}:{order.order_id or order.client_order_id or 'unknown'}")
         if validation.unsupported_bot_exit_orders:
+            self.recovery_manual_required = True
             for order in validation.unsupported_bot_exit_orders:
                 self.recovery_alerts.append(f"unsupported_take_profit_or_trailing_manual_required:{exchange}:{order.order_id or order.client_order_id or 'unknown'}")
-        if validation.valid:
+        if validation.should_keep_existing_stop:
             return signals
-        if validation.should_cancel_bot_owned_stops and not validation.unknown_exit_orders:
+        if validation.should_cancel_and_replace_bot_stops:
+            action = "manual_required" if validation.has_unknown_exit_orders else "cancel_replace"
+            logger.info(
+                "Recovery exit order resync | reason=%s valid_bot_stop_count=%s invalid_bot_stop_count=%s unknown_stop_count=%s action=%s",
+                validation.primary_invalid_reason,
+                len(validation.valid_bot_owned_orders),
+                len(validation.invalid_bot_owned_orders),
+                len(validation.unknown_exit_orders),
+                action,
+            )
+            if validation.has_unknown_exit_orders:
+                self.recovery_manual_required = True
+                self.recovery_alerts.append(f"critical_recovery_exit_order_manual_required:{exchange}:unknown_stop_blocks_cancel_all")
+                logger.critical(
+                    "Recovery exit order manual required | reason=unknown_stop_blocks_cancel_all exchange=%s position_id=%s invalid_bot_stop_count=%s unknown_stop_count=%s",
+                    exchange,
+                    self.position.position_id,
+                    len(validation.invalid_bot_owned_orders),
+                    len(validation.unknown_exit_orders),
+                )
+                return signals
             signals.extend(
                 self._replace_stop_signals(
                     target_exchanges=[exchange],
@@ -1040,7 +1071,7 @@ class Strategy:
                     bar_close_time_ms=None,
                 )
             )
-            cancel_count = len(validation.bot_owned_invalid_orders)
+            cancel_count = len(validation.bot_owned_orders)
         else:
             signals.extend(
                 self._place_stop_signals(
@@ -1053,9 +1084,13 @@ class Strategy:
             )
             cancel_count = 0
         logger.info(
-            "Recovery exit order resync | exchange=%s reason=%s cancel_count=%s new_stop_base_quantity=%s new_stop_native_quantity_preview=%s stop_price=%s",
+            "Recovery exit order resync | exchange=%s reason=%s valid_bot_stop_count=%s invalid_bot_stop_count=%s unknown_stop_count=%s action=%s cancel_count=%s new_stop_base_quantity=%s new_stop_native_quantity_preview=%s stop_price=%s",
             exchange,
             validation.primary_invalid_reason,
+            len(validation.valid_bot_owned_orders),
+            len(validation.invalid_bot_owned_orders),
+            len(validation.unknown_exit_orders),
+            "cancel_replace" if cancel_count else "place_new_stop",
             cancel_count,
             quantity,
             validation.expected_native_quantity,
@@ -1076,6 +1111,7 @@ class Strategy:
             else:
                 unknown_stops.append(order)
         for order in unknown_stops:
+            self.recovery_manual_required = True
             self.recovery_alerts.append(f"unknown_exit_order_manual_required:{exchange}:{order.order_id or order.client_order_id or 'unknown'}")
             logger.info(
                 "Recovery exit order validation | exchange=%s symbol=%s position_side=None position_mode=%s current_position_base_quantity=0 current_position_native_quantity=0 canonical_stop_price=None existing_order_id=%s existing_client_order_id=%s valid=false invalid_reason=follower_missing_unknown_stop action=alert_manual_required",
@@ -1085,12 +1121,24 @@ class Strategy:
                 order.order_id,
                 order.client_order_id,
             )
-        if not bot_owned_stops or unknown_stops:
+        if not bot_owned_stops:
+            return []
+        if unknown_stops:
+            self.recovery_manual_required = True
+            self.recovery_alerts.append(f"critical_recovery_exit_order_manual_required:{exchange}:unknown_stop_blocks_cancel_all")
+            logger.critical(
+                "Recovery exit order manual required | reason=unknown_stop_blocks_cancel_all exchange=%s position_id=%s invalid_bot_stop_count=%s unknown_stop_count=%s",
+                exchange,
+                position_id,
+                len(bot_owned_stops),
+                len(unknown_stops),
+            )
             return []
         self.recovery_alerts.append(f"no_position_stop_cancelled:{exchange}")
         logger.info(
-            "Recovery exit order resync | exchange=%s reason=follower_missing_no_position_stop_cancelled cancel_count=%s new_stop_base_quantity=0 new_stop_native_quantity_preview=0 stop_price=None",
+            "Recovery exit order resync | exchange=%s reason=follower_missing_no_position_stop_cancelled valid_bot_stop_count=0 invalid_bot_stop_count=%s unknown_stop_count=0 action=cancel_replace cancel_count=%s new_stop_base_quantity=0 new_stop_native_quantity_preview=0 stop_price=None",
             exchange,
+            len(bot_owned_stops),
             len(bot_owned_stops),
         )
         return [

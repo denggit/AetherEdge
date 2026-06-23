@@ -70,23 +70,63 @@ class RecoveryExitValidationResult:
 
     @property
     def valid(self) -> bool:
-        return any(check.valid for check in self.checks)
+        return self.has_valid_bot_owned_stop
 
     @property
     def should_replace(self) -> bool:
-        return not self.valid
+        return not self.should_keep_existing_stop
 
     @property
-    def bot_owned_invalid_orders(self) -> tuple[Order, ...]:
+    def bot_owned_orders(self) -> tuple[Order, ...]:
+        return tuple(check.order for check in self.checks if check.order is not None and check.bot_owned)
+
+    @property
+    def valid_bot_owned_orders(self) -> tuple[Order, ...]:
+        return tuple(check.order for check in self.checks if check.order is not None and check.bot_owned and check.valid)
+
+    @property
+    def invalid_bot_owned_orders(self) -> tuple[Order, ...]:
         return tuple(check.order for check in self.checks if check.order is not None and check.bot_owned and not check.valid)
 
     @property
+    def bot_owned_invalid_orders(self) -> tuple[Order, ...]:
+        return self.invalid_bot_owned_orders
+
+    @property
+    def has_valid_bot_owned_stop(self) -> bool:
+        return bool(self.valid_bot_owned_orders)
+
+    @property
+    def has_invalid_bot_owned_stop(self) -> bool:
+        return bool(self.invalid_bot_owned_orders)
+
+    @property
+    def has_unknown_exit_orders(self) -> bool:
+        return bool(self.unknown_exit_orders)
+
+    @property
+    def should_keep_existing_stop(self) -> bool:
+        return self.has_valid_bot_owned_stop and not self.has_invalid_bot_owned_stop and len(self.bot_owned_orders) == 1
+
+    @property
     def should_cancel_bot_owned_stops(self) -> bool:
-        return bool(self.bot_owned_invalid_orders)
+        return self.should_cancel_and_replace_bot_stops
+
+    @property
+    def should_cancel_and_replace_bot_stops(self) -> bool:
+        return self.has_invalid_bot_owned_stop or len(self.bot_owned_orders) > 1
+
+    @property
+    def should_place_new_stop(self) -> bool:
+        return not self.has_valid_bot_owned_stop and not self.has_invalid_bot_owned_stop
 
     @property
     def primary_invalid_reason(self) -> str | None:
-        if self.valid:
+        if self.has_invalid_bot_owned_stop:
+            return "invalid_bot_owned_stop_present"
+        if len(self.valid_bot_owned_orders) > 1:
+            return "duplicate_valid_bot_owned_stop"
+        if self.should_keep_existing_stop:
             return None
         for check in self.checks:
             if check.invalid_reason:
