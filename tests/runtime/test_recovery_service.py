@@ -261,7 +261,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 from src.app import AppContext
-from src.order_management.safety import RecoveryExitOrderValidator, is_bot_owned_order
+from src.order_management.safety import RecoveryExitOrderValidator
 from src.platform.exchanges.models import OrderSide, PositionMode
 from src.platform.markets import get_market_profile
 from src.platform.snapshot import PlatformSnapshot

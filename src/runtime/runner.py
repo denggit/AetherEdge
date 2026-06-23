@@ -20,7 +20,7 @@ from src.order_management.position_plan.models import LegRole
 from src.order_management.models import ExchangeOrderResult, OrderIntentStatus
 from src.order_management.quantity import NativeQuantityConverter
 from src.order_management.reconciliation.service import LiveStateReconciliationService
-from src.order_management.safety import RecoveryExitOrderValidator, is_bot_owned_order
+from src.order_management.safety import RecoveryExitOrderValidator
 from src.platform import create_account_client, create_execution_client
 from src.platform.account.events import AccountEvent
 from src.platform.account.ports import AccountClient
@@ -800,14 +800,15 @@ class LiveRuntimeRunner:
                 f"runtime recovery blocking manual required: "
                 f"alerts={alerts}"
             )
+        # ── Validate recovery protection postcondition ────────────────────
+        self._validate_recovery_protection_postcondition(report)
+        # ── Only log completion AFTER postcondition passes ────────────────
         logger.info(
             "Runtime recovery completed | snapshots=%s strategy_signals=%s issues=%s",
             len(report.snapshots),
             len(report.strategy_signals),
             len(report.issues),
         )
-        # ── Validate recovery protection postcondition ────────────────────
-        self._validate_recovery_protection_postcondition(report)
         if report.strategy_signals:
             await self._execute_signals(report.strategy_signals, source="recovery", event_time_ms=int(time.time() * 1000), metadata={"feature_type": "recovery"})
         if report.snapshots:
@@ -904,15 +905,6 @@ class LiveRuntimeRunner:
             if exchange_str in place_stop_exchanges:
                 continue
 
-            # ── Check 3: any bot-owned active stop as fallback ──
-            if self._has_any_bot_owned_active_stop(snapshot, strategy_id, position_id):
-                logger.warning(
-                    "Recovery protection postcondition: bot-owned stop found but not "
-                    "fully validated | exchange=%s — proceeding with caution",
-                    exchange_str,
-                )
-                continue
-
             # ── Postcondition FAILED ─────────────────────────────────────
             open_stop_orders = getattr(snapshot, "open_stop_orders", ()) or ()
             raise LiveRuntimeError(
@@ -928,17 +920,6 @@ class LiveRuntimeRunner:
                 f"canonical_stop_price={canonical_stop_price} "
                 f"strategy_recovery_blocking_manual_required=false"
             )
-
-    def _has_any_bot_owned_active_stop(self, snapshot, strategy_id: str, position_id: str | None) -> bool:
-        """Lightweight check: does the snapshot contain at least one bot-owned
-        stop order that is still active (NEW / PARTIALLY_FILLED)?"""
-        active_statuses = {OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED}
-        for order in getattr(snapshot, "open_stop_orders", ()) or ():
-            if order.status not in active_statuses:
-                continue
-            if is_bot_owned_order(order=order, strategy_id=strategy_id, position_id=position_id):
-                return True
-        return False
 
     async def _call_on_start(self, snapshot: PlatformSnapshot) -> None:
         on_start = getattr(self.context.strategy, "on_start", None)
