@@ -7,8 +7,8 @@ from src.platform import ExchangeName
 from src.planner import ExecutionPlanner
 from src.runtime import LiveRuntimeConfig, LiveRuntimeRunner, RuntimeMode
 from src.runtime.tasks import ClosedBarScheduler
-from src.signals import SignalAction
-from strategies.eth_lf_portfolio_v8.domain.models import BarReadyContext, ClosedKlineContext, MicroDecision, Side
+from src.signals import SignalAction, TradeSignal
+from strategies.eth_lf_portfolio_v8.domain.models import BarReadyContext, ClosedKlineContext, MicroDecision, RangeAggregateContext, RoutedSignal, Side
 from strategies.eth_lf_portfolio_v8.strategy import Strategy
 from strategies.eth_lf_portfolio_v8.strategy import _default_engine_execution_params
 
@@ -220,7 +220,98 @@ def test_v9c_strategy_config_min_range_bars_is_read_by_runner():
     )
 
 
-def _bar_ready_context(*, close: Decimal, engine_features: dict[str, dict[str, Decimal]]) -> BarReadyContext:
+def test_v9c_strategy_builds_last_decision_audit_for_no_signal():
+    strategy = Strategy()
+    strategy.started = True
+    strategy.equity = Decimal("1000")
+    context = _bar_ready_context(
+        close=Decimal("100"),
+        engine_features={},
+        routed_signal=RoutedSignal.flat(),
+    )
+
+    audit = strategy._build_decision_audit(context, [])
+
+    assert audit["signal_count"] == 0
+    assert audit["reason"] in {"flat_route", "micro_blocked", "no_signal"}
+    assert "range_available" in audit
+    assert "range_bar_count" in audit
+    assert "range_imbalance" in audit
+    assert "range_close_pos" in audit
+    assert "micro_entry_risk_scale" in audit
+
+
+def test_v9c_strategy_builds_last_decision_audit_for_open_signal():
+    strategy = Strategy()
+    strategy.started = True
+    strategy.equity = Decimal("1000")
+    context = _bar_ready_context(
+        close=Decimal("100"),
+        engine_features={},
+        routed_signal=RoutedSignal(
+            side=Side.LONG,
+            engine="BULL_RECLAIM_V2",
+            priority=10,
+            risk_mult=Decimal("1.2"),
+            quality_mult=Decimal("0.8"),
+        ),
+    )
+    signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.OPEN_LONG,
+        quantity=Decimal("0.1"),
+    )
+
+    audit = strategy._build_decision_audit(context, [signal])
+
+    assert audit["reason"] == "entry_signal"
+    assert "open_long" in audit["actions"]
+    assert audit["selected_engine"]
+    assert audit["selected_side"] == "long"
+
+
+def test_v9c_strategy_decision_audit_includes_range_bar_fields():
+    strategy = Strategy()
+    strategy.started = True
+    strategy.equity = Decimal("1000")
+    aggregate = _range_aggregate(bar_count=37)
+    context = _bar_ready_context(
+        close=Decimal("101"),
+        engine_features={},
+        range_aggregate=aggregate,
+        micro=MicroDecision(
+            signal_side=Side.LONG,
+            context_available=True,
+            aligned=True,
+            contra=False,
+            entry_risk_scale=Decimal("1"),
+            action="allow",
+        ),
+        routed_signal=RoutedSignal(
+            side=Side.LONG,
+            engine="BULL_RECLAIM_V2",
+            priority=10,
+        ),
+    )
+
+    audit = strategy._build_decision_audit(context, [])
+
+    assert audit["range_available"] is True
+    assert audit["range_bar_count"] == 37
+    assert audit["range_imbalance"] is not None
+    assert audit["range_taker_buy_ratio"] is not None
+    assert audit["range_close_pos"] is not None
+    assert audit["range_micro_return_pct"] is not None
+
+
+def _bar_ready_context(
+    *,
+    close: Decimal,
+    engine_features: dict[str, dict[str, Decimal]],
+    range_aggregate: RangeAggregateContext | None = None,
+    micro: MicroDecision | None = None,
+    routed_signal: RoutedSignal | None = None,
+) -> BarReadyContext:
     return BarReadyContext(
         kline=ClosedKlineContext(
             symbol="ETH-USDT-PERP",
@@ -234,8 +325,8 @@ def _bar_ready_context(*, close: Decimal, engine_features: dict[str, dict[str, D
             close=close,
             volume=Decimal("1"),
         ),
-        range_aggregate=None,
-        micro=MicroDecision(
+        range_aggregate=range_aggregate,
+        micro=micro or MicroDecision(
             signal_side=Side.FLAT,
             context_available=False,
             aligned=False,
@@ -244,5 +335,30 @@ def _bar_ready_context(*, close: Decimal, engine_features: dict[str, dict[str, D
             action="skip",
         ),
         global_risk_scale=Decimal("1"),
+        routed_signal=routed_signal or RoutedSignal.flat(),
         engine_features=engine_features,
+    )
+
+
+def _range_aggregate(*, bar_count: int) -> RangeAggregateContext:
+    return RangeAggregateContext(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        timeframe="4h",
+        bucket_start_ms=0,
+        bucket_end_ms=H4,
+        range_pct=Decimal("0.002"),
+        bar_count=bar_count,
+        first_open=Decimal("100"),
+        last_close=Decimal("101"),
+        high=Decimal("102"),
+        low=Decimal("99"),
+        buy_notional_sum=Decimal("560"),
+        sell_notional_sum=Decimal("440"),
+        delta_notional_sum=Decimal("120"),
+        notional_sum=Decimal("1000"),
+        micro_return_pct=Decimal("0.01"),
+        imbalance=Decimal("0.12"),
+        taker_buy_ratio=Decimal("0.56"),
+        close_pos=Decimal("0.6666666667"),
     )

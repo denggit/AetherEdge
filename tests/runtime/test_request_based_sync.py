@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
 import pytest
 
+import src.runtime.account_sync.service as sync_service
 from src.app.alerts import AppAlert
 from src.platform import Balance, ExchangeName, LeverageInfo, Order, OrderQuery, OrderSide, OrderStatus, Position, PositionMode, PositionSide, StopOrderQuery
 from src.runtime.account_sync import AccountStateSyncService, KnownOrderRef, OrderStateSyncService, SyncExchangeContext
@@ -147,6 +150,67 @@ async def test_order_sync_fetches_positions_open_orders_and_open_stop_orders_whe
     assert "fetch_positions" in account.calls
     assert execution.calls == ["fetch_open_orders", "fetch_open_stop_orders"]
     assert [(order.order_id, is_stop) for order, is_stop in state.orders] == [("o1", False), ("s1", True)]
+
+
+@pytest.mark.asyncio
+async def test_order_sync_inactive_logs_debug_not_info(caplog, monkeypatch):
+    async def no_sleep(stop_event, interval_seconds):
+        return None
+
+    monkeypatch.setattr(sync_service, "_sleep_with_jitter", no_sleep)
+    stop_event = asyncio.Event()
+
+    def inactive_once() -> bool:
+        stop_event.set()
+        return False
+
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=FakeAccount(), execution=FakeExecution(open_orders=[], open_stop_orders=[]), state_store=MemoryState()),),
+        config=OrderStateRequirement(poll_interval_seconds=0),
+        active_check=inactive_once,
+    )
+
+    caplog.set_level(logging.DEBUG)
+    await service.run_periodic(stop_event)
+
+    info_messages = [record.getMessage() for record in caplog.records if record.levelno == logging.INFO]
+    debug_messages = [record.getMessage() for record in caplog.records if record.levelno == logging.DEBUG]
+    assert not any("Order state sync inactive" in message for message in info_messages)
+    assert not any("Order state sync still inactive" in message for message in info_messages)
+    assert any("Order state sync inactive" in message for message in debug_messages)
+
+
+@pytest.mark.asyncio
+async def test_order_sync_still_inactive_never_logs_info(caplog, monkeypatch):
+    async def no_sleep(stop_event, interval_seconds):
+        return None
+
+    monkeypatch.setattr(sync_service, "_sleep_with_jitter", no_sleep)
+    stop_event = asyncio.Event()
+    ticks = 0
+
+    def inactive_then_stop() -> bool:
+        nonlocal ticks
+        ticks += 1
+        if ticks >= 3:
+            stop_event.set()
+        return False
+
+    service = OrderStateSyncService(
+        contexts=(SyncExchangeContext(account=FakeAccount(), execution=FakeExecution(open_orders=[], open_stop_orders=[]), state_store=MemoryState()),),
+        config=OrderStateRequirement(poll_interval_seconds=0),
+        active_check=inactive_then_stop,
+    )
+    monkeypatch.setattr(service._inactive_skip_summary, "should_emit_summary", lambda *args, **kwargs: True)
+
+    caplog.set_level(logging.DEBUG)
+    await service.run_periodic(stop_event)
+
+    info_messages = [record.getMessage() for record in caplog.records if record.levelno == logging.INFO]
+    debug_messages = [record.getMessage() for record in caplog.records if record.levelno == logging.DEBUG]
+    assert not any("still inactive" in message for message in info_messages)
+    assert not any("skipped_ticks" in message for message in info_messages)
+    assert any("Order state sync still inactive" in message for message in debug_messages)
 
 
 @pytest.mark.asyncio

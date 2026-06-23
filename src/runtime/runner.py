@@ -253,6 +253,70 @@ class LiveRuntimeRunner:
     async def process_account_event(self, event: AccountEvent) -> None:
         await self._process_account_event(event)
 
+    def _log_4h_decision_summary(self, *, open_time_ms: int, closed_kline: MarketKline) -> None:
+        audit = getattr(self.context.strategy, "last_decision_audit", None)
+
+        if not isinstance(audit, dict) or audit.get("bar_open_time_ms") != open_time_ms:
+            logger.info(
+                "4H decision completed | symbol=%s interval=%s open_time_ms=%s close_time_ms=%s decision=no_audit reason=no_strategy_audit actions= selected_engine=%s selected_side=%s risk_mult=%s quality_mult=%s micro_action=%s micro_scale=%s micro_aligned=%s micro_contra=%s range_available=%s range_bar_count=%s range_imbalance=%s range_taker_buy_ratio=%s range_close_pos=%s range_micro_return_pct=%s position=%s position_side=%s position_engine=%s position_stop=%s close=%s close_buffer_ms=%s",
+                self.app_config.symbol,
+                self._closed_bar_interval,
+                closed_kline.open_time_ms,
+                closed_kline.close_time_ms,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                closed_kline.close,
+                self._closed_bar_buffer_ms,
+            )
+            return
+
+        actions = audit.get("actions") or []
+        logger.info(
+            "4H decision completed | symbol=%s interval=%s open_time_ms=%s close_time_ms=%s decision=%s actions=%s selected_engine=%s selected_side=%s risk_mult=%s quality_mult=%s micro_action=%s micro_scale=%s micro_aligned=%s micro_contra=%s range_available=%s range_bar_count=%s range_imbalance=%s range_taker_buy_ratio=%s range_close_pos=%s range_micro_return_pct=%s position=%s position_side=%s position_engine=%s position_stop=%s close=%s close_buffer_ms=%s",
+            self.app_config.symbol,
+            self._closed_bar_interval,
+            audit.get("bar_open_time_ms"),
+            audit.get("bar_close_time_ms"),
+            audit.get("reason"),
+            ",".join(actions),
+            audit.get("selected_engine"),
+            audit.get("selected_side"),
+            audit.get("risk_mult"),
+            audit.get("quality_mult"),
+            audit.get("micro_action"),
+            audit.get("micro_entry_risk_scale"),
+            audit.get("micro_aligned"),
+            audit.get("micro_contra"),
+            audit.get("range_available"),
+            audit.get("range_bar_count"),
+            audit.get("range_imbalance"),
+            audit.get("range_taker_buy_ratio"),
+            audit.get("range_close_pos"),
+            audit.get("range_micro_return_pct"),
+            audit.get("position_in_pos"),
+            audit.get("position_side"),
+            audit.get("position_engine"),
+            audit.get("position_stop"),
+            closed_kline.close,
+            self._closed_bar_buffer_ms,
+        )
+
     async def poll_closed_bar_once(self, *, now_ms: int | None = None) -> list[MarketFeatureEvent]:
         now = int(time.time() * 1000) if now_ms is None else now_ms
         open_time_ms = self._closed_bar_scheduler.due_closed_bar(now)
@@ -269,13 +333,6 @@ class LiveRuntimeRunner:
             return []
         event = closed_kline_feature(closed_rows[-1])
         self.stats.closed_klines_seen += 1
-        logger.info(
-            "Closed kline detected | symbol=%s interval=%s open_time_ms=%s close_time_ms=%s",
-            self.app_config.symbol,
-            self._closed_bar_interval,
-            closed_rows[-1].open_time_ms,
-            closed_rows[-1].close_time_ms,
-        )
         await self.process_market_feature(event)
         mark_emitted = getattr(self._closed_bar_scheduler, "mark_emitted", None)
         if callable(mark_emitted):
@@ -311,8 +368,10 @@ class LiveRuntimeRunner:
                 )
                 await self.process_market_feature(unavailable)
                 features.append(unavailable)
+                self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_rows[-1])
                 return features
         features.extend(await self.emit_range_aggregate_for_bucket(open_time_ms))
+        self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_rows[-1])
         return features
 
     async def emit_range_aggregate_for_bucket(self, bucket_start_ms: int) -> list[MarketFeatureEvent]:

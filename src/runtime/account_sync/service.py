@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from src.app.alerts import AppAlert
 from src.order_management.reconciliation.validation import (
@@ -216,6 +216,7 @@ class OrderStateSyncService:
         self._last_open_order_count: dict[str, int] = {}
         self._last_open_stop_order_count: dict[str, int] = {}
         self._last_position_nonzero: dict[str, bool] = {}
+        self._last_order_state_fingerprint: dict[tuple[str, str], tuple] = {}
 
     async def run_periodic(self, stop_event: asyncio.Event) -> None:
         logger.info("Order sync task started | interval_seconds=%s active_only=True", self.config.poll_interval_seconds)
@@ -233,9 +234,9 @@ class OrderStateSyncService:
                     # least interval_seconds away — the state-change log above
                     # already serves as the first notification.
                     self._inactive_skip_summary.mark_emitted("inactive", now=now_s)
-                    logger.info("Order state sync inactive | reason=no_active_position_no_pending_orders")
+                    logger.debug("Order state sync inactive | reason=no_active_position_no_pending_orders")
                 elif self._inactive_skip_summary.should_emit_summary("inactive", interval_seconds=600.0, now=now_s):
-                    logger.info(
+                    logger.debug(
                         "Order state sync still inactive | skipped_ticks=%s",
                         self._inactive_skip_summary.count("inactive"),
                     )
@@ -246,7 +247,7 @@ class OrderStateSyncService:
             self._inactive_skip_summary.reset("inactive")
             if self._last_order_sync_active is not True:
                 self._last_order_sync_active = True
-                logger.info("Order state sync active | reason=active_position_or_pending_orders")
+                logger.debug("Order state sync active | reason=active_position_or_pending_orders")
             else:
                 logger.debug(
                     "Order state sync tick | active_position=True interval_seconds=%s",
@@ -259,47 +260,35 @@ class OrderStateSyncService:
 
     async def _sync_context(self, context: SyncExchangeContext, *, sync_type: str, priority: bool) -> SyncResult:
         exchange = context.execution.exchange.value
+        symbol = context.execution.symbol
         start = time.perf_counter()
         request_count = 0
+        positions: list[Any] = []
+        orders: list[Any] = []
+        stop_orders: list[Any] = []
         try:
             await self.throttle.wait(exchange, priority=priority)
             if self.config.sync_position:
                 positions = await context.account.fetch_positions()
                 request_count += 1
-                # Log only when nonzero-state changes (position appeared/disappeared)
-                is_nonzero = any(getattr(p, "quantity", 0) != 0 for p in (positions or []))
-                prev_nonzero = self._last_position_nonzero.get(exchange)
-                self._last_position_nonzero[exchange] = is_nonzero
-                if prev_nonzero != is_nonzero:
-                    logger.info("Positions synced | exchange=%s sync_type=%s nonzero=%s", exchange, sync_type, is_nonzero)
-                else:
-                    logger.debug("Positions synced | exchange=%s sync_type=%s unchanged=True", exchange, sync_type)
+                self._last_position_nonzero[exchange] = any(getattr(p, "quantity", 0) != 0 for p in (positions or []))
+                logger.debug("Positions synced | exchange=%s sync_type=%s count=%s", exchange, sync_type, len(positions or []))
             if self.config.sync_open_orders:
                 orders = await context.execution.fetch_open_orders()
                 request_count += 1
                 for order in orders:
                     context.state_store.save_order(order, is_stop_order=False)
                 self._mark_missing_open_orders_closed(context, orders=orders, is_stop_order=False)
-                prev_count = self._last_open_order_count.get(exchange, -1)
-                new_count = len(orders)
-                self._last_open_order_count[exchange] = new_count
-                if prev_count != new_count:
-                    logger.info("Open orders synced | exchange=%s sync_type=%s count=%s", exchange, sync_type, new_count)
-                else:
-                    logger.debug("Open orders synced | exchange=%s sync_type=%s count=%s unchanged=True", exchange, sync_type, new_count)
+                self._last_open_order_count[exchange] = len(orders)
+                logger.debug("Open orders synced | exchange=%s sync_type=%s count=%s", exchange, sync_type, len(orders))
             if self.config.sync_open_stop_orders:
                 stop_orders = await context.execution.fetch_open_stop_orders()
                 request_count += 1
                 for order in stop_orders:
                     context.state_store.save_order(order, is_stop_order=True)
                 self._mark_missing_open_orders_closed(context, orders=stop_orders, is_stop_order=True)
-                prev_count = self._last_open_stop_order_count.get(exchange, -1)
-                new_count = len(stop_orders)
-                self._last_open_stop_order_count[exchange] = new_count
-                if prev_count != new_count:
-                    logger.info("Open stop orders synced | exchange=%s sync_type=%s count=%s", exchange, sync_type, new_count)
-                else:
-                    logger.debug("Open stop orders synced | exchange=%s sync_type=%s count=%s unchanged=True", exchange, sync_type, new_count)
+                self._last_open_stop_order_count[exchange] = len(stop_orders)
+                logger.debug("Open stop orders synced | exchange=%s sync_type=%s count=%s", exchange, sync_type, len(stop_orders))
             # ── known order status fetch (with client_order_id fallback) ──
             known_failures: list[str] = []
             skipped_invalid: int = 0
@@ -389,6 +378,15 @@ class OrderStateSyncService:
                             severity="error",
                         ),
                     )
+                self._log_order_state_fingerprint(
+                    exchange=exchange,
+                    symbol=symbol,
+                    sync_type=sync_type,
+                    positions=positions or [],
+                    open_orders=orders or [],
+                    open_stop_orders=stop_orders or [],
+                    known_order_failure_count=len(known_failures),
+                )
             else:
                 self._failures[exchange] = 0
                 meta: dict[str, Any] = {}
@@ -396,7 +394,7 @@ class OrderStateSyncService:
                     meta["skipped_invalid_order_refs"] = skipped_invalid
                 result = _result(exchange, sync_type, request_count, start, True, metadata=meta)
                 if skipped_invalid > 0:
-                    logger.info(
+                    logger.debug(
                         "Order state synced | exchange=%s sync_type=%s request_count=%s duration_ms=%s success=%s skipped_invalid=%s",
                         result.exchange,
                         result.sync_type,
@@ -414,6 +412,15 @@ class OrderStateSyncService:
                         result.duration_ms,
                         result.success,
                     )
+                self._log_order_state_fingerprint(
+                    exchange=exchange,
+                    symbol=symbol,
+                    sync_type=sync_type,
+                    positions=positions or [],
+                    open_orders=orders or [],
+                    open_stop_orders=stop_orders or [],
+                    known_order_failure_count=0,
+                )
             logger.debug("Position plan reconciled | exchange=%s sync_type=%s", exchange, sync_type)
             return result
         except Exception as exc:
@@ -433,6 +440,56 @@ class OrderStateSyncService:
             if failures >= self.config.consecutive_failure_alert_threshold:
                 _emit(self.alert_sink, AppAlert(subject="AetherEdge order sync failures", content=f"{exchange} {sync_type} failed {failures} times: {exc}", severity="error"))
             return result
+
+    def _log_order_state_fingerprint(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        sync_type: str,
+        positions: Sequence[Any],
+        open_orders: Sequence[Any],
+        open_stop_orders: Sequence[Any],
+        known_order_failure_count: int,
+    ) -> None:
+        position_side, position_qty = _position_fingerprint_fields(positions)
+        open_order_count = len(open_orders)
+        open_stop_order_count = len(open_stop_orders)
+        fingerprint = (
+            exchange,
+            symbol,
+            position_side,
+            position_qty,
+            open_order_count,
+            open_stop_order_count,
+            known_order_failure_count,
+        )
+        key = (exchange, symbol)
+        previous = self._last_order_state_fingerprint.get(key)
+        self._last_order_state_fingerprint[key] = fingerprint
+        if previous == fingerprint:
+            logger.debug(
+                "Order state sync unchanged | exchange=%s symbol=%s sync_type=%s position_side=%s position_qty=%s open_orders=%s open_stop_orders=%s known_order_failures=%s",
+                exchange,
+                symbol,
+                sync_type,
+                position_side,
+                position_qty,
+                open_order_count,
+                open_stop_order_count,
+                known_order_failure_count,
+            )
+            return
+        logger.info(
+            "Order state changed | exchange=%s symbol=%s position_side=%s position_qty=%s open_orders=%s open_stop_orders=%s known_order_failures=%s",
+            exchange,
+            symbol,
+            position_side,
+            position_qty,
+            open_order_count,
+            open_stop_order_count,
+            known_order_failure_count,
+        )
 
     def _known_ids(self, exchange: str, *, key: str) -> tuple[KnownOrderRef, ...]:
         """Return cleaned order references for *exchange*.
@@ -654,6 +711,30 @@ class OrderStateSyncService:
                 is_stop_order,
                 closed,
             )
+
+
+def _position_fingerprint_fields(positions: Sequence[Any]) -> tuple[str, str]:
+    nonzero = [
+        position
+        for position in positions
+        if getattr(position, "quantity", None) is not None and getattr(position, "quantity") != 0
+    ]
+    if not nonzero:
+        return "flat", "0"
+    rows = sorted(
+        (
+            _enum_value(getattr(position, "side", "unknown")),
+            str(getattr(position, "quantity", "0")),
+        )
+        for position in nonzero
+    )
+    if len(rows) == 1:
+        return rows[0]
+    return "mixed", ";".join(f"{side}:{qty}" for side, qty in rows)
+
+
+def _enum_value(value: Any) -> str:
+    return str(value.value) if hasattr(value, "value") else str(value)
 
 
 def _result(exchange: str, sync_type: str, request_count: int, start: float, success: bool, *, error: str | None = None, metadata: Mapping[str, Any] | None = None) -> SyncResult:

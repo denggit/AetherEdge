@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import tempfile
 import time
@@ -133,6 +134,7 @@ class FeatureStrategy:
         self.events = []
         self.on_start_called = False
         self.recovered = False
+        self.last_decision_audit = None
 
     async def on_start(self, snapshot):
         self.on_start_called = True
@@ -270,6 +272,51 @@ def _runner(strategy, *, data=None, services=None, dry_run=False, data_streams=(
     return LiveRuntimeRunner(app_config=cfg, app_context=context, runtime_config=runtime_config, services=resolved_services)
 
 
+def _decision_audit(
+    *,
+    reason: str,
+    actions: tuple[str, ...],
+    selected_engine: str | None = None,
+    selected_side: str | None = "flat",
+    range_available: bool = True,
+    range_bar_count: int | None = 36,
+    range_imbalance: str | None = "-0.08",
+    range_taker_buy_ratio: str | None = "0.46",
+    range_close_pos: str | None = "0.42",
+    range_micro_return_pct: str | None = "-0.0012",
+) -> dict[str, object]:
+    return {
+        "strategy_id": "test",
+        "symbol": "ETH-USDT-PERP",
+        "bar_open_time_ms": 2 * H4,
+        "bar_close_time_ms": 3 * H4 - 1,
+        "signal_count": len(actions),
+        "actions": list(actions),
+        "reason": reason,
+        "position_in_pos": False,
+        "position_side": "flat",
+        "position_engine": None,
+        "position_qty": "0",
+        "position_stop": None,
+        "pending_entry": False,
+        "selected_engine": selected_engine,
+        "selected_side": selected_side,
+        "risk_mult": "0",
+        "quality_mult": "0",
+        "micro_context_available": range_available,
+        "micro_aligned": False,
+        "micro_contra": False,
+        "micro_entry_risk_scale": "1",
+        "micro_action": "skip",
+        "range_available": range_available,
+        "range_bar_count": range_bar_count,
+        "range_imbalance": range_imbalance,
+        "range_taker_buy_ratio": range_taker_buy_ratio,
+        "range_close_pos": range_close_pos,
+        "range_micro_return_pct": range_micro_return_pct,
+    }
+
+
 @pytest.mark.asyncio
 async def test_live_runtime_calls_recovery_and_on_start_before_events():
     strategy = FeatureStrategy()
@@ -312,6 +359,88 @@ async def test_closed_bar_poll_uses_buffer_and_only_emits_closed_kline():
     assert early[0].data["open_time_ms"] == H4
     assert closed[0].data["open_time_ms"] == 2 * H4
     assert all(event.data["is_closed"] for event in [*early, *closed] if event.type_value == "closed_kline")
+
+
+@pytest.mark.asyncio
+async def test_poll_closed_bar_logs_4h_decision_summary_no_signal(caplog):
+    strategy = FeatureStrategy()
+    strategy.last_decision_audit = _decision_audit(reason="flat_route", actions=())
+    runner = _runner(strategy, services={"recovery_service": None, "snapshot": _snapshot()}, dry_run=True)
+
+    caplog.set_level(logging.INFO)
+    await runner.poll_closed_bar_once(now_ms=12 * 60 * 60_000 + 60_000)
+
+    messages = "\n".join(record.getMessage() for record in caplog.records if record.levelno == logging.INFO)
+    assert "4H decision completed" in messages
+    assert "decision=flat_route" in messages
+    assert "range_available=" in messages
+    assert "range_bar_count=" in messages
+    assert "close_buffer_ms=" in messages
+    assert "Closed kline detected" not in messages
+
+
+@pytest.mark.asyncio
+async def test_poll_closed_bar_logs_4h_decision_summary_with_signal_and_range_fields(caplog):
+    strategy = FeatureStrategy()
+    strategy.last_decision_audit = _decision_audit(
+        reason="entry_signal",
+        actions=("open_long",),
+        selected_engine="BULL_RECLAIM_V2",
+        selected_side="long",
+        range_bar_count=42,
+    )
+    runner = _runner(strategy, services={"recovery_service": None, "snapshot": _snapshot()}, dry_run=True)
+
+    caplog.set_level(logging.INFO)
+    await runner.poll_closed_bar_once(now_ms=12 * 60 * 60_000 + 60_000)
+
+    messages = "\n".join(record.getMessage() for record in caplog.records if record.levelno == logging.INFO)
+    assert "4H decision completed" in messages
+    assert "actions=open_long" in messages
+    assert "selected_engine=BULL_RECLAIM_V2" in messages
+    assert "range_bar_count=42" in messages
+    assert "Closed kline detected" not in messages
+
+
+@pytest.mark.asyncio
+async def test_poll_closed_bar_logs_4h_decision_summary_when_range_unavailable(caplog):
+    strategy = FeatureStrategy()
+    strategy.last_decision_audit = _decision_audit(
+        reason="flat_route",
+        actions=(),
+        range_available=False,
+        range_bar_count=None,
+        range_imbalance=None,
+        range_taker_buy_ratio=None,
+        range_close_pos=None,
+        range_micro_return_pct=None,
+    )
+    req = StrategyRuntimeRequirements.from_mapping({
+        "closed_kline": {"enabled": True, "interval": "4h", "close_buffer_ms": 60000},
+        "trades": {"enabled": True, "stream_enabled": True},
+        "range_bars": {"enabled": True, "range_pct": "0.002", "aggregate_interval": "4h"},
+    })
+    runner = _runner(
+        strategy,
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": req,
+            "range_bar_store": MemoryRangeBarStore(),
+            "range_bar_builder": RangeBarBuilder(range_pct=Decimal("0.002"), contract_value=Decimal("0.1")),
+            "range_bar_aggregator": RangeBarAggregator(),
+        },
+        dry_run=True,
+    )
+    runner._rangebar_trust_start_bucket_ms = 3 * H4
+
+    caplog.set_level(logging.INFO)
+    await runner.poll_closed_bar_once(now_ms=12 * 60 * 60_000 + 60_000)
+
+    messages = "\n".join(record.getMessage() for record in caplog.records if record.levelno == logging.INFO)
+    assert "4H decision completed" in messages
+    assert "range_available=False" in messages
+    assert "Closed kline detected" not in messages
 
 
 @pytest.mark.asyncio

@@ -120,6 +120,7 @@ class Strategy:
         self.recovery_manual_required = False
         self.pending_entry: PendingEntryPlan | None = None
         self.bar_ready_events: list[BarReadyContext] = []
+        self.last_decision_audit: dict[str, Any] | None = None
         self.recovery_alerts: list[str] = []
         self.recovered = False
         self.started = False
@@ -320,9 +321,89 @@ class Strategy:
                 engine_features=engine_features,
             )
             self.bar_ready_events.append(ready)
-            signals.extend(self._signals_from_ready_context(ready))
+            bar_signals = self._signals_from_ready_context(ready)
+            self.last_decision_audit = self._build_decision_audit(ready, bar_signals)
+            signals.extend(bar_signals)
             self.buffer.mark_evaluated(close_time_ms)
         return signals
+
+    def _build_decision_audit(
+        self,
+        context: BarReadyContext,
+        signals: Sequence[TradeSignal],
+    ) -> dict[str, Any]:
+        routed = context.routed_signal
+        actions = [signal.action.value for signal in signals]
+
+        has_open = any(action in {"open_long", "open_short"} for action in actions)
+        has_close = any(action in {"close_long", "close_short"} for action in actions)
+        has_stop = any("stop" in action for action in actions)
+
+        reason = "no_signal"
+        if not self.started or self.equity is None:
+            reason = "strategy_not_started"
+        elif self.recovery_manual_required:
+            reason = "recovery_manual_required"
+        elif self.position.in_pos:
+            if signals:
+                if has_close:
+                    reason = "position_close_signal"
+                elif has_stop:
+                    reason = "position_stop_update"
+                else:
+                    reason = "position_signal"
+            else:
+                reason = "position_hold"
+        elif self.pending_entry is not None:
+            reason = "pending_entry_exists"
+        elif not self._cooldown_ok(context.kline.close_time_ms):
+            reason = "cooldown"
+        elif routed is None or routed.side is Side.FLAT:
+            reason = "flat_route"
+        elif context.micro.entry_risk_scale <= 0:
+            reason = "micro_blocked"
+        elif has_open:
+            reason = "entry_signal"
+        elif signals:
+            reason = "non_entry_signal"
+
+        aggregate = context.range_aggregate
+        range_available = aggregate is not None and aggregate.bar_count > 0
+
+        return {
+            "strategy_id": self.config.strategy_id,
+            "symbol": self.config.symbol,
+            "bar_open_time_ms": context.kline.open_time_ms,
+            "bar_close_time_ms": context.kline.close_time_ms,
+            "signal_count": len(signals),
+            "actions": actions,
+            "reason": reason,
+
+            "position_in_pos": self.position.in_pos,
+            "position_side": _side_label(self.position.side),
+            "position_engine": self.position.entry_engine,
+            "position_qty": str(self.position.qty),
+            "position_stop": None if self.position.stop_price is None else str(self.position.stop_price),
+            "pending_entry": self.pending_entry is not None,
+
+            "selected_engine": None if routed is None else routed.engine,
+            "selected_side": None if routed is None else _side_label(routed.side),
+            "risk_mult": None if routed is None else str(routed.risk_mult),
+            "quality_mult": None if routed is None else str(routed.quality_mult),
+
+            "micro_context_available": context.micro.context_available,
+            "micro_aligned": context.micro.aligned,
+            "micro_contra": context.micro.contra,
+            "micro_entry_risk_scale": str(context.micro.entry_risk_scale),
+            "micro_action": context.micro.action,
+
+            "range_available": range_available,
+            "range_bar_count": None if not range_available else aggregate.bar_count,
+            "range_imbalance": None if not range_available else str(aggregate.imbalance),
+            "range_taker_buy_ratio": None if not range_available else str(aggregate.taker_buy_ratio),
+            "range_close_pos": None if not range_available else str(aggregate.close_pos),
+            "range_micro_return_pct": None if not range_available else str(aggregate.micro_return_pct),
+        }
 
     def _signals_from_ready_context(self, context: BarReadyContext) -> list[TradeSignal]:
         if not self.started or self.equity is None or self.recovery_manual_required:
@@ -1028,6 +1109,14 @@ def _side_from_plan(value: Any) -> Side:
     if text == "short":
         return Side.SHORT
     return Side.FLAT
+
+
+def _side_label(side: Side) -> str:
+    if side is Side.LONG:
+        return "long"
+    if side is Side.SHORT:
+        return "short"
+    return "flat"
 
 
 def _side_from_position(position: Position) -> Side:
