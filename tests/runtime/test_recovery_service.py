@@ -592,6 +592,172 @@ class TestRecoveryProtectionPostcondition:
         assert "place_stop_signal=false" in msg
 
 
+class TestPostExecutionStopProtection:
+    """Acceptance criteria 1–5: post-execution stop protection validation."""
+
+    @pytest.fixture
+    def runner_with_mock_exchanges(self):
+        """Runner whose exchange clients can be controlled per test."""
+        strategy = MagicMock()
+        strategy.config = MagicMock()
+        strategy.config.strategy_id = "test_strategy"
+        strategy.position = MagicMock()
+        strategy.position.in_pos = True
+        strategy.position.position_id = "pos-1"
+        strategy.position.stop_price = Decimal("1719.40")
+        strategy.position.open_legs = {"okx": MagicMock()}
+        runner = _minimal_runner(strategy=strategy)
+        return runner
+
+    def _set_mock_clients(self, runner, *, positions=None, open_stop_orders=None,
+                          position_mode=PositionMode.ONE_WAY,
+                          fetch_position_mode_ok=True):
+        """Install mock exchange clients that return the given data."""
+        mock_exec = MagicMock()
+        mock_exec.exchange = ExchangeName.OKX
+        mock_exec.fetch_open_stop_orders = _async_return(open_stop_orders or [])
+        mock_acct = MagicMock()
+        mock_acct.exchange = ExchangeName.OKX
+        mock_acct.fetch_positions = _async_return(positions or [])
+        if fetch_position_mode_ok:
+            mock_acct.fetch_position_mode = _async_return(position_mode)
+        else:
+            mock_acct.fetch_position_mode = _async_raise(RuntimeError("unsupported"))
+        runner._execution_clients = (mock_exec,)
+        runner._account_clients = (mock_acct,)
+
+    # ── Acceptance criteria tests ───────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_stop_submit_success_post_validation_passes(self, runner_with_mock_exchanges):
+        """1. active position + stop submit success → startup passes."""
+        runner = runner_with_mock_exchanges
+        valid_stop = Order(
+            exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP",
+            raw_symbol="ETH-USDT-SWAP", order_id="new-stop",
+            client_order_id="pos-1-stop", status=OrderStatus.NEW,
+            side=OrderSide.BUY, order_type=OrderType.MARKET,
+            price=Decimal("1719.40"), quantity=Decimal("2.82"),
+            raw={"reduceOnly": "true"},
+        )
+        self._set_mock_clients(
+            runner,
+            positions=[_position(ExchangeName.OKX, "-2.82")],
+            open_stop_orders=[valid_stop],
+        )
+        # Should not raise
+        await runner._validate_post_execution_stop_protection()
+
+    @pytest.mark.asyncio
+    async def test_stop_submit_fails_post_validation_raises(self, runner_with_mock_exchanges):
+        """2. active position + stop submit fails (no stop on exchange) → fatal."""
+        runner = runner_with_mock_exchanges
+        self._set_mock_clients(
+            runner,
+            positions=[_position(ExchangeName.OKX, "-2.82")],
+            open_stop_orders=[],  # stop was not placed
+        )
+        with pytest.raises(LiveRuntimeError, match="post-execution stop validation failed"):
+            await runner._validate_post_execution_stop_protection()
+
+    @pytest.mark.asyncio
+    async def test_manual_stop_only_stop_submit_success_passes(self, runner_with_mock_exchanges):
+        """4. manual stop only + active plan + stop submit success → passes."""
+        runner = runner_with_mock_exchanges
+        manual_stop = Order(
+            exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP",
+            raw_symbol="ETH-USDT-SWAP", order_id="manual-1",
+            client_order_id="user-manual", status=OrderStatus.NEW,
+            side=OrderSide.BUY, order_type=OrderType.MARKET,
+            price=Decimal("1719.40"), quantity=Decimal("2.0"),
+            raw={"reduceOnly": "true"},
+        )
+        bot_stop = Order(
+            exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP",
+            raw_symbol="ETH-USDT-SWAP", order_id="bot-stop",
+            client_order_id="pos-1-stop", status=OrderStatus.NEW,
+            side=OrderSide.BUY, order_type=OrderType.MARKET,
+            price=Decimal("1719.40"), quantity=Decimal("2.82"),
+            raw={"reduceOnly": "true"},
+        )
+        self._set_mock_clients(
+            runner,
+            positions=[_position(ExchangeName.OKX, "-2.82")],
+            open_stop_orders=[manual_stop, bot_stop],
+        )
+        # Should not raise — bot stop now exists alongside manual stop
+        await runner._validate_post_execution_stop_protection()
+
+    @pytest.mark.asyncio
+    async def test_manual_stop_only_stop_submit_fails_raises(self, runner_with_mock_exchanges):
+        """5. manual stop only + active plan + stop submit fails → fatal."""
+        runner = runner_with_mock_exchanges
+        manual_stop = Order(
+            exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP",
+            raw_symbol="ETH-USDT-SWAP", order_id="manual-1",
+            client_order_id="user-manual", status=OrderStatus.NEW,
+            side=OrderSide.BUY, order_type=OrderType.MARKET,
+            price=Decimal("1719.40"), quantity=Decimal("2.0"),
+            raw={"reduceOnly": "true"},
+        )
+        self._set_mock_clients(
+            runner,
+            positions=[_position(ExchangeName.OKX, "-2.82")],
+            open_stop_orders=[manual_stop],  # only manual, no bot stop
+        )
+        with pytest.raises(LiveRuntimeError, match="post-execution stop validation failed"):
+            await runner._validate_post_execution_stop_protection()
+
+    @pytest.mark.asyncio
+    async def test_no_canonical_stop_price_raises(self, runner_with_mock_exchanges):
+        """Missing canonical_stop_price → fatal."""
+        runner = runner_with_mock_exchanges
+        runner.context.strategy.position.stop_price = None
+        with pytest.raises(LiveRuntimeError, match="no canonical stop price"):
+            await runner._validate_post_execution_stop_protection()
+
+    @pytest.mark.asyncio
+    async def test_position_gone_after_placement_passes(self, runner_with_mock_exchanges):
+        """If the position was closed between pre and post check, it's ok."""
+        runner = runner_with_mock_exchanges
+        self._set_mock_clients(
+            runner,
+            positions=[_position(ExchangeName.OKX, "0")],  # flat
+            open_stop_orders=[],
+        )
+        # Should not raise — no position to protect
+        await runner._validate_post_execution_stop_protection()
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_raises(self, runner_with_mock_exchanges):
+        """Cannot fetch exchange state → fatal."""
+        runner = runner_with_mock_exchanges
+        mock_exec = MagicMock()
+        mock_exec.exchange = ExchangeName.OKX
+        mock_exec.fetch_open_stop_orders = _async_raise(RuntimeError("network error"))
+        mock_acct = MagicMock()
+        mock_acct.exchange = ExchangeName.OKX
+        mock_acct.fetch_positions = _async_return([_position(ExchangeName.OKX, "-2.82")])
+        mock_acct.fetch_position_mode = _async_return(PositionMode.ONE_WAY)
+        runner._execution_clients = (mock_exec,)
+        runner._account_clients = (mock_acct,)
+
+        with pytest.raises(LiveRuntimeError, match="cannot fetch exchange state"):
+            await runner._validate_post_execution_stop_protection()
+
+
+def _async_return(value):
+    async def _fn(*args, **kwargs):
+        return value
+    return _fn
+
+
+def _async_raise(exc):
+    async def _fn(*args, **kwargs):
+        raise exc
+    return _fn
+
+
 def _custom_snapshot(
     exchange: ExchangeName,
     *,

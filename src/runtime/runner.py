@@ -25,7 +25,7 @@ from src.platform import create_account_client, create_execution_client
 from src.platform.account.events import AccountEvent
 from src.platform.account.ports import AccountClient
 from src.platform.data.models import MarketEvent, MarketEventType, MarketKline, MarketOrderBook, MarketTicker, MarketTrade
-from src.platform.exchanges.models import ExchangeConfig, ExchangeName, Order, OrderStatus, Position, PositionSide
+from src.platform.exchanges.models import ExchangeConfig, ExchangeName, Order, OrderStatus, Position, PositionMode, PositionSide
 from src.platform.execution.ports import ExecutionClient
 from src.platform.markets import get_market_profile
 from src.platform.snapshot import PlatformSnapshot
@@ -800,17 +800,51 @@ class LiveRuntimeRunner:
                 f"runtime recovery blocking manual required: "
                 f"alerts={alerts}"
             )
-        # ── Validate recovery protection postcondition ────────────────────
+        # ── Pre-execution postcondition: must have coverage plan ───────────
         self._validate_recovery_protection_postcondition(report)
-        # ── Only log completion AFTER postcondition passes ────────────────
+
+        # ── Separate stop signals from other recovery signals ──────────────
+        _STOP_ACTIONS = {SignalAction.PLACE_STOP_LOSS_LONG, SignalAction.PLACE_STOP_LOSS_SHORT}
+        stop_signals = [s for s in report.strategy_signals if s.action in _STOP_ACTIONS]
+        other_signals = [s for s in report.strategy_signals if s.action not in _STOP_ACTIONS]
+
+        if stop_signals:
+            # ── Execute stop signals with failure detection ────────────────
+            failed_before = self.stats.failed_intents
+            partial_before = self.stats.partial_failures
+            await self._execute_signals(
+                stop_signals,
+                source="recovery",
+                event_time_ms=int(time.time() * 1000),
+                metadata={"feature_type": "recovery"},
+            )
+            if self.stats.failed_intents > failed_before:
+                raise LiveRuntimeError(
+                    "recovery stop placement failed: all target exchanges rejected the stop order"
+                )
+            if self.stats.partial_failures > partial_before:
+                raise LiveRuntimeError(
+                    "recovery stop placement partially failed: some target exchanges rejected the stop order"
+                )
+            # ── Post-execution validation: stop must now exist on exchange ──
+            await self._validate_post_execution_stop_protection()
+
+        # ── Execute remaining recovery signals (non-stop) ─────────────────
+        if other_signals:
+            await self._execute_signals(
+                other_signals,
+                source="recovery",
+                event_time_ms=int(time.time() * 1000),
+                metadata={"feature_type": "recovery"},
+            )
+
+        # ── All checks passed — safe to log completion ────────────────────
         logger.info(
             "Runtime recovery completed | snapshots=%s strategy_signals=%s issues=%s",
             len(report.snapshots),
             len(report.strategy_signals),
             len(report.issues),
         )
-        if report.strategy_signals:
-            await self._execute_signals(report.strategy_signals, source="recovery", event_time_ms=int(time.time() * 1000), metadata={"feature_type": "recovery"})
         if report.snapshots:
             self._last_snapshots = tuple(report.snapshots)
             self._last_snapshot = report.snapshots[0]  # backward-compat for on_start / legacy consumers
@@ -919,6 +953,110 @@ class LiveRuntimeRunner:
                 f"place_stop_signal=false "
                 f"canonical_stop_price={canonical_stop_price} "
                 f"strategy_recovery_blocking_manual_required=false"
+            )
+
+    async def _validate_post_execution_stop_protection(self) -> None:
+        """After executing PLACE_STOP_LOSS signals, verify the stop orders
+        actually exist on every exchange that holds an active position.
+
+        Fetches fresh exchange state (positions + open stop orders) and
+        re-runs ``RecoveryExitOrderValidator``.  Every protected exchange
+        MUST satisfy ``should_keep_existing_stop`` — a valid, bot-owned
+        protective stop must be live on the exchange right now.
+        """
+        strategy = self.context.strategy
+        strategy_id = getattr(getattr(strategy, "config", None), "strategy_id", "")
+        strategy_position = getattr(strategy, "position", None)
+        if strategy_position is None or not getattr(strategy_position, "in_pos", False):
+            return
+
+        position_id = getattr(strategy_position, "position_id", None)
+        canonical_stop_price = getattr(strategy_position, "stop_price", None)
+        if canonical_stop_price is None:
+            raise LiveRuntimeError(
+                "post-execution stop validation failed: no canonical stop price available"
+            )
+
+        market_profile = get_market_profile(self.app_config.symbol)
+        converter = NativeQuantityConverter()
+        validator = RecoveryExitOrderValidator(quantity_converter=converter)
+
+        execution_clients = self._get_execution_clients()
+        account_clients = self._get_account_clients()
+        exec_by_exchange = {c.exchange: c for c in execution_clients}
+        acct_by_exchange = {c.exchange: c for c in account_clients}
+
+        master_exchange_str = self.app_config.data_exchange.value
+        open_legs: dict[str, Any] = getattr(strategy_position, "open_legs", {}) or {}
+
+        for exchange in self.app_config.exchanges:
+            exchange_str = exchange.value
+            if exchange_str != master_exchange_str and exchange_str not in open_legs:
+                continue
+
+            exec_client = exec_by_exchange.get(exchange)
+            acct_client = acct_by_exchange.get(exchange)
+            if exec_client is None or acct_client is None:
+                continue
+
+            # ── Fetch fresh exchange state ─────────────────────────────
+            try:
+                positions = await acct_client.fetch_positions()
+                open_stop_orders = await exec_client.fetch_open_stop_orders()
+            except Exception as exc:
+                raise LiveRuntimeError(
+                    "post-execution stop validation failed: cannot fetch exchange state | "
+                    f"exchange={exchange_str} error={exc}"
+                ) from exc
+
+            active_pos = _first_active_position(positions or ())
+            if active_pos is None:
+                continue
+
+            pos_side = _position_side_from_quantity(active_pos.quantity)
+            if pos_side is None:
+                continue
+
+            try:
+                mode = await acct_client.fetch_position_mode()
+            except Exception:
+                mode = PositionMode.ONE_WAY
+
+            # ── Re-validate against live exchange state ────────────────
+            validation = validator.validate_stop_orders(
+                exchange=exchange,
+                symbol=self.app_config.symbol,
+                strategy_id=strategy_id,
+                position_id=position_id,
+                position_side=pos_side,
+                position_mode=mode,
+                current_position_native_quantity=abs(active_pos.quantity),
+                canonical_stop_price=canonical_stop_price,
+                open_stop_orders=open_stop_orders or (),
+                open_orders=(),
+                market_profile=market_profile,
+            )
+
+            if not validation.should_keep_existing_stop:
+                raise LiveRuntimeError(
+                    "post-execution stop validation failed: "
+                    "active position still without bot-owned valid stop "
+                    "after recovery stop placement | "
+                    f"exchange={exchange_str} "
+                    f"symbol={self.app_config.symbol} "
+                    f"position_qty={active_pos.quantity} "
+                    f"canonical_stop_price={canonical_stop_price} "
+                    f"valid_bot_stops={len(validation.valid_bot_owned_orders)} "
+                    f"invalid_bot_stops={len(validation.invalid_bot_owned_orders)} "
+                    f"unknown_stops={len(validation.unknown_exit_orders)} "
+                    f"primary_reason={validation.primary_invalid_reason}"
+                )
+
+            logger.info(
+                "Post-execution stop protection validated | exchange=%s "
+                "valid_bot_stops=%s",
+                exchange_str,
+                len(validation.valid_bot_owned_orders),
             )
 
     async def _call_on_start(self, snapshot: PlatformSnapshot) -> None:
