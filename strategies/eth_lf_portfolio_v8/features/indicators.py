@@ -13,7 +13,7 @@ def atr(df: pd.DataFrame, period: int) -> pd.Series:
     close = df["close"]
     prev_close = close.shift(1)
     tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    return tr.rolling(period, min_periods=period).mean()
+    return tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
 
 
 def adx(df: pd.DataFrame, period: int) -> pd.Series:
@@ -26,19 +26,21 @@ def adx(df: pd.DataFrame, period: int) -> pd.Series:
     minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
     prev_close = close.shift(1)
     tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    atr_val = tr.rolling(period, min_periods=period).mean()
-    plus_di = 100 * plus_dm.rolling(period, min_periods=period).sum() / atr_val
-    minus_di = 100 * minus_dm.rolling(period, min_periods=period).sum() / atr_val
-    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di)).replace([float("inf"), -float("inf")], float("nan"))
-    return dx.rolling(period, min_periods=period).mean()
+    atr_val = tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False, min_periods=period).mean() / atr_val
+    minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False, min_periods=period).mean() / atr_val
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, pd.NA)
+    return dx.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
 
 
 def rsi(series: pd.Series, period: int) -> pd.Series:
     delta = series.diff()
-    gain = delta.clip(lower=0).rolling(period, min_periods=period).mean()
-    loss = (-delta.clip(upper=0)).rolling(period, min_periods=period).mean()
-    rs = gain / loss
-    return 100 - 100 / (1 + rs)
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, pd.NA)
+    return (100 - 100 / (1 + rs)).fillna(50.0)
 
 
 def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:

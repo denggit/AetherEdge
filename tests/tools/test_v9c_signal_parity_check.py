@@ -10,6 +10,8 @@ import pytest
 
 import tools.v9c_signal_parity_check as parity
 from tools.v9c_signal_parity_check import (
+    FEATURE_MISMATCH_CONTEXT_FILENAME,
+    FEATURE_MISMATCH_FILENAME,
     FINGERPRINT_FILENAME,
     MISMATCH_CONTEXT_FILENAME,
     MISMATCH_FILENAME,
@@ -17,6 +19,7 @@ from tools.v9c_signal_parity_check import (
     SUMMARY_FILENAME,
     build_range_context_from_rf_columns,
     build_parser,
+    build_feature_mismatch_context,
     build_signal_mismatch_context,
     compare_signal_audits,
     detect_feature_warmup,
@@ -257,6 +260,24 @@ def test_diagnostic_mismatch_does_not_fail_parity() -> None:
     assert result.mismatches.iloc[0]["category"] == "diagnostic"
 
 
+def test_feature_mismatch_is_reported_separately() -> None:
+    coin_df = _coin_audit_df(atr=10.0, atr_pct=0.01, adx=20.0, bull_long_exit_channel=False)
+    ae_df = _coin_audit_df(atr=11.0, atr_pct=0.011, adx=20.0, bull_long_exit_channel=False)
+
+    result = compare_signal_audits(coin_df, ae_df, skip_warmup_bars=0)
+
+    assert result.passed is True
+    assert result.feature_mismatch_count == 2
+    assert result.feature_mismatch_fields == {"atr": 1, "atr_pct": 1}
+    assert result.first_feature_mismatch == {
+        "timestamp": "2023-01-01 04:00:00",
+        "field": "atr",
+        "coin_value": 10.0,
+        "aetheredge_value": 11.0,
+        "abs_diff": 1.0,
+    }
+
+
 def test_strategy_fingerprint_hash_is_stable() -> None:
     first = strategy_fingerprint()
     second = strategy_fingerprint()
@@ -272,6 +293,7 @@ def test_parser_exposes_logging_options() -> None:
     assert "--log-every-rows" in help_text
     assert "--quiet" in help_text
     assert "--auto-skip-feature-warmup" in help_text
+    assert "--feature-context-bars" in help_text
 
 
 def test_replay_logs_progress(caplog) -> None:
@@ -331,6 +353,8 @@ def test_cli_writes_expected_outputs(tmp_path: Path) -> None:
     assert (out_dir / REPLAY_AUDIT_FILENAME).exists()
     assert (out_dir / MISMATCH_FILENAME).exists()
     assert (out_dir / MISMATCH_CONTEXT_FILENAME).exists()
+    assert (out_dir / FEATURE_MISMATCH_FILENAME).exists()
+    assert (out_dir / FEATURE_MISMATCH_CONTEXT_FILENAME).exists()
     assert (out_dir / SUMMARY_FILENAME).exists()
     assert (out_dir / FINGERPRINT_FILENAME).exists()
     summary = json.loads((out_dir / SUMMARY_FILENAME).read_text(encoding="utf-8"))
@@ -341,6 +365,8 @@ def test_cli_writes_expected_outputs(tmp_path: Path) -> None:
     assert summary["skip_warmup_bars"] == 0
     assert summary["auto_skip_feature_warmup"] is False
     assert "feature_warmup" in summary
+    assert "feature_mismatch_count" in summary
+    assert "feature_mismatch_fields" in summary
 
 
 def test_cli_writes_signal_mismatch_context_csv(tmp_path: Path) -> None:
@@ -361,6 +387,37 @@ def test_cli_writes_signal_mismatch_context_csv(tmp_path: Path) -> None:
 
     assert exit_code == 0
     assert (out_dir / MISMATCH_CONTEXT_FILENAME).exists()
+
+
+def test_v9c_parity_writes_feature_mismatch_outputs(tmp_path: Path, monkeypatch) -> None:
+    coin_audit = tmp_path / "coin_signal_audit.csv"
+    out_dir = tmp_path / "out"
+    coin_df = _coin_audit_df(atr=10.0, atr_pct=0.01, adx=20.0, bull_long_exit_channel=False)
+    ae_df = _coin_audit_df(atr=11.0, atr_pct=0.011, adx=20.0, bull_long_exit_channel=False)
+    coin_df.to_csv(coin_audit, index=False)
+
+    monkeypatch.setattr(parity, "replay_aetheredge_signal_audit", lambda *_args, **_kwargs: ae_df)
+
+    exit_code = main(
+        [
+            "--coin-audit",
+            str(coin_audit),
+            "--out-dir",
+            str(out_dir),
+            "--skip-warmup-bars",
+            "0",
+            "--log-every-rows",
+            "0",
+        ]
+    )
+
+    assert exit_code == 0
+    assert (out_dir / FEATURE_MISMATCH_FILENAME).exists()
+    assert (out_dir / FEATURE_MISMATCH_CONTEXT_FILENAME).exists()
+    summary = json.loads((out_dir / SUMMARY_FILENAME).read_text(encoding="utf-8"))
+    assert summary["feature_mismatch_count"] == 2
+    assert summary["feature_mismatch_fields"] == {"atr": 1, "atr_pct": 1}
+    assert summary["first_feature_mismatch"]["field"] == "atr"
 
 
 def test_cli_quiet_still_prints_summary(tmp_path: Path, capsys) -> None:
@@ -478,6 +535,19 @@ def test_mismatch_context_marks_warmup_invalid() -> None:
 
     assert int(context.iloc[0]["row_index"]) == 0
     assert context.iloc[0]["warmup_invalid"] is True
+
+
+def test_feature_mismatch_context_includes_recent_action_mismatch_window() -> None:
+    coin_df = _three_row_coin_audit_df(signal=1, atr=1.0, atr_pct=0.01, adx=20.0)
+    ae_df = _three_row_coin_audit_df(signal=0, atr=2.0, atr_pct=0.02, adx=21.0)
+    result = compare_signal_audits(coin_df, ae_df, skip_warmup_bars=0)
+
+    context = build_feature_mismatch_context(coin_df, ae_df, result, context_bars=2)
+
+    assert len(context) == 5
+    assert "coin_atr" in context.columns
+    assert "ae_atr" in context.columns
+    assert list(context["bars_before_mismatch"]) == [0, 1, 0, 1, 0]
 
 
 def _coin_audit_df(**overrides) -> pd.DataFrame:

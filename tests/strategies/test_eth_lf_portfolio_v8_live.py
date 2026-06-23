@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from pathlib import Path
+
+import pandas as pd
+import pytest
 
 from src.app import AppConfig, AppContext, AsyncAlertDispatcher, NoopAlertSink
 from src.platform import ExchangeName
@@ -9,11 +13,16 @@ from src.runtime import LiveRuntimeConfig, LiveRuntimeRunner, RuntimeMode
 from src.runtime.tasks import ClosedBarScheduler
 from src.signals import SignalAction, TradeSignal
 from strategies.eth_lf_portfolio_v8.domain.models import BarReadyContext, ClosedKlineContext, MicroDecision, RangeAggregateContext, RoutedSignal, Side
+from tools.v9c_signal_parity_check import load_replay_warmup_ohlcv, replay_aetheredge_signal_audit
 from strategies.eth_lf_portfolio_v8.strategy import Strategy
 from strategies.eth_lf_portfolio_v8.strategy import _default_engine_execution_params
 
 
 H4 = 4 * 60 * 60_000
+COIN_V9C_AUDIT = Path(
+    "../CoinBacktest/data/reports/lf/eth_lf_portfolio_v9c_reclaim_priority/reclaim_bear_second_gs_1p3/"
+    "eth_lf_portfolio_v9c_reclaim_priority_signal_audit.csv"
+)
 
 
 class _FakeData:
@@ -419,6 +428,27 @@ def test_v9c_strategy_decision_audit_range_status_ok():
     assert audit["range_min_required"] == 5
     assert audit["range_imbalance"] is not None
     assert audit["range_close_pos"] is not None
+
+
+def test_v9c_first_known_mismatch_20230426_1600_matches_coinbacktest():
+    if not COIN_V9C_AUDIT.exists():
+        pytest.skip("CoinBacktest V9C audit fixture is not available next to this workspace")
+    coin_df = pd.read_csv(COIN_V9C_AUDIT)
+    target_timestamp = "2023-04-26 16:00:00"
+    target_positions = coin_df.index[coin_df["timestamp"] == target_timestamp].tolist()
+    assert target_positions, f"missing target timestamp {target_timestamp}"
+    target_position = int(target_positions[0])
+    replay_input = coin_df.iloc[: target_position + 1].copy()
+    warmup_df, warmup_info = load_replay_warmup_ohlcv(COIN_V9C_AUDIT, replay_input)
+
+    ae_df = replay_aetheredge_signal_audit(replay_input, warmup_ohlcv_df=warmup_df, log_every_rows=0)
+
+    coin_row = replay_input.iloc[target_position]
+    ae_row = ae_df[ae_df["timestamp"] == target_timestamp].iloc[0]
+    assert warmup_info["status"] == "loaded"
+    assert int(coin_row["signal"]) == int(ae_row["signal"]) == 0
+    assert coin_row["selected_engine"] == ae_row["selected_engine"] == "NONE"
+    assert int(coin_row["bull_signal"]) == int(ae_row["bull_signal"]) == 0
 
 
 def _bar_ready_context(

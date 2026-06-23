@@ -36,7 +36,7 @@ class MicroContextEngine:
         if mode == "off":
             return MicroDecision(signal_side=side, context_available=False, aligned=False, contra=False, entry_risk_scale=Decimal("1"), action="OFF")
         if aggregate is None or aggregate.bar_count < self.config.min_range_bars:
-            return MicroDecision(signal_side=side, context_available=False, aligned=False, contra=False, entry_risk_scale=Decimal("1"), action="NO_CONTEXT")
+            return MicroDecision(signal_side=side, context_available=False, aligned=False, contra=False, entry_risk_scale=Decimal("1"), action="NEUTRAL")
 
         imbalance = aggregate.imbalance
         close_pos = aggregate.close_pos
@@ -50,7 +50,7 @@ class MicroContextEngine:
         if mode == "strict":
             if aligned:
                 risk_scale = Decimal("1")
-                action = "ALIGNED"
+                action = "NEUTRAL"
             else:
                 risk_scale = Decimal("0")
                 action = "NOT_ALIGNED_BLOCKED"
@@ -60,7 +60,7 @@ class MicroContextEngine:
                 action = "CONTRA_RISK_REDUCED"
             elif aligned:
                 risk_scale = Decimal("1")
-                action = "ALIGNED"
+                action = "NEUTRAL"
             else:
                 risk_scale = self.config.not_aligned_risk_scale
                 action = "NOT_ALIGNED_RISK_REDUCED"

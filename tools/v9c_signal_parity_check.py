@@ -18,17 +18,21 @@ from typing import Any, Mapping, Sequence
 import pandas as pd
 
 from strategies.eth_lf_portfolio_v8.domain.models import BarReadyContext, ClosedKlineContext, RangeAggregateContext, Side
+from strategies.eth_lf_portfolio_v8.features.live_features import V8EngineFeatureRows, build_bear_features, build_bull_features, build_momentum_features
 from strategies.eth_lf_portfolio_v8.strategy import DEFAULT_CONFIG_PATH, FOUR_HOURS_MS, Strategy
 
 
 logger = logging.getLogger("v9c_signal_parity")
 
 DEFAULT_OUT_DIR = Path("data/parity/v9c_signal")
+DEFAULT_REPLAY_WARMUP_DAYS = 365
 REPLAY_AUDIT_FILENAME = "aetheredge_v9c_replay_signal_audit.csv"
 MISMATCH_FILENAME = "signal_mismatches.csv"
+FEATURE_MISMATCH_FILENAME = "feature_mismatches.csv"
 SUMMARY_FILENAME = "parity_summary.json"
 FINGERPRINT_FILENAME = "fingerprint.json"
 MISMATCH_CONTEXT_FILENAME = "signal_mismatch_context.csv"
+FEATURE_MISMATCH_CONTEXT_FILENAME = "feature_mismatch_context.csv"
 
 REQUIRED_COLUMNS = [
     "timestamp",
@@ -114,6 +118,32 @@ DIAGNOSTIC_FLOAT_FIELDS = [
     "rf_taker_buy_ratio",
 ]
 
+FEATURE_COMPARE_FIELDS = [
+    "atr",
+    "atr_pct",
+    "adx",
+    "momentum_long_exit_channel",
+    "momentum_short_exit_channel",
+    "bear_short_exit_channel",
+    "bull_long_exit_channel",
+    "risk_mult",
+    "quality_mult",
+    "momentum_signal",
+    "bear_signal",
+    "bull_signal",
+    "selected_engine",
+    "selected_priority",
+    "signal",
+]
+
+FEATURE_FLOAT_FIELDS = {
+    "atr",
+    "atr_pct",
+    "adx",
+    "risk_mult",
+    "quality_mult",
+}
+
 
 def configure_logging(*, verbose: bool = True) -> None:
     level = logging.INFO if verbose else logging.WARNING
@@ -128,7 +158,9 @@ def configure_logging(*, verbose: bool = True) -> None:
 @dataclass(frozen=True)
 class CompareResult:
     mismatches: pd.DataFrame
+    feature_mismatches: pd.DataFrame
     mismatch_fields: dict[str, int]
+    feature_mismatch_fields: dict[str, int]
     action_critical_mismatch_fields: dict[str, int]
     signal_scoped_mismatch_fields: dict[str, int]
     diagnostic_mismatch_fields: dict[str, int]
@@ -138,6 +170,10 @@ class CompareResult:
     @property
     def mismatch_count(self) -> int:
         return int(len(self.mismatches))
+
+    @property
+    def feature_mismatch_count(self) -> int:
+        return int(len(self.feature_mismatches))
 
     @property
     def action_critical_mismatch_count(self) -> int:
@@ -168,6 +204,19 @@ class CompareResult:
             "field": row["field"],
             "coin_value": row["coin_value"],
             "aetheredge_value": row["aetheredge_value"],
+        }
+
+    @property
+    def first_feature_mismatch(self) -> dict[str, Any] | None:
+        if self.feature_mismatches.empty:
+            return None
+        row = self.feature_mismatches.iloc[0]
+        return {
+            "timestamp": row["timestamp"],
+            "field": row["field"],
+            "coin_value": row["coin_value"],
+            "aetheredge_value": row["aetheredge_value"],
+            "abs_diff": row["abs_diff"],
         }
 
 
@@ -276,10 +325,13 @@ def replay_aetheredge_signal_audit(
     *,
     max_rows: int | None = None,
     log_every_rows: int = 500,
+    warmup_ohlcv_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     coin_df = coin_df.head(max_rows).copy() if max_rows is not None else coin_df.copy()
     validate_coin_audit_columns(coin_df)
     strategy = Strategy()
+    replay_ohlcv = _build_replay_ohlcv_dataframe(coin_df, warmup_ohlcv_df=warmup_ohlcv_df)
+    engine_feature_frames = _build_engine_feature_frames(strategy, replay_ohlcv)
     rows: list[dict[str, Any]] = []
     total_rows = len(coin_df)
     started = time.perf_counter()
@@ -298,7 +350,6 @@ def replay_aetheredge_signal_audit(
             close=_decimal(row["close"]),
             volume=_decimal(row["volume"]),
         )
-        strategy.buffer.put_kline(kline)
 
         aggregate = build_range_context_from_rf_columns(
             row.to_dict(),
@@ -306,10 +357,7 @@ def replay_aetheredge_signal_audit(
             open_time_ms=open_time_ms,
             close_time_ms=close_time_ms,
         )
-        if aggregate is not None:
-            strategy.buffer.put_range_aggregate(aggregate)
-
-        feature_rows = strategy.feature_builder.build_latest(strategy.buffer.closed_klines, target_close_time_ms=close_time_ms)
+        feature_rows = _feature_rows_for_timestamp(engine_feature_frames, row["timestamp"])
         engine_features = {
             "momentum": feature_rows.momentum or {},
             "bear": feature_rows.bear or {},
@@ -351,6 +399,111 @@ def replay_aetheredge_signal_audit(
     return pd.DataFrame(rows, columns=AUDIT_COLUMNS)
 
 
+def load_replay_warmup_ohlcv(
+    coin_audit_path: Path,
+    coin_df: pd.DataFrame,
+    *,
+    warmup_days: int = DEFAULT_REPLAY_WARMUP_DAYS,
+) -> tuple[pd.DataFrame | None, dict[str, Any]]:
+    info: dict[str, Any] = {
+        "enabled": True,
+        "warmup_days": int(warmup_days),
+        "path": None,
+        "rows": 0,
+        "first_timestamp": None,
+        "last_timestamp": None,
+        "status": "not_loaded",
+    }
+    if coin_df.empty:
+        info["status"] = "empty_coin_audit"
+        return None, info
+
+    history_path = _find_coinbacktest_history_4h_path(coin_audit_path)
+    if history_path is None:
+        info["status"] = "history_not_found"
+        return None, info
+
+    first_trade_ts = pd.to_datetime(coin_df.iloc[0]["timestamp"])
+    warmup_start_ts = first_trade_ts - pd.Timedelta(days=int(warmup_days))
+    try:
+        history = pd.read_csv(history_path, usecols=["timestamp", "open", "high", "low", "close", "volume"])
+    except Exception as exc:
+        info["path"] = str(history_path)
+        info["status"] = f"history_load_failed: {exc}"
+        return None, info
+
+    history["timestamp"] = pd.to_datetime(history["timestamp"])
+    warmup = history[(history["timestamp"] >= warmup_start_ts) & (history["timestamp"] < first_trade_ts)].copy()
+    info["path"] = str(history_path)
+    info["rows"] = int(len(warmup))
+    if warmup.empty:
+        info["status"] = "empty"
+        return None, info
+    info["first_timestamp"] = _timestamp_string(warmup.iloc[0]["timestamp"])
+    info["last_timestamp"] = _timestamp_string(warmup.iloc[-1]["timestamp"])
+    info["status"] = "loaded"
+    return warmup, info
+
+
+def _find_coinbacktest_history_4h_path(coin_audit_path: Path) -> Path | None:
+    try:
+        start = coin_audit_path.resolve()
+    except OSError:
+        start = coin_audit_path
+    candidates: list[Path] = []
+    for parent in [start.parent, *start.parents]:
+        history_dir = parent / "data" / "history_k"
+        if history_dir.exists():
+            candidates.extend(sorted(history_dir.glob("ETH-USDT-SWAP_4H_*.csv")))
+        if parent.name.lower() == "coinbacktest":
+            history_dir = parent / "data" / "history_k"
+            candidates.extend(sorted(history_dir.glob("ETH-USDT-SWAP_4H_*.csv")))
+            break
+    if not candidates:
+        return None
+    return candidates[0]
+
+
+def _build_replay_ohlcv_dataframe(coin_df: pd.DataFrame, *, warmup_ohlcv_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    parts: list[pd.DataFrame] = []
+    if warmup_ohlcv_df is not None and not warmup_ohlcv_df.empty:
+        parts.append(warmup_ohlcv_df[["timestamp", "open", "high", "low", "close", "volume"]].copy())
+    parts.append(coin_df[["timestamp", "open", "high", "low", "close", "volume"]].copy())
+    raw = pd.concat(parts, ignore_index=True)
+    raw["timestamp"] = pd.to_datetime(raw["timestamp"], utc=True).dt.tz_convert(None)
+    for column in ["open", "high", "low", "close", "volume"]:
+        raw[column] = pd.to_numeric(raw[column], errors="coerce")
+    raw = raw.dropna(subset=["timestamp", "open", "high", "low", "close", "volume"])
+    raw = raw.drop_duplicates(subset=["timestamp"], keep="last").sort_values("timestamp")
+    return raw.set_index("timestamp")
+
+
+def _build_engine_feature_frames(strategy: Strategy, replay_ohlcv: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    if replay_ohlcv.empty:
+        return {"momentum": pd.DataFrame(), "bear": pd.DataFrame(), "bull": pd.DataFrame()}
+    return {
+        "momentum": build_momentum_features(replay_ohlcv, strategy.feature_builder.momentum_cfg),
+        "bear": build_bear_features(replay_ohlcv, strategy.feature_builder.bear_cfg),
+        "bull": build_bull_features(replay_ohlcv, strategy.feature_builder.bull_cfg),
+    }
+
+
+def _feature_rows_for_timestamp(engine_feature_frames: Mapping[str, pd.DataFrame], timestamp: Any) -> V8EngineFeatureRows:
+    target_index = pd.to_datetime(timestamp, utc=True).tz_convert(None)
+    return V8EngineFeatureRows(
+        momentum=_feature_row_or_none(engine_feature_frames.get("momentum"), target_index),
+        bear=_feature_row_or_none(engine_feature_frames.get("bear"), target_index),
+        bull=_feature_row_or_none(engine_feature_frames.get("bull"), target_index),
+    )
+
+
+def _feature_row_or_none(df: pd.DataFrame | None, target_index: pd.Timestamp) -> Mapping[str, Any] | None:
+    if df is None or df.empty or target_index not in df.index:
+        return None
+    row = df.loc[target_index]
+    return {key: _python_value(value) for key, value in row.to_dict().items()}
+
+
 def compare_signal_audits(
     coin_df: pd.DataFrame,
     aetheredge_df: pd.DataFrame,
@@ -361,10 +514,14 @@ def compare_signal_audits(
 ) -> CompareResult:
     validate_coin_audit_columns(coin_df)
     _validate_aetheredge_audit_columns(aetheredge_df)
+    coin_df = _with_missing_columns(coin_df, FEATURE_COMPARE_FIELDS)
+    aetheredge_df = _with_missing_columns(aetheredge_df, FEATURE_COMPARE_FIELDS)
     joined = pd.merge(coin_df, aetheredge_df, on="timestamp", how="inner", suffixes=("_coin", "_aetheredge"))
     compared = joined.iloc[skip_warmup_bars:] if skip_warmup_bars else joined
     mismatches: list[dict[str, Any]] = []
+    feature_mismatches: list[dict[str, Any]] = []
     mismatch_fields: dict[str, int] = {}
+    feature_mismatch_fields: dict[str, int] = {}
     action_critical_mismatch_fields: dict[str, int] = {}
     signal_scoped_mismatch_fields: dict[str, int] = {}
     diagnostic_mismatch_fields: dict[str, int] = {}
@@ -374,6 +531,15 @@ def compare_signal_audits(
     for row_idx, (_, row) in enumerate(compared.iterrows(), start=1):
         timestamp = row["timestamp"]
         has_signal = _canonical_int(row["signal_coin"]) != 0 or _canonical_int(row["signal_aetheredge"]) != 0
+        for field in FEATURE_COMPARE_FIELDS:
+            _compare_feature_field(
+                row,
+                feature_mismatches,
+                feature_mismatch_fields,
+                timestamp,
+                field,
+                tolerance,
+            )
         for field in ACTION_CRITICAL_FIELDS:
             coin_value = row[f"{field}_coin"]
             ae_value = row[f"{field}_aetheredge"]
@@ -436,7 +602,7 @@ def compare_signal_audits(
         if log_every_rows > 0 and (row_idx == 1 or row_idx % log_every_rows == 0 or row_idx == total_rows):
             elapsed = time.perf_counter() - started
             logger.info(
-                "Compare progress | row=%s/%s timestamp=%s mismatches=%s action_critical=%s signal_scoped=%s diagnostic=%s elapsed_sec=%.3f",
+                "Compare progress | row=%s/%s timestamp=%s mismatches=%s action_critical=%s signal_scoped=%s diagnostic=%s feature=%s elapsed_sec=%.3f",
                 row_idx,
                 total_rows,
                 timestamp,
@@ -444,19 +610,75 @@ def compare_signal_audits(
                 _sum_counts(action_critical_mismatch_fields),
                 _sum_counts(signal_scoped_mismatch_fields),
                 _sum_counts(diagnostic_mismatch_fields),
+                len(feature_mismatches),
                 elapsed,
             )
 
     mismatch_df = pd.DataFrame(mismatches, columns=["timestamp", "category", "field", "coin_value", "aetheredge_value", "abs_diff"])
+    feature_mismatch_df = pd.DataFrame(feature_mismatches, columns=["timestamp", "field", "coin_value", "aetheredge_value", "abs_diff"])
     return CompareResult(
         mismatches=mismatch_df,
+        feature_mismatches=feature_mismatch_df,
         mismatch_fields=mismatch_fields,
+        feature_mismatch_fields=feature_mismatch_fields,
         action_critical_mismatch_fields=action_critical_mismatch_fields,
         signal_scoped_mismatch_fields=signal_scoped_mismatch_fields,
         diagnostic_mismatch_fields=diagnostic_mismatch_fields,
         joined_rows=int(len(joined)),
         compared_rows=int(len(compared)),
     )
+
+
+def _compare_feature_field(
+    row: pd.Series,
+    feature_mismatches: list[dict[str, Any]],
+    feature_mismatch_fields: dict[str, int],
+    timestamp: Any,
+    field: str,
+    tolerance: float,
+) -> None:
+    coin_value = row[f"{field}_coin"]
+    ae_value = row[f"{field}_aetheredge"]
+    if field in FEATURE_FLOAT_FIELDS:
+        coin_float = _optional_float(coin_value)
+        ae_float = _optional_float(ae_value)
+        if coin_float is None or ae_float is None:
+            if coin_float != ae_float:
+                _append_feature_mismatch(
+                    feature_mismatches,
+                    feature_mismatch_fields,
+                    timestamp,
+                    field,
+                    coin_value,
+                    ae_value,
+                    None,
+                )
+            return
+        abs_diff = abs(coin_float - ae_float)
+        if abs_diff > tolerance:
+            _append_feature_mismatch(
+                feature_mismatches,
+                feature_mismatch_fields,
+                timestamp,
+                field,
+                coin_value,
+                ae_value,
+                abs_diff,
+            )
+        return
+
+    coin_canonical = _canonical_strict_value(coin_value)
+    ae_canonical = _canonical_strict_value(ae_value)
+    if coin_canonical != ae_canonical:
+        _append_feature_mismatch(
+            feature_mismatches,
+            feature_mismatch_fields,
+            timestamp,
+            field,
+            coin_value,
+            ae_value,
+            _strict_abs_diff(coin_value, ae_value),
+        )
 
 
 def _compare_float_field(
@@ -534,10 +756,13 @@ def write_outputs(
     auto_skip_feature_warmup: bool,
     feature_warmup: Mapping[str, Any],
     fingerprint: Mapping[str, Any],
+    feature_context_bars: int = 5,
+    replay_warmup: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     out_dir.mkdir(parents=True, exist_ok=True)
     aetheredge_df.to_csv(out_dir / REPLAY_AUDIT_FILENAME, index=False)
     compare_result.mismatches.to_csv(out_dir / MISMATCH_FILENAME, index=False)
+    compare_result.feature_mismatches.to_csv(out_dir / FEATURE_MISMATCH_FILENAME, index=False)
     context_df = build_signal_mismatch_context(
         coin_df,
         aetheredge_df,
@@ -545,6 +770,14 @@ def write_outputs(
         recommended_skip_warmup_bars=feature_warmup.get("recommended_skip_warmup_bars"),
     )
     context_df.to_csv(out_dir / MISMATCH_CONTEXT_FILENAME, index=False)
+    feature_context_df = build_feature_mismatch_context(
+        coin_df,
+        aetheredge_df,
+        compare_result,
+        context_bars=feature_context_bars,
+        recommended_skip_warmup_bars=feature_warmup.get("recommended_skip_warmup_bars"),
+    )
+    feature_context_df.to_csv(out_dir / FEATURE_MISMATCH_CONTEXT_FILENAME, index=False)
     Path(out_dir / FINGERPRINT_FILENAME).write_text(json.dumps(fingerprint, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
     summary = {
         "passed": compare_result.passed,
@@ -558,16 +791,20 @@ def write_outputs(
         "effective_skip_warmup_bars": int(effective_skip_warmup_bars),
         "auto_skip_feature_warmup": bool(auto_skip_feature_warmup),
         "feature_warmup": dict(feature_warmup),
+        "replay_warmup": dict(replay_warmup or {}),
         "compared_rows": compare_result.compared_rows,
         "action_critical_mismatch_count": compare_result.action_critical_mismatch_count,
         "signal_scoped_mismatch_count": compare_result.signal_scoped_mismatch_count,
         "diagnostic_mismatch_count": compare_result.diagnostic_mismatch_count,
+        "feature_mismatch_count": compare_result.feature_mismatch_count,
         "mismatch_count": compare_result.mismatch_count,
         "mismatch_fields": compare_result.mismatch_fields,
+        "feature_mismatch_fields": compare_result.feature_mismatch_fields,
         "action_critical_mismatch_fields": compare_result.action_critical_mismatch_fields,
         "signal_scoped_mismatch_fields": compare_result.signal_scoped_mismatch_fields,
         "diagnostic_mismatch_fields": compare_result.diagnostic_mismatch_fields,
         "first_action_critical_mismatch": compare_result.first_action_critical_mismatch,
+        "first_feature_mismatch": compare_result.first_feature_mismatch,
         "tolerance": float(tolerance),
     }
     Path(out_dir / SUMMARY_FILENAME).write_text(json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
@@ -712,6 +949,79 @@ def build_signal_mismatch_context(
     return context
 
 
+def build_feature_mismatch_context(
+    coin_df: pd.DataFrame,
+    aetheredge_df: pd.DataFrame,
+    compare_result: CompareResult,
+    *,
+    context_bars: int = 5,
+    recommended_skip_warmup_bars: int | None = None,
+) -> pd.DataFrame:
+    context_bars = max(1, int(context_bars))
+    columns = [
+        "mismatch_timestamp",
+        "context_timestamp",
+        "row_index",
+        "bars_before_mismatch",
+        "warmup_invalid",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+    ]
+    for field in FEATURE_COMPARE_FIELDS:
+        columns.extend([f"coin_{field}", f"ae_{field}"])
+
+    if compare_result.mismatches.empty:
+        return pd.DataFrame(columns=columns)
+    action_mismatches = compare_result.mismatches[compare_result.mismatches["category"] == "action_critical"]
+    if action_mismatches.empty:
+        return pd.DataFrame(columns=columns)
+
+    action_timestamps = list(dict.fromkeys(action_mismatches["timestamp"].tolist()))
+    coin_context_df = _with_missing_columns(coin_df, FEATURE_COMPARE_FIELDS)
+    aetheredge_context_df = _with_missing_columns(aetheredge_df, FEATURE_COMPARE_FIELDS)
+    joined = pd.merge(coin_context_df, aetheredge_context_df, on="timestamp", how="inner", suffixes=("_coin", "_aetheredge"))
+    joined = joined.reset_index(drop=True)
+    joined["row_index"] = joined.index
+
+    rows: list[dict[str, Any]] = []
+    for mismatch_timestamp in action_timestamps:
+        match = joined[joined["timestamp"] == mismatch_timestamp]
+        if match.empty:
+            continue
+        mismatch_position = int(match.iloc[0]["row_index"])
+        start = max(0, mismatch_position - context_bars + 1)
+        window = joined.iloc[start : mismatch_position + 1]
+        for _, row in window.iterrows():
+            row_index = int(row["row_index"])
+            item: dict[str, Any] = {
+                "mismatch_timestamp": mismatch_timestamp,
+                "context_timestamp": row["timestamp"],
+                "row_index": row_index,
+                "bars_before_mismatch": int(mismatch_position - row_index),
+                "warmup_invalid": (
+                    False
+                    if recommended_skip_warmup_bars is None
+                    else bool(row_index < int(recommended_skip_warmup_bars))
+                ),
+                "open": _get_unsuffixed_or_joined_value(row, "open"),
+                "high": _get_unsuffixed_or_joined_value(row, "high"),
+                "low": _get_unsuffixed_or_joined_value(row, "low"),
+                "close": _get_unsuffixed_or_joined_value(row, "close"),
+                "volume": _get_unsuffixed_or_joined_value(row, "volume"),
+            }
+            for field in FEATURE_COMPARE_FIELDS:
+                item[f"coin_{field}"] = _get_joined_value(row, field, "coin")
+                item[f"ae_{field}"] = _get_joined_value(row, field, "aetheredge")
+            rows.append(item)
+    context = pd.DataFrame(rows, columns=columns)
+    if "warmup_invalid" in context.columns:
+        context["warmup_invalid"] = context["warmup_invalid"].astype(object)
+    return context
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Replay AetherEdge V9C signals and compare with an exported signal_audit.csv.")
     parser.add_argument("--coin-audit", required=True, type=Path, help="Path to exported signal_audit.csv.")
@@ -726,6 +1036,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-rows", type=int, default=None, help="Replay only the first N rows. Default: all rows")
     parser.add_argument("--log-every-rows", type=int, default=500, help="Print replay/compare progress every N rows. Default: 500")
+    parser.add_argument("--feature-context-bars", type=int, default=5, help="Recent 4H rows to write per action-critical mismatch in feature_mismatch_context.csv. Default: 5")
     parser.add_argument("--quiet", action="store_true", help="Only print warnings/errors and final JSON summary.")
     return parser
 
@@ -754,11 +1065,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.info("Validating CoinBacktest audit columns | required=%s", len(REQUIRED_COLUMNS))
         validate_coin_audit_columns(coin_df)
         logger.info("CoinBacktest audit columns validated | missing=0")
+        replay_warmup_df, replay_warmup_info = load_replay_warmup_ohlcv(args.coin_audit, coin_df)
+        logger.info(
+            "Replay warmup OHLCV | status=%s rows=%s path=%s first=%s last=%s",
+            replay_warmup_info.get("status"),
+            replay_warmup_info.get("rows"),
+            replay_warmup_info.get("path"),
+            replay_warmup_info.get("first_timestamp"),
+            replay_warmup_info.get("last_timestamp"),
+        )
         logger.info("AetherEdge V9C replay started | rows=%s", len(coin_df))
         replay_started = time.perf_counter()
         aetheredge_df = replay_aetheredge_signal_audit(
             coin_df,
             log_every_rows=args.log_every_rows,
+            warmup_ohlcv_df=replay_warmup_df,
         )
         logger.info(
             "AetherEdge V9C replay completed | rows=%s duration_sec=%.3f",
@@ -815,13 +1136,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             effective_skip_warmup_bars=effective_skip_warmup_bars,
             auto_skip_feature_warmup=args.auto_skip_feature_warmup,
             feature_warmup=warmup_diag,
+            feature_context_bars=args.feature_context_bars,
             fingerprint=strategy_fingerprint(),
+            replay_warmup=replay_warmup_info,
         )
         logger.info(
-            "Parity outputs written | replay_audit=%s mismatches=%s mismatch_context=%s summary=%s fingerprint=%s",
+            "Parity outputs written | replay_audit=%s mismatches=%s feature_mismatches=%s mismatch_context=%s feature_mismatch_context=%s summary=%s fingerprint=%s",
             args.out_dir / REPLAY_AUDIT_FILENAME,
             args.out_dir / MISMATCH_FILENAME,
+            args.out_dir / FEATURE_MISMATCH_FILENAME,
             args.out_dir / MISMATCH_CONTEXT_FILENAME,
+            args.out_dir / FEATURE_MISMATCH_CONTEXT_FILENAME,
             args.out_dir / SUMMARY_FILENAME,
             args.out_dir / FINGERPRINT_FILENAME,
         )
@@ -851,6 +1176,16 @@ def _audit_row_from_context(input_row: Mapping[str, Any], context: BarReadyConte
     routed = context.routed_signal
     is_flat = routed.side is Side.FLAT
     selected_feature_key = _feature_key_for_engine(None if is_flat else routed.engine)
+    audit_risk_mult = (
+        _engine_feature_value(context.engine_features, "momentum", "risk_mult")
+        if is_flat
+        else getattr(routed, "risk_mult", Decimal("1"))
+    )
+    audit_quality_mult = (
+        _engine_feature_value(context.engine_features, "momentum", "quality_mult")
+        if is_flat
+        else getattr(routed, "quality_mult", Decimal("1"))
+    )
     return {
         "timestamp": _timestamp_string(input_row["timestamp"]),
         "open": input_row["open"],
@@ -861,8 +1196,8 @@ def _audit_row_from_context(input_row: Mapping[str, Any], context: BarReadyConte
         "signal": int(routed.side.value),
         "selected_engine": "NONE" if is_flat else routed.engine,
         "selected_priority": 0 if is_flat else int(routed.priority),
-        "risk_mult": float(getattr(routed, "risk_mult", Decimal("1"))),
-        "quality_mult": float(getattr(routed, "quality_mult", Decimal("1"))),
+        "risk_mult": float(Decimal(str(_none_if_missing(audit_risk_mult) or "1"))),
+        "quality_mult": float(Decimal(str(_none_if_missing(audit_quality_mult) or "1"))),
         "momentum_signal": _engine_signal(context.engine_features.get("momentum")),
         "bear_signal": _engine_signal(context.engine_features.get("bear")),
         "bull_signal": _engine_signal(context.engine_features.get("bull")),
@@ -880,10 +1215,10 @@ def _audit_row_from_context(input_row: Mapping[str, Any], context: BarReadyConte
         "atr": _engine_feature_value(context.engine_features, selected_feature_key, "atr"),
         "atr_pct": _engine_feature_value(context.engine_features, selected_feature_key, "atr_pct"),
         "adx": _engine_feature_value(context.engine_features, selected_feature_key, "adx"),
-        "momentum_long_exit_channel": _engine_feature_value(context.engine_features, "momentum", "long_exit_channel", fallback=False),
-        "momentum_short_exit_channel": _engine_feature_value(context.engine_features, "momentum", "short_exit_channel", fallback=False),
-        "bear_short_exit_channel": _engine_feature_value(context.engine_features, "bear", "short_exit_channel", fallback=False),
-        "bull_long_exit_channel": _engine_feature_value(context.engine_features, "bull", "long_exit_channel", fallback=False),
+        "momentum_long_exit_channel": _engine_feature_bool_value(context.engine_features, "momentum", "long_exit_channel"),
+        "momentum_short_exit_channel": _engine_feature_bool_value(context.engine_features, "momentum", "short_exit_channel"),
+        "bear_short_exit_channel": _engine_feature_bool_value(context.engine_features, "bear", "short_exit_channel"),
+        "bull_long_exit_channel": _engine_feature_bool_value(context.engine_features, "bull", "long_exit_channel"),
     }
 
 
@@ -916,6 +1251,27 @@ def _append_mismatch(
     )
     mismatch_fields[field] = mismatch_fields.get(field, 0) + 1
     category_mismatch_fields[field] = category_mismatch_fields.get(field, 0) + 1
+
+
+def _append_feature_mismatch(
+    feature_mismatches: list[dict[str, Any]],
+    feature_mismatch_fields: dict[str, int],
+    timestamp: Any,
+    field: str,
+    coin_value: Any,
+    aetheredge_value: Any,
+    abs_diff: float | None,
+) -> None:
+    feature_mismatches.append(
+        {
+            "timestamp": timestamp,
+            "field": field,
+            "coin_value": coin_value,
+            "aetheredge_value": aetheredge_value,
+            "abs_diff": abs_diff,
+        }
+    )
+    feature_mismatch_fields[field] = feature_mismatch_fields.get(field, 0) + 1
 
 
 def _canonical_strict_value(value: Any) -> Any:
@@ -982,6 +1338,13 @@ def _engine_feature_value(engine_features: Mapping[str, Mapping[str, Any]], feat
     return None
 
 
+def _engine_feature_bool_value(engine_features: Mapping[str, Mapping[str, Any]], feature_key: str, key: str) -> bool:
+    value = _engine_feature_value(engine_features, feature_key, key, fallback=False)
+    if _is_missing(value):
+        return False
+    return bool(value)
+
+
 def _get_joined_value(row: pd.Series, field: str, side: str) -> Any:
     suffixed = f"{field}_{side}"
     if suffixed in row.index:
@@ -999,6 +1362,22 @@ def _get_unsuffixed_or_joined_value(row: pd.Series, field: str) -> Any:
 
 def _none_if_missing(value: Any) -> Any:
     return None if _is_missing(value) else value
+
+
+def _strict_abs_diff(coin_value: Any, ae_value: Any) -> float | None:
+    coin_float = _optional_float(coin_value)
+    ae_float = _optional_float(ae_value)
+    if coin_float is None or ae_float is None:
+        return None
+    return abs(coin_float - ae_float)
+
+
+def _with_missing_columns(df: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
+    out = df.copy()
+    for column in columns:
+        if column not in out.columns:
+            out[column] = None
+    return out
 
 
 def _sum_counts(counts: Mapping[str, int]) -> int:
@@ -1023,6 +1402,17 @@ def _jsonable(value: Any) -> Any:
         return {str(key): _jsonable(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_jsonable(item) for item in value]
+    return value
+
+
+def _python_value(value: Any) -> Any:
+    if _is_missing(value):
+        return None
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
     return value
 
 

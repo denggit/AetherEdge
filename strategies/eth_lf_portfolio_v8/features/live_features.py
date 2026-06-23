@@ -46,6 +46,8 @@ class BearV3FeatureConfig:
     min_risk_mult: float = 0.25
     max_risk_mult: float = 2.3
     style: str = "bear_permission_v3"
+    entry_lookback: int = 40
+    exit_lookback: int = 36
     d1_ema_fast: int = 20
     d1_ema_mid: int = 50
     d1_ema_slow: int = 100
@@ -155,7 +157,7 @@ def klines_to_dataframe(klines: Mapping[int, ClosedKlineContext], *, target_clos
     return out
 
 
-def build_v8_base_features(df: pd.DataFrame) -> pd.DataFrame:
+def build_v8_base_features(df: pd.DataFrame, *, entry_lookback: int = 40, exit_lookback: int = 36) -> pd.DataFrame:
     out = df.copy()
     out["atr"] = atr(out, 20)
     out["atr_pct"] = out["atr"] / out["close"]
@@ -165,10 +167,10 @@ def build_v8_base_features(df: pd.DataFrame) -> pd.DataFrame:
     out["ema89"] = ema(out["close"], 89)
     out["ema100"] = ema(out["close"], 100)
     out["ema200"] = ema(out["close"], 200)
-    out["entry_high"] = out["high"].rolling(12, min_periods=12).max().shift(1)
-    out["entry_low"] = out["low"].rolling(12, min_periods=12).min().shift(1)
-    out["exit_high"] = out["high"].rolling(12, min_periods=12).max().shift(1)
-    out["exit_low"] = out["low"].rolling(12, min_periods=12).min().shift(1)
+    out["entry_high"] = out["high"].rolling(entry_lookback, min_periods=entry_lookback).max().shift(1)
+    out["entry_low"] = out["low"].rolling(entry_lookback, min_periods=entry_lookback).min().shift(1)
+    out["exit_high"] = out["high"].rolling(exit_lookback, min_periods=exit_lookback).max().shift(1)
+    out["exit_low"] = out["low"].rolling(exit_lookback, min_periods=exit_lookback).min().shift(1)
     return out
 
 
@@ -224,7 +226,7 @@ def build_momentum_features(base_4h: pd.DataFrame, cfg: MomentumV3FeatureConfig)
 
 
 def build_bear_features(base_4h: pd.DataFrame, cfg: BearV3FeatureConfig) -> pd.DataFrame:
-    out = build_v8_base_features(base_4h)
+    out = build_v8_base_features(base_4h, entry_lookback=cfg.entry_lookback, exit_lookback=cfg.exit_lookback)
     out = _bear_add_shifted_htf(base_4h, out, cfg)
     out["long_signal"] = False
     weekly_bear = (out["w_close"] < out["w_ema20"]) & (out["w_ema20_slope"] < 0)
