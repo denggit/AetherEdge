@@ -11,6 +11,7 @@ from src.platform.exchanges.models import (
     OrderQuery,
     OrderRequest,
     Position,
+    PositionMode,
     StopMarketOrderRequest,
     StopOrderQuery,
     TriggerPriceType,
@@ -74,6 +75,12 @@ class ExecutionClient(Protocol):
         ...
 
     async def fetch_open_stop_orders(self) -> list[Order]:
+        ...
+
+    async def fetch_positions(self) -> list[Position]:
+        ...
+
+    async def fetch_position_mode(self) -> PositionMode:
         ...
 
     async def replace_order(self, cancel_request: CancelOrderRequest, new_order: OrderRequest) -> Order:

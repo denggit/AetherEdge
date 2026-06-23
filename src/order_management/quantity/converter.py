@@ -75,6 +75,30 @@ class NativeQuantityConverter:
             contract_value=contract_value,
         )
 
+    def native_to_base_quantity(
+        self,
+        *,
+        exchange: ExchangeName | str,
+        symbol: str,
+        native_quantity: Decimal,
+        market_profile: MarketProfile,
+    ) -> Decimal:
+        exchange_name = exchange if isinstance(exchange, ExchangeName) else ExchangeName(str(exchange).strip().lower())
+        if native_quantity < 0:
+            raise ValueError("native_quantity must be non-negative")
+
+        unit = str(market_profile.quantity_unit_by_exchange.get(exchange_name, "base_asset")).strip().lower()
+        contract_value = market_profile.contract_value(exchange_name)
+        if unit in self.CONTRACT_UNITS:
+            if contract_value is None or contract_value <= 0:
+                raise ValueError(f"contract_value is required for contract-sized exchange {exchange_name.value}:{symbol}")
+            return native_quantity * contract_value
+        if unit in self.BASE_ASSET_UNITS:
+            return native_quantity
+        if contract_value is not None and contract_value != Decimal("1"):
+            return native_quantity * contract_value
+        return native_quantity
+
     def convert_order_request(self, request: OrderRequest, *, exchange: ExchangeName | str, market_profile: MarketProfile) -> tuple[OrderRequest, NativeQuantityConversion]:
         conversion = self.convert_quantity(
             exchange=exchange,

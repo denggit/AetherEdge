@@ -19,6 +19,7 @@ from src.platform.exchanges.models import (
     OrderRequest,
     OrderSide,
     Position,
+    PositionMode,
     PositionSide,
     StopMarketOrderRequest,
     StopOrderQuery,
@@ -173,6 +174,18 @@ class ExchangeExecutionService:
 
     async def fetch_open_stop_orders(self) -> list[Order]:
         return await self._exchange_client.fetch_open_stop_orders(self._symbol)
+
+    async def fetch_positions(self) -> list[Position]:
+        fetch_positions = getattr(self._exchange_client, "fetch_positions", None)
+        if fetch_positions is None:
+            return []
+        return await fetch_positions(self._symbol)
+
+    async def fetch_position_mode(self) -> PositionMode:
+        fetch_position_mode = getattr(self._exchange_client, "fetch_position_mode", None)
+        if fetch_position_mode is None:
+            return PositionMode.ONE_WAY
+        return await fetch_position_mode()
 
     async def replace_order(self, cancel_request: CancelOrderRequest, new_order: OrderRequest) -> Order:
         self._ensure_live_write_allowed("replace_order")

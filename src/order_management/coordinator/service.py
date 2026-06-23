@@ -11,10 +11,11 @@ from src.order_management.position_plan import LegPlan, LegRole, LegSyncStatus, 
 from src.order_management.ports import ClientOrderIdFactory, DuplicateOrderGuard, OrderIntentRepository
 from src.order_management.quantity import NativeQuantityConverter
 from src.order_management.master_follower import MasterFollowerExecutionPolicy, MasterFollowerPolicyEvaluator
+from src.order_management.safety import ExitSafetyError, ExitSafetyGuard, is_exit_action, target_position_side_for_action
 from src.order_management.sync import OrderStatusSynchronizer, extract_avg_fill_price, extract_fee
 from src.planner import ExecutionPlanner, PlannedExecution, PlannedExecutionAction
 from src.platform.execution import ExecutionClient
-from src.platform.exchanges.models import ExchangeName, Order, OrderRequest, OrderStatus, StopMarketOrderRequest
+from src.platform.exchanges.models import ExchangeName, Order, OrderRequest, OrderStatus, PositionMode, PositionSide, StopMarketOrderRequest
 from src.signals.models import SignalAction
 from src.utils.log import get_logger
 
@@ -43,6 +44,7 @@ class MultiExchangeOrderCoordinator:
         quantity_converter: NativeQuantityConverter | None = None,
         order_status_synchronizer: OrderStatusSynchronizer | None = None,
         master_follower_policy: MasterFollowerExecutionPolicy | None = None,
+        exit_safety_guard: ExitSafetyGuard | None = None,
         position_plan_store=None,
     ) -> None:
         if not clients:
@@ -53,10 +55,12 @@ class MultiExchangeOrderCoordinator:
         self.client_order_id_factory = client_order_id_factory or DeterministicClientOrderIdFactory()
         self.duplicate_guard = duplicate_guard
         self.quantity_converter = quantity_converter or NativeQuantityConverter()
+        self.exit_safety_guard = exit_safety_guard or ExitSafetyGuard(quantity_converter=self.quantity_converter)
         self.order_status_synchronizer = order_status_synchronizer or OrderStatusSynchronizer()
         self.master_follower_policy = master_follower_policy
         self.master_follower_evaluator = MasterFollowerPolicyEvaluator(master_follower_policy) if master_follower_policy is not None else None
         self.position_plan_store = position_plan_store
+        self._position_mode_cache: dict[ExchangeName, PositionMode] = {}
 
     async def execute(self, intent: OrderIntent) -> list[ExchangeOrderResult]:
         if self.duplicate_guard is not None:
@@ -185,6 +189,8 @@ class MultiExchangeOrderCoordinator:
                 master_delta = _signal_exchange_quantity(signal, master_exchange, fallback=signal.quantity)
                 self.position_plan_store.upsert_position(replace(existing, master_target_qty_base=existing.master_target_qty_base + master_delta))
         by_exchange = {result.exchange: result for result in results}
+        master_result = by_exchange.get(master_exchange)
+        master_entry_ok = bool(master_result and master_result.ok)
         for exchange in intent.target_exchanges:
             result = by_exchange.get(exchange)
             if result is None:
@@ -210,6 +216,28 @@ class MultiExchangeOrderCoordinator:
                         self.position_plan_store.upsert_position(replace(plan, master_filled_qty_base=plan.master_filled_qty_base + filled))
             elif purpose == "follower_recovery_topup":
                 self.position_plan_store.update_leg_sync_status(position_id=position_id, exchange=exchange, sync_status=LegSyncStatus.TOPUP_FAILED)
+            elif master_entry_ok and exchange is not master_exchange:
+                self.position_plan_store.update_leg_sync_status(position_id=position_id, exchange=exchange, sync_status=LegSyncStatus.FOLLOWER_ENTRY_FAILED)
+                add_event = getattr(self.repository, "add_event", None)
+                if callable(add_event):
+                    add_event(
+                        OrderJournalEvent(
+                            intent_id=intent.intent_id,
+                            status=OrderIntentStatus.PARTIALLY_SUBMITTED,
+                            message="critical_follower_entry_failed",
+                            exchange=exchange,
+                            metadata={
+                                "severity": "CRITICAL",
+                                "position_id": position_id,
+                                "master_exchange": master_exchange.value,
+                                "follower_exchange": exchange.value,
+                                "error": result.error or "follower entry failed",
+                                "policy": "master_kept_follower_manual_required",
+                                "auto_close_master": False,
+                                "auto_reduce_master": False,
+                            },
+                        )
+                    )
 
     def _record_stop_plan(self, intent: OrderIntent, results: Sequence[ExchangeOrderResult]) -> None:
         signal = intent.signal
@@ -440,7 +468,28 @@ class MultiExchangeOrderCoordinator:
                 try:
                     order = await self._execute_item(client, item, intent=intent, client_order_id=client_order_id)
                     synced = await self.order_status_synchronizer.sync_after_submit(client=client, item=item, order=order)
-                    results.append(_order_to_result(synced, attempts=attempt + 1))
+                    results.append(_order_to_result(synced, client=client, quantity_converter=self.quantity_converter, attempts=attempt + 1))
+                    break
+                except ExitSafetyError as exc:
+                    last_error = exc
+                    self._record_exit_safety_event(intent=intent, exchange=client.exchange, error=exc)
+                    logger.critical(
+                        "Exit safety rejected order | intent_id=%s exchange=%s action=%s reason=%s metadata=%s",
+                        intent.intent_id,
+                        client.exchange.value,
+                        item.signal.action.value,
+                        exc.reason,
+                        exc.metadata,
+                    )
+                    results.append(
+                        ExchangeOrderResult(
+                            exchange=client.exchange,
+                            ok=False,
+                            client_order_id=client_order_id,
+                            error=exc.reason,
+                            raw={"attempts": attempt + 1, "exit_safety": exc.metadata},
+                        )
+                    )
                     break
                 except Exception as exc:
                     last_error = exc
@@ -471,12 +520,22 @@ class MultiExchangeOrderCoordinator:
         if item.action is PlannedExecutionAction.PLACE_ORDER:
             if item.order_request is None:
                 raise ValueError("order_request is required")
-            request = self._convert_order_for_client(client, _with_exchange_quantity(item.order_request, intent=intent, exchange=client.exchange))
+            request = await self._normalize_order_for_client(
+                client,
+                item.signal.action,
+                _with_exchange_quantity(item.order_request, intent=intent, exchange=client.exchange),
+            )
+            request = self._convert_order_for_client(client, request)
             return await client.place_order(_with_order_client_id(request, client_order_id))
         if item.action is PlannedExecutionAction.PLACE_STOP_MARKET_ORDER:
             if item.stop_market_request is None:
                 raise ValueError("stop_market_request is required")
-            request = self._convert_stop_for_client(client, _with_exchange_quantity(item.stop_market_request, intent=intent, exchange=client.exchange))
+            request = await self._normalize_stop_for_client(
+                client,
+                item.signal.action,
+                _with_exchange_quantity(item.stop_market_request, intent=intent, exchange=client.exchange),
+            )
+            request = self._convert_stop_for_client(client, request)
             return await client.place_stop_market_order(_with_stop_client_id(request, client_order_id))
         if item.action is PlannedExecutionAction.CANCEL_ALL_ORDERS:
             orders = await client.cancel_all_orders()
@@ -553,6 +612,76 @@ class MultiExchangeOrderCoordinator:
         )
         return converted
 
+    async def _normalize_order_for_client(self, client: ExecutionClient, action: SignalAction, request: OrderRequest) -> OrderRequest:
+        position_mode = await self._position_mode_for_client(client)
+        if is_exit_action(action) and self._client_supports_exit_safety(client):
+            profile = _client_market_profile(client)
+            assert profile is not None
+            positions = await _client_positions(client)
+            normalized, report = self.exit_safety_guard.normalize_order(
+                exchange=client.exchange,
+                action=action,
+                request=request,
+                position_mode=position_mode,
+                positions=positions,
+                market_profile=profile,
+            )
+            if report is not None:
+                logger.info("Exit safety approved order | %s", report.as_log_fields())
+            return normalized
+        return _with_position_side_for_mode(request, action=action, exchange=client.exchange, position_mode=position_mode)
+
+    async def _normalize_stop_for_client(self, client: ExecutionClient, action: SignalAction, request: StopMarketOrderRequest) -> StopMarketOrderRequest:
+        position_mode = await self._position_mode_for_client(client)
+        if is_exit_action(action) and self._client_supports_exit_safety(client):
+            profile = _client_market_profile(client)
+            assert profile is not None
+            positions = await _client_positions(client)
+            normalized, report = self.exit_safety_guard.normalize_stop_market(
+                exchange=client.exchange,
+                action=action,
+                request=request,
+                position_mode=position_mode,
+                positions=positions,
+                market_profile=profile,
+            )
+            if report is not None:
+                logger.info("Exit safety approved stop order | %s", report.as_log_fields())
+            return normalized
+        return _with_position_side_for_mode(request, action=action, exchange=client.exchange, position_mode=position_mode)
+
+    async def _position_mode_for_client(self, client: ExecutionClient) -> PositionMode:
+        cached = self._position_mode_cache.get(client.exchange)
+        if cached is not None:
+            return cached
+        fetch_position_mode = getattr(client, "fetch_position_mode", None)
+        if callable(fetch_position_mode):
+            mode = await fetch_position_mode()
+            if not isinstance(mode, PositionMode):
+                mode = PositionMode(str(mode).strip().lower())
+            self._position_mode_cache[client.exchange] = mode
+            return mode
+        positions = await _client_positions(client)
+        mode = PositionMode.HEDGE if any(position.side in {PositionSide.LONG, PositionSide.SHORT} for position in positions) else PositionMode.ONE_WAY
+        self._position_mode_cache[client.exchange] = mode
+        return mode
+
+    def _client_supports_exit_safety(self, client: ExecutionClient) -> bool:
+        return _client_market_profile(client) is not None and callable(getattr(client, "fetch_positions", None))
+
+    def _record_exit_safety_event(self, *, intent: OrderIntent, exchange: ExchangeName, error: ExitSafetyError) -> None:
+        add_event = getattr(self.repository, "add_event", None)
+        if callable(add_event):
+            add_event(
+                OrderJournalEvent(
+                    intent_id=intent.intent_id,
+                    status=OrderIntentStatus.FAILED,
+                    message="critical_exit_safety_rejected",
+                    exchange=exchange,
+                    metadata={"severity": "CRITICAL", "reason": error.reason, **dict(error.metadata)},
+                )
+            )
+
 
 def _signal_exchange_quantities(signal) -> dict[ExchangeName, Decimal]:
     raw = signal.metadata.get("exchange_quantities_base") if signal.metadata else None
@@ -609,9 +738,48 @@ def _client_market_profile(client: ExecutionClient):
         return None
 
 
-def _order_to_result(order: Order, *, attempts: int = 1) -> ExchangeOrderResult:
+async def _client_positions(client: ExecutionClient):
+    fetch_positions = getattr(client, "fetch_positions", None)
+    if not callable(fetch_positions):
+        return ()
+    return tuple(await fetch_positions())
+
+
+def _with_position_side_for_mode(request, *, action: SignalAction, exchange: ExchangeName, position_mode: PositionMode):
+    target_side = target_position_side_for_action(action)
+    if target_side is None:
+        return request
+    if position_mode is PositionMode.HEDGE:
+        return replace(request, position_side=target_side)
+    if exchange.value in {"okx", "binance"} and getattr(request, "position_side", None) is not None:
+        return replace(request, position_side=None)
+    return request
+
+
+def _order_to_result(order: Order, *, client: ExecutionClient | None = None, quantity_converter: NativeQuantityConverter | None = None, attempts: int = 1) -> ExchangeOrderResult:
     fee, fee_asset = extract_fee(order)
     raw = {**dict(order.raw), "status_sync_attempts": attempts}
+    quantity = order.quantity
+    filled_quantity = order.filled_quantity
+    profile = _client_market_profile(client) if client is not None else None
+    if profile is not None and quantity_converter is not None:
+        if quantity is not None:
+            raw["native_quantity"] = str(quantity)
+            quantity = quantity_converter.native_to_base_quantity(
+                exchange=order.exchange,
+                symbol=order.symbol,
+                native_quantity=abs(quantity),
+                market_profile=profile,
+            )
+        if filled_quantity is not None:
+            raw["native_filled_quantity"] = str(filled_quantity)
+            filled_quantity = quantity_converter.native_to_base_quantity(
+                exchange=order.exchange,
+                symbol=order.symbol,
+                native_quantity=abs(filled_quantity),
+                market_profile=profile,
+            )
+        raw["quantity_semantics"] = "base_asset"
     return ExchangeOrderResult(
         exchange=order.exchange,
         ok=True,
@@ -619,8 +787,8 @@ def _order_to_result(order: Order, *, attempts: int = 1) -> ExchangeOrderResult:
         client_order_id=order.client_order_id,
         status=order.status,
         side=order.side,
-        quantity=order.quantity,
-        filled_quantity=order.filled_quantity,
+        quantity=quantity,
+        filled_quantity=filled_quantity,
         avg_fill_price=extract_avg_fill_price(order),
         fee=fee,
         fee_asset=fee_asset,

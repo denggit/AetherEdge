@@ -708,8 +708,10 @@ class Strategy:
     def _handle_master_entry_fill(self, *, event: AccountEvent, filled_qty: Decimal) -> list[TradeSignal]:
         assert self.pending_entry is not None
         exchange = event.exchange.value
+        base_filled_qty = filled_qty if event.raw.get("quantity_semantics") == "base_asset" else self.pending_entry.quantity
+        native_filled_qty = None if base_filled_qty == filled_qty else filled_qty
         if self.pending_entry.is_add and self.position.in_pos:
-            self.position.add_master_fill(avg_fill_price=event.price, add_qty=filled_qty)  # type: ignore[arg-type]
+            self.position.add_master_fill(avg_fill_price=event.price, add_qty=base_filled_qty)  # type: ignore[arg-type]
         else:
             stop_price = initial_stop_from_risk(
                 side=self.pending_entry.side,
@@ -720,7 +722,7 @@ class Strategy:
                 side=self.pending_entry.side,
                 entry_time_ms=event.event_time_ms or self.pending_entry.bar_close_time_ms,
                 avg_entry=event.price,  # type: ignore[arg-type]
-                qty=filled_qty,
+                qty=base_filled_qty,
                 stop_price=stop_price,
                 entry_engine=self.pending_entry.engine,
                 entry_risk_mult=self.pending_entry.entry_risk_scale,
@@ -729,7 +731,8 @@ class Strategy:
         self.position.mark_leg_open(
             exchange=exchange,
             avg_fill_price=event.price,  # type: ignore[arg-type]
-            base_qty=filled_qty if not self.pending_entry.is_add else self.position.qty,
+            base_qty=base_filled_qty if not self.pending_entry.is_add else self.position.qty,
+            native_qty=native_filled_qty,
             order_id=event.order_id,
             client_order_id=event.client_order_id,
         )

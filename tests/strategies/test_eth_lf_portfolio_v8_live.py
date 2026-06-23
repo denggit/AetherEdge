@@ -7,14 +7,17 @@ import pandas as pd
 import pytest
 
 from src.app import AppConfig, AppContext, AsyncAlertDispatcher, NoopAlertSink
-from src.platform import ExchangeName
+from src.order_management.quantity import NativeQuantityConverter
+from src.platform.account.events import AccountEvent, AccountEventType
+from src.platform import ExchangeName, get_market_profile
+from src.platform.exchanges.models import OrderSide, OrderStatus, StopMarketOrderRequest
 from src.planner import ExecutionPlanner
 from src.runtime import LiveRuntimeConfig, LiveRuntimeRunner, RuntimeMode
 from src.runtime.tasks import ClosedBarScheduler
 from src.signals import SignalAction, TradeSignal
 from strategies.eth_lf_portfolio_v8.domain.models import BarReadyContext, ClosedKlineContext, MicroDecision, RangeAggregateContext, RoutedSignal, Side
 from tools.v9c_signal_parity_check import load_replay_warmup_ohlcv, replay_aetheredge_signal_audit
-from strategies.eth_lf_portfolio_v8.strategy import Strategy
+from strategies.eth_lf_portfolio_v8.strategy import PendingEntryPlan, Strategy
 from strategies.eth_lf_portfolio_v8.strategy import _default_engine_execution_params
 
 
@@ -179,6 +182,86 @@ def test_v9c_live_stop_update_falls_back_to_protected_when_atr_missing():
     place = next(s for s in signals if s.action is SignalAction.PLACE_STOP_LOSS_LONG)
     assert place.trigger_price == Decimal("107")
     assert place.reason == "V8_PROTECTED_TRAILING_STOP_UPDATE"
+
+
+def test_okx_master_fill_native_contract_quantity_does_not_double_convert_stop():
+    strategy = Strategy()
+    strategy.started = True
+    strategy.equity = Decimal("1000")
+    strategy.pending_entry = PendingEntryPlan(
+        position_id="okx-native-fill",
+        side=Side.SHORT,
+        engine="MOMENTUM_V3",
+        quantity=Decimal("0.282"),
+        estimated_entry_price=Decimal("1720"),
+        atr=Decimal("10"),
+        initial_atr_mult=Decimal("2"),
+        bar_close_time_ms=1,
+        entry_risk_scale=Decimal("1"),
+        risk_mult=Decimal("1"),
+        quality_mult=Decimal("1"),
+    )
+    event = AccountEvent(
+        exchange=ExchangeName.OKX,
+        event_type=AccountEventType.ORDER,
+        symbol="ETH-USDT-PERP",
+        order_status=OrderStatus.FILLED,
+        side=OrderSide.SELL,
+        price=Decimal("1720"),
+        quantity=Decimal("2.82"),
+        filled_quantity=Decimal("2.82"),
+        event_time_ms=2,
+        raw={"quantity_unit": "contracts"},
+    )
+
+    signals = list(strategy._handle_master_entry_fill(event=event, filled_qty=Decimal("2.82")))
+
+    assert strategy.position.qty == Decimal("0.282")
+    assert strategy.position.legs["okx"].base_qty == Decimal("0.282")
+    assert strategy.position.legs["okx"].native_qty == Decimal("2.82")
+    stop = next(signal for signal in signals if signal.action is SignalAction.PLACE_STOP_LOSS_SHORT)
+    assert stop.quantity == Decimal("0.282")
+    converted, _ = NativeQuantityConverter().convert_stop_market_request(
+        StopMarketOrderRequest(
+            symbol=stop.symbol,
+            side=OrderSide.BUY,
+            quantity=stop.quantity,
+            trigger_price=stop.trigger_price,
+            reduce_only=True,
+        ),
+        exchange=ExchangeName.OKX,
+        market_profile=get_market_profile("ETH-USDT-PERP"),
+    )
+    assert converted.quantity == Decimal("2.82")
+
+
+def test_exit_sync_targets_only_open_legs_when_follower_entry_failed():
+    strategy = Strategy()
+    strategy.started = True
+    strategy.equity = Decimal("1000")
+    strategy.position.open_master(
+        side=Side.SHORT,
+        entry_time_ms=1,
+        avg_entry=Decimal("1720"),
+        qty=Decimal("0.282"),
+        stop_price=Decimal("1740"),
+        entry_engine="MOMENTUM_V3",
+        position_id="follower-failed-stop-sync",
+    )
+    strategy.position.mark_leg_open(exchange="okx", avg_fill_price=Decimal("1720"), base_qty=Decimal("0.282"))
+    strategy.position.mark_leg_closed(exchange="binance", sync_status="follower_entry_failed")
+    strategy.position.first_entry = Decimal("1720")
+    strategy.position.risk_per_coin = Decimal("20")
+    strategy.position.max_fav = Decimal("1680")
+
+    signals = strategy._stop_update_signals_if_needed(
+        _bar_ready_context(close=Decimal("1680"), engine_features={"momentum": {"atr": Decimal("5")}})
+    )
+
+    assert len(signals) == 2
+    assert all(signal.metadata["target_exchanges"] == ["okx"] for signal in signals)
+    assert all("binance" not in signal.metadata["target_exchanges"] for signal in signals)
+    assert next(signal for signal in signals if signal.action is SignalAction.PLACE_STOP_LOSS_SHORT).quantity == Decimal("0.282")
 
 
 def test_v9c_strategy_config_min_range_bars_is_read_by_runner():

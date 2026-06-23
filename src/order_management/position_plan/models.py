@@ -36,6 +36,7 @@ class LegSyncStatus(str, Enum):
     TOPUP_FAILED = "topup_failed"
     MANUAL_REQUIRED = "manual_required"
     CLOSED = "closed"
+    FOLLOWER_ENTRY_FAILED = "follower_entry_failed"
     FOLLOWER_CLOSE_FAILED = "follower_close_failed"
     STALE_RECONCILED = "stale_reconciled"
 
