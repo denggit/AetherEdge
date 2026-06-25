@@ -2067,6 +2067,10 @@ class LiveRuntimeRunner:
             if self.requirements.order_state.post_submit_sync_enabled:
                 logger.info("Post-submit order sync started | action=%s source=%s", signal.action.value, source)
                 await self._get_order_sync_service().sync_once(sync_type="post_submit", priority=True)
+            results = await self._validate_order_results_before_journal(
+                intent=intent,
+                results=results,
+            )
             self._record_order_results(results)
             self._save_order_results(signal, results)
             self._check_follower_close_failure(signal, results)

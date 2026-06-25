@@ -3230,3 +3230,205 @@ async def test_market_consumer_drains_batch(monkeypatch):
     assert len(processed) == 3
     assert producer_health_checks == 1
     assert runner._market_queue.empty()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Stop order post-check wired into _execute_signals() live chain
+# (AE-V9C-LIVE-STOP-POSTCHECK-001)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+from src.runtime.requirements import AccountStateRequirement, OrderStateRequirement
+
+_NO_POST_SUBMIT_SYNC_REQ = StrategyRuntimeRequirements(
+    account_state=AccountStateRequirement(post_order_sync_enabled=False),
+    order_state=OrderStateRequirement(post_submit_sync_enabled=False),
+)
+
+
+@pytest.mark.asyncio
+async def test_execute_stop_signal_post_check_failure_blocks_confirmed_stop():
+    """Full _execute_signals() chain: coordinator returns ok=True but exchange
+    has no valid bot-owned stop → post-check marks result ok=False →
+    _record_order_results counts failure → strategy does NOT confirm stop
+    and enters manual_required / recovery_blocking_manual_required."""
+    strategy = _v8_strategy_with_pending_initial_stop()
+
+    runner = _runner(
+        strategy,
+        services={
+            "execution_clients": (FakeExecutionClient(ExchangeName.OKX),),
+            "account_clients": (
+                FakeAccountClient(
+                    ExchangeName.OKX,
+                    positions=[
+                        Position(
+                            exchange=ExchangeName.OKX,
+                            symbol="ETH-USDT-PERP",
+                            raw_symbol="ETH-USDT-SWAP",
+                            side=PositionSide.SHORT,
+                            quantity=Decimal("-25.5"),
+                        )
+                    ],
+                ),
+            ),
+            "runtime_requirements": _NO_POST_SUBMIT_SYNC_REQ,
+        },
+    )
+
+    signal = _v8_stop_signal()
+
+    # ── Mock coordinator: returns ok=True (unverified) ────────────────────
+    coordinator = AsyncMock()
+    coordinator.execute = AsyncMock(
+        return_value=[
+            ExchangeOrderResult(
+                exchange=ExchangeName.OKX,
+                ok=True,
+                order_id="okx-stop-1",
+                client_order_id="AEOKSS0123456789ABCDEF",
+                status=OrderStatus.NEW,
+            )
+        ]
+    )
+
+    with patch.object(runner, "_get_order_coordinator", return_value=coordinator):
+        await runner._execute_signals([signal], source="test", event_time_ms=6)
+
+    # ── Post-check must have failed → strategy must NOT confirm stop ────
+    assert strategy.position.confirmed_stop_price is None, (
+        "confirmed_stop_price must be None after post-check failure"
+    )
+    assert strategy.recovery_manual_required is True
+    assert strategy.recovery_blocking_manual_required is True
+    assert any(
+        "stop_replace_failed_manual_required" in item
+        for item in strategy.recovery_alerts
+    ), f"Expected stop_replace_failed alert; got {strategy.recovery_alerts}"
+
+    # ── Runner stats must reflect failure ─────────────────────────────────
+    assert runner.stats.failed_intents == 1, (
+        f"Expected 1 failed intent; got {runner.stats.failed_intents}"
+    )
+    assert runner.stats.submitted_intents == 0
+
+
+@pytest.mark.asyncio
+async def test_execute_stop_signal_post_check_success_confirms_stop():
+    """Full _execute_signals() chain: coordinator returns ok=True AND exchange
+    has a valid bot-owned stop → post-check passes → strategy confirms stop."""
+    strategy = _v8_strategy_with_pending_initial_stop()
+
+    stop_order = Order(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP",
+        order_id="okx-stop-1",
+        client_order_id="AEOKSS0123456789ABCDEF",
+        status=OrderStatus.NEW,
+        side=OrderSide.BUY,
+        price=Decimal("1686.42"),
+        quantity=Decimal("25.5"),
+        raw={"reduce_only": True, "source": "aetheredge"},
+    )
+
+    runner = _runner(
+        strategy,
+        services={
+            "execution_clients": (
+                FakeExecutionClient(ExchangeName.OKX, open_stop_orders=[stop_order]),
+            ),
+            "account_clients": (
+                FakeAccountClient(
+                    ExchangeName.OKX,
+                    positions=[
+                        Position(
+                            exchange=ExchangeName.OKX,
+                            symbol="ETH-USDT-PERP",
+                            raw_symbol="ETH-USDT-SWAP",
+                            side=PositionSide.SHORT,
+                            quantity=Decimal("-25.5"),
+                        )
+                    ],
+                ),
+            ),
+            "runtime_requirements": _NO_POST_SUBMIT_SYNC_REQ,
+        },
+    )
+
+    signal = _v8_stop_signal()
+
+    # ── Mock coordinator: returns ok=True ─────────────────────────────────
+    coordinator = AsyncMock()
+    coordinator.execute = AsyncMock(
+        return_value=[
+            ExchangeOrderResult(
+                exchange=ExchangeName.OKX,
+                ok=True,
+                order_id="okx-stop-1",
+                client_order_id="AEOKSS0123456789ABCDEF",
+                status=OrderStatus.NEW,
+            )
+        ]
+    )
+
+    with patch.object(runner, "_get_order_coordinator", return_value=coordinator):
+        await runner._execute_signals([signal], source="test", event_time_ms=6)
+
+    # ── Post-check must pass → strategy must confirm stop ─────────────────
+    assert strategy.position.confirmed_stop_price == Decimal("1686.42"), (
+        f"Expected confirmed_stop_price=1686.42; "
+        f"got {strategy.position.confirmed_stop_price}"
+    )
+    assert strategy.position.pending_stop_replace is False
+    assert runner.stats.submitted_intents == 1
+    assert runner.stats.failed_intents == 0
+
+
+@pytest.mark.asyncio
+async def test_open_signal_does_not_run_stop_post_check_before_followup_stop():
+    """OPEN_SHORT entry signal must NOT be affected by stop post-check.
+    The post-check only applies to PLACE_STOP_LOSS_* signals.
+    Open result should remain ok=True even when no open_stop_orders exist."""
+    strategy = FeatureStrategy()
+
+    open_signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.OPEN_SHORT,
+        quantity=Decimal("0.5"),
+        metadata={"target_exchanges": ["okx"]},
+    )
+
+    runner = _runner(
+        strategy,
+        services={
+            "execution_clients": (FakeExecutionClient(ExchangeName.OKX),),
+            "account_clients": (FakeAccountClient(ExchangeName.OKX),),
+            "runtime_requirements": _NO_POST_SUBMIT_SYNC_REQ,
+        },
+    )
+
+    # ── Mock coordinator: returns ok=True result for open order ───────────
+    coordinator = AsyncMock()
+    coordinator.execute = AsyncMock(
+        return_value=[
+            ExchangeOrderResult(
+                exchange=ExchangeName.OKX,
+                ok=True,
+                order_id="okx-open-1",
+                client_order_id="client-open-1",
+                status=OrderStatus.FILLED,
+                filled_quantity=Decimal("5"),
+                avg_fill_price=Decimal("100.00"),
+            )
+        ]
+    )
+
+    with patch.object(runner, "_get_order_coordinator", return_value=coordinator):
+        await runner._execute_signals([open_signal], source="test", event_time_ms=7)
+
+    # ── Non-stop signal must pass through unchanged ───────────────────────
+    assert runner.stats.submitted_intents == 1
+    assert runner.stats.failed_intents == 0
+    # OPEN_SHORT should not require open_stop_orders to exist
+    # The post-check simply returns results unchanged for non-stop signals
