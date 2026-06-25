@@ -2252,9 +2252,9 @@ class LiveRuntimeRunner:
                 )
                 continue
 
-            # ── Retry loop: exchange open_stop_orders may be briefly stale ──
-            attempts = int(os.getenv("AETHER_STOP_POST_CHECK_ATTEMPTS", "3"))
-            delay = float(os.getenv("AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS", "0.5"))
+            # ── Retry loop: exchange state may be briefly stale ──
+            attempts = _stop_post_check_attempts_from_env()
+            delay = _stop_post_check_delay_from_env()
 
             for attempt in range(1, attempts + 1):
                 try:
@@ -2285,22 +2285,32 @@ class LiveRuntimeRunner:
                     break
 
                 active_pos = _first_active_position(positions or ())
-                if active_pos is not None:
-                    position_side = _position_side_from_quantity(active_pos.quantity)
-                    native_qty = abs(active_pos.quantity)
-                else:
-                    position_side = _strategy_position_side(strategy_position)
-                    base_qty = abs(getattr(strategy_position, "qty", Decimal("0")))
-                    native_qty = (
-                        Decimal("0")
-                        if base_qty <= 0
-                        else converter.convert_quantity(
-                            exchange=exchange,
-                            symbol=self.app_config.symbol,
-                            base_quantity=base_qty,
-                            market_profile=market_profile,
-                        ).native_quantity
+                if active_pos is None:
+                    if attempt < attempts:
+                        logger.warning(
+                            "Stop post-check missing exchange position; retrying | "
+                            "exchange=%s attempt=%s attempts=%s",
+                            exchange.value,
+                            attempt,
+                            attempts,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    verified.append(
+                        self._stop_post_check_failed_result(
+                            result,
+                            reason="stop_post_check_failed:missing_exchange_position",
+                            metadata={
+                                "post_check": "stop_order_exchange_verification",
+                                "stop_post_check_attempts": attempt,
+                                "invalid_reason": "missing_exchange_position",
+                            },
+                        )
                     )
+                    break
+
+                position_side = _position_side_from_quantity(active_pos.quantity)
+                native_qty = abs(active_pos.quantity)
 
                 if position_side is None or native_qty <= 0:
                     verified.append(result)
@@ -2789,6 +2799,40 @@ def _is_trade_at_or_before(event: MarketEvent, close_time_ms: int) -> bool:
         return False
     event_ms = _event_time_ms(event)
     return event_ms is not None and event_ms <= close_time_ms
+
+
+def _stop_post_check_attempts_from_env() -> int:
+    """Parse ``AETHER_STOP_POST_CHECK_ATTEMPTS`` safely, clamping to >= 1."""
+    raw = os.getenv("AETHER_STOP_POST_CHECK_ATTEMPTS", "").strip()
+    if not raw:
+        return 3
+    try:
+        value = int(raw)
+    except (ValueError, TypeError):
+        logger.warning(
+            "Invalid stop post-check env value; using default | env=%s raw=%r default=3",
+            "AETHER_STOP_POST_CHECK_ATTEMPTS",
+            os.getenv("AETHER_STOP_POST_CHECK_ATTEMPTS", ""),
+        )
+        return 3
+    return max(1, value)
+
+
+def _stop_post_check_delay_from_env() -> float:
+    """Parse ``AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS`` safely, clamping to >= 0.0."""
+    raw = os.getenv("AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS", "").strip()
+    if not raw:
+        return 0.5
+    try:
+        value = float(raw)
+    except (ValueError, TypeError):
+        logger.warning(
+            "Invalid stop post-check env value; using default | env=%s raw=%r default=0.5",
+            "AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS",
+            os.getenv("AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS", ""),
+        )
+        return 0.5
+    return max(0.0, value)
 
 
 def _first_active_position(positions: Sequence[Position]) -> Position | None:

@@ -3287,6 +3287,23 @@ def _valid_bot_stop() -> Order:
     )
 
 
+class CountingFakeAccountClient(FakeAccountClient):
+    """FakeAccountClient that tracks fetch_positions call count
+    and supports per-call return sequences for retry tests."""
+
+    def __init__(self, exchange, *, positions_sequence=()):
+        super().__init__(exchange)
+        self.positions_sequence = list(positions_sequence)
+        self.fetch_positions_calls = 0
+
+    async def fetch_positions(self, symbol=None):
+        idx = self.fetch_positions_calls
+        self.fetch_positions_calls += 1
+        if idx < len(self.positions_sequence):
+            return list(self.positions_sequence[idx])
+        return list(self.positions)
+
+
 def _short_position() -> Position:
     return Position(
         exchange=ExchangeName.OKX,
@@ -3665,3 +3682,280 @@ async def test_stop_post_check_runs_once_via_coordinator(monkeypatch):
     assert strategy.position.confirmed_stop_price == Decimal("1686.42")
     assert runner.stats.submitted_intents == 1
     assert runner.stats.failed_intents == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Stop post-check env parsing & exchange position validation tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_stop_post_check_attempts_env_invalid_falls_back_to_default(monkeypatch):
+    """AETHER_STOP_POST_CHECK_ATTEMPTS=abc → falls back to default 3."""
+    monkeypatch.setenv("AETHER_STOP_POST_CHECK_ATTEMPTS", "abc")
+    monkeypatch.setenv("AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS", "0")
+
+    strategy = _v8_strategy_with_pending_initial_stop()
+
+    exec_client = CountingFakeExecutionClient(
+        ExchangeName.OKX,
+        open_stop_orders_sequence=[[], [], []],
+    )
+
+    runner = _runner(
+        strategy,
+        services={
+            "execution_clients": (exec_client,),
+            "account_clients": (
+                FakeAccountClient(ExchangeName.OKX, positions=[_short_position()]),
+            ),
+        },
+    )
+
+    signal = _v8_stop_signal()
+    result = ExchangeOrderResult(
+        exchange=ExchangeName.OKX,
+        ok=True,
+        order_id="okx-stop-1",
+        client_order_id="AEOKSS0123456789ABCDEF",
+        status=OrderStatus.NEW,
+    )
+
+    verified = await runner._verify_stop_order_results(
+        signal=signal, results=[result]
+    )
+
+    # ── Falls back to 3 attempts; all return [] → fail ─────────────────
+    assert exec_client.fetch_open_stop_orders_calls == 3, (
+        f"Expected 3 fetch_open_stop_orders calls (default fallback); "
+        f"got {exec_client.fetch_open_stop_orders_calls}"
+    )
+    assert verified[0].ok is False
+    assert verified[0].raw.get("stop_post_check_attempts") == 3, (
+        f"Expected stop_post_check_attempts=3; "
+        f"got {verified[0].raw.get('stop_post_check_attempts')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_post_check_attempts_env_clamped_to_one(monkeypatch):
+    """AETHER_STOP_POST_CHECK_ATTEMPTS=0 → clamped to 1."""
+    monkeypatch.setenv("AETHER_STOP_POST_CHECK_ATTEMPTS", "0")
+    monkeypatch.setenv("AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS", "0")
+
+    strategy = _v8_strategy_with_pending_initial_stop()
+
+    exec_client = CountingFakeExecutionClient(
+        ExchangeName.OKX,
+        open_stop_orders_sequence=[[]],
+    )
+
+    runner = _runner(
+        strategy,
+        services={
+            "execution_clients": (exec_client,),
+            "account_clients": (
+                FakeAccountClient(ExchangeName.OKX, positions=[_short_position()]),
+            ),
+        },
+    )
+
+    signal = _v8_stop_signal()
+    result = ExchangeOrderResult(
+        exchange=ExchangeName.OKX,
+        ok=True,
+        order_id="okx-stop-1",
+        client_order_id="AEOKSS0123456789ABCDEF",
+        status=OrderStatus.NEW,
+    )
+
+    verified = await runner._verify_stop_order_results(
+        signal=signal, results=[result]
+    )
+
+    # ── Clamped to 1 attempt; returns [] → fail ─────────────────────────
+    assert exec_client.fetch_open_stop_orders_calls == 1, (
+        f"Expected 1 fetch_open_stop_orders call (clamped to 1); "
+        f"got {exec_client.fetch_open_stop_orders_calls}"
+    )
+    assert verified[0].ok is False
+    assert verified[0].raw.get("stop_post_check_attempts") == 1, (
+        f"Expected stop_post_check_attempts=1; "
+        f"got {verified[0].raw.get('stop_post_check_attempts')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_post_check_delay_env_invalid_does_not_crash(monkeypatch):
+    """AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS=abc → falls back to
+    0.5, does not raise."""
+    monkeypatch.setenv("AETHER_STOP_POST_CHECK_ATTEMPTS", "1")
+    monkeypatch.setenv("AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS", "abc")
+
+    strategy = _v8_strategy_with_pending_initial_stop()
+
+    exec_client = CountingFakeExecutionClient(
+        ExchangeName.OKX,
+        open_stop_orders_sequence=[[]],
+    )
+
+    runner = _runner(
+        strategy,
+        services={
+            "execution_clients": (exec_client,),
+            "account_clients": (
+                FakeAccountClient(ExchangeName.OKX, positions=[_short_position()]),
+            ),
+        },
+    )
+
+    signal = _v8_stop_signal()
+    result = ExchangeOrderResult(
+        exchange=ExchangeName.OKX,
+        ok=True,
+        order_id="okx-stop-1",
+        client_order_id="AEOKSS0123456789ABCDEF",
+        status=OrderStatus.NEW,
+    )
+
+    # ── Must not raise ──────────────────────────────────────────────────
+    verified = await runner._verify_stop_order_results(
+        signal=signal, results=[result]
+    )
+
+    assert verified[0].ok is False
+    assert verified[0].raw.get("stop_post_check_attempts") == 1, (
+        f"Expected stop_post_check_attempts=1; "
+        f"got {verified[0].raw.get('stop_post_check_attempts')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_post_check_missing_exchange_position_does_not_confirm_stop(
+    monkeypatch,
+):
+    """When fetch_positions() returns no active position, stop post-check
+    must NOT confirm the stop — even if open_stop_orders has a valid bot-owned
+    stop order."""
+    monkeypatch.setenv("AETHER_STOP_POST_CHECK_ATTEMPTS", "1")
+    monkeypatch.setenv("AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS", "0")
+
+    strategy = _v8_strategy_with_pending_initial_stop()
+
+    exec_client = FakeExecutionClient(
+        ExchangeName.OKX, open_stop_orders=[_valid_bot_stop()]
+    )
+
+    runner = _runner(
+        strategy,
+        services={
+            "execution_clients": (exec_client,),
+            "account_clients": (
+                FakeAccountClient(ExchangeName.OKX, positions=[]),
+            ),
+        },
+    )
+
+    signal = _v8_stop_signal()
+    result = ExchangeOrderResult(
+        exchange=ExchangeName.OKX,
+        ok=True,
+        order_id="okx-stop-1",
+        client_order_id="AEOKSS0123456789ABCDEF",
+        status=OrderStatus.NEW,
+    )
+
+    verified = await runner._verify_stop_order_results(
+        signal=signal, results=[result]
+    )
+
+    # ── Must fail — no exchange position ────────────────────────────────
+    assert verified[0].ok is False
+    assert verified[0].error == "stop_post_check_failed:missing_exchange_position", (
+        f"Expected 'stop_post_check_failed:missing_exchange_position'; "
+        f"got {verified[0].error}"
+    )
+    assert verified[0].raw.get("invalid_reason") == "missing_exchange_position", (
+        f"Expected invalid_reason='missing_exchange_position'; "
+        f"got {verified[0].raw.get('invalid_reason')}"
+    )
+    assert verified[0].raw.get("stop_post_check_attempts") == 1, (
+        f"Expected stop_post_check_attempts=1; "
+        f"got {verified[0].raw.get('stop_post_check_attempts')}"
+    )
+
+    # ── Strategy feedback: stop must NOT be confirmed ────────────────────
+    await strategy.on_order_results(
+        signal=signal, results=verified, source="test", event_time_ms=6
+    )
+    assert strategy.position.confirmed_stop_price is None, (
+        "confirmed_stop_price must be None when no exchange position exists"
+    )
+    assert strategy.recovery_manual_required is True
+    assert strategy.recovery_blocking_manual_required is True
+
+
+@pytest.mark.asyncio
+async def test_stop_post_check_retries_until_exchange_position_visible(monkeypatch):
+    """Post-check retries up to 3 times.  Position appears on 3rd fetch_positions()
+    call; stop appears on all 3 fetch_open_stop_orders() calls.  Must succeed."""
+    monkeypatch.setenv("AETHER_STOP_POST_CHECK_ATTEMPTS", "3")
+    monkeypatch.setenv("AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS", "0")
+
+    strategy = _v8_strategy_with_pending_initial_stop()
+
+    exec_client = CountingFakeExecutionClient(
+        ExchangeName.OKX,
+        open_stop_orders_sequence=[[_valid_bot_stop()], [_valid_bot_stop()], [_valid_bot_stop()]],
+    )
+    acct_client = CountingFakeAccountClient(
+        ExchangeName.OKX,
+        positions_sequence=[[], [], [_short_position()]],
+    )
+
+    runner = _runner(
+        strategy,
+        services={
+            "execution_clients": (exec_client,),
+            "account_clients": (acct_client,),
+        },
+    )
+
+    signal = _v8_stop_signal()
+    result = ExchangeOrderResult(
+        exchange=ExchangeName.OKX,
+        ok=True,
+        order_id="okx-stop-1",
+        client_order_id="AEOKSS0123456789ABCDEF",
+        status=OrderStatus.NEW,
+    )
+
+    verified = await runner._verify_stop_order_results(
+        signal=signal, results=[result]
+    )
+
+    # ── Post-check must succeed on 3rd attempt ──────────────────────────
+    assert verified[0].ok is True, (
+        f"Expected ok=True; got ok=False error={verified[0].error}"
+    )
+    assert acct_client.fetch_positions_calls == 3, (
+        f"Expected 3 fetch_positions calls; "
+        f"got {acct_client.fetch_positions_calls}"
+    )
+    assert exec_client.fetch_open_stop_orders_calls == 3, (
+        f"Expected 3 fetch_open_stop_orders calls; "
+        f"got {exec_client.fetch_open_stop_orders_calls}"
+    )
+    assert verified[0].raw.get("stop_post_check_attempts") == 3, (
+        f"Expected stop_post_check_attempts=3; "
+        f"got {verified[0].raw.get('stop_post_check_attempts')}"
+    )
+
+    # ── Strategy feedback: stop must be confirmed ───────────────────────
+    await strategy.on_order_results(
+        signal=signal, results=verified, source="test", event_time_ms=6
+    )
+    assert strategy.position.confirmed_stop_price == Decimal("1686.42"), (
+        f"Expected confirmed_stop_price=1686.42; "
+        f"got {strategy.position.confirmed_stop_price}"
+    )

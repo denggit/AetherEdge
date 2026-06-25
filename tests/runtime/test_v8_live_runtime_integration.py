@@ -19,7 +19,7 @@ from src.order_management.models import ExchangeOrderResult
 from src.signals import SignalAction, TradeSignal
 from src.platform import Balance, ExchangeName, LeverageInfo, MarginMode, PositionMode
 from src.platform.account.events import AccountEvent, AccountEventType
-from src.platform.exchanges.models import Order, OrderQuery, OrderSide, OrderStatus, OrderType, StopOrderQuery
+from src.platform.exchanges.models import Order, OrderQuery, OrderSide, OrderStatus, OrderType, Position, PositionSide, StopOrderQuery
 from src.platform.markets import get_market_profile
 from src.platform.snapshot import PlatformSnapshot
 from src.planner import ExecutionPlanner
@@ -186,21 +186,38 @@ class _FakeExecutionClient:
         return []
 
     async def fetch_open_stop_orders(self):
-        return []
+        return [
+            Order(
+                exchange=self.exchange,
+                symbol=self.symbol,
+                raw_symbol=self.symbol,
+                order_id=req.client_order_id or f"{self.exchange.value}-stop-{i}",
+                client_order_id=req.client_order_id,
+                status=OrderStatus.NEW,
+                side=req.side,
+                order_type=OrderType.MARKET,
+                quantity=req.quantity,
+                filled_quantity=Decimal("0"),
+                price=req.trigger_price,
+                raw={"reduce_only": True, "source": "aetheredge"},
+            )
+            for i, req in enumerate(self.stop_orders)
+        ]
 
 
 class _FakeAccountClient:
     symbol = "ETH-USDT-PERP"
     market_profile = get_market_profile("ETH-USDT-PERP")
 
-    def __init__(self, exchange: ExchangeName) -> None:
+    def __init__(self, exchange: ExchangeName, *, positions=()) -> None:
         self.exchange = exchange
+        self._positions = list(positions)
 
     async def fetch_balance(self, asset="USDT"):
         return Balance(exchange=self.exchange, asset=asset, total=Decimal("1000"), available=Decimal("1000"))
 
     async def fetch_positions(self, symbol=None):
-        return []
+        return list(self._positions)
 
     async def fetch_leverage(self, *, margin_mode=None):
         return LeverageInfo(exchange=self.exchange, symbol=self.symbol, raw_symbol=self.symbol, leverage=Decimal("10"))
@@ -240,7 +257,32 @@ async def test_v8_live_runtime_routes_entry_and_leg_specific_stops(tmp_path) -> 
             "recovery_service": None,
             "snapshot": _snapshot(),
             "execution_clients": (okx, binance),
-            "account_clients": (_FakeAccountClient(ExchangeName.OKX), _FakeAccountClient(ExchangeName.BINANCE)),
+            "account_clients": (
+                _FakeAccountClient(
+                    ExchangeName.OKX,
+                    positions=[
+                        Position(
+                            exchange=ExchangeName.OKX,
+                            symbol="ETH-USDT-PERP",
+                            raw_symbol="ETH-USDT-SWAP",
+                            side=PositionSide.LONG,
+                            quantity=Decimal("18.91"),
+                        )
+                    ],
+                ),
+                _FakeAccountClient(
+                    ExchangeName.BINANCE,
+                    positions=[
+                        Position(
+                            exchange=ExchangeName.BINANCE,
+                            symbol="ETH-USDT-PERP",
+                            raw_symbol="ETHUSDT",
+                            side=PositionSide.LONG,
+                            quantity=Decimal("0.19"),
+                        )
+                    ],
+                ),
+            ),
             "order_journal": journal,
         },
     )
