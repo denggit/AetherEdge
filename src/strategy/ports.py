@@ -59,6 +59,13 @@ class RecoverableStrategyPort(Protocol):
         ...
 
 
+class AccountSnapshotStrategyPort(Protocol):
+    """Optional strategy extension for request-synced account snapshots."""
+
+    async def on_account_snapshot(self, snapshot: PlatformSnapshot) -> None:
+        ...
+
+
 class MarketFeatureStrategyPort(Protocol):
     """Optional strategy extension for reusable market feature events."""
 

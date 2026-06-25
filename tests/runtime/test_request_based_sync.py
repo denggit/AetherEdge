@@ -116,6 +116,24 @@ async def test_account_sync_fetches_snapshot_and_persists_state():
 
 
 @pytest.mark.asyncio
+async def test_account_sync_notifies_snapshot_callback_after_success():
+    state = MemoryState()
+    seen: list[tuple[Any, str]] = []
+    service = AccountStateSyncService(
+        contexts=(SyncExchangeContext(account=FakeAccount(), execution=FakeExecution(), state_store=state),),
+        config=AccountStateRequirement(poll_interval_seconds=300),
+        snapshot_callback=lambda snapshot, sync_type: seen.append((snapshot, sync_type)),
+    )
+
+    results = await service.sync_once(sync_type="account_periodic")
+
+    assert results[0].success is True
+    assert len(seen) == 1
+    assert seen[0][0].balance.available == Decimal("90")
+    assert seen[0][1] == "account_periodic"
+
+
+@pytest.mark.asyncio
 async def test_account_sync_failure_does_not_raise_and_alerts_after_threshold():
     alerts = MemoryAlerts()
     account = FakeAccount(fail=True)

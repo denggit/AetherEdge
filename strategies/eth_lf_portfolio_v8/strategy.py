@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -124,6 +125,8 @@ class Strategy:
         self.engine_params = _default_engine_execution_params()
         self.equity: Decimal | None = None
         self.exchange_equity: dict[str, Decimal] = {}
+        self.exchange_available: dict[str, Decimal] = {}
+        self.exchange_equity_updated_at_ms: dict[str, int] = {}
         self.recovery_manual_required = False
         self.recovery_blocking_manual_required = False
         self.pending_entry: PendingEntryPlan | None = None
@@ -138,21 +141,18 @@ class Strategy:
 
     async def on_start(self, snapshot: PlatformSnapshot) -> Sequence[TradeSignal]:
         self.started = True
-        balance = snapshot.balance.available if snapshot.balance.available > 0 else snapshot.balance.total
-        self.equity = balance
-        self.exchange_equity[snapshot.balance.exchange.value] = balance
+        self._refresh_account_equity(snapshot)
         return []
 
     async def recover(self, context: StrategyRecoveryContext) -> Sequence[TradeSignal]:
         self.recovered = True
         for snapshot in context.snapshots:
-            balance = snapshot.balance.available if snapshot.balance.available > 0 else snapshot.balance.total
-            if balance > 0:
-                self.exchange_equity[snapshot.balance.exchange.value] = balance
-            if snapshot.balance.exchange.value == self.config.data_exchange:
-                self.equity = balance
+            self._refresh_account_equity(snapshot)
         plans = tuple(context.metadata.get("active_position_plans", ()) if context.metadata else ())
         return self._recover_position_from_plans(snapshots=context.snapshots, plans=plans)
+
+    async def on_account_snapshot(self, snapshot: PlatformSnapshot) -> None:
+        self._refresh_account_equity(snapshot)
 
     async def on_kline(self, kline: MarketKline) -> Sequence[TradeSignal]:
         return []
@@ -543,6 +543,7 @@ class Strategy:
                     "position_id": position_id,
                     "target_exchanges": sorted(exchange_quantities),
                     "exchange_quantities_base": _exchange_quantity_metadata(exchange_quantities),
+                    **self._sizing_equity_metadata(exchange_quantities),
                 },
             )
         )
@@ -654,6 +655,7 @@ class Strategy:
                     "position_id": position_id,
                     "target_exchanges": sorted(exchange_quantities),
                     "exchange_quantities_base": _exchange_quantity_metadata(exchange_quantities),
+                    **self._sizing_equity_metadata(exchange_quantities),
                 },
             )
         )
@@ -1263,6 +1265,7 @@ class Strategy:
     ) -> dict[str, Decimal]:
         quantities: dict[str, Decimal] = {}
         exchanges = set(self.exchange_equity) | {self.config.data_exchange}
+        effective_risk_pct = params.unit_risk_per_trade * risk_mult * quality_mult * micro_entry_risk_scale * self.config.global_risk_scale
         for exchange in sorted(exchanges):
             equity = self.exchange_equity.get(exchange)
             if equity is None or equity <= 0:
@@ -1282,7 +1285,56 @@ class Strategy:
             )
             if qty > 0:
                 quantities[exchange] = qty
+                logger.info(
+                    "V9C entry sizing equity | exchange=%s sizing_equity=%s available_equity=%s equity_updated_at_ms=%s unit_risk_per_trade=%s global_risk_scale=%s risk_mult=%s quality_mult=%s micro_scale=%s effective_risk_pct=%s current_qty=%s planned_qty=%s entry_price=%s stop_price=%s",
+                    exchange,
+                    equity,
+                    self.exchange_available.get(exchange),
+                    self.exchange_equity_updated_at_ms.get(exchange),
+                    params.unit_risk_per_trade,
+                    self.config.global_risk_scale,
+                    risk_mult,
+                    quality_mult,
+                    micro_entry_risk_scale,
+                    effective_risk_pct,
+                    current_by_exchange.get(exchange, Decimal("0")),
+                    qty,
+                    entry_price,
+                    stop_price,
+                )
         return quantities
+
+    def _refresh_account_equity(self, snapshot: PlatformSnapshot) -> None:
+        exchange = snapshot.balance.exchange.value
+        sizing_equity = _snapshot_sizing_equity(snapshot)
+        available = snapshot.balance.available
+        if sizing_equity > 0:
+            self.exchange_equity[exchange] = sizing_equity
+            if exchange == self.config.data_exchange:
+                self.equity = sizing_equity
+        if available >= 0:
+            self.exchange_available[exchange] = available
+        self.exchange_equity_updated_at_ms[exchange] = int(time.time() * 1000)
+
+    def _sizing_equity_metadata(self, exchange_quantities: Mapping[str, Decimal]) -> dict[str, Mapping[str, str]]:
+        exchanges = sorted(exchange_quantities)
+        return {
+            "sizing_equity_by_exchange": {
+                exchange: str(self.exchange_equity[exchange])
+                for exchange in exchanges
+                if exchange in self.exchange_equity
+            },
+            "available_equity_by_exchange": {
+                exchange: str(self.exchange_available[exchange])
+                for exchange in exchanges
+                if exchange in self.exchange_available
+            },
+            "equity_updated_at_ms_by_exchange": {
+                exchange: str(self.exchange_equity_updated_at_ms[exchange])
+                for exchange in exchanges
+                if exchange in self.exchange_equity_updated_at_ms
+            },
+        }
 
     def _open_leg_quantities(self) -> dict[str, Decimal]:
         quantities = {exchange: leg.base_qty for exchange, leg in self.position.open_legs.items() if leg.base_qty > 0}
@@ -1324,6 +1376,12 @@ class Strategy:
         if last_exit is None:
             return True
         return (current_close_time_ms - last_exit) >= _max_cooldown_bars(self.engine_params) * FOUR_HOURS_MS
+
+
+def _snapshot_sizing_equity(snapshot: PlatformSnapshot) -> Decimal:
+    if snapshot.balance.total > 0:
+        return snapshot.balance.total
+    return snapshot.balance.available
 
 
 def _exchange_quantity_metadata(values: Mapping[str, Decimal]) -> dict[str, str]:

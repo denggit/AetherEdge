@@ -1817,6 +1817,29 @@ class LiveRuntimeRunner:
         signals = await handler(event)
         await self._execute_signals(signals or (), source=f"account:{event.exchange.value}", event_time_ms=event.event_time_ms)
 
+    async def _on_account_snapshot_synced(self, snapshot: PlatformSnapshot, sync_type: str) -> None:
+        snapshots = [
+            existing
+            for existing in self._last_snapshots
+            if existing.balance.exchange != snapshot.balance.exchange
+        ]
+        snapshots.append(snapshot)
+        self._last_snapshots = tuple(snapshots)
+        if snapshot.balance.exchange == self.app_config.data_exchange:
+            self._last_snapshot = snapshot
+
+        handler = getattr(self.context.strategy, "on_account_snapshot", None)
+        if not callable(handler):
+            return
+        await handler(snapshot)
+        logger.info(
+            "Strategy account snapshot refreshed | exchange=%s sync_type=%s available=%s total=%s",
+            snapshot.balance.exchange.value,
+            sync_type,
+            snapshot.balance.available,
+            snapshot.balance.total,
+        )
+
     async def _drain_market_events_before_closed_bar(
         self,
         *,
@@ -2363,6 +2386,7 @@ class LiveRuntimeRunner:
                 config=self.requirements.account_state,
                 alert_sink=self.context.alerts,
                 throttle=self._request_sync_throttle,
+                snapshot_callback=self._on_account_snapshot_synced,
             )
         return self._account_sync_service
 

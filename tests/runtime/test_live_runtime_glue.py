@@ -135,6 +135,7 @@ class FeatureStrategy:
         self.on_start_called = False
         self.recovered = False
         self.last_decision_audit = None
+        self.account_snapshots = []
 
     async def on_start(self, snapshot):
         self.on_start_called = True
@@ -159,6 +160,9 @@ class FeatureStrategy:
 
     async def on_account_event(self, event):
         return []
+
+    async def on_account_snapshot(self, snapshot):
+        self.account_snapshots.append(snapshot)
 
     async def on_market_feature(self, event):
         self.events.append(event.type_value)
@@ -770,6 +774,40 @@ def test_request_sync_services_share_runtime_throttle():
     assert account_service.throttle is throttle
     assert order_service.throttle is throttle
     assert [context.account.exchange for context in account_service.contexts] == [ExchangeName.OKX, ExchangeName.BINANCE]
+
+
+@pytest.mark.asyncio
+async def test_account_sync_refreshes_strategy_account_snapshot():
+    class BalanceAccountClient(FakeAccountClient):
+        def __init__(self, exchange: ExchangeName, *, total: str, available: str) -> None:
+            super().__init__(exchange)
+            self.total = Decimal(total)
+            self.available = Decimal(available)
+
+        async def fetch_balance(self, asset="USDT"):
+            return Balance(exchange=self.exchange, asset=asset, total=self.total, available=self.available)
+
+    strategy = FeatureStrategy()
+    runner = _runner(
+        strategy,
+        services={
+            "recovery_service": FakeRecoveryService(),
+            "execution_clients": (FakeExecutionClient(ExchangeName.OKX), FakeExecutionClient(ExchangeName.BINANCE)),
+            "account_clients": (
+                BalanceAccountClient(ExchangeName.OKX, total="700", available="650"),
+                BalanceAccountClient(ExchangeName.BINANCE, total="300", available="280"),
+            ),
+        },
+    )
+
+    results = await runner._get_account_sync_service().sync_once(sync_type="account_periodic")
+
+    assert [result.success for result in results] == [True, True]
+    assert [(snap.balance.exchange, snap.balance.total, snap.balance.available) for snap in strategy.account_snapshots] == [
+        (ExchangeName.OKX, Decimal("700"), Decimal("650")),
+        (ExchangeName.BINANCE, Decimal("300"), Decimal("280")),
+    ]
+    assert {snapshot.balance.exchange for snapshot in runner._last_snapshots} == {ExchangeName.OKX, ExchangeName.BINANCE}
 
 
 @pytest.mark.asyncio

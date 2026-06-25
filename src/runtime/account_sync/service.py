@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import random
 import time
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -74,12 +75,14 @@ class AccountStateSyncService:
         config: AccountStateRequirement | None = None,
         alert_sink: Any | None = None,
         throttle: RequestThrottle | None = None,
+        snapshot_callback: Callable[[PlatformSnapshot, str], Any] | None = None,
         asset: str = "USDT",
     ) -> None:
         self.contexts = tuple(contexts)
         self.config = config or AccountStateRequirement()
         self.alert_sink = alert_sink
         self.throttle = throttle or RequestThrottle()
+        self.snapshot_callback = snapshot_callback
         self.asset = asset
         self._failures: dict[str, int] = {}
         self._last_account_fingerprint: dict[str, tuple] = {}
@@ -125,6 +128,10 @@ class AccountStateSyncService:
                 position_mode=position_mode,
             )
             context.state_store.save_snapshot(snapshot)
+            if self.snapshot_callback is not None:
+                maybe_awaitable = self.snapshot_callback(snapshot, sync_type)
+                if inspect.isawaitable(maybe_awaitable):
+                    await maybe_awaitable
             self._failures[exchange] = 0
             result = _result(exchange, sync_type, request_count, start, True)
 

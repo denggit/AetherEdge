@@ -803,16 +803,45 @@ async def test_strategy_respects_cooldown_after_master_exit() -> None:
     assert signals == []
     assert strategy.pending_entry is None
 
-def _snapshot() -> PlatformSnapshot:
+def _snapshot(
+    *,
+    exchange: ExchangeName = ExchangeName.OKX,
+    total: str = "1000",
+    available: str = "1000",
+) -> PlatformSnapshot:
     return PlatformSnapshot(
         symbol="ETH-USDT-PERP",
-        balance=Balance(exchange=ExchangeName.OKX, asset="USDT", total=Decimal("1000"), available=Decimal("1000")),
+        balance=Balance(exchange=exchange, asset="USDT", total=Decimal(total), available=Decimal(available)),
         positions=[],
         open_orders=[],
         open_stop_orders=[],
-        leverage=LeverageInfo(exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP", raw_symbol="ETH-USDT-SWAP", leverage=Decimal("10"), margin_mode=MarginMode.ISOLATED),
+        leverage=LeverageInfo(exchange=exchange, symbol="ETH-USDT-PERP", raw_symbol="ETH-USDT-SWAP", leverage=Decimal("10"), margin_mode=MarginMode.ISOLATED),
         position_mode=PositionMode.ONE_WAY,
     )
+
+
+@pytest.mark.asyncio
+async def test_strategy_account_snapshot_refresh_uses_total_equity_for_future_sizing() -> None:
+    strategy = Strategy()
+    await strategy.on_start(_snapshot(total="1000", available="1000"))
+
+    await strategy.on_account_snapshot(_snapshot(total="700", available="600"))
+
+    params = strategy.engine_params["MOMENTUM_V3"]
+    quantities = strategy._entry_exchange_quantities(
+        params=params,
+        entry_price=Decimal("100"),
+        stop_price=Decimal("90"),
+        risk_mult=Decimal("1"),
+        quality_mult=Decimal("1"),
+        micro_entry_risk_scale=Decimal("1"),
+        current_by_exchange={},
+    )
+
+    assert strategy.equity == Decimal("700")
+    assert strategy.exchange_equity["okx"] == Decimal("700")
+    assert strategy.exchange_available["okx"] == Decimal("600")
+    assert quantities["okx"] == Decimal("2.912")
 
 
 @pytest.mark.asyncio
