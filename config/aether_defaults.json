@@ -16,7 +16,9 @@
   "background_queue_maxsize": 1000,
   "scheduler_poll_seconds": 1.0,
   "closed_bar_interval": "4h",
-  "closed_bar_buffer_ms": 60000,
+  "closed_bar_buffer_ms": 5000,
+  "closed_bar_retry_interval_ms": 5000,
+  "closed_bar_missing_alert_after_ms": 120000,
   "range_pct": "0.002",
   "producer_stale_timeout_ms": 60000
 }

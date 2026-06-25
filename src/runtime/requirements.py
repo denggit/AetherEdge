@@ -13,6 +13,8 @@ class ClosedKlineRequirement:
     interval: str = "4h"
     warmup_days: int = 0
     close_buffer_ms: int | None = None
+    retry_interval_ms: int | None = None
+    missing_alert_after_ms: int | None = None
     min_records: int = 1
 
 
@@ -142,6 +144,8 @@ def _closed_kline(value: Any) -> ClosedKlineRequirement:
         interval=str(raw.get("interval", "4h")),
         warmup_days=int(raw.get("warmup_days", 0) or 0),
         close_buffer_ms=None if raw.get("close_buffer_ms") is None else int(raw.get("close_buffer_ms")),
+        retry_interval_ms=None if raw.get("closed_bar_retry_interval_ms", raw.get("retry_interval_ms")) is None else int(raw.get("closed_bar_retry_interval_ms", raw.get("retry_interval_ms"))),
+        missing_alert_after_ms=None if raw.get("closed_bar_missing_alert_after_ms", raw.get("missing_alert_after_ms")) is None else int(raw.get("closed_bar_missing_alert_after_ms", raw.get("missing_alert_after_ms"))),
         min_records=int(raw.get("min_records", 1) or 1),
     )
 

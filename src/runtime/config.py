@@ -39,7 +39,9 @@ class LiveRuntimeConfig:
     background_queue_maxsize: int = 1000
     scheduler_poll_seconds: float = 1.0
     closed_bar_interval: str = "4h"
-    closed_bar_buffer_ms: int = 60_000
+    closed_bar_buffer_ms: int = 5_000
+    closed_bar_retry_interval_ms: int = 5_000
+    closed_bar_missing_alert_after_ms: int = 120_000
     range_pct: Decimal = Decimal("0.002")
     producer_stale_timeout_ms: int = 60_000
     master_follower_policy: MasterFollowerPolicyConfig | None = None
@@ -79,7 +81,9 @@ def live_runtime_config_from_app(
         background_queue_maxsize=int(env.get("AETHER_BACKGROUND_QUEUE_MAXSIZE", defaults.get("background_queue_maxsize", 1000))),
         scheduler_poll_seconds=float(env.get("AETHER_SCHEDULER_POLL_SECONDS", defaults.get("scheduler_poll_seconds", 1.0))),
         closed_bar_interval=str(env.get("AETHER_CLOSED_BAR_INTERVAL", defaults.get("closed_bar_interval", "4h"))),
-        closed_bar_buffer_ms=int(env.get("AETHER_CLOSED_BAR_BUFFER_MS", defaults.get("closed_bar_buffer_ms", 60_000))),
+        closed_bar_buffer_ms=int(env.get("AETHER_CLOSED_BAR_BUFFER_MS", defaults.get("closed_bar_buffer_ms", 5_000))),
+        closed_bar_retry_interval_ms=int(env.get("AETHER_CLOSED_BAR_RETRY_INTERVAL_MS", defaults.get("closed_bar_retry_interval_ms", 5_000))),
+        closed_bar_missing_alert_after_ms=int(env.get("AETHER_CLOSED_BAR_MISSING_ALERT_AFTER_MS", defaults.get("closed_bar_missing_alert_after_ms", 120_000))),
         range_pct=Decimal(str(env.get("AETHER_RANGE_PCT", defaults.get("range_pct", "0.002")))),
         producer_stale_timeout_ms=int(env.get("AETHER_PRODUCER_STALE_TIMEOUT_MS", defaults.get("producer_stale_timeout_ms", 60_000))),
         master_follower_policy=MasterFollowerPolicyConfig.from_env(

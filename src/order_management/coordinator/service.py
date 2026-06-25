@@ -468,7 +468,24 @@ class MultiExchangeOrderCoordinator:
                 try:
                     order = await self._execute_item(client, item, intent=intent, client_order_id=client_order_id)
                     synced = await self.order_status_synchronizer.sync_after_submit(client=client, item=item, order=order)
-                    results.append(_order_to_result(synced, client=client, quantity_converter=self.quantity_converter, attempts=attempt + 1))
+                    result = _order_to_result(synced, client=client, quantity_converter=self.quantity_converter, attempts=attempt + 1)
+                    if _requires_real_fill(intent.signal.action, item) and not _result_has_real_fill(result):
+                        result = ExchangeOrderResult(
+                            exchange=result.exchange,
+                            ok=False,
+                            order_id=result.order_id,
+                            client_order_id=result.client_order_id,
+                            status=result.status,
+                            side=result.side,
+                            quantity=result.quantity,
+                            filled_quantity=result.filled_quantity,
+                            avg_fill_price=result.avg_fill_price,
+                            fee=result.fee,
+                            fee_asset=result.fee_asset,
+                            error="missing_real_fill_price_or_quantity",
+                            raw={**dict(result.raw), "real_fill_required": True},
+                        )
+                    results.append(result)
                     break
                 except ExitSafetyError as exc:
                     last_error = exc
@@ -871,6 +888,21 @@ def _result_is_filled(result: ExchangeOrderResult) -> bool:
         and result.status is OrderStatus.FILLED
         and result.filled_quantity is not None
         and result.filled_quantity > Decimal("0")
+    )
+
+
+def _requires_real_fill(action: SignalAction, item: PlannedExecution) -> bool:
+    return action in {SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT} and item.action is PlannedExecutionAction.PLACE_ORDER
+
+
+def _result_has_real_fill(result: ExchangeOrderResult) -> bool:
+    return (
+        result.ok
+        and result.status is OrderStatus.FILLED
+        and result.filled_quantity is not None
+        and result.filled_quantity > Decimal("0")
+        and result.avg_fill_price is not None
+        and result.avg_fill_price > Decimal("0")
     )
 
 

@@ -167,12 +167,16 @@ class LiveRuntimeRunner:
         )
         self._closed_bar_interval = self.requirements.closed_kline.interval if self.requirements.closed_kline.enabled else self.runtime_config.closed_bar_interval
         self._closed_bar_buffer_ms = self.requirements.closed_kline.close_buffer_ms if self.requirements.closed_kline.close_buffer_ms is not None else self.runtime_config.closed_bar_buffer_ms
+        self._closed_bar_retry_interval_ms = self.requirements.closed_kline.retry_interval_ms if self.requirements.closed_kline.retry_interval_ms is not None else self.runtime_config.closed_bar_retry_interval_ms
+        self._closed_bar_missing_alert_after_ms = self.requirements.closed_kline.missing_alert_after_ms if self.requirements.closed_kline.missing_alert_after_ms is not None else self.runtime_config.closed_bar_missing_alert_after_ms
         self._closed_bar_interval_ms = interval_to_ms(self._closed_bar_interval)
         self._range_pct = self.requirements.range_bars.range_pct if self.requirements.range_bars.enabled else self.runtime_config.range_pct
         self._range_aggregate_interval = self.requirements.range_bars.aggregate_interval if self.requirements.range_bars.enabled else self._closed_bar_interval
         self._closed_bar_scheduler: ClosedBarScheduler = self.services.get("closed_bar_scheduler") or ClosedBarScheduler(
             interval_ms=self._closed_bar_interval_ms,
             close_buffer_ms=self._closed_bar_buffer_ms,
+            retry_interval_ms=self._closed_bar_retry_interval_ms,
+            missing_alert_after_ms=self._closed_bar_missing_alert_after_ms,
         )
         self._rangebar_trust_start_bucket_ms: int | None = None
         self._intent_factory = self.services.get("intent_factory") or LiveOrderIntentFactory(
@@ -356,11 +360,38 @@ class LiveRuntimeRunner:
         rows = await self.context.data.fetch_klines(
             interval=self._closed_bar_interval,
             limit=10,
-            use_cache=True,
+            start_time_ms=open_time_ms,
+            end_time_ms=open_time_ms,
+            use_cache=False,
             oldest_first=True,
         )
         closed_rows = [row for row in rows if row.is_closed and row.open_time_ms == open_time_ms]
         if not closed_rows:
+            should_alert = getattr(self._closed_bar_scheduler, "should_alert_missing", None)
+            if callable(should_alert) and should_alert(open_time_ms, now):
+                close_time_ms = open_time_ms + self._closed_bar_interval_ms
+                self.context.alerts.emit(
+                    AppAlert(
+                        subject="AetherEdge closed bar missing",
+                        severity="error",
+                        content=(
+                            f"symbol={self.app_config.symbol}\n"
+                            f"interval={self._closed_bar_interval}\n"
+                            f"open_time_ms={open_time_ms}\n"
+                            f"close_time_ms={close_time_ms}\n"
+                            f"now_ms={now}\n"
+                            f"missing_after_ms={self._closed_bar_missing_alert_after_ms}\n"
+                        ),
+                    )
+                )
+                logger.error(
+                    "Closed bar missing after retry window | symbol=%s interval=%s open_time_ms=%s close_time_ms=%s now_ms=%s",
+                    self.app_config.symbol,
+                    self._closed_bar_interval,
+                    open_time_ms,
+                    close_time_ms,
+                    now,
+                )
             return []
         closed_kline = closed_rows[-1]
         drain_result = await self._drain_market_events_before_closed_bar(

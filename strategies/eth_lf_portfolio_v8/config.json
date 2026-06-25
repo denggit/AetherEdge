@@ -21,7 +21,9 @@
       "enabled": true,
       "interval": "4h",
       "warmup_days": 365,
-      "close_buffer_ms": 60000,
+      "close_buffer_ms": 5000,
+      "closed_bar_retry_interval_ms": 5000,
+      "closed_bar_missing_alert_after_ms": 120000,
       "min_records": 2000
     },
     "trades": {

@@ -35,6 +35,11 @@ class V8PositionState:
     avg_entry: Decimal | None = None
     initial_sl: Decimal | None = None
     stop_price: Decimal | None = None
+    confirmed_stop_price: Decimal | None = None
+    desired_stop_price: Decimal | None = None
+    pending_stop_replace: bool = False
+    pending_stop_reason: str | None = None
+    pending_stop_bar_close_time_ms: int | None = None
     risk_per_coin: Decimal | None = None
     qty: Decimal = Decimal("0")
     units: int = 0
@@ -45,6 +50,12 @@ class V8PositionState:
     last_exit_time_ms: int | None = None
     legs: dict[str, ExchangeLegState] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if self.confirmed_stop_price is None and self.stop_price is not None:
+            self.confirmed_stop_price = self.stop_price
+        elif self.stop_price is None and self.confirmed_stop_price is not None:
+            self.stop_price = self.confirmed_stop_price
+
     def reset(self, *, keep_last_exit: bool = False) -> None:
         self.in_pos = False
         self.position_id = None
@@ -54,6 +65,11 @@ class V8PositionState:
         self.avg_entry = None
         self.initial_sl = None
         self.stop_price = None
+        self.confirmed_stop_price = None
+        self.desired_stop_price = None
+        self.pending_stop_replace = False
+        self.pending_stop_reason = None
+        self.pending_stop_bar_close_time_ms = None
         self.risk_per_coin = None
         self.qty = Decimal("0")
         self.units = 0
@@ -92,6 +108,11 @@ class V8PositionState:
         self.avg_entry = avg_entry
         self.initial_sl = stop_price if self.initial_sl is None else self.initial_sl
         self.stop_price = stop_price
+        self.confirmed_stop_price = stop_price
+        self.desired_stop_price = None
+        self.pending_stop_replace = False
+        self.pending_stop_reason = None
+        self.pending_stop_bar_close_time_ms = None
         self.risk_per_coin = abs(avg_entry - stop_price)
         self.qty = qty
         self.units = units
@@ -136,9 +157,40 @@ class V8PositionState:
         if stop_price <= 0:
             raise ValueError("stop_price must be positive")
         self.stop_price = stop_price
+        self.confirmed_stop_price = stop_price
+        self.desired_stop_price = None
+        self.pending_stop_replace = False
+        self.pending_stop_reason = None
+        self.pending_stop_bar_close_time_ms = None
         for leg in self.legs.values():
             if leg.is_open:
                 leg.stop_price = stop_price
+
+    def mark_pending_stop_replace(
+        self,
+        *,
+        desired_stop_price: Decimal,
+        reason: str,
+        bar_close_time_ms: int | None,
+    ) -> None:
+        if desired_stop_price <= 0:
+            raise ValueError("desired_stop_price must be positive")
+        self.desired_stop_price = desired_stop_price
+        self.pending_stop_replace = True
+        self.pending_stop_reason = reason
+        self.pending_stop_bar_close_time_ms = bar_close_time_ms
+
+    def confirm_pending_stop_replace(self, *, stop_price: Decimal | None = None) -> None:
+        confirmed = stop_price if stop_price is not None else self.desired_stop_price
+        if confirmed is None or confirmed <= 0:
+            raise ValueError("confirmed stop_price must be positive")
+        self.update_stop(confirmed)
+
+    def reject_pending_stop_replace(self) -> None:
+        self.desired_stop_price = None
+        self.pending_stop_replace = False
+        self.pending_stop_reason = None
+        self.pending_stop_bar_close_time_ms = None
 
     def mark_leg_open(
         self,

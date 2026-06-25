@@ -212,7 +212,10 @@ class Strategy:
         source: str,
         event_time_ms: int | None,
     ) -> Sequence[TradeSignal]:
-        if signal.action in {SignalAction.PLACE_STOP_LOSS_LONG, SignalAction.PLACE_STOP_LOSS_SHORT, SignalAction.CANCEL_ALL_STOP_ORDERS}:
+        if signal.action in {SignalAction.PLACE_STOP_LOSS_LONG, SignalAction.PLACE_STOP_LOSS_SHORT}:
+            self._handle_stop_order_results(signal=signal, results=results, event_time_ms=event_time_ms)
+            return []
+        if signal.action is SignalAction.CANCEL_ALL_STOP_ORDERS:
             return []
         if signal.action not in {SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT, SignalAction.CLOSE_LONG, SignalAction.CLOSE_SHORT}:
             return []
@@ -225,6 +228,10 @@ class Strategy:
         ]
         if signal.action in {SignalAction.CLOSE_LONG, SignalAction.CLOSE_SHORT}:
             return self._handle_close_order_result_events(signal=signal, events=events)
+
+        if signal.action in {SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT} and not self._entry_has_master_fill_event(events):
+            self._record_entry_fill_failure(signal=signal, results=results, event_time_ms=event_time_ms)
+            return []
 
         # Entry fills can intentionally cascade: the master fill establishes the
         # canonical stop, then follower fills reuse it. Keep this path
@@ -245,6 +252,80 @@ class Strategy:
             elif self.position.in_pos and _is_entry_side(event.side, self.position.side) and not is_master:
                 signals.extend(self._handle_follower_entry_fill(event=event, filled_qty=filled_qty))
         return signals
+
+    def _entry_has_master_fill_event(self, events: Sequence[AccountEvent]) -> bool:
+        return any(event.exchange.value == self.config.data_exchange for event in events)
+
+    def _record_entry_fill_failure(
+        self,
+        *,
+        signal: TradeSignal,
+        results: Sequence[ExchangeOrderResult],
+        event_time_ms: int | None,
+    ) -> None:
+        if self.pending_entry is None:
+            return
+        master_result = next((result for result in results if result.exchange.value == self.config.data_exchange), None)
+        if master_result is None:
+            detail = "missing_master_order_result"
+        elif not master_result.ok:
+            detail = master_result.error or "master_order_result_failed"
+        elif master_result.avg_fill_price is None or master_result.avg_fill_price <= 0:
+            detail = "missing_avg_fill_price"
+        elif master_result.filled_quantity is None or master_result.filled_quantity <= 0:
+            detail = "missing_filled_quantity"
+        else:
+            detail = "master_fill_not_confirmed"
+        self.recovery_manual_required = True
+        self.recovery_blocking_manual_required = True
+        self.recovery_alerts.append(f"entry_real_fill_missing_manual_required:{detail}")
+        self.pending_entry = None
+        logger.critical(
+            "Entry real fill missing | action=%s detail=%s event_time_ms=%s",
+            signal.action.value,
+            detail,
+            event_time_ms,
+        )
+
+    def _handle_stop_order_results(
+        self,
+        *,
+        signal: TradeSignal,
+        results: Sequence[ExchangeOrderResult],
+        event_time_ms: int | None,
+    ) -> None:
+        target_exchanges = _target_exchanges(signal)
+        if not target_exchanges:
+            target_exchanges = tuple(result.exchange.value for result in results)
+        successful = [
+            result
+            for result in results
+            if result.exchange.value in target_exchanges
+            and result.ok
+            and result.status not in {OrderStatus.CANCELED, OrderStatus.REJECTED}
+        ]
+        if target_exchanges and len(successful) == len(set(target_exchanges)):
+            stop_price = self.position.desired_stop_price or signal.trigger_price
+            if stop_price is not None:
+                self.position.confirm_pending_stop_replace(stop_price=stop_price)
+            return
+        self.position.reject_pending_stop_replace()
+        self.recovery_manual_required = True
+        self.recovery_blocking_manual_required = True
+        errors = [
+            result.error or (result.status.value if result.status else "unknown")
+            for result in results
+            if not result.ok or result.status in {OrderStatus.CANCELED, OrderStatus.REJECTED}
+        ]
+        self.recovery_alerts.append(f"stop_replace_failed_manual_required:{','.join(errors) or 'missing_success'}")
+        logger.critical(
+            "Stop replace failed | action=%s trigger_price=%s event_time_ms=%s target_exchanges=%s errors=%s",
+            signal.action.value,
+            signal.trigger_price,
+            event_time_ms,
+            list(target_exchanges),
+            errors,
+        )
 
     def _handle_close_order_result_events(self, *, signal: TradeSignal, events: Sequence[AccountEvent]) -> Sequence[TradeSignal]:
         if not self.position.in_pos or self.position.side is Side.FLAT:
@@ -565,6 +646,8 @@ class Strategy:
         stop_signals = self._stop_update_signals_if_needed(context)
         if stop_signals:
             return stop_signals
+        if self.position.pending_stop_replace:
+            return []
         if self._stop_update_blocked_bar_close_time_ms == context.kline.close_time_ms:
             return []
         self._stop_update_checked_bar_close_time_ms = context.kline.close_time_ms
@@ -729,11 +812,26 @@ class Strategy:
             reference_price=context.kline.close,
         )
         if signals:
-            self.position.update_stop(candidate)
+            self.position.mark_pending_stop_replace(
+                desired_stop_price=candidate,
+                reason="V8_PROTECTED_TRAILING_STOP_UPDATE",
+                bar_close_time_ms=context.kline.close_time_ms,
+            )
         return signals
 
     def _handle_master_entry_fill(self, *, event: AccountEvent, filled_qty: Decimal) -> list[TradeSignal]:
         assert self.pending_entry is not None
+        if event.price is None or event.price <= 0 or filled_qty <= 0:
+            self._record_entry_fill_failure(
+                signal=TradeSignal(
+                    symbol=self.config.symbol,
+                    action=SignalAction.OPEN_LONG if self.pending_entry.side is Side.LONG else SignalAction.OPEN_SHORT,
+                    quantity=self.pending_entry.quantity,
+                ),
+                results=(),
+                event_time_ms=event.event_time_ms,
+            )
+            return []
         exchange = event.exchange.value
         base_filled_qty = filled_qty if event.raw.get("quantity_semantics") == "base_asset" else self.pending_entry.quantity
         native_filled_qty = None if base_filled_qty == filled_qty else filled_qty
@@ -1093,6 +1191,17 @@ class Strategy:
             self.recovery_blocking_manual_required = True
             for order in validation.unsupported_bot_exit_orders:
                 self.recovery_alerts.append(f"unsupported_take_profit_or_trailing_manual_required:{exchange}:{order.order_id or order.client_order_id or 'unknown'}")
+        if any(check.order is None and check.invalid_reason == "missing_bot_owned_stop" for check in validation.checks):
+            self.recovery_manual_required = True
+            self.recovery_blocking_manual_required = True
+            self.recovery_alerts.append(f"critical_stop_missing_while_in_position_manual_required:{exchange}")
+            logger.critical(
+                "Stop missing while position is active | exchange=%s position_id=%s quantity=%s stop_price=%s",
+                exchange,
+                self.position.position_id,
+                quantity,
+                stop_price,
+            )
         if validation.should_keep_existing_stop:
             return signals
         if validation.should_cancel_and_replace_bot_stops:
@@ -1296,6 +1405,9 @@ class Strategy:
                     "target_exchanges": target_exchanges,
                     "stop_price_source": "master_canonical",
                     "execution_purpose": "stop_sync",
+                    "replace_mode": "cancel_then_place_validated",
+                    "desired_stop_price": str(stop_price),
+                    "confirmed_stop_price": None if self.position.stop_price is None else str(self.position.stop_price),
                     "position_id": self.position.position_id,
                     **({"exchange_quantities_base": _exchange_quantity_metadata(exchange_quantities)} if exchange_quantities else {}),
                 },
@@ -1645,7 +1757,7 @@ def _account_event_from_order_result(*, signal: TradeSignal, result: ExchangeOrd
         price=price,
         quantity=result.quantity,
         filled_quantity=filled_qty,
-        raw={**dict(result.raw), "source": "request_order_result"},
+        raw={**dict(result.raw), "source": "request_order_result", "fill_price_source": "order_status"},
     )
 
 

@@ -29,6 +29,21 @@ class FakeExecutionClient:
         self.orders.append(request)
         return Order(exchange=self.exchange, symbol=request.symbol, raw_symbol=request.symbol, order_id=f"{self.exchange.value}-1", client_order_id=request.client_order_id, status=OrderStatus.NEW, side=request.side, order_type=request.order_type, quantity=request.quantity)
 
+    async def fetch_order_status(self, query):
+        return Order(
+            exchange=self.exchange,
+            symbol=query.symbol,
+            raw_symbol=query.symbol,
+            order_id=query.order_id,
+            client_order_id=query.client_order_id,
+            status=OrderStatus.FILLED,
+            side=self.orders[-1].side,
+            order_type=self.orders[-1].order_type,
+            quantity=self.orders[-1].quantity,
+            filled_quantity=self.orders[-1].quantity,
+            raw={"avgPx": "100"},
+        )
+
     async def place_stop_market_order(self, request):
         if self.fail:
             raise RuntimeError(f"{self.exchange.value} failed")

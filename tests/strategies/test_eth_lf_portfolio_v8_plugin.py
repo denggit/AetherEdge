@@ -762,7 +762,9 @@ async def test_strategy_updates_protected_stop_when_favorable_move_reaches_thres
     assert signals[0].metadata["target_exchanges"] == ["okx"]
     assert signals[1].action is SignalAction.PLACE_STOP_LOSS_LONG
     assert signals[1].trigger_price == Decimal("101.0")
-    assert strategy.position.stop_price == Decimal("101.0")
+    assert strategy.position.stop_price == Decimal("90")
+    assert strategy.position.desired_stop_price == Decimal("101.0")
+    assert strategy.position.pending_stop_replace is True
 
 
 @pytest.mark.asyncio

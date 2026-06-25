@@ -826,7 +826,8 @@ def test_recovery_active_position_no_stop_places_bot_stop():
     assert [signal.action for signal in signals] == [SignalAction.PLACE_STOP_LOSS_SHORT]
     assert signals[0].quantity == Decimal("0.282")
     assert signals[0].trigger_price == Decimal("1719.40")
-    assert strategy.recovery_manual_required is False
+    assert strategy.recovery_manual_required is True
+    assert "critical_stop_missing_while_in_position_manual_required:okx" in strategy.recovery_alerts
 
 
 def test_recovery_valid_bot_stop_no_signals_needed():
