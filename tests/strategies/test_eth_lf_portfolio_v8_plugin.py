@@ -722,6 +722,7 @@ async def test_strategy_emits_add_signal_when_next_r_trigger_is_hit() -> None:
         stop_price=Decimal("90"),
         entry_engine="MOMENTUM_V3",
     )
+    strategy.position.update_stop(Decimal("101.0"))
     strategy.router = PortfolioRouter(engines=(_StaticEngine(name="none", priority=0, side=Side.FLAT),))
     strategy.feature_builder = _FakeFeatureBuilder(atr="10")
 

@@ -27,7 +27,7 @@ from strategies.eth_lf_portfolio_v8.engines.momentum_v3 import MomentumV3Engine
 from strategies.eth_lf_portfolio_v8.engines.router import PortfolioRouter
 from strategies.eth_lf_portfolio_v8.execution.signal_mapper import SignalMapperConfig, V8SignalMapper
 from strategies.eth_lf_portfolio_v8.execution.sizing import RiskSizingConfig, V8RiskSizer
-from strategies.eth_lf_portfolio_v8.execution.stops import initial_stop_from_risk, is_better_stop, protected_stop
+from strategies.eth_lf_portfolio_v8.execution.stops import initial_stop_from_risk, is_better_stop, protected_stop, validate_exchange_stop
 from strategies.eth_lf_portfolio_v8.features.buffer import V8FeatureBuffer
 from strategies.eth_lf_portfolio_v8.features.feature_frame import parse_closed_kline, parse_range_aggregate
 from strategies.eth_lf_portfolio_v8.features.live_features import V8LiveFeatureBuilder
@@ -103,6 +103,7 @@ class PendingEntryPlan:
     risk_mult: Decimal
     quality_mult: Decimal
     is_add: bool = False
+    stop_update_checked_at_ms: int | None = None
 
     @property
     def risk_per_coin(self) -> Decimal:
@@ -133,6 +134,11 @@ class Strategy:
         self.bar_ready_events: list[BarReadyContext] = []
         self.last_decision_audit: dict[str, Any] | None = None
         self.recovery_alerts: list[str] = []
+        self.stop_safety_alerts: list[str] = []
+        self.last_stop_reject_reason: str | None = None
+        self.last_stop_reject_metadata: dict[str, Any] | None = None
+        self._stop_update_checked_bar_close_time_ms: int | None = None
+        self._stop_update_blocked_bar_close_time_ms: int | None = None
         self.recovered = False
         self.started = False
 
@@ -416,6 +422,8 @@ class Strategy:
             "position_qty": str(self.position.qty),
             "position_stop": None if self.position.stop_price is None else str(self.position.stop_price),
             "pending_entry": self.pending_entry is not None,
+            "stop_reject_reason": self.last_stop_reject_reason,
+            "stop_reject_metadata": self.last_stop_reject_metadata,
 
             "open": str(context.kline.open),
             "high": str(context.kline.high),
@@ -550,13 +558,20 @@ class Strategy:
 
     def _position_lifecycle_signals(self, context: BarReadyContext) -> list[TradeSignal]:
         self.position.update_favorable_extremes(high=context.kline.high, low=context.kline.low)
+        self._stop_update_checked_bar_close_time_ms = None
         close_decision = self._close_decision_if_needed(context)
         if close_decision is not None:
             return self.signal_mapper.map_decision(close_decision)
+        stop_signals = self._stop_update_signals_if_needed(context)
+        if stop_signals:
+            return stop_signals
+        if self._stop_update_blocked_bar_close_time_ms == context.kline.close_time_ms:
+            return []
+        self._stop_update_checked_bar_close_time_ms = context.kline.close_time_ms
         add_signals = self._add_signal_if_needed(context)
         if add_signals:
             return add_signals
-        return self._stop_update_signals_if_needed(context)
+        return []
 
     def _close_decision_if_needed(self, context: BarReadyContext) -> V8TradeDecision | None:
         if not self.position.in_pos or self.position.side is Side.FLAT or self.position.qty <= 0:
@@ -634,6 +649,7 @@ class Strategy:
             risk_mult=context.routed_signal.risk_mult,
             quality_mult=context.routed_signal.quality_mult,
             is_add=True,
+            stop_update_checked_at_ms=self._stop_update_checked_bar_close_time_ms,
         )
         return self.signal_mapper.map_decision(
             V8TradeDecision(
@@ -698,27 +714,35 @@ class Strategy:
             return []
         if not is_better_stop(side=self.position.side, current_stop=self.position.stop_price, candidate=candidate):
             return []
-        self.position.update_stop(candidate)
         exchange_quantities = self._open_leg_quantities()
         target_exchanges = sorted(exchange_quantities)
         if not target_exchanges:
             target_exchanges = [self.config.data_exchange]
             exchange_quantities = {self.config.data_exchange: self.position.qty}
-        return self._replace_stop_signals(
+        signals = self._replace_stop_signals(
             target_exchanges=target_exchanges,
             quantity=exchange_quantities.get(self.config.data_exchange, self.position.qty),
             stop_price=candidate,
             reason="V8_PROTECTED_TRAILING_STOP_UPDATE",
             bar_close_time_ms=context.kline.close_time_ms,
             exchange_quantities=exchange_quantities,
+            reference_price=context.kline.close,
         )
+        if signals:
+            self.position.update_stop(candidate)
+        return signals
 
     def _handle_master_entry_fill(self, *, event: AccountEvent, filled_qty: Decimal) -> list[TradeSignal]:
         assert self.pending_entry is not None
         exchange = event.exchange.value
         base_filled_qty = filled_qty if event.raw.get("quantity_semantics") == "base_asset" else self.pending_entry.quantity
         native_filled_qty = None if base_filled_qty == filled_qty else filled_qty
-        if self.pending_entry.is_add and self.position.in_pos:
+        is_add_fill = self.pending_entry.is_add and self.position.in_pos
+        add_stop_checked = (
+            is_add_fill
+            and self.pending_entry.stop_update_checked_at_ms == self.pending_entry.bar_close_time_ms
+        )
+        if is_add_fill:
             self.position.add_master_fill(avg_fill_price=event.price, add_qty=base_filled_qty)  # type: ignore[arg-type]
         else:
             stop_price = initial_stop_from_risk(
@@ -744,6 +768,16 @@ class Strategy:
             order_id=event.order_id,
             client_order_id=event.client_order_id,
         )
+        if is_add_fill and not add_stop_checked:
+            self._record_stop_reject(
+                reason="add_fill_stop_update_not_checked",
+                stop_price=self.position.stop_price,
+                reference_price=event.price,
+                bar_close_time_ms=event.event_time_ms,
+                signal_reason="MASTER_ADD_FILLED_REPLACE_STOP",
+            )
+            self.pending_entry = None
+            return []
         self.pending_entry = None
         if self.position.stop_price is None:
             return []
@@ -753,10 +787,12 @@ class Strategy:
             stop_price=self.position.stop_price,
             reason="MASTER_ENTRY_FILLED_REPLACE_STOP",
             bar_close_time_ms=event.event_time_ms,
+            reference_price=event.price,
         )
 
     def _handle_follower_entry_fill(self, *, event: AccountEvent, filled_qty: Decimal) -> list[TradeSignal]:
         exchange = event.exchange.value
+        was_add_fill = exchange in self.position.open_legs and self.position.open_legs[exchange].base_qty > 0
         self.position.add_leg_fill(
             exchange=exchange,
             avg_fill_price=event.price,  # type: ignore[arg-type]
@@ -764,6 +800,15 @@ class Strategy:
             order_id=event.order_id,
             client_order_id=event.client_order_id,
         )
+        if was_add_fill:
+            self._record_stop_reject(
+                reason="follower_add_fill_stop_update_not_checked",
+                stop_price=self.position.stop_price,
+                reference_price=event.price,
+                bar_close_time_ms=event.event_time_ms,
+                signal_reason="FOLLOWER_ADD_FILLED_REPLACE_STOP",
+            )
+            return []
         if self.position.stop_price is None:
             return []
         leg_qty = self.position.legs[exchange].base_qty
@@ -773,6 +818,7 @@ class Strategy:
             stop_price=self.position.stop_price,
             reason="FOLLOWER_ENTRY_FILLED_REPLACE_STOP",
             bar_close_time_ms=event.event_time_ms,
+            reference_price=event.price,
         )
 
     def _recover_position_from_plans(self, *, snapshots: Sequence[PlatformSnapshot], plans: Sequence[Mapping[str, Any]]) -> list[TradeSignal]:
@@ -1174,7 +1220,24 @@ class Strategy:
             },
         )
 
-    def _replace_stop_signals(self, *, target_exchanges: list[str], quantity: Decimal, stop_price: Decimal, reason: str, bar_close_time_ms: int | None, exchange_quantities: Mapping[str, Decimal] | None = None) -> list[TradeSignal]:
+    def _replace_stop_signals(
+        self,
+        *,
+        target_exchanges: list[str],
+        quantity: Decimal,
+        stop_price: Decimal,
+        reason: str,
+        bar_close_time_ms: int | None,
+        exchange_quantities: Mapping[str, Decimal] | None = None,
+        reference_price: Decimal | None = None,
+    ) -> list[TradeSignal]:
+        if not self._stop_is_exchange_valid(
+            stop_price=stop_price,
+            reference_price=reference_price,
+            reason=reason,
+            bar_close_time_ms=bar_close_time_ms,
+        ):
+            return []
         return [
             self._cancel_stop_signal(target_exchanges=target_exchanges, reason=f"{reason}_CANCEL_OLD"),
             *self._place_stop_signals(
@@ -1184,6 +1247,7 @@ class Strategy:
                 reason=reason,
                 bar_close_time_ms=bar_close_time_ms,
                 exchange_quantities=exchange_quantities,
+                reference_price=reference_price,
             ),
         ]
 
@@ -1199,7 +1263,24 @@ class Strategy:
             },
         )
 
-    def _place_stop_signals(self, *, target_exchanges: list[str], quantity: Decimal, stop_price: Decimal, reason: str, bar_close_time_ms: int | None, exchange_quantities: Mapping[str, Decimal] | None = None) -> list[TradeSignal]:
+    def _place_stop_signals(
+        self,
+        *,
+        target_exchanges: list[str],
+        quantity: Decimal,
+        stop_price: Decimal,
+        reason: str,
+        bar_close_time_ms: int | None,
+        exchange_quantities: Mapping[str, Decimal] | None = None,
+        reference_price: Decimal | None = None,
+    ) -> list[TradeSignal]:
+        if not self._stop_is_exchange_valid(
+            stop_price=stop_price,
+            reference_price=reference_price,
+            reason=reason,
+            bar_close_time_ms=bar_close_time_ms,
+        ):
+            return []
         exchange_quantities = dict(exchange_quantities or {})
         stop = self.signal_mapper.map_decision(
             V8TradeDecision(
@@ -1221,6 +1302,68 @@ class Strategy:
             )
         )[0]
         return [stop]
+
+    def _stop_is_exchange_valid(
+        self,
+        *,
+        stop_price: Decimal,
+        reference_price: Decimal | None,
+        reason: str,
+        bar_close_time_ms: int | None,
+    ) -> bool:
+        if reference_price is None:
+            return True
+        validation = validate_exchange_stop(
+            side=self.position.side,
+            stop_price=stop_price,
+            reference_price=reference_price,
+        )
+        if validation.valid:
+            return True
+        self._record_stop_reject(
+            reason=validation.reason,
+            stop_price=stop_price,
+            reference_price=reference_price,
+            bar_close_time_ms=bar_close_time_ms,
+            signal_reason=reason,
+            buffer=validation.buffer,
+        )
+        if bar_close_time_ms is not None:
+            self._stop_update_blocked_bar_close_time_ms = bar_close_time_ms
+        return False
+
+    def _record_stop_reject(
+        self,
+        *,
+        reason: str,
+        stop_price: Decimal | None,
+        reference_price: Decimal | None,
+        bar_close_time_ms: int | None,
+        signal_reason: str,
+        buffer: Decimal | None = None,
+    ) -> None:
+        alert = f"invalid_stop:{reason}"
+        self.last_stop_reject_reason = alert
+        self.last_stop_reject_metadata = {
+            "reason": reason,
+            "signal_reason": signal_reason,
+            "side": _side_label(self.position.side),
+            "stop_price": None if stop_price is None else str(stop_price),
+            "reference_price": None if reference_price is None else str(reference_price),
+            "buffer": None if buffer is None else str(buffer),
+            "bar_close_time_ms": bar_close_time_ms,
+        }
+        self.stop_safety_alerts.append(alert)
+        logger.warning(
+            "Blocked stop signal | reason=%s signal_reason=%s side=%s stop_price=%s reference_price=%s buffer=%s bar_close_time_ms=%s",
+            reason,
+            signal_reason,
+            _side_label(self.position.side),
+            stop_price,
+            reference_price,
+            buffer,
+            bar_close_time_ms,
+        )
 
     def _follower_close_signals_after_master_close(self, *, event_time_ms: int | None, only_exchanges: list[str] | None = None) -> list[TradeSignal]:
         if not self.position.in_pos or self.position.side is Side.FLAT:

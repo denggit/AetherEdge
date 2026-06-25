@@ -12,3 +12,4 @@ data/
 /.env
 /.agents/
 /.tmp/
+/.tmp_pytest/

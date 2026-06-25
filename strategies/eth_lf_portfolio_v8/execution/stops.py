@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal
 
 from strategies.eth_lf_portfolio_v8.domain.models import Side
@@ -70,3 +71,44 @@ def is_better_stop(*, side: Side, current_stop: Decimal | None, candidate: Decim
     if side is Side.SHORT:
         return candidate < current_stop
     return False
+
+
+@dataclass(frozen=True)
+class StopExchangeValidation:
+    valid: bool
+    reason: str = ""
+    buffer: Decimal | None = None
+
+
+def exchange_stop_buffer(*, reference_price: Decimal, tick_size: Decimal | None = None) -> Decimal:
+    pct_buffer = reference_price * Decimal("0.0001")
+    if tick_size is not None and tick_size > pct_buffer:
+        return tick_size
+    return pct_buffer
+
+
+def validate_exchange_stop(
+    *,
+    side: Side,
+    stop_price: Decimal,
+    reference_price: Decimal,
+    tick_size: Decimal | None = None,
+) -> StopExchangeValidation:
+    if stop_price <= 0:
+        return StopExchangeValidation(valid=False, reason="invalid_stop_price")
+    if reference_price <= 0:
+        return StopExchangeValidation(valid=False, reason="invalid_reference_price")
+    buffer = exchange_stop_buffer(reference_price=reference_price, tick_size=tick_size)
+    if side is Side.SHORT:
+        return StopExchangeValidation(
+            valid=stop_price > reference_price + buffer,
+            reason="" if stop_price > reference_price + buffer else "stop_not_exchange_valid",
+            buffer=buffer,
+        )
+    if side is Side.LONG:
+        return StopExchangeValidation(
+            valid=stop_price < reference_price - buffer,
+            reason="" if stop_price < reference_price - buffer else "stop_not_exchange_valid",
+            buffer=buffer,
+        )
+    return StopExchangeValidation(valid=False, reason="invalid_position_side", buffer=buffer)
