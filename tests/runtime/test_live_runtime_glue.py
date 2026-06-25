@@ -3233,8 +3233,13 @@ async def test_market_consumer_drains_batch(monkeypatch):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Stop order post-check wired into _execute_signals() live chain
-# (AE-V9C-LIVE-STOP-POSTCHECK-001)
+# Stop order post-check via coordinator post_result_validator + retry
+# (AE-V9C-LIVE-STOP-POSTCHECK-002)
+#
+# Design: post_result_validator runs inside MultiExchangeOrderCoordinator,
+# NOT duplicated in LiveRuntimeRunner._execute_signals().  The validator
+# retries up to 3 times (0.5 s delay) to tolerate brief exchange latency
+# before marking a stop result ok=False.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -3246,12 +3251,63 @@ _NO_POST_SUBMIT_SYNC_REQ = StrategyRuntimeRequirements(
 )
 
 
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+
+class CountingFakeExecutionClient(FakeExecutionClient):
+    """FakeExecutionClient that tracks fetch_open_stop_orders call count
+    and supports per-call return sequences for retry tests."""
+
+    def __init__(self, exchange, *, open_stop_orders_sequence=(), fail=False):
+        super().__init__(exchange, fail=fail)
+        self.open_stop_orders_sequence = list(open_stop_orders_sequence)
+        self.fetch_open_stop_orders_calls = 0
+
+    async def fetch_open_stop_orders(self):
+        idx = self.fetch_open_stop_orders_calls
+        self.fetch_open_stop_orders_calls += 1
+        if idx < len(self.open_stop_orders_sequence):
+            return list(self.open_stop_orders_sequence[idx])
+        return list(self.open_stop_orders)
+
+
+def _valid_bot_stop() -> Order:
+    """Return a bot-owned valid protective stop for a SHORT position."""
+    return Order(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP",
+        order_id="okx-stop-1",
+        client_order_id="AEOKSS0123456789ABCDEF",
+        status=OrderStatus.NEW,
+        side=OrderSide.BUY,
+        price=Decimal("1686.42"),
+        quantity=Decimal("25.5"),
+        raw={"reduce_only": True, "source": "aetheredge"},
+    )
+
+
+def _short_position() -> Position:
+    return Position(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP",
+        side=PositionSide.SHORT,
+        quantity=Decimal("-25.5"),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Test 1: post-check failure via coordinator (not runner) → stop NOT confirmed
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
 @pytest.mark.asyncio
 async def test_execute_stop_signal_post_check_failure_blocks_confirmed_stop():
-    """Full _execute_signals() chain: coordinator returns ok=True but exchange
-    has no valid bot-owned stop → post-check marks result ok=False →
-    _record_order_results counts failure → strategy does NOT confirm stop
-    and enters manual_required / recovery_blocking_manual_required."""
+    """Coordinator post_result_validator marks stop ok=False when exchange
+    has no valid bot-owned stop.  Runner does NOT call the post-check
+    a second time — the coordinator's verified result flows through
+    _record_order_results / _process_order_result_feedback."""
     strategy = _v8_strategy_with_pending_initial_stop()
 
     runner = _runner(
@@ -3259,18 +3315,7 @@ async def test_execute_stop_signal_post_check_failure_blocks_confirmed_stop():
         services={
             "execution_clients": (FakeExecutionClient(ExchangeName.OKX),),
             "account_clients": (
-                FakeAccountClient(
-                    ExchangeName.OKX,
-                    positions=[
-                        Position(
-                            exchange=ExchangeName.OKX,
-                            symbol="ETH-USDT-PERP",
-                            raw_symbol="ETH-USDT-SWAP",
-                            side=PositionSide.SHORT,
-                            quantity=Decimal("-25.5"),
-                        )
-                    ],
-                ),
+                FakeAccountClient(ExchangeName.OKX, positions=[_short_position()]),
             ),
             "runtime_requirements": _NO_POST_SUBMIT_SYNC_REQ,
         },
@@ -3278,10 +3323,10 @@ async def test_execute_stop_signal_post_check_failure_blocks_confirmed_stop():
 
     signal = _v8_stop_signal()
 
-    # ── Mock coordinator: returns ok=True (unverified) ────────────────────
-    coordinator = AsyncMock()
-    coordinator.execute = AsyncMock(
-        return_value=[
+    # ── Mock coordinator whose execute() applies the post-check internally,
+    #     mirroring the real MultiExchangeOrderCoordinator behaviour. ─────
+    async def mock_execute(intent):
+        raw = [
             ExchangeOrderResult(
                 exchange=ExchangeName.OKX,
                 ok=True,
@@ -3290,7 +3335,13 @@ async def test_execute_stop_signal_post_check_failure_blocks_confirmed_stop():
                 status=OrderStatus.NEW,
             )
         ]
-    )
+        verified = await runner._validate_order_results_before_journal(
+            intent=intent, results=raw
+        )
+        return list(verified)
+
+    coordinator = AsyncMock()
+    coordinator.execute = mock_execute
 
     with patch.object(runner, "_get_order_coordinator", return_value=coordinator):
         await runner._execute_signals([signal], source="test", event_time_ms=6)
@@ -3313,44 +3364,24 @@ async def test_execute_stop_signal_post_check_failure_blocks_confirmed_stop():
     assert runner.stats.submitted_intents == 0
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Test 2: post-check success via coordinator → stop confirmed
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
 @pytest.mark.asyncio
 async def test_execute_stop_signal_post_check_success_confirms_stop():
-    """Full _execute_signals() chain: coordinator returns ok=True AND exchange
-    has a valid bot-owned stop → post-check passes → strategy confirms stop."""
+    """Coordinator post_result_validator verifies stop → strategy confirms."""
     strategy = _v8_strategy_with_pending_initial_stop()
-
-    stop_order = Order(
-        exchange=ExchangeName.OKX,
-        symbol="ETH-USDT-PERP",
-        raw_symbol="ETH-USDT-SWAP",
-        order_id="okx-stop-1",
-        client_order_id="AEOKSS0123456789ABCDEF",
-        status=OrderStatus.NEW,
-        side=OrderSide.BUY,
-        price=Decimal("1686.42"),
-        quantity=Decimal("25.5"),
-        raw={"reduce_only": True, "source": "aetheredge"},
-    )
 
     runner = _runner(
         strategy,
         services={
             "execution_clients": (
-                FakeExecutionClient(ExchangeName.OKX, open_stop_orders=[stop_order]),
+                FakeExecutionClient(ExchangeName.OKX, open_stop_orders=[_valid_bot_stop()]),
             ),
             "account_clients": (
-                FakeAccountClient(
-                    ExchangeName.OKX,
-                    positions=[
-                        Position(
-                            exchange=ExchangeName.OKX,
-                            symbol="ETH-USDT-PERP",
-                            raw_symbol="ETH-USDT-SWAP",
-                            side=PositionSide.SHORT,
-                            quantity=Decimal("-25.5"),
-                        )
-                    ],
-                ),
+                FakeAccountClient(ExchangeName.OKX, positions=[_short_position()]),
             ),
             "runtime_requirements": _NO_POST_SUBMIT_SYNC_REQ,
         },
@@ -3358,10 +3389,8 @@ async def test_execute_stop_signal_post_check_success_confirms_stop():
 
     signal = _v8_stop_signal()
 
-    # ── Mock coordinator: returns ok=True ─────────────────────────────────
-    coordinator = AsyncMock()
-    coordinator.execute = AsyncMock(
-        return_value=[
+    async def mock_execute(intent):
+        raw = [
             ExchangeOrderResult(
                 exchange=ExchangeName.OKX,
                 ok=True,
@@ -3370,7 +3399,13 @@ async def test_execute_stop_signal_post_check_success_confirms_stop():
                 status=OrderStatus.NEW,
             )
         ]
-    )
+        verified = await runner._validate_order_results_before_journal(
+            intent=intent, results=raw
+        )
+        return list(verified)
+
+    coordinator = AsyncMock()
+    coordinator.execute = mock_execute
 
     with patch.object(runner, "_get_order_coordinator", return_value=coordinator):
         await runner._execute_signals([signal], source="test", event_time_ms=6)
@@ -3383,6 +3418,11 @@ async def test_execute_stop_signal_post_check_success_confirms_stop():
     assert strategy.position.pending_stop_replace is False
     assert runner.stats.submitted_intents == 1
     assert runner.stats.failed_intents == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Test 3: OPEN signal NOT affected by stop post-check
+# ═══════════════════════════════════════════════════════════════════════════════
 
 
 @pytest.mark.asyncio
@@ -3432,3 +3472,196 @@ async def test_open_signal_does_not_run_stop_post_check_before_followup_stop():
     assert runner.stats.failed_intents == 0
     # OPEN_SHORT should not require open_stop_orders to exist
     # The post-check simply returns results unchanged for non-stop signals
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Test 4: retry succeeds when open_stop_order becomes visible on 3rd attempt
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_stop_post_check_retries_until_open_stop_order_visible(monkeypatch):
+    """Post-check retries up to 3 times.  When the stop appears on the 3rd
+    fetch_open_stop_orders() call, the result remains ok=True."""
+    monkeypatch.setenv("AETHER_STOP_POST_CHECK_ATTEMPTS", "3")
+    monkeypatch.setenv("AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS", "0.01")
+
+    strategy = _v8_strategy_with_pending_initial_stop()
+
+    # open_stop_orders_sequence: empty, empty, valid
+    exec_client = CountingFakeExecutionClient(
+        ExchangeName.OKX,
+        open_stop_orders_sequence=[[], [], [_valid_bot_stop()]],
+    )
+
+    runner = _runner(
+        strategy,
+        services={
+            "execution_clients": (exec_client,),
+            "account_clients": (
+                FakeAccountClient(ExchangeName.OKX, positions=[_short_position()]),
+            ),
+        },
+    )
+
+    signal = _v8_stop_signal()
+    result = ExchangeOrderResult(
+        exchange=ExchangeName.OKX,
+        ok=True,
+        order_id="okx-stop-1",
+        client_order_id="AEOKSS0123456789ABCDEF",
+        status=OrderStatus.NEW,
+    )
+
+    verified = await runner._verify_stop_order_results(
+        signal=signal, results=[result]
+    )
+
+    # ── Post-check must succeed on 3rd attempt ────────────────────────────
+    assert verified[0].ok is True
+    assert exec_client.fetch_open_stop_orders_calls == 3, (
+        f"Expected 3 fetch_open_stop_orders calls; "
+        f"got {exec_client.fetch_open_stop_orders_calls}"
+    )
+    assert verified[0].raw.get("stop_post_check_attempts") == 3, (
+        f"Expected stop_post_check_attempts=3; "
+        f"got {verified[0].raw.get('stop_post_check_attempts')}"
+    )
+
+    # ── Strategy feedback: stop must be confirmed ─────────────────────────
+    await strategy.on_order_results(
+        signal=signal, results=verified, source="test", event_time_ms=6
+    )
+    assert strategy.position.confirmed_stop_price == Decimal("1686.42")
+    assert strategy.position.pending_stop_replace is False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Test 5: retry exhausted → post-check fails
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_stop_post_check_fails_after_retry_exhausted(monkeypatch):
+    """Post-check retries 3 times; all return empty open_stop_orders →
+    result ok=False, strategy enters manual_required."""
+    monkeypatch.setenv("AETHER_STOP_POST_CHECK_ATTEMPTS", "3")
+    monkeypatch.setenv("AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS", "0.01")
+
+    strategy = _v8_strategy_with_pending_initial_stop()
+
+    exec_client = CountingFakeExecutionClient(
+        ExchangeName.OKX,
+        open_stop_orders_sequence=[[], [], []],
+    )
+
+    runner = _runner(
+        strategy,
+        services={
+            "execution_clients": (exec_client,),
+            "account_clients": (
+                FakeAccountClient(ExchangeName.OKX, positions=[_short_position()]),
+            ),
+        },
+    )
+
+    signal = _v8_stop_signal()
+    result = ExchangeOrderResult(
+        exchange=ExchangeName.OKX,
+        ok=True,
+        order_id="okx-stop-1",
+        client_order_id="AEOKSS0123456789ABCDEF",
+        status=OrderStatus.NEW,
+    )
+
+    verified = await runner._verify_stop_order_results(
+        signal=signal, results=[result]
+    )
+
+    # ── All attempts exhausted → result must be ok=False ──────────────────
+    assert verified[0].ok is False
+    assert "stop_post_check_failed" in (verified[0].error or "")
+    assert exec_client.fetch_open_stop_orders_calls == 3, (
+        f"Expected 3 fetch_open_stop_orders calls; "
+        f"got {exec_client.fetch_open_stop_orders_calls}"
+    )
+    assert verified[0].raw.get("stop_post_check_attempts") == 3, (
+        f"Expected stop_post_check_attempts=3; "
+        f"got {verified[0].raw.get('stop_post_check_attempts')}"
+    )
+
+    # ── Strategy feedback: stop must NOT be confirmed ─────────────────────
+    await strategy.on_order_results(
+        signal=signal, results=verified, source="test", event_time_ms=6
+    )
+    assert strategy.position.confirmed_stop_price is None
+    assert strategy.recovery_manual_required is True
+    assert strategy.recovery_blocking_manual_required is True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Test 6: post-check runs exactly once (not duplicated by runner)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_stop_post_check_runs_once_via_coordinator(monkeypatch):
+    """Verify runner._execute_signals() does NOT call the post-check a second
+    time.  The coordinator (mocked but simulating internal post_result_validator)
+    is the sole caller.  fetch_open_stop_orders must be called exactly the
+    retry count — not doubled."""
+    monkeypatch.setenv("AETHER_STOP_POST_CHECK_ATTEMPTS", "3")
+    monkeypatch.setenv("AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS", "0.01")
+
+    strategy = _v8_strategy_with_pending_initial_stop()
+
+    exec_client = CountingFakeExecutionClient(
+        ExchangeName.OKX,
+        open_stop_orders_sequence=[[], [], [_valid_bot_stop()]],
+    )
+
+    runner = _runner(
+        strategy,
+        services={
+            "execution_clients": (exec_client,),
+            "account_clients": (
+                FakeAccountClient(ExchangeName.OKX, positions=[_short_position()]),
+            ),
+            "runtime_requirements": _NO_POST_SUBMIT_SYNC_REQ,
+        },
+    )
+
+    signal = _v8_stop_signal()
+
+    # ── Mock coordinator whose execute() internally calls the post-check ──
+    async def mock_execute(intent):
+        raw = [
+            ExchangeOrderResult(
+                exchange=ExchangeName.OKX,
+                ok=True,
+                order_id="okx-stop-1",
+                client_order_id="AEOKSS0123456789ABCDEF",
+                status=OrderStatus.NEW,
+            )
+        ]
+        verified = await runner._validate_order_results_before_journal(
+            intent=intent, results=raw
+        )
+        return list(verified)
+
+    coordinator = AsyncMock()
+    coordinator.execute = mock_execute
+
+    with patch.object(runner, "_get_order_coordinator", return_value=coordinator):
+        await runner._execute_signals([signal], source="test", event_time_ms=6)
+
+    # ── fetch_open_stop_orders called exactly 3 times (retry), NOT 6 ──────
+    assert exec_client.fetch_open_stop_orders_calls == 3, (
+        f"Expected 3 fetch_open_stop_orders calls (retry only, no duplicate); "
+        f"got {exec_client.fetch_open_stop_orders_calls}"
+    )
+
+    # ── Strategy received verified result (succeeded on 3rd attempt) ─────
+    assert strategy.position.confirmed_stop_price == Decimal("1686.42")
+    assert runner.stats.submitted_intents == 1
+    assert runner.stats.failed_intents == 0

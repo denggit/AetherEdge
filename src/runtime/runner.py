@@ -2067,10 +2067,6 @@ class LiveRuntimeRunner:
             if self.requirements.order_state.post_submit_sync_enabled:
                 logger.info("Post-submit order sync started | action=%s source=%s", signal.action.value, source)
                 await self._get_order_sync_service().sync_once(sync_type="post_submit", priority=True)
-            results = await self._validate_order_results_before_journal(
-                intent=intent,
-                results=results,
-            )
             self._record_order_results(results)
             self._save_order_results(signal, results)
             self._check_follower_close_failure(signal, results)
@@ -2256,106 +2252,160 @@ class LiveRuntimeRunner:
                 )
                 continue
 
-            try:
-                positions = await acct_client.fetch_positions()
-                open_stop_orders = await exec_client.fetch_open_stop_orders()
-            except Exception as exc:
-                verified.append(
-                    self._stop_post_check_failed_result(
-                        result,
-                        reason="stop_post_check_fetch_failed",
-                        metadata={"post_check": "stop_order_exchange_verification", "fetch_error": str(exc)},
+            # ── Retry loop: exchange open_stop_orders may be briefly stale ──
+            attempts = int(os.getenv("AETHER_STOP_POST_CHECK_ATTEMPTS", "3"))
+            delay = float(os.getenv("AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS", "0.5"))
+
+            for attempt in range(1, attempts + 1):
+                try:
+                    positions = await acct_client.fetch_positions()
+                    open_stop_orders = await exec_client.fetch_open_stop_orders()
+                except Exception as exc:
+                    if attempt < attempts:
+                        logger.warning(
+                            "Stop post-check fetch failed; retrying | exchange=%s attempt=%s attempts=%s error=%s",
+                            exchange.value,
+                            attempt,
+                            attempts,
+                            exc,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    verified.append(
+                        self._stop_post_check_failed_result(
+                            result,
+                            reason="stop_post_check_fetch_failed",
+                            metadata={
+                                "post_check": "stop_order_exchange_verification",
+                                "fetch_error": str(exc),
+                                "stop_post_check_attempts": attempt,
+                            },
+                        )
                     )
+                    break
+
+                active_pos = _first_active_position(positions or ())
+                if active_pos is not None:
+                    position_side = _position_side_from_quantity(active_pos.quantity)
+                    native_qty = abs(active_pos.quantity)
+                else:
+                    position_side = _strategy_position_side(strategy_position)
+                    base_qty = abs(getattr(strategy_position, "qty", Decimal("0")))
+                    native_qty = (
+                        Decimal("0")
+                        if base_qty <= 0
+                        else converter.convert_quantity(
+                            exchange=exchange,
+                            symbol=self.app_config.symbol,
+                            base_quantity=base_qty,
+                            market_profile=market_profile,
+                        ).native_quantity
+                    )
+
+                if position_side is None or native_qty <= 0:
+                    verified.append(result)
+                    break
+
+                try:
+                    position_mode = await acct_client.fetch_position_mode()
+                except Exception:
+                    position_mode = PositionMode.ONE_WAY
+
+                validation = validator.validate_stop_orders(
+                    exchange=exchange,
+                    symbol=self.app_config.symbol,
+                    strategy_id=strategy_id,
+                    position_id=position_id,
+                    position_side=position_side,
+                    position_mode=position_mode,
+                    current_position_native_quantity=native_qty,
+                    canonical_stop_price=canonical_stop_price,
+                    open_stop_orders=open_stop_orders or (),
+                    open_orders=(),
+                    market_profile=market_profile,
                 )
-                continue
+                if validation.should_keep_existing_stop:
+                    verified.append(
+                        ExchangeOrderResult(
+                            exchange=result.exchange,
+                            ok=result.ok,
+                            order_id=result.order_id,
+                            client_order_id=result.client_order_id,
+                            status=result.status,
+                            side=result.side,
+                            quantity=result.quantity,
+                            filled_quantity=result.filled_quantity,
+                            avg_fill_price=result.avg_fill_price,
+                            fee=result.fee,
+                            fee_asset=result.fee_asset,
+                            raw={
+                                **dict(result.raw),
+                                "stop_post_check_attempts": attempt,
+                            },
+                        )
+                    )
+                    logger.info(
+                        "Stop order post-check verified | exchange=%s position_qty=%s desired_stop=%s open_stop_orders=%s attempts=%s",
+                        exchange.value,
+                        native_qty,
+                        canonical_stop_price,
+                        len(open_stop_orders or ()),
+                        attempt,
+                    )
+                    break
 
-            active_pos = _first_active_position(positions or ())
-            if active_pos is not None:
-                position_side = _position_side_from_quantity(active_pos.quantity)
-                native_qty = abs(active_pos.quantity)
-            else:
-                position_side = _strategy_position_side(strategy_position)
-                base_qty = abs(getattr(strategy_position, "qty", Decimal("0")))
-                native_qty = (
-                    Decimal("0")
-                    if base_qty <= 0
-                    else converter.convert_quantity(
-                        exchange=exchange,
-                        symbol=self.app_config.symbol,
-                        base_quantity=base_qty,
-                        market_profile=market_profile,
-                    ).native_quantity
-                )
+                if attempt < attempts:
+                    reason_hint = validation.primary_invalid_reason or "missing_bot_owned_stop"
+                    logger.warning(
+                        "Stop post-check not verified yet; retrying | exchange=%s attempt=%s attempts=%s reason=%s",
+                        exchange.value,
+                        attempt,
+                        attempts,
+                        reason_hint,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
 
-            if position_side is None or native_qty <= 0:
-                verified.append(result)
-                continue
-
-            try:
-                position_mode = await acct_client.fetch_position_mode()
-            except Exception:
-                position_mode = PositionMode.ONE_WAY
-
-            validation = validator.validate_stop_orders(
-                exchange=exchange,
-                symbol=self.app_config.symbol,
-                strategy_id=strategy_id,
-                position_id=position_id,
-                position_side=position_side,
-                position_mode=position_mode,
-                current_position_native_quantity=native_qty,
-                canonical_stop_price=canonical_stop_price,
-                open_stop_orders=open_stop_orders or (),
-                open_orders=(),
-                market_profile=market_profile,
-            )
-            if validation.should_keep_existing_stop:
-                verified.append(result)
-                logger.info(
-                    "Stop order post-check verified | exchange=%s position_qty=%s desired_stop=%s open_stop_orders=%s",
+                # ── All retry attempts exhausted → fail ──────────────────
+                reason = validation.primary_invalid_reason or "missing_bot_owned_stop"
+                logger.critical(
+                    "Stop order post-check failed after %s attempts | exchange=%s position_qty=%s desired_stop=%s open_stop_orders=%s invalid_reason=%s",
+                    attempt,
                     exchange.value,
                     native_qty,
                     canonical_stop_price,
                     len(open_stop_orders or ()),
+                    reason,
                 )
-                continue
-
-            reason = validation.primary_invalid_reason or "missing_bot_owned_stop"
-            logger.critical(
-                "Stop order post-check failed | exchange=%s position_qty=%s desired_stop=%s open_stop_orders=%s invalid_reason=%s",
-                exchange.value,
-                native_qty,
-                canonical_stop_price,
-                len(open_stop_orders or ()),
-                reason,
-            )
-            self.context.alerts.emit(
-                AppAlert(
-                    subject="AetherEdge stop order post-check failed",
-                    severity="critical",
-                    content=(
-                        f"exchange={exchange.value}\n"
-                        f"symbol={self.app_config.symbol}\n"
-                        f"position_qty={native_qty}\n"
-                        f"desired_stop={canonical_stop_price}\n"
-                        f"open_stop_orders={len(open_stop_orders or ())}\n"
-                        f"invalid_reason={reason}\n"
-                    ),
+                self.context.alerts.emit(
+                    AppAlert(
+                        subject="AetherEdge stop order post-check failed",
+                        severity="critical",
+                        content=(
+                            f"exchange={exchange.value}\n"
+                            f"symbol={self.app_config.symbol}\n"
+                            f"position_qty={native_qty}\n"
+                            f"desired_stop={canonical_stop_price}\n"
+                            f"open_stop_orders={len(open_stop_orders or ())}\n"
+                            f"invalid_reason={reason}\n"
+                            f"stop_post_check_attempts={attempt}\n"
+                        ),
+                    )
                 )
-            )
-            verified.append(
-                self._stop_post_check_failed_result(
-                    result,
-                    reason=f"stop_post_check_failed:{reason}",
-                    metadata={
-                        "post_check": "stop_order_exchange_verification",
-                        "position_qty": str(native_qty),
-                        "desired_stop": str(canonical_stop_price),
-                        "open_stop_orders": len(open_stop_orders or ()),
-                        "invalid_reason": reason,
-                    },
+                verified.append(
+                    self._stop_post_check_failed_result(
+                        result,
+                        reason=f"stop_post_check_failed:{reason}",
+                        metadata={
+                            "post_check": "stop_order_exchange_verification",
+                            "stop_post_check_attempts": attempt,
+                            "position_qty": str(native_qty),
+                            "desired_stop": str(canonical_stop_price),
+                            "open_stop_orders": len(open_stop_orders or ()),
+                            "invalid_reason": reason,
+                        },
+                    )
                 )
-            )
         return tuple(verified)
 
     def _stop_post_check_failed_result(
