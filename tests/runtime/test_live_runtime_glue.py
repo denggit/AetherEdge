@@ -18,11 +18,11 @@ from src.market_data.events import MarketFeatureEvent, MarketFeatureEventType
 from src.market_data.models import MarketDataSet, RangeBar, RangeBarAggregate, TimeRange, WarmupRequest, WarmupResult
 from src.market_data.storage import SqliteTradeStore
 from src.market_data.warmup.current_rangebar import CurrentRangeBarWarmupResult
-from src.platform import Balance, ExchangeName, LeverageInfo, Order, OrderStatus, PositionMode
+from src.platform import Balance, ExchangeName, LeverageInfo, Order, OrderSide, OrderStatus, Position, PositionMode, PositionSide
 from src.platform.data.models import MarketKline, MarketTicker, MarketTrade, TradeSide
 from src.platform.markets import get_market_profile
 from src.platform.snapshot import PlatformSnapshot
-from src.order_management import OrderIntent, OrderIntentStatus, SqliteOrderJournalStore, SqlitePositionPlanStore
+from src.order_management import ExchangeOrderResult, OrderIntent, OrderIntentStatus, SqliteOrderJournalStore, SqlitePositionPlanStore
 from src.order_management.position_plan.models import LegPlan, LegRole, LegSyncStatus, PositionPlan, PositionPlanStatus
 from src.planner import ExecutionPlanner
 from src.runtime import LiveRuntimeConfig, LiveRuntimeRunner, RuntimeMode, RuntimePhase, StrategyRuntimeRequirements
@@ -32,6 +32,8 @@ from src.runtime.requirements import ClosedKlineRequirement
 from src.runtime.runner import LiveRuntimeError
 from src.runtime.tasks import ClosedBarScheduler
 from src.signals import SignalAction, TradeSignal
+from strategies.eth_lf_portfolio_v8.domain.models import Side
+from strategies.eth_lf_portfolio_v8.strategy import Strategy as V8Strategy
 
 H4 = 4 * 60 * 60_000
 
@@ -189,12 +191,13 @@ class FakeRecoveryService:
 
 
 class FakeExecutionClient:
-    def __init__(self, exchange: ExchangeName, *, fail: bool = False) -> None:
+    def __init__(self, exchange: ExchangeName, *, fail: bool = False, open_stop_orders=()) -> None:
         self.exchange = exchange
         self.symbol = "ETH-USDT-PERP"
         self.market_profile = get_market_profile("ETH-USDT-PERP")
         self.fail = fail
         self.orders = []
+        self.open_stop_orders = list(open_stop_orders)
 
     async def place_order(self, request):
         if self.fail:
@@ -215,7 +218,7 @@ class FakeExecutionClient:
         return Order(exchange=self.exchange, symbol=query.symbol, raw_symbol=query.symbol, order_id=query.stop_order_id, client_order_id=query.client_order_id, status=OrderStatus.NEW)
 
     async def fetch_open_stop_orders(self):
-        return []
+        return list(self.open_stop_orders)
 
     async def cancel_all_orders(self):
         return []
@@ -228,14 +231,15 @@ class FakeAccountClient:
     symbol = "ETH-USDT-PERP"
     market_profile = get_market_profile("ETH-USDT-PERP")
 
-    def __init__(self, exchange: ExchangeName) -> None:
+    def __init__(self, exchange: ExchangeName, *, positions=()) -> None:
         self.exchange = exchange
+        self.positions = list(positions)
 
     async def fetch_balance(self, asset="USDT"):
         return Balance(exchange=self.exchange, asset=asset, total=Decimal("1000"), available=Decimal("1000"))
 
     async def fetch_positions(self, symbol=None):
-        return []
+        return list(self.positions)
 
     async def fetch_leverage(self, *, margin_mode=None):
         return LeverageInfo(exchange=self.exchange, symbol=self.symbol, raw_symbol=self.symbol, leverage=Decimal("1"))
@@ -362,6 +366,40 @@ def _range_bar(*, bar_id: int, start_time_ms: int, end_time_ms: int, price: Deci
         buy_notional=price,
         sell_notional=Decimal("0"),
         trade_count=1,
+    )
+
+
+def _v8_strategy_with_pending_initial_stop() -> V8Strategy:
+    strategy = V8Strategy()
+    strategy.position.open_master(
+        side=Side.SHORT,
+        entry_time_ms=5,
+        avg_entry=Decimal("1620.30"),
+        qty=Decimal("2.55"),
+        stop_price=Decimal("1686.42"),
+        entry_engine="MOMENTUM_V3",
+        position_id="v8-initial-stop-post-check",
+        stop_confirmed=False,
+    )
+    return strategy
+
+
+def _v8_stop_signal() -> TradeSignal:
+    return TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.PLACE_STOP_LOSS_SHORT,
+        quantity=Decimal("2.55"),
+        trigger_price=Decimal("1686.42"),
+        metadata={"target_exchanges": ["okx"], "position_id": "v8-initial-stop-post-check"},
+    )
+
+
+def _v8_stop_intent(signal: TradeSignal) -> OrderIntent:
+    return OrderIntent(
+        intent_id="intent-v8-stop-post-check",
+        strategy_id="eth_lf_portfolio_v8",
+        signal=signal,
+        target_exchanges=(ExchangeName.OKX,),
     )
 
 
@@ -678,10 +716,17 @@ async def test_live_runtime_smoke_success_records_submitted_journal(tmp_path):
 
     assert repo.get_intent(intent_id).status is OrderIntentStatus.SUBMITTED  # type: ignore[union-attr]
     assert len(repo.list_results(intent_id=intent_id)) == 2
+    with sqlite3.connect(repo.path) as conn:
+        intents = conn.execute("SELECT intent_id FROM order_intents").fetchall()
+        result_exchanges = conn.execute("SELECT exchange, COUNT(*) FROM exchange_order_results WHERE intent_id = ? GROUP BY exchange", (intent_id,)).fetchall()
+    assert len(intents) == 1
+    assert dict(result_exchanges) == {"binance": 1, "okx": 1}
     assert okx.orders[0].quantity == Decimal("5")
     assert binance.orders[0].quantity == Decimal("0.5")
     assert strategy.events[0] == "on_start"
+    assert strategy.events.count("range_aggregate") == 1
     assert runner.stats.submitted_intents == 1
+    assert runner.stats.submitted_intents == len(intents)
     assert (await runner.health()).healthy is True
 
 
@@ -691,8 +736,126 @@ async def test_live_runtime_smoke_partial_failure_is_not_silent(tmp_path):
 
     assert repo.get_intent(intent_id).status is OrderIntentStatus.PARTIALLY_SUBMITTED  # type: ignore[union-attr]
     assert [result.ok for result in repo.list_results(intent_id=intent_id)] == [True, False]
+    with sqlite3.connect(repo.path) as conn:
+        intents = conn.execute("SELECT intent_id FROM order_intents").fetchall()
+        result_exchanges = conn.execute("SELECT exchange, COUNT(*) FROM exchange_order_results WHERE intent_id = ? GROUP BY exchange", (intent_id,)).fetchall()
+    assert len(intents) == 1
+    assert dict(result_exchanges) == {"binance": 1, "okx": 1}
+    assert strategy.events.count("range_aggregate") == 1
     assert runner.stats.partial_failures == 1
+    assert runner.stats.partial_failures == len(intents)
     assert (await runner.health()).healthy is False
+
+
+@pytest.mark.asyncio
+async def test_range_aggregate_for_same_bucket_is_not_executed_twice(tmp_path):
+    runner, repo, intent_id, okx, binance, strategy = await _run_smoke(tmp_path, binance_fail=False)
+
+    duplicate_events = await runner.emit_range_aggregate_for_bucket(0)
+
+    with sqlite3.connect(repo.path) as conn:
+        intents = conn.execute("SELECT intent_id FROM order_intents").fetchall()
+    assert duplicate_events == []
+    assert len(intents) == 1
+    assert len(repo.list_results(intent_id=intent_id)) == 2
+    assert len(okx.orders) == 1
+    assert len(binance.orders) == 1
+    assert strategy.events.count("range_aggregate") == 1
+
+
+@pytest.mark.asyncio
+async def test_place_stop_success_but_open_stop_orders_missing_blocks_confirmed_stop():
+    strategy = _v8_strategy_with_pending_initial_stop()
+    runner = _runner(
+        strategy,
+        services={
+            "execution_clients": (FakeExecutionClient(ExchangeName.OKX),),
+            "account_clients": (
+                FakeAccountClient(
+                    ExchangeName.OKX,
+                    positions=[
+                        Position(
+                            exchange=ExchangeName.OKX,
+                            symbol="ETH-USDT-PERP",
+                            raw_symbol="ETH-USDT-SWAP",
+                            side=PositionSide.SHORT,
+                            quantity=Decimal("-25.5"),
+                        )
+                    ],
+                ),
+            ),
+        },
+    )
+    signal = _v8_stop_signal()
+    result = ExchangeOrderResult(
+        exchange=ExchangeName.OKX,
+        ok=True,
+        order_id="okx-stop-1",
+        client_order_id="AEOKSS0123456789ABCDEF",
+        status=OrderStatus.NEW,
+    )
+
+    verified = await runner._validate_order_results_before_journal(intent=_v8_stop_intent(signal), results=[result])
+    await strategy.on_order_results(signal=signal, results=verified, source="test", event_time_ms=6)
+
+    assert verified[0].ok is False
+    assert verified[0].error == "stop_post_check_failed:missing_bot_owned_stop"
+    assert strategy.position.confirmed_stop_price is None
+    assert strategy.recovery_manual_required is True
+    assert strategy.recovery_blocking_manual_required is True
+    assert any("stop_replace_failed_manual_required" in item for item in strategy.recovery_alerts)
+
+
+@pytest.mark.asyncio
+async def test_place_stop_success_and_exchange_stop_verified_confirms_stop():
+    strategy = _v8_strategy_with_pending_initial_stop()
+    stop_order = Order(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP",
+        order_id="okx-stop-1",
+        client_order_id="AEOKSS0123456789ABCDEF",
+        status=OrderStatus.NEW,
+        side=OrderSide.BUY,
+        price=Decimal("1686.42"),
+        quantity=Decimal("25.5"),
+        raw={"reduce_only": True, "source": "aetheredge"},
+    )
+    runner = _runner(
+        strategy,
+        services={
+            "execution_clients": (FakeExecutionClient(ExchangeName.OKX, open_stop_orders=[stop_order]),),
+            "account_clients": (
+                FakeAccountClient(
+                    ExchangeName.OKX,
+                    positions=[
+                        Position(
+                            exchange=ExchangeName.OKX,
+                            symbol="ETH-USDT-PERP",
+                            raw_symbol="ETH-USDT-SWAP",
+                            side=PositionSide.SHORT,
+                            quantity=Decimal("-25.5"),
+                        )
+                    ],
+                ),
+            ),
+        },
+    )
+    signal = _v8_stop_signal()
+    result = ExchangeOrderResult(
+        exchange=ExchangeName.OKX,
+        ok=True,
+        order_id="okx-stop-1",
+        client_order_id="AEOKSS0123456789ABCDEF",
+        status=OrderStatus.NEW,
+    )
+
+    verified = await runner._validate_order_results_before_journal(intent=_v8_stop_intent(signal), results=[result])
+    await strategy.on_order_results(signal=signal, results=verified, source="test", event_time_ms=6)
+
+    assert verified[0].ok is True
+    assert strategy.position.confirmed_stop_price == Decimal("1686.42")
+    assert strategy.position.pending_stop_replace is False
 
 @pytest.mark.asyncio
 async def test_legacy_private_account_stream_requirement_does_not_start_account_producers(tmp_path):

@@ -87,7 +87,7 @@ def _merge_raw(order: Order, values: Mapping[str, Any]) -> Order:
     return replace(order, raw={**dict(order.raw), **dict(values)})
 
 
-def extract_avg_fill_price(order: Order) -> Decimal | None:
+def extract_avg_fill_price(order: Order, *, allow_price_fallback: bool = False) -> Decimal | None:
     """Extract average fill price from normalized or raw order payloads."""
     raw = _flatten_raw(order.raw)
     for key in ("avg_fill_price", "avgPx", "avgPrice", "fillPx", "priceAvg"):
@@ -98,7 +98,7 @@ def extract_avg_fill_price(order: Order) -> Decimal | None:
     executed_qty = _decimal_or_none(raw.get("executedQty")) or order.filled_quantity
     if cum_quote is not None and executed_qty is not None and executed_qty > 0:
         return cum_quote / executed_qty
-    if order.price is not None and order.price > 0:
+    if allow_price_fallback and order.price is not None and order.price > 0:
         return order.price
     return None
 

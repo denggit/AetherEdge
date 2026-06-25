@@ -15,9 +15,16 @@ class _Client:
     symbol = "ETH-USDT-PERP"
     market_profile = None
 
-    def __init__(self, *, synced_avg_price: Decimal | None, synced_filled_qty: Decimal | None = Decimal("0.5")) -> None:
+    def __init__(
+        self,
+        *,
+        synced_avg_price: Decimal | None,
+        synced_filled_qty: Decimal | None = Decimal("0.5"),
+        synced_order_price: Decimal | None = None,
+    ) -> None:
         self.synced_avg_price = synced_avg_price
         self.synced_filled_qty = synced_filled_qty
+        self.synced_order_price = synced_order_price
         self.queries: list[OrderQuery] = []
 
     async def place_order(self, request):
@@ -48,6 +55,7 @@ class _Client:
             status=OrderStatus.FILLED,
             side=OrderSide.BUY,
             order_type=OrderType.MARKET,
+            price=self.synced_order_price,
             quantity=Decimal("0.5"),
             filled_quantity=self.synced_filled_qty,
             raw=raw,
@@ -95,6 +103,38 @@ async def test_market_entry_without_real_fill_after_status_sync_fails(tmp_path) 
     assert results[0].ok is False
     assert results[0].error == "missing_real_fill_price_or_quantity"
     assert results[0].raw["real_fill_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_market_entry_order_price_does_not_count_as_real_avg_fill_price(tmp_path) -> None:
+    client = _Client(synced_avg_price=None, synced_order_price=Decimal("1620.30"))
+    coordinator = MultiExchangeOrderCoordinator(
+        clients=[client],
+        repository=SqliteOrderJournalStore(tmp_path / "journal.sqlite3"),
+    )
+    intent = _open_intent()
+
+    results = await coordinator.execute(intent)
+
+    assert len(client.queries) == 1
+    assert results[0].ok is False
+    assert results[0].avg_fill_price is None
+    assert results[0].error == "missing_real_fill_price_or_quantity"
+
+
+@pytest.mark.asyncio
+async def test_market_entry_raw_avg_price_counts_as_real_avg_fill_price(tmp_path) -> None:
+    client = _Client(synced_avg_price=Decimal("1620.30"), synced_order_price=Decimal("9999"))
+    coordinator = MultiExchangeOrderCoordinator(
+        clients=[client],
+        repository=SqliteOrderJournalStore(tmp_path / "journal.sqlite3"),
+    )
+    intent = _open_intent()
+
+    results = await coordinator.execute(intent)
+
+    assert results[0].ok is True
+    assert results[0].avg_fill_price == Decimal("1620.30")
 
 
 def _open_intent() -> OrderIntent:

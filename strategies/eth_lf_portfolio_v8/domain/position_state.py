@@ -91,6 +91,7 @@ class V8PositionState:
         entry_risk_mult: Decimal = Decimal("1"),
         units: int = 1,
         position_id: str | None = None,
+        stop_confirmed: bool = True,
     ) -> None:
         if side is Side.FLAT:
             raise ValueError("cannot open flat position")
@@ -107,12 +108,19 @@ class V8PositionState:
         self.first_entry = avg_entry if self.first_entry is None else self.first_entry
         self.avg_entry = avg_entry
         self.initial_sl = stop_price if self.initial_sl is None else self.initial_sl
-        self.stop_price = stop_price
-        self.confirmed_stop_price = stop_price
-        self.desired_stop_price = None
-        self.pending_stop_replace = False
-        self.pending_stop_reason = None
-        self.pending_stop_bar_close_time_ms = None
+        if stop_confirmed:
+            self.stop_price = stop_price
+            self.confirmed_stop_price = stop_price
+            self.desired_stop_price = None
+            self.pending_stop_replace = False
+            self.pending_stop_reason = None
+            self.pending_stop_bar_close_time_ms = None
+        else:
+            self.stop_price = self.confirmed_stop_price
+            self.desired_stop_price = stop_price
+            self.pending_stop_replace = True
+            self.pending_stop_reason = "MASTER_ENTRY_FILLED_REPLACE_STOP"
+            self.pending_stop_bar_close_time_ms = entry_time_ms
         self.risk_per_coin = abs(avg_entry - stop_price)
         self.qty = qty
         self.units = units

@@ -46,6 +46,7 @@ class MultiExchangeOrderCoordinator:
         master_follower_policy: MasterFollowerExecutionPolicy | None = None,
         exit_safety_guard: ExitSafetyGuard | None = None,
         position_plan_store=None,
+        post_result_validator=None,
     ) -> None:
         if not clients:
             raise ValueError("at least one execution client is required")
@@ -60,6 +61,7 @@ class MultiExchangeOrderCoordinator:
         self.master_follower_policy = master_follower_policy
         self.master_follower_evaluator = MasterFollowerPolicyEvaluator(master_follower_policy) if master_follower_policy is not None else None
         self.position_plan_store = position_plan_store
+        self.post_result_validator = post_result_validator
         self._position_mode_cache: dict[ExchangeName, PositionMode] = {}
 
     async def execute(self, intent: OrderIntent) -> list[ExchangeOrderResult]:
@@ -84,6 +86,8 @@ class MultiExchangeOrderCoordinator:
         else:
             results_nested = await asyncio.gather(*(self._execute_for_client(client, intent, plan.items) for client in clients))
             results = [item for group in results_nested for item in group]
+        if callable(self.post_result_validator):
+            results = list(await self.post_result_validator(intent=intent, results=tuple(results)))
         for result in results:
             save_result = getattr(self.repository, "save_result", None)
             if save_result is not None:

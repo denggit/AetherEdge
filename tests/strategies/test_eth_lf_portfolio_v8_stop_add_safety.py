@@ -218,9 +218,96 @@ def test_initial_stop_uses_real_fill_price_not_estimated_close() -> None:
     )
 
     assert strategy.position.avg_entry == Decimal("1620.30")
-    assert strategy.position.stop_price == Decimal("1600.30")
+    assert strategy.position.stop_price is None
+    assert strategy.position.confirmed_stop_price is None
+    assert strategy.position.desired_stop_price == Decimal("1600.30")
+    assert strategy.position.pending_stop_replace is True
     stop = next(signal for signal in signals if signal.action is SignalAction.PLACE_STOP_LOSS_LONG)
     assert stop.trigger_price == Decimal("1600.30")
+
+
+def test_initial_stop_is_pending_until_stop_order_confirmed() -> None:
+    strategy = Strategy()
+    strategy.started = True
+    strategy.equity = Decimal("1000")
+    strategy.pending_entry = PendingEntryPlan(
+        position_id="initial-stop-pending",
+        side=Side.SHORT,
+        engine="MOMENTUM_V3",
+        quantity=Decimal("2.55"),
+        estimated_entry_price=Decimal("1620.30"),
+        atr=Decimal("66.12"),
+        initial_atr_mult=Decimal("1"),
+        bar_close_time_ms=4,
+        entry_risk_scale=Decimal("1.3"),
+        risk_mult=Decimal("1"),
+        quality_mult=Decimal("1"),
+    )
+
+    signals = strategy._handle_master_entry_fill(
+        event=_master_fill_event(price=Decimal("1620.30"), quantity=Decimal("2.55"), event_time_ms=5),
+        filled_qty=Decimal("2.55"),
+    )
+
+    assert strategy.position.in_pos is True
+    assert strategy.position.desired_stop_price == Decimal("1686.42")
+    assert strategy.position.pending_stop_replace is True
+    assert strategy.position.confirmed_stop_price is None
+    assert any(signal.action is SignalAction.PLACE_STOP_LOSS_SHORT for signal in signals)
+
+    asyncio.run(
+        strategy.on_order_results(
+            signal=next(signal for signal in signals if signal.action is SignalAction.PLACE_STOP_LOSS_SHORT),
+            results=[
+                ExchangeOrderResult(
+                    exchange=ExchangeName.OKX,
+                    ok=True,
+                    order_id="okx-stop-1",
+                    status=OrderStatus.NEW,
+                    filled_quantity=Decimal("0"),
+                )
+            ],
+            source="test",
+            event_time_ms=6,
+        )
+    )
+
+    assert strategy.position.confirmed_stop_price == Decimal("1686.42")
+    assert strategy.position.pending_stop_replace is False
+
+    failed = Strategy()
+    failed.started = True
+    failed.equity = Decimal("1000")
+    failed.pending_entry = PendingEntryPlan(
+        position_id="initial-stop-failed",
+        side=Side.SHORT,
+        engine="MOMENTUM_V3",
+        quantity=Decimal("2.55"),
+        estimated_entry_price=Decimal("1620.30"),
+        atr=Decimal("66.12"),
+        initial_atr_mult=Decimal("1"),
+        bar_close_time_ms=4,
+        entry_risk_scale=Decimal("1.3"),
+        risk_mult=Decimal("1"),
+        quality_mult=Decimal("1"),
+    )
+    failed_signals = failed._handle_master_entry_fill(
+        event=_master_fill_event(price=Decimal("1620.30"), quantity=Decimal("2.55"), event_time_ms=5),
+        filled_qty=Decimal("2.55"),
+    )
+    asyncio.run(
+        failed.on_order_results(
+            signal=next(signal for signal in failed_signals if signal.action is SignalAction.PLACE_STOP_LOSS_SHORT),
+            results=[ExchangeOrderResult(exchange=ExchangeName.OKX, ok=False, error="exchange rejected stop")],
+            source="test",
+            event_time_ms=6,
+        )
+    )
+
+    assert failed.position.confirmed_stop_price is None
+    assert failed.recovery_manual_required is True
+    assert failed.recovery_blocking_manual_required is True
+    assert any("stop_replace_failed_manual_required" in item for item in failed.recovery_alerts)
 
 
 def test_add_fill_updates_average_entry_from_real_fill_price() -> None:

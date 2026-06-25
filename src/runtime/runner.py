@@ -194,6 +194,7 @@ class LiveRuntimeRunner:
         self._market_queue_drain_batch_size = int(os.getenv("AETHER_MARKET_QUEUE_DRAIN_BATCH_SIZE", "1000"))
         self._last_trade_health_update_ms = 0
         self._range_context_degraded_buckets: dict[int, str] = {}
+        self._executed_range_aggregate_buckets: set[tuple[str, str, int]] = set()
         self._follower_close_alert_last_ms: dict[str, int] = {}
         self._health = RuntimeHealth(
             phase=RuntimePhase.CREATED,
@@ -532,6 +533,16 @@ class LiveRuntimeRunner:
     async def _emit_range_aggregates(self, aggregates: Sequence[RangeBarAggregate]) -> list[MarketFeatureEvent]:
         events: list[MarketFeatureEvent] = []
         for aggregate in aggregates:
+            key = (aggregate.symbol, str(aggregate.range_pct), int(aggregate.bucket_start_ms))
+            if key in self._executed_range_aggregate_buckets:
+                logger.warning(
+                    "Duplicate range aggregate skipped | symbol=%s range_pct=%s bucket_start_ms=%s",
+                    aggregate.symbol,
+                    aggregate.range_pct,
+                    aggregate.bucket_start_ms,
+                )
+                continue
+            self._executed_range_aggregate_buckets.add(key)
             event = range_aggregate_feature(aggregate, exchange=self.app_config.data_exchange, timeframe=self._range_aggregate_interval)
             self.stats.range_aggregates_created += 1
             await self.process_market_feature(event)
@@ -2053,12 +2064,12 @@ class LiveRuntimeRunner:
             )
             intent = self._intent_factory.create(signal, source=source, event_time_ms=event_time_ms, metadata=metadata)
             results = await self._get_order_coordinator().execute(intent)
-            self._record_order_results(results)
-            self._save_order_results(signal, results)
-            self._check_follower_close_failure(signal, results)
             if self.requirements.order_state.post_submit_sync_enabled:
                 logger.info("Post-submit order sync started | action=%s source=%s", signal.action.value, source)
                 await self._get_order_sync_service().sync_once(sync_type="post_submit", priority=True)
+            self._record_order_results(results)
+            self._save_order_results(signal, results)
+            self._check_follower_close_failure(signal, results)
             if self.requirements.account_state.post_order_sync_enabled and signal.action in {SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT, SignalAction.CLOSE_LONG, SignalAction.CLOSE_SHORT}:
                 await self._get_account_sync_service().sync_once(sync_type="post_order_account", priority=True)
             follow_up = await self._process_order_result_feedback(signal=signal, results=results, source=source, event_time_ms=event_time_ms)
@@ -2154,6 +2165,217 @@ class LiveRuntimeRunner:
                 error_str,
                 attempts,
             )
+
+    async def _validate_order_results_before_journal(
+        self,
+        *,
+        intent,
+        results: Sequence[ExchangeOrderResult],
+    ) -> Sequence[ExchangeOrderResult]:
+        if intent.signal.action not in {SignalAction.PLACE_STOP_LOSS_LONG, SignalAction.PLACE_STOP_LOSS_SHORT}:
+            return results
+        return await self._verify_stop_order_results(signal=intent.signal, results=results)
+
+    async def _verify_stop_order_results(
+        self,
+        *,
+        signal: TradeSignal,
+        results: Sequence[ExchangeOrderResult],
+    ) -> Sequence[ExchangeOrderResult]:
+        successful = [result for result in results if result.ok]
+        if not successful:
+            return results
+
+        strategy = self.context.strategy
+        strategy_position = getattr(strategy, "position", None)
+        if strategy_position is None or not getattr(strategy_position, "in_pos", False):
+            return results
+
+        canonical_stop_price = getattr(strategy_position, "desired_stop_price", None) or signal.trigger_price
+        if canonical_stop_price is None:
+            return [
+                self._stop_post_check_failed_result(
+                    result,
+                    reason="missing_canonical_stop_price",
+                    metadata={"post_check": "stop_order_exchange_verification"},
+                )
+                if result.ok
+                else result
+                for result in results
+            ]
+
+        execution_by_exchange = {client.exchange: client for client in self._get_execution_clients()}
+        account_by_exchange = {client.exchange: client for client in self._get_account_clients()}
+        strategy_id = getattr(getattr(strategy, "config", None), "strategy_id", self.app_config.strategy)
+        position_id = getattr(strategy_position, "position_id", None)
+        market_profile = get_market_profile(self.app_config.symbol)
+        converter = NativeQuantityConverter()
+        validator = RecoveryExitOrderValidator(quantity_converter=converter)
+
+        verified: list[ExchangeOrderResult] = []
+        for result in results:
+            if not result.ok:
+                verified.append(result)
+                continue
+            if not result.order_id and not result.client_order_id:
+                verified.append(
+                    self._stop_post_check_failed_result(
+                        result,
+                        reason="missing_exchange_stop_order_id",
+                        metadata={"post_check": "stop_order_exchange_verification"},
+                    )
+                )
+                continue
+            if result.status not in {OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED}:
+                verified.append(
+                    self._stop_post_check_failed_result(
+                        result,
+                        reason="stop_order_status_not_live",
+                        metadata={
+                            "post_check": "stop_order_exchange_verification",
+                            "status": None if result.status is None else result.status.value,
+                        },
+                    )
+                )
+                continue
+
+            exchange = result.exchange
+            exec_client = execution_by_exchange.get(exchange)
+            acct_client = account_by_exchange.get(exchange)
+            if exec_client is None or acct_client is None:
+                verified.append(
+                    self._stop_post_check_failed_result(
+                        result,
+                        reason="missing_exchange_client_for_stop_post_check",
+                        metadata={"post_check": "stop_order_exchange_verification"},
+                    )
+                )
+                continue
+
+            try:
+                positions = await acct_client.fetch_positions()
+                open_stop_orders = await exec_client.fetch_open_stop_orders()
+            except Exception as exc:
+                verified.append(
+                    self._stop_post_check_failed_result(
+                        result,
+                        reason="stop_post_check_fetch_failed",
+                        metadata={"post_check": "stop_order_exchange_verification", "fetch_error": str(exc)},
+                    )
+                )
+                continue
+
+            active_pos = _first_active_position(positions or ())
+            if active_pos is not None:
+                position_side = _position_side_from_quantity(active_pos.quantity)
+                native_qty = abs(active_pos.quantity)
+            else:
+                position_side = _strategy_position_side(strategy_position)
+                base_qty = abs(getattr(strategy_position, "qty", Decimal("0")))
+                native_qty = (
+                    Decimal("0")
+                    if base_qty <= 0
+                    else converter.convert_quantity(
+                        exchange=exchange,
+                        symbol=self.app_config.symbol,
+                        base_quantity=base_qty,
+                        market_profile=market_profile,
+                    ).native_quantity
+                )
+
+            if position_side is None or native_qty <= 0:
+                verified.append(result)
+                continue
+
+            try:
+                position_mode = await acct_client.fetch_position_mode()
+            except Exception:
+                position_mode = PositionMode.ONE_WAY
+
+            validation = validator.validate_stop_orders(
+                exchange=exchange,
+                symbol=self.app_config.symbol,
+                strategy_id=strategy_id,
+                position_id=position_id,
+                position_side=position_side,
+                position_mode=position_mode,
+                current_position_native_quantity=native_qty,
+                canonical_stop_price=canonical_stop_price,
+                open_stop_orders=open_stop_orders or (),
+                open_orders=(),
+                market_profile=market_profile,
+            )
+            if validation.should_keep_existing_stop:
+                verified.append(result)
+                logger.info(
+                    "Stop order post-check verified | exchange=%s position_qty=%s desired_stop=%s open_stop_orders=%s",
+                    exchange.value,
+                    native_qty,
+                    canonical_stop_price,
+                    len(open_stop_orders or ()),
+                )
+                continue
+
+            reason = validation.primary_invalid_reason or "missing_bot_owned_stop"
+            logger.critical(
+                "Stop order post-check failed | exchange=%s position_qty=%s desired_stop=%s open_stop_orders=%s invalid_reason=%s",
+                exchange.value,
+                native_qty,
+                canonical_stop_price,
+                len(open_stop_orders or ()),
+                reason,
+            )
+            self.context.alerts.emit(
+                AppAlert(
+                    subject="AetherEdge stop order post-check failed",
+                    severity="critical",
+                    content=(
+                        f"exchange={exchange.value}\n"
+                        f"symbol={self.app_config.symbol}\n"
+                        f"position_qty={native_qty}\n"
+                        f"desired_stop={canonical_stop_price}\n"
+                        f"open_stop_orders={len(open_stop_orders or ())}\n"
+                        f"invalid_reason={reason}\n"
+                    ),
+                )
+            )
+            verified.append(
+                self._stop_post_check_failed_result(
+                    result,
+                    reason=f"stop_post_check_failed:{reason}",
+                    metadata={
+                        "post_check": "stop_order_exchange_verification",
+                        "position_qty": str(native_qty),
+                        "desired_stop": str(canonical_stop_price),
+                        "open_stop_orders": len(open_stop_orders or ()),
+                        "invalid_reason": reason,
+                    },
+                )
+            )
+        return tuple(verified)
+
+    def _stop_post_check_failed_result(
+        self,
+        result: ExchangeOrderResult,
+        *,
+        reason: str,
+        metadata: Mapping[str, Any],
+    ) -> ExchangeOrderResult:
+        return ExchangeOrderResult(
+            exchange=result.exchange,
+            ok=False,
+            order_id=result.order_id,
+            client_order_id=result.client_order_id,
+            status=result.status,
+            side=result.side,
+            quantity=result.quantity,
+            filled_quantity=result.filled_quantity,
+            avg_fill_price=result.avg_fill_price,
+            fee=result.fee,
+            fee_asset=result.fee_asset,
+            error=reason,
+            raw={**dict(result.raw), **dict(metadata)},
+        )
 
     def _save_order_results(self, signal: TradeSignal, results: Sequence[ExchangeOrderResult]) -> None:
         save_order = getattr(self.context.state_store, "save_order", None)
@@ -2269,6 +2491,7 @@ class LiveRuntimeRunner:
                     else MasterFollowerExecutionPolicy.from_config(self.runtime_config.master_follower_policy)
                 ),
                 position_plan_store=self._get_position_plan_store(),
+                post_result_validator=self._validate_order_results_before_journal,
             )
         return self._order_coordinator
 
@@ -2536,6 +2759,16 @@ def _position_side_label(position: Position) -> str:
     if side is PositionSide.SHORT:
         return "short"
     return "flat"
+
+
+def _strategy_position_side(position: Any) -> PositionSide | None:
+    side = getattr(position, "side", None)
+    value = str(getattr(side, "value", side) or "").strip().lower()
+    if value == "long":
+        return PositionSide.LONG
+    if value == "short":
+        return PositionSide.SHORT
+    return None
 
 
 async def _jittered_sleep(stop_event: asyncio.Event, interval_seconds: float) -> None:

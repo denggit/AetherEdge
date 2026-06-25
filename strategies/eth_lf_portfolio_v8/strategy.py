@@ -302,7 +302,8 @@ class Strategy:
             for result in results
             if result.exchange.value in target_exchanges
             and result.ok
-            and result.status not in {OrderStatus.CANCELED, OrderStatus.REJECTED}
+            and result.status in {OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED}
+            and (result.order_id is not None or result.client_order_id is not None)
         ]
         if target_exchanges and len(successful) == len(set(target_exchanges)):
             stop_price = self.position.desired_stop_price or signal.trigger_price
@@ -857,6 +858,7 @@ class Strategy:
                 entry_engine=self.pending_entry.engine,
                 entry_risk_mult=self.pending_entry.entry_risk_scale,
                 position_id=self.pending_entry.position_id,
+                stop_confirmed=False,
             )
         self.position.mark_leg_open(
             exchange=exchange,
@@ -877,12 +879,13 @@ class Strategy:
             self.pending_entry = None
             return []
         self.pending_entry = None
-        if self.position.stop_price is None:
+        stop_signal_price = self.position.desired_stop_price or self.position.stop_price
+        if stop_signal_price is None:
             return []
         return self._replace_stop_signals(
             target_exchanges=[exchange],
             quantity=self.position.qty,
-            stop_price=self.position.stop_price,
+            stop_price=stop_signal_price,
             reason="MASTER_ENTRY_FILLED_REPLACE_STOP",
             bar_close_time_ms=event.event_time_ms,
             reference_price=event.price,
@@ -907,13 +910,14 @@ class Strategy:
                 signal_reason="FOLLOWER_ADD_FILLED_REPLACE_STOP",
             )
             return []
-        if self.position.stop_price is None:
+        stop_signal_price = self.position.desired_stop_price or self.position.stop_price
+        if stop_signal_price is None:
             return []
         leg_qty = self.position.legs[exchange].base_qty
         return self._replace_stop_signals(
             target_exchanges=[exchange],
             quantity=leg_qty,
-            stop_price=self.position.stop_price,
+            stop_price=stop_signal_price,
             reason="FOLLOWER_ENTRY_FILLED_REPLACE_STOP",
             bar_close_time_ms=event.event_time_ms,
             reference_price=event.price,
