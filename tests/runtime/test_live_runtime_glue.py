@@ -780,6 +780,7 @@ async def test_place_stop_success_but_open_stop_orders_missing_blocks_confirmed_
                             raw_symbol="ETH-USDT-SWAP",
                             side=PositionSide.SHORT,
                             quantity=Decimal("-25.5"),
+                            entry_price=Decimal("1620.50"),
                         )
                     ],
                 ),
@@ -835,6 +836,7 @@ async def test_place_stop_success_and_exchange_stop_verified_confirms_stop():
                             raw_symbol="ETH-USDT-SWAP",
                             side=PositionSide.SHORT,
                             quantity=Decimal("-25.5"),
+                            entry_price=Decimal("1620.50"),
                         )
                     ],
                 ),
@@ -3311,6 +3313,7 @@ def _short_position() -> Position:
         raw_symbol="ETH-USDT-SWAP",
         side=PositionSide.SHORT,
         quantity=Decimal("-25.5"),
+        entry_price=Decimal("1620.50"),
     )
 
 

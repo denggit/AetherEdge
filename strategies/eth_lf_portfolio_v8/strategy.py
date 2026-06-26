@@ -308,6 +308,18 @@ class Strategy:
         if target_exchanges and len(successful) == len(set(target_exchanges)):
             stop_price = self.position.desired_stop_price or signal.trigger_price
             initial_stop_pending = self.position.confirmed_stop_price is None
+            master_metadata_ok = True
+            for result in successful:
+                if result.exchange.value == self.config.data_exchange:
+                    master_metadata_ok = self._validate_master_position_reconcile_metadata(
+                        result=result,
+                        event_time_ms=event_time_ms,
+                    )
+                    if not master_metadata_ok:
+                        break
+            if not master_metadata_ok:
+                self.position.reject_pending_stop_replace()
+                return
             if stop_price is not None:
                 self.position.confirm_pending_stop_replace(stop_price=stop_price)
             for result in successful:
@@ -334,6 +346,67 @@ class Strategy:
             list(target_exchanges),
             errors,
         )
+
+    def _validate_master_position_reconcile_metadata(
+        self,
+        *,
+        result: ExchangeOrderResult,
+        event_time_ms: int | None,
+    ) -> bool:
+        if result.exchange.value != self.config.data_exchange:
+            return True
+
+        raw = dict(result.raw)
+        source = str(raw.get("exchange_position_source") or "").strip()
+        if not source:
+            logger.debug(
+                "Master exchange position reconcile metadata source missing; allowing legacy stop confirmation | exchange=%s raw_keys=%s event_time_ms=%s",
+                result.exchange.value,
+                sorted(raw),
+                event_time_ms,
+            )
+            return True
+        if source != "stop_post_check":
+            return True
+
+        entry_price = _dec_or_none(raw.get("exchange_position_entry_price"))
+        base_quantity = _dec_or_none(raw.get("exchange_position_base_quantity"))
+        exchange_side = str(raw.get("exchange_position_side") or "").strip().lower()
+        local_side = _side_label(self.position.side)
+
+        if entry_price is None or entry_price <= 0:
+            self.recovery_manual_required = True
+            self.recovery_blocking_manual_required = True
+            self.recovery_alerts.append("master_position_entry_price_missing_manual_required")
+            logger.critical(
+                "Master exchange position entry price missing before stop confirm | exchange=%s raw_keys=%s event_time_ms=%s",
+                result.exchange.value,
+                sorted(raw),
+                event_time_ms,
+            )
+            return False
+        if base_quantity is None or base_quantity <= 0:
+            self.recovery_manual_required = True
+            self.recovery_blocking_manual_required = True
+            self.recovery_alerts.append("master_position_quantity_missing_manual_required")
+            logger.critical(
+                "Master exchange position quantity missing before stop confirm | exchange=%s event_time_ms=%s",
+                result.exchange.value,
+                event_time_ms,
+            )
+            return False
+        if exchange_side and exchange_side != local_side:
+            self.recovery_manual_required = True
+            self.recovery_blocking_manual_required = True
+            self.recovery_alerts.append("master_position_side_mismatch_manual_required")
+            logger.critical(
+                "Master exchange position side mismatch before stop confirm | local_side=%s exchange_side=%s event_time_ms=%s",
+                local_side,
+                exchange_side,
+                event_time_ms,
+            )
+            return False
+        return True
 
     def _reconcile_master_position_from_exchange_result(
         self,

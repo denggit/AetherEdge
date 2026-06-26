@@ -88,6 +88,65 @@ def test_master_position_side_mismatch_enters_manual_required() -> None:
     assert strategy.recovery_manual_required is True
     assert strategy.recovery_blocking_manual_required is True
     assert "master_position_side_mismatch_manual_required" in strategy.recovery_alerts
+    assert strategy.position.confirmed_stop_price is None
+    assert strategy.position.pending_stop_replace is False
+    assert strategy.position.desired_stop_price is None
+
+
+def test_master_position_missing_entry_price_does_not_confirm_stop() -> None:
+    strategy = _short_strategy()
+
+    asyncio.run(
+        strategy.on_order_results(
+            signal=_stop_signal("okx"),
+            results=[
+                _stop_result(
+                    ExchangeName.OKX,
+                    entry_price=None,
+                    base_quantity=Decimal("0.255"),
+                    native_quantity=Decimal("2.55"),
+                    side="short",
+                )
+            ],
+            source="test",
+            event_time_ms=5,
+        )
+    )
+
+    assert strategy.position.confirmed_stop_price is None
+    assert strategy.position.pending_stop_replace is False
+    assert strategy.position.desired_stop_price is None
+    assert strategy.recovery_manual_required is True
+    assert strategy.recovery_blocking_manual_required is True
+    assert "master_position_entry_price_missing_manual_required" in strategy.recovery_alerts
+
+
+def test_master_position_missing_base_quantity_does_not_confirm_stop() -> None:
+    strategy = _short_strategy()
+
+    asyncio.run(
+        strategy.on_order_results(
+            signal=_stop_signal("okx"),
+            results=[
+                _stop_result(
+                    ExchangeName.OKX,
+                    entry_price=Decimal("1620.50"),
+                    base_quantity=None,
+                    native_quantity=Decimal("2.55"),
+                    side="short",
+                )
+            ],
+            source="test",
+            event_time_ms=5,
+        )
+    )
+
+    assert strategy.position.confirmed_stop_price is None
+    assert strategy.position.pending_stop_replace is False
+    assert strategy.position.desired_stop_price is None
+    assert strategy.recovery_manual_required is True
+    assert strategy.recovery_blocking_manual_required is True
+    assert "master_position_quantity_missing_manual_required" in strategy.recovery_alerts
 
 
 def test_master_avg_entry_large_diff_alerts_but_uses_exchange_truth() -> None:
@@ -170,8 +229,8 @@ def _stop_signal(exchange: str) -> TradeSignal:
 def _stop_result(
     exchange: ExchangeName,
     *,
-    entry_price: Decimal,
-    base_quantity: Decimal,
+    entry_price: Decimal | None,
+    base_quantity: Decimal | None,
     native_quantity: Decimal,
     side: str,
 ) -> ExchangeOrderResult:

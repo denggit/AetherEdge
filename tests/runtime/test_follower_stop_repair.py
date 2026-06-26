@@ -79,6 +79,25 @@ def test_follower_stop_repair_uses_exchange_position_quantity_not_local_leg_qty(
     assert place.metadata["follower_position_base_quantity"] == "0.598"
 
 
+def test_follower_topup_uses_follower_leg_target_qty_not_master_qty() -> None:
+    signals, strategy = _recover_with_follower(
+        open_stop_orders=[],
+        follower_quantity=Decimal("-0.211"),
+        local_follower_qty=Decimal("0.598"),
+    )
+
+    topup = _single_follower_topup(signals)
+    assert topup.action is SignalAction.OPEN_SHORT
+    assert topup.metadata["target_exchanges"] == ["binance"]
+    assert topup.metadata["execution_purpose"] == "follower_recovery_topup"
+    assert topup.quantity == Decimal("0.387")
+    assert topup.quantity != Decimal("0.255")
+    assert topup.quantity != Decimal("0.255") - Decimal("0.211")
+
+    assert strategy.position.qty == Decimal("0.255")
+    assert _single_place_stop(signals).quantity == Decimal("0.211")
+
+
 def _recover_with_follower(
     *,
     open_stop_orders: list[Order],
@@ -124,6 +143,16 @@ def _recover_with_follower(
 
 def _single_place_stop(signals: tuple):
     return next(signal for signal in signals if signal.action is SignalAction.PLACE_STOP_LOSS_SHORT)
+
+
+def _single_follower_topup(signals: tuple):
+    return next(
+        signal
+        for signal in signals
+        if signal.action is SignalAction.OPEN_SHORT
+        and signal.metadata.get("execution_purpose") == "follower_recovery_topup"
+        and signal.metadata.get("target_exchanges") == ["binance"]
+    )
 
 
 def _active_plan(*, local_follower_qty: Decimal) -> dict:
