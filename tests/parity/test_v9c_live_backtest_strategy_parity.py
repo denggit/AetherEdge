@@ -1,3 +1,11 @@
+"""V9C live-vs-backtest strategy parity tests.
+
+The expected values here come from the canonical snapshot helper in
+`v9c_backtest_canonical_helpers.py`, not from importing CoinBacktest at test
+runtime. This keeps AetherEdge tests deterministic while making the canonical
+baseline explicit.
+"""
+
 from __future__ import annotations
 
 import asyncio

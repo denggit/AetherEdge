@@ -1,3 +1,15 @@
+"""Minimal CoinBacktest V9C canonical snapshot helpers.
+
+These helpers intentionally do not import the CoinBacktest runtime. They are a
+small, deterministic snapshot of the V9C formulas extracted from the
+CoinBacktest backtest implementation and used to guard AetherEdge live strategy
+semantics.
+
+If CoinBacktest V9C changes, update these helpers and the parity report
+together, then rerun the relevant historical backtest before accepting the new
+canonical baseline.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
