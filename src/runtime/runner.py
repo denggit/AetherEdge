@@ -29,11 +29,16 @@ from src.platform.exchanges.models import ExchangeConfig, ExchangeName, Order, O
 from src.platform.execution.ports import ExecutionClient
 from src.platform.markets import get_market_profile
 from src.platform.snapshot import PlatformSnapshot
+from src.runtime.account_config import (
+    bootstrap_account_config,
+    load_account_config_env,
+    raise_on_failed_account_config,
+)
 from src.runtime.account_sync import AccountStateSyncService, OrderStateSyncService, RequestThrottle, SyncExchangeContext
 from src.runtime.config import LiveRuntimeConfig, live_runtime_config_from_app
 from src.runtime.features import closed_kline_feature, range_aggregate_feature, range_aggregate_unavailable_feature, range_bar_closed_feature
 from src.runtime.heartbeat import RuntimeHeartbeatService
-from src.runtime.models import RuntimeHealth, RuntimePhase
+from src.runtime.models import RuntimeHealth, RuntimeMode, RuntimePhase
 from src.runtime.requirements import StrategyRuntimeRequirements, resolve_strategy_runtime_requirements
 from src.runtime.startup_catchup import (
     StartupCatchupConfig,
@@ -556,6 +561,7 @@ class LiveRuntimeRunner:
         logger.info("Live runtime startup phase started")
         self._initialize_rangebar_trust_window()
         self._set_health(RuntimePhase.WARMING_UP, healthy=True)
+        await self._bootstrap_account_config_if_enabled()
         await self._run_warmup()
         self._set_health(RuntimePhase.CATCHING_UP, healthy=True, warmup_complete=True)
         snapshots = await self._run_recovery()
@@ -575,6 +581,52 @@ class LiveRuntimeRunner:
         )
         self._set_health(RuntimePhase.RUNNING, healthy=True, warmup_complete=True, caught_up=True)
         logger.info("Live runtime startup phase completed")
+
+    async def _bootstrap_account_config_if_enabled(self) -> None:
+        if self.runtime_config.mode is not RuntimeMode.LIVE_RUNTIME:
+            return
+
+        live_trading = _env_bool(os.getenv("AETHER_LIVE_TRADING", "false"))
+        require_leverage = live_trading and not self.app_config.dry_run
+        env = load_account_config_env(
+            exchanges=self.app_config.exchanges,
+            symbol=self.app_config.symbol,
+            require_leverage=require_leverage,
+        )
+        if env.missing_leverage:
+            logger.warning(
+                "Account config leverage env missing; skipping exchanges | exchanges=%s dry_run=%s live_trading=%s",
+                ",".join(exchange.value for exchange in env.missing_leverage),
+                self.app_config.dry_run,
+                live_trading,
+            )
+        if not env.targets:
+            return
+
+        apply_writes = (not self.app_config.dry_run) and (
+            live_trading or _all_exchange_sandbox(self.app_config.exchanges)
+        )
+        results = await bootstrap_account_config(
+            targets=env.targets,
+            account_clients=self._get_account_clients(),
+            execution_clients=self._get_execution_clients(),
+            apply=apply_writes,
+            dry_run=self.app_config.dry_run,
+            fail_on_error=require_leverage,
+        )
+        for result in results:
+            log = logger.info if result.ok else logger.warning
+            log(
+                "Account config bootstrap result | exchange=%s symbol=%s applied=%s verified=%s reason=%s error=%s",
+                result.exchange.value,
+                result.symbol,
+                result.applied,
+                result.verified,
+                result.reason,
+                result.error,
+            )
+        if require_leverage:
+            raise_on_failed_account_config(results)
 
     def _initialize_rangebar_trust_window(self) -> None:
         if not self.requirements.range_bars.enabled or not self.requirements.trades.enabled:
@@ -2841,6 +2893,19 @@ def _stop_post_check_delay_from_env() -> float:
         )
         return 0.5
     return max(0.0, value)
+
+
+def _env_bool(value: str) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _all_exchange_sandbox(exchanges: Sequence[ExchangeName]) -> bool:
+    if not exchanges:
+        return False
+    return all(
+        _env_bool(os.getenv(f"{exchange.value.upper()}_SANDBOX", os.getenv("SANDBOX", "false")))
+        for exchange in exchanges
+    )
 
 
 def _first_active_position(positions: Sequence[Position]) -> Position | None:

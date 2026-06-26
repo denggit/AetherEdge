@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Any, Mapping
 from urllib.parse import urlencode
 
-from src.platform.exchanges.errors import ExchangeConfigError, ExchangeMappingError
+from src.platform.exchanges.errors import ExchangeApiError, ExchangeConfigError, ExchangeMappingError
 from src.platform.exchanges.models import (
     AmendOrderRequest,
     Balance,
@@ -320,15 +320,17 @@ class BinanceExchangeClient:
 
     async def fetch_leverage(self, symbol: str, *, margin_mode: MarginMode = MarginMode.CROSS) -> LeverageInfo:
         positions = await self.fetch_positions(symbol)
-        selected = next((position for position in positions if position.raw_symbol == to_exchange_symbol(self.exchange, symbol)), None)
+        raw_symbol = to_exchange_symbol(self.exchange, symbol)
+        selected = next((position for position in positions if position.raw_symbol == raw_symbol), None)
+        raw = selected.raw if selected is not None else {}
         return LeverageInfo(
             exchange=self.exchange,
             symbol=symbol,
-            raw_symbol=to_exchange_symbol(self.exchange, symbol),
-            leverage=selected.leverage if selected is not None else None,
-            margin_mode=margin_mode,
+            raw_symbol=raw_symbol,
+            leverage=_optional_decimal(raw.get("leverage")) if raw else None,
+            margin_mode=_optional_margin_mode(raw.get("marginType")) or _optional_margin_mode(raw.get("margin_type")) or margin_mode,
             position_side=selected.side if selected is not None else None,
-            raw=selected.raw if selected is not None else {},
+            raw=raw,
         )
 
     async def set_leverage(self, request: LeverageRequest) -> LeverageInfo:
@@ -350,11 +352,13 @@ class BinanceExchangeClient:
 
     async def set_margin_mode(self, symbol: str, margin_mode: MarginMode) -> Mapping[str, Any]:
         raw_symbol = to_exchange_symbol(self.exchange, symbol)
-        return await self._request_signed(
-            "POST",
-            "/fapi/v1/marginType",
-            params={"symbol": raw_symbol, "marginType": _map_binance_margin_type(margin_mode)},
-        )
+        params = {"symbol": raw_symbol, "marginType": _map_binance_margin_type(margin_mode)}
+        try:
+            return await self._request_signed("POST", "/fapi/v1/marginType", params=params)
+        except ExchangeApiError as exc:
+            if _is_binance_margin_type_already_set(exc):
+                return {"code": -4046, "msg": "No need to change margin type.", "symbol": raw_symbol, "marginType": params["marginType"]}
+            raise
 
     async def fetch_position_mode(self) -> PositionMode:
         payload = await self._request_signed("GET", "/fapi/v1/positionSide/dual")
@@ -550,6 +554,25 @@ def _map_binance_trigger_price_type(value: TriggerPriceType) -> str:
 
 def _map_binance_margin_type(mode: MarginMode) -> str:
     return "CROSSED" if mode == MarginMode.CROSS else "ISOLATED"
+
+
+def _optional_margin_mode(value: Any) -> MarginMode | None:
+    text = str(value or "").strip().lower()
+    if text in {"cross", "crossed"}:
+        return MarginMode.CROSS
+    if text == "isolated":
+        return MarginMode.ISOLATED
+    return None
+
+
+def _is_binance_margin_type_already_set(exc: ExchangeApiError) -> bool:
+    payload = exc.payload
+    code = None
+    msg = str(exc).lower()
+    if isinstance(payload, Mapping):
+        code = payload.get("code")
+        msg = str(payload.get("msg") or msg).lower()
+    return str(code) == "-4046" or "no need to change margin type" in msg
 
 
 def _clean_params(params: Mapping[str, Any] | None) -> dict[str, Any]:

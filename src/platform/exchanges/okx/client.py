@@ -543,7 +543,7 @@ class OkxExchangeClient:
             symbol=symbol,
             raw_symbol=raw_symbol,
             leverage=_optional_decimal(data.get("lever")),
-            margin_mode=margin_mode,
+            margin_mode=_optional_margin_mode(data.get("mgnMode")) or margin_mode,
             position_side=_optional_position_side(data.get("posSide")),
             raw=data,
         )
@@ -797,6 +797,15 @@ def _optional_position_side(value: Any) -> PositionSide | None:
         return PositionSide.SHORT
     if text in {"both", "net"}:
         return PositionSide.BOTH
+    return None
+
+
+def _optional_margin_mode(value: Any) -> MarginMode | None:
+    text = str(value or "").lower()
+    if text in {"cross", "crossed"}:
+        return MarginMode.CROSS
+    if text == "isolated":
+        return MarginMode.ISOLATED
     return None
 
 

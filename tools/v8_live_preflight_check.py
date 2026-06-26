@@ -39,6 +39,11 @@ from src.platform.execution.factory import create_execution_client
 from src.platform.exchanges.models import ExchangeConfig, MarginMode, Position, PositionMode, PositionSide
 from src.platform.markets import get_market_profile
 from src.runtime import RuntimeMode, live_runtime_config_from_app, runtime_mode_from_env
+from src.runtime.account_config import (
+    AccountConfigBootstrapResult,
+    bootstrap_account_config,
+    load_account_config_env,
+)
 from src.runtime.requirements import resolve_strategy_runtime_requirements
 from src.runtime.tasks.scheduler import closed_bar_open_time_ms
 from src.strategy import load_strategy
@@ -101,6 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expect-recovery-live", action="store_true", help="Alias for --allow-recovery-start")
     parser.add_argument("--allow-existing-position", action="store_true", help="Do not fail when positions already exist")
     parser.add_argument("--allow-open-orders", action="store_true", help="Do not fail when open regular/stop orders already exist")
+    parser.add_argument("--apply-account-config", action="store_true", help="Apply MARGIN_MODE and exchange leverage before verifying account config")
     parser.add_argument("--skip-api", action="store_true", help="Skip exchange REST read checks")
     parser.add_argument("--skip-kline", action="store_true", help="Skip latest closed 4H kline read check")
     return parser.parse_args()
@@ -141,6 +147,12 @@ async def main() -> int:
             allow_open_orders=args.allow_open_orders or allow_recovery_start,
             allow_recovery_start=allow_recovery_start,
             strategy_id=strategy_id,
+        )
+        await _check_account_config(
+            report,
+            app=app,
+            env_file=args.env_file,
+            apply_account_config=args.apply_account_config,
         )
         await _check_follower_min_notional_balance(report, app=app, runtime=runtime)
     if not args.skip_kline:
@@ -438,6 +450,138 @@ def _check_recovery_start_state(
         report.add("recovery_start", "warn", detail=detail, error="stop_missing_but_recoverable")
         return
     report.add("recovery_start", "warn", detail=detail, error="stop_invalid_but_recoverable")
+
+
+async def _check_account_config(
+    report: PreflightReport,
+    *,
+    app: AppConfig,
+    env_file: str | None,
+    apply_account_config: bool,
+) -> None:
+    live_trading = _bool(os.getenv("AETHER_LIVE_TRADING", "false"))
+    require_leverage = live_trading and not app.dry_run
+    try:
+        env = load_account_config_env(
+            exchanges=app.exchanges,
+            symbol=app.symbol,
+            env_file=env_file,
+            require_leverage=require_leverage,
+        )
+    except Exception as exc:
+        report.add("account_config_env_loaded", "fail", error=str(exc))
+        return
+
+    env_detail = {
+        "margin_mode": env.margin_mode.value,
+        "targets": {
+            target.exchange.value: {
+                "symbol": target.symbol,
+                "leverage": str(target.leverage),
+            }
+            for target in env.targets
+        },
+        "missing_leverage": [exchange.value for exchange in env.missing_leverage],
+        "apply_account_config": apply_account_config,
+        "dry_run": app.dry_run,
+        "live_trading": live_trading,
+    }
+    if env.missing_leverage:
+        status = "fail" if require_leverage else "warn"
+        report.add("account_config_env_loaded", status, detail=env_detail, error="missing exchange leverage env")
+    else:
+        report.add("account_config_env_loaded", "ok", detail=env_detail)
+
+    target_exchanges = {target.exchange for target in env.targets}
+    missing_status = "fail" if require_leverage else "warn"
+    for exchange in app.exchanges:
+        if exchange not in target_exchanges:
+            report.add(
+                f"account_leverage:{exchange.value}",
+                missing_status,
+                detail={"exchange": exchange.value, "symbol": app.symbol, "expected_leverage": None},
+                error=f"{exchange.value.upper()}_LEVERAGE is not configured",
+            )
+
+    if not env.targets:
+        return
+
+    account_clients = [
+        create_account_client(exchange, symbol=app.symbol, config=ExchangeConfig.from_env(exchange))
+        for exchange in app.exchanges
+    ]
+    execution_clients = [
+        create_execution_client(exchange, symbol=app.symbol, config=ExchangeConfig.from_env(exchange))
+        for exchange in app.exchanges
+    ]
+    results = await bootstrap_account_config(
+        targets=env.targets,
+        account_clients=account_clients,
+        execution_clients=execution_clients,
+        apply=apply_account_config,
+        dry_run=app.dry_run,
+        fail_on_error=False,
+    )
+    for result in results:
+        _add_account_config_result_checks(report, result, apply_account_config=apply_account_config, dry_run=app.dry_run)
+
+
+def _add_account_config_result_checks(
+    report: PreflightReport,
+    result: AccountConfigBootstrapResult,
+    *,
+    apply_account_config: bool,
+    dry_run: bool,
+) -> None:
+    exchange = result.exchange.value
+    detail = result.detail()
+    no_position = len(result.active_positions) == 0
+    no_orders = len(result.open_orders) == 0 and len(result.open_stop_orders) == 0
+
+    blocker_status = "ok" if result.verified else "fail"
+    report.add(
+        f"account_config_no_existing_position:{exchange}",
+        "ok" if no_position else blocker_status,
+        detail=detail,
+        error=None if no_position or result.verified else "existing position blocks account config change",
+    )
+    report.add(
+        f"account_config_no_open_orders:{exchange}",
+        "ok" if no_orders else blocker_status,
+        detail=detail,
+        error=None if no_orders or result.verified else "open regular/stop orders block account config change",
+    )
+
+    margin_ok = result.after_margin_mode is result.expected_margin_mode
+    leverage_ok = result.after_leverage == result.expected_leverage
+    mismatch_status = "warn" if dry_run or (result.skipped_write and not apply_account_config) else "fail"
+    report.add(
+        f"account_margin_mode:{exchange}",
+        "ok" if margin_ok else mismatch_status,
+        detail=detail,
+        error=None if margin_ok else "margin mode does not match target",
+    )
+    report.add(
+        f"account_leverage:{exchange}",
+        "ok" if leverage_ok else mismatch_status,
+        detail=detail,
+        error=None if leverage_ok else "leverage does not match target",
+    )
+
+    applied_ok = result.applied or result.verified or (not apply_account_config and result.skipped_write)
+    report.add(
+        f"account_config_applied:{exchange}",
+        "ok" if applied_ok else "fail",
+        detail=detail,
+        error=None if applied_ok else result.error or "account config was not applied",
+    )
+    verified_status = "ok" if result.verified else ("warn" if dry_run or (result.skipped_write and not apply_account_config) else "fail")
+    report.add(
+        f"account_config_verified:{exchange}",
+        verified_status,
+        detail=detail,
+        error=None if result.verified else result.error or "account config not verified",
+    )
 
 
 def _load_active_position_plan_payloads(report: PreflightReport) -> list[dict[str, Any]]:
