@@ -40,6 +40,18 @@ Live intentionally does not implement `delay_bars` or pending delayed range
 exit. User testing selected delay `0`; non-zero live delay config fails at
 strategy config load.
 
+## Risk-Per-Coin Parity
+
+CoinBacktest V9E initializes `risk_per_coin` from the first entry initial stop
+distance: `abs(first_entry - initial_sl)`.
+
+Add-on fills change `avg_entry`, `qty`, and `units`, but they do not change
+`risk_per_coin`. AetherEdge live preserves this behavior. Master position
+reconciliation may update `avg_entry` and `qty` from exchange truth, but it must
+not recompute `risk_per_coin` from the reconciled `avg_entry`. If
+`risk_per_coin` is missing, live repairs it only from `first_entry` and
+`initial_sl`.
+
 ## Execution Ordering
 
 CoinBacktest V9E order:

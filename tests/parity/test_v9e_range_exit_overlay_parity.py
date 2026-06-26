@@ -76,6 +76,38 @@ def test_v9e_short_peak_current_giveback_formula_matches_canonical() -> None:
     assert Decimal(live.metadata["range_exit_giveback_frac"]) == meta["range_exit_giveback_frac"]
 
 
+def test_v9e_range_exit_formula_uses_preserved_initial_risk_after_add_reconcile() -> None:
+    live = evaluate_range_exit(
+        side=Side.LONG,
+        avg_entry=Decimal("105"),
+        risk_per_coin=Decimal("10"),
+        max_fav=Decimal("145"),
+        hold_bars=3,
+        close=Decimal("118"),
+        micro_context_available=True,
+        rf_imbalance=Decimal("-0.06"),
+        rf_close_pos=Decimal("0.50"),
+        config=RangeExitConfig(),
+    )
+    expected, reason, meta = canonical.range_exit_signal(
+        side=1,
+        avg_entry=Decimal("105"),
+        risk_per_coin=Decimal("10"),
+        max_fav=Decimal("145"),
+        hold_bars=3,
+        close=Decimal("118"),
+        micro_context_available=True,
+        rf_imbalance=Decimal("-0.06"),
+        rf_close_pos=Decimal("0.50"),
+    )
+
+    assert live.should_exit is expected is True
+    assert live.reason == reason == "RANGE_EXIT_NEXT_OPEN"
+    assert Decimal(live.metadata["range_exit_peak_r"]) == meta["range_exit_peak_r"] == Decimal("4")
+    assert Decimal(live.metadata["range_exit_current_r"]) == meta["range_exit_current_r"] == Decimal("1.3")
+    assert Decimal(live.metadata["range_exit_giveback_frac"]) == meta["range_exit_giveback_frac"] == Decimal("0.675")
+
+
 def test_v9e_range_exit_priority_between_opposite_and_max_hold() -> None:
     strategy = _started_strategy(Side.SHORT)
     strategy.position.entry_time_ms = 0

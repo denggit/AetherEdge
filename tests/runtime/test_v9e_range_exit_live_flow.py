@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from src.order_management.models import ExchangeOrderResult
+from src.platform import ExchangeName
 from src.signals import SignalAction
 from strategies.eth_lf_portfolio_v8.domain.models import (
     BarReadyContext,
@@ -119,6 +121,60 @@ def test_preflight_requires_v9e_strategy_id_and_range_exit_config() -> None:
     assert any(check.name == "range_exit_no_delay" and check.status == "ok" for check in report.checks)
 
 
+def test_v9e_risk_per_coin_preserved_after_add_fill() -> None:
+    strategy = _started_strategy(Side.LONG)
+
+    strategy.position.add_master_fill(avg_fill_price=Decimal("110"), add_qty=Decimal("1"))
+
+    assert strategy.position.first_entry == Decimal("100")
+    assert strategy.position.initial_sl == Decimal("90")
+    assert strategy.position.avg_entry == Decimal("105")
+    assert strategy.position.risk_per_coin == Decimal("10")
+
+
+def test_v9e_risk_per_coin_preserved_after_master_position_reconcile() -> None:
+    strategy = _started_strategy(Side.LONG)
+
+    strategy._reconcile_master_position_from_exchange_result(
+        result=_master_position_result(entry_price=Decimal("105"), base_quantity=Decimal("2"), side="long"),
+        event_time_ms=H4,
+    )
+
+    assert strategy.position.avg_entry == Decimal("105")
+    assert strategy.position.qty == Decimal("2")
+    assert strategy.position.risk_per_coin == Decimal("10")
+
+
+def test_v9e_risk_per_coin_initialized_from_first_entry_when_missing() -> None:
+    strategy = _started_strategy(Side.LONG)
+    strategy.position.risk_per_coin = None
+
+    strategy._reconcile_master_position_from_exchange_result(
+        result=_master_position_result(entry_price=Decimal("105"), base_quantity=Decimal("2"), side="long"),
+        event_time_ms=H4,
+    )
+
+    assert strategy.position.avg_entry == Decimal("105")
+    assert strategy.position.risk_per_coin == Decimal("10")
+
+
+def test_v9e_range_exit_uses_preserved_initial_risk_after_add_reconcile() -> None:
+    strategy = _started_strategy(Side.LONG)
+    strategy.position.avg_entry = Decimal("105")
+    strategy.position.qty = Decimal("2")
+    strategy.position.units = 2
+    strategy.position.risk_per_coin = Decimal("10")
+    context = _bar_ready_context(side=Side.LONG, close=Decimal("118"), high=Decimal("145"), low=Decimal("104"))
+
+    signals = strategy._position_lifecycle_signals(context)
+
+    assert [signal.action for signal in signals] == [SignalAction.CLOSE_LONG]
+    assert signals[0].reason == "RANGE_EXIT_NEXT_OPEN"
+    assert signals[0].metadata["range_exit_peak_r"] == "4"
+    assert signals[0].metadata["range_exit_current_r"] == "1.3"
+    assert signals[0].metadata["range_exit_giveback_frac"] == "0.675"
+
+
 def _started_strategy(side: Side) -> Strategy:
     strategy = Strategy()
     strategy.started = True
@@ -232,4 +288,17 @@ def _pending_add_plan(strategy: Strategy, context: BarReadyContext) -> PendingAd
         add_unit_number=2,
         position_qty=strategy.position.qty,
         position_units=strategy.position.units,
+    )
+
+
+def _master_position_result(*, entry_price: Decimal, base_quantity: Decimal, side: str) -> ExchangeOrderResult:
+    return ExchangeOrderResult(
+        exchange=ExchangeName.OKX,
+        ok=True,
+        raw={
+            "exchange_position_entry_price": entry_price,
+            "exchange_position_base_quantity": base_quantity,
+            "exchange_position_side": side,
+            "exchange_position_source": "stop_post_check",
+        },
     )

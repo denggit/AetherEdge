@@ -36,7 +36,7 @@ def test_master_exchange_position_avgpx_reconciles_strategy_position_after_stop_
 
     assert strategy.position.avg_entry == Decimal("1620.50")
     assert strategy.position.qty == Decimal("0.255")
-    assert strategy.position.risk_per_coin == abs(Decimal("1620.50") - INITIAL_STOP)
+    assert strategy.position.risk_per_coin == abs(Decimal("1620.30") - INITIAL_STOP)
     assert strategy.position.confirmed_stop_price == INITIAL_STOP
     assert strategy.position.pending_stop_replace is False
 

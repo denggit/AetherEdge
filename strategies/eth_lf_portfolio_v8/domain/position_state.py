@@ -121,7 +121,7 @@ class V8PositionState:
             self.pending_stop_replace = True
             self.pending_stop_reason = "MASTER_ENTRY_FILLED_REPLACE_STOP"
             self.pending_stop_bar_close_time_ms = entry_time_ms
-        self.risk_per_coin = abs(avg_entry - stop_price)
+        self.risk_per_coin = abs(self.first_entry - self.initial_sl)
         self.qty = qty
         self.units = units
         if units == 1:
@@ -145,6 +145,13 @@ class V8PositionState:
         self.avg_entry = (old_avg * self.qty + avg_fill_price * add_qty) / total_qty
         self.qty = total_qty
         self.units += 1
+
+    def initialize_initial_risk_if_missing(self) -> None:
+        if self.risk_per_coin is not None:
+            return
+        if self.first_entry is None or self.initial_sl is None:
+            return
+        self.risk_per_coin = abs(self.first_entry - self.initial_sl)
 
     def update_favorable_extremes(self, *, high: Decimal, low: Decimal) -> None:
         if not self.in_pos:

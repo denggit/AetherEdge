@@ -501,8 +501,7 @@ class Strategy:
         if self.position.first_entry is None or initial_stop_pending:
             self.position.first_entry = entry_price
         self.position.qty = base_quantity
-        if self.position.initial_sl is not None:
-            self.position.risk_per_coin = abs(self.position.avg_entry - self.position.initial_sl)
+        self.position.initialize_initial_risk_if_missing()
         master_leg = self.position.legs.get(self.config.data_exchange)
         if master_leg is not None and master_leg.is_open:
             master_leg.avg_fill_price = entry_price
