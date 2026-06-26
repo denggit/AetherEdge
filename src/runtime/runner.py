@@ -2061,7 +2061,7 @@ class LiveRuntimeRunner:
 
         cfg = getattr(strategy, "config", None)
         strategy_id = getattr(cfg, "strategy_id", "")
-        if str(strategy_id).lower().startswith("eth_lf_portfolio_v9c"):
+        if str(strategy_id).lower().startswith(("eth_lf_portfolio_v9c", "eth_lf_portfolio_v9e")):
             return True
 
         return False

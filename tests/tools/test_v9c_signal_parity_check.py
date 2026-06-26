@@ -283,7 +283,7 @@ def test_strategy_fingerprint_hash_is_stable() -> None:
     second = strategy_fingerprint()
 
     assert first["fingerprint_hash"] == second["fingerprint_hash"]
-    assert first["strategy_id"] == "eth_lf_portfolio_v9c_reclaim_priority"
+    assert first["strategy_id"] == "eth_lf_portfolio_v9e_range_exit_overlay"
 
 
 def test_parser_exposes_logging_options() -> None:

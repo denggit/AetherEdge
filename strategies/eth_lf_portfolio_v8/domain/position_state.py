@@ -124,6 +124,9 @@ class V8PositionState:
         self.risk_per_coin = abs(avg_entry - stop_price)
         self.qty = qty
         self.units = units
+        if units == 1:
+            self.max_fav = avg_entry
+            self.max_adv = avg_entry
         self.entry_engine = entry_engine
         self.entry_risk_mult = entry_risk_mult
 

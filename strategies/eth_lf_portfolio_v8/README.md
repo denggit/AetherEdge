@@ -1,6 +1,6 @@
-# ETH LF Portfolio V9C AetherEdge Plugin
+# ETH LF Portfolio V9E AetherEdge Plugin
 
-Live strategy plugin for the CoinBacktest V9C reclaim-priority portfolio.
+Live strategy plugin for the CoinBacktest V9E range-exit overlay portfolio.
 
 The Python package path is intentionally kept as:
 
@@ -12,13 +12,12 @@ This avoids changing the existing live startup and preflight path. The internal
 `strategy_id` is now:
 
 ```text
-eth_lf_portfolio_v9c_reclaim_priority
+eth_lf_portfolio_v9e_range_exit_overlay
 ```
 
 ## Portfolio routing
 
-V9C uses the same live LF engines as the previous V8 migration, but changes the
-conflict-routing priority:
+V9E keeps the V9C reclaim-first conflict-routing priority:
 
 ```text
 BULL_RECLAIM_V2 > MOMENTUM_V3 > BEAR_V3_ONLY
@@ -55,6 +54,15 @@ The strategy plugin:
 ```
 
 
+## Range Exit Overlay
+
+V9E adds only the range/footprint protective exit overlay on top of the frozen
+V9C baseline. It does not change entries, sizing, stops, priority, or add logic.
+
+The live implementation supports only immediate closed-bar range exit with
+`RANGE_EXIT_NEXT_OPEN` semantics. Delayed range exit is not implemented and
+non-zero `range_exit.delay_bars` is rejected at config load.
+
 ## Live trades warmup policy
 
-V9C does not use REST historical trade warmup in live runtime. Range bars are built only from live websocket trades. If the process starts in the middle of a 4H bucket, that first bucket is treated as micro context unavailable; subsequent fully captured buckets use rangebar/micro risk scaling normally.
+V9E does not use REST historical trade warmup in live runtime. Range bars are built only from live websocket trades. If the process starts in the middle of a 4H bucket, that first bucket is treated as micro context unavailable; subsequent fully captured buckets use rangebar/micro risk scaling normally.

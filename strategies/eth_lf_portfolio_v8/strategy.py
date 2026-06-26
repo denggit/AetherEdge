@@ -26,6 +26,7 @@ from strategies.eth_lf_portfolio_v8.engines.bull_reclaim_v2 import BullReclaimV2
 from strategies.eth_lf_portfolio_v8.engines.momentum_v3 import MomentumV3Engine
 from strategies.eth_lf_portfolio_v8.engines.router import PortfolioRouter
 from strategies.eth_lf_portfolio_v8.execution.signal_mapper import SignalMapperConfig, V8SignalMapper
+from strategies.eth_lf_portfolio_v8.execution.range_exit import RangeExitConfig, evaluate_range_exit
 from strategies.eth_lf_portfolio_v8.execution.sizing import RiskSizingConfig, V8RiskSizer
 from strategies.eth_lf_portfolio_v8.execution.stops import initial_stop_from_risk, is_better_stop, protected_stop, validate_exchange_stop
 from strategies.eth_lf_portfolio_v8.features.buffer import V8FeatureBuffer
@@ -46,12 +47,14 @@ class V8Config:
     data_exchange: str
     runtime_requirements: Mapping[str, Any]
     micro_context: MicroContextConfig
+    range_exit: RangeExitConfig
     global_risk_scale: Decimal
 
     @classmethod
     def from_file(cls, path: str | Path = DEFAULT_CONFIG_PATH) -> "V8Config":
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         micro = data.get("micro_context", {})
+        range_exit = RangeExitConfig.from_mapping(data.get("range_exit", {}))
         return cls(
             strategy_id=str(data.get("strategy_id", "eth_lf_portfolio_v8")),
             symbol=str(data.get("symbol", "ETH-USDT-PERP")),
@@ -67,6 +70,7 @@ class V8Config:
                 contra_risk_scale=Decimal(str(micro.get("contra_risk_scale", "0.50"))),
                 not_aligned_risk_scale=Decimal(str(micro.get("not_aligned_risk_scale", "0.50"))),
             ),
+            range_exit=range_exit,
             global_risk_scale=Decimal(str(data.get("risk", {}).get("global_risk_scale", "1.3"))),
         )
 
@@ -121,7 +125,7 @@ class PendingAddAfterStopUpdatePlan:
 
 
 class Strategy:
-    """AetherEdge live plugin for ETH LF Portfolio V9C reclaim-first routing."""
+    """AetherEdge live plugin for ETH LF Portfolio V9E range-exit overlay."""
 
     raw_trade_callbacks_enabled = False
 
@@ -634,6 +638,8 @@ class Strategy:
         has_open = any(action in {"open_long", "open_short"} for action in actions)
         has_close = any(action in {"close_long", "close_short"} for action in actions)
         has_stop = any("stop" in action for action in actions)
+        range_exit_signal = next((signal for signal in signals if signal.metadata.get("range_exit_triggered") is True), None)
+        range_exit_metadata = dict(range_exit_signal.metadata) if range_exit_signal is not None else {}
 
         reason = "no_signal"
         if not self.started or self.equity is None:
@@ -743,6 +749,11 @@ class Strategy:
             "rf_delta_sum": None if aggregate is None else str(aggregate.delta_notional_sum),
             "rf_imbalance": None if aggregate is None else str(aggregate.imbalance),
             "rf_taker_buy_ratio": None if aggregate is None else str(aggregate.taker_buy_ratio),
+            "range_exit_triggered": bool(range_exit_metadata.get("range_exit_triggered", False)),
+            "range_exit_reason": range_exit_metadata.get("range_exit_reason", ""),
+            "range_exit_peak_r": range_exit_metadata.get("range_exit_peak_r"),
+            "range_exit_current_r": range_exit_metadata.get("range_exit_current_r"),
+            "range_exit_giveback_frac": range_exit_metadata.get("range_exit_giveback_frac"),
         }
 
     def _signals_from_ready_context(self, context: BarReadyContext) -> list[TradeSignal]:
@@ -782,7 +793,7 @@ class Strategy:
         qty = exchange_quantities.get(self.config.data_exchange, Decimal("0"))
         if qty <= 0:
             return []
-        position_id = f"v9c-{context.kline.close_time_ms}-{routed.engine}-{routed.side.name.lower()}"
+        position_id = f"v9e-{context.kline.close_time_ms}-{routed.engine}-{routed.side.name.lower()}"
         entry_risk_scale = context.micro.entry_risk_scale * self.config.global_risk_scale
         self.pending_entry = PendingEntryPlan(
             position_id=position_id,
@@ -856,11 +867,37 @@ class Strategy:
         exit_channel = _entry_engine_exit_channel(context, self.position.entry_engine, self.position.side)
         opposite = context.routed_signal.side is not Side.FLAT and context.routed_signal.side is not self.position.side
         max_hold = params is not None and hold_bars is not None and hold_bars >= params.max_hold_bars
-        if not exit_channel and not opposite and not max_hold:
+        range_exit = None
+        if not exit_channel and not opposite and hold_bars is not None and self.position.avg_entry is not None and self.position.risk_per_coin is not None:
+            aggregate = context.range_aggregate
+            range_context_available = aggregate is not None and aggregate.bar_count >= self.config.micro_context.min_range_bars
+            range_exit = evaluate_range_exit(
+                side=self.position.side,
+                avg_entry=self.position.avg_entry,
+                risk_per_coin=self.position.risk_per_coin,
+                max_fav=self.position.max_fav,
+                hold_bars=hold_bars,
+                close=context.kline.close,
+                micro_context_available=range_context_available,
+                rf_imbalance=None if aggregate is None else aggregate.imbalance,
+                rf_close_pos=None if aggregate is None else aggregate.close_pos,
+                config=self.config.range_exit,
+            )
+        range_exit_now = bool(range_exit is not None and range_exit.should_exit)
+        if not exit_channel and not opposite and not range_exit_now and not max_hold:
             return None
-        reason = "V8_CHANNEL_EXIT" if exit_channel else "V8_OPPOSITE_SIGNAL_EXIT" if opposite else "V8_MAX_HOLD_EXIT"
+        reason = (
+            "V8_CHANNEL_EXIT"
+            if exit_channel
+            else "V8_OPPOSITE_SIGNAL_EXIT"
+            if opposite
+            else range_exit.reason
+            if range_exit_now and range_exit is not None
+            else "V8_MAX_HOLD_EXIT"
+        )
         exchange_quantities = self._open_leg_quantities()
         quantity = exchange_quantities.get(self.config.data_exchange, self.position.qty)
+        range_exit_metadata = dict(range_exit.metadata) if range_exit_now and range_exit is not None else {}
         return V8TradeDecision(
             decision_type=V8DecisionType.CLOSE,
             side=self.position.side,
@@ -875,6 +912,7 @@ class Strategy:
                 "position_id": self.position.position_id,
                 "target_exchanges": sorted(exchange_quantities),
                 "exchange_quantities_base": _exchange_quantity_metadata(exchange_quantities),
+                **range_exit_metadata,
             },
         )
 
@@ -925,7 +963,7 @@ class Strategy:
         qty = exchange_quantities.get(self.config.data_exchange, Decimal("0"))
         if qty <= 0:
             return None
-        position_id = self.position.position_id or f"v9c-add-{context.kline.close_time_ms}-{self.position.entry_engine}-{self.position.side.name.lower()}"
+        position_id = self.position.position_id or f"v9e-add-{context.kline.close_time_ms}-{self.position.entry_engine}-{self.position.side.name.lower()}"
         entry = PendingEntryPlan(
             position_id=position_id,
             side=self.position.side,

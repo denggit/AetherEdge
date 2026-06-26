@@ -134,6 +134,7 @@ async def main() -> int:
 
     _check_runtime_config(report, app=app, runtime_mode=runtime_mode, runtime=runtime, requirements=requirements, expect_real_live=args.expect_real_live)
     _check_strategy_identity(report, strategy)
+    _check_range_exit_config(report, strategy, requirements=requirements)
     _check_local_writable(report, app=app)
 
     if not args.skip_api:
@@ -252,10 +253,29 @@ def _check_runtime_config(report: PreflightReport, *, app: AppConfig, runtime_mo
 
 def _check_strategy_identity(report: PreflightReport, strategy: Any) -> None:
     strategy_id = getattr(getattr(strategy, "config", None), "strategy_id", None)
-    if strategy_id != "eth_lf_portfolio_v9c_reclaim_priority":
-        report.add("strategy_id_v9c", "fail", detail={"strategy_id": strategy_id}, error="strategy_id must be eth_lf_portfolio_v9c_reclaim_priority")
+    if strategy_id != "eth_lf_portfolio_v9e_range_exit_overlay":
+        report.add("strategy_id_v9e", "fail", detail={"strategy_id": strategy_id}, error="strategy_id must be eth_lf_portfolio_v9e_range_exit_overlay")
     else:
-        report.add("strategy_id_v9c", "ok", detail={"strategy_id": strategy_id})
+        report.add("strategy_id_v9e", "ok", detail={"strategy_id": strategy_id})
+
+
+def _check_range_exit_config(report: PreflightReport, strategy: Any, *, requirements: Any) -> None:
+    cfg = getattr(getattr(strategy, "config", None), "range_exit", None)
+    detail = {
+        "enabled": getattr(cfg, "enabled", None),
+        "mode": getattr(cfg, "mode", None),
+        "delay_bars": 0,
+        "range_bars_enabled": getattr(getattr(requirements, "range_bars", None), "enabled", None),
+        "trades_enabled": getattr(getattr(requirements, "trades", None), "enabled", None),
+        "trades_stream_enabled": getattr(getattr(requirements, "trades", None), "stream_enabled", None),
+    }
+    if cfg is None or getattr(cfg, "enabled", False) is not True or getattr(cfg, "mode", "") != "soft":
+        report.add("range_exit_configured", "fail", detail=detail, error="range_exit must be enabled with mode=soft")
+    elif not detail["range_bars_enabled"] or not detail["trades_enabled"] or not detail["trades_stream_enabled"]:
+        report.add("range_exit_configured", "fail", detail=detail, error="range_exit requires enabled range_bars and trades stream")
+    else:
+        report.add("range_exit_configured", "ok", detail=detail)
+    report.add("range_exit_no_delay", "ok", detail={"delay_bars": 0})
 
 
 def _check_local_writable(report: PreflightReport, *, app: AppConfig) -> None:
