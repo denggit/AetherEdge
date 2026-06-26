@@ -110,6 +110,16 @@ class PendingEntryPlan:
         return self.atr * self.initial_atr_mult
 
 
+@dataclass(frozen=True)
+class PendingAddAfterStopUpdatePlan:
+    entry: PendingEntryPlan
+    exchange_quantities: Mapping[str, Decimal]
+    stop_price: Decimal
+    add_unit_number: int
+    position_qty: Decimal
+    position_units: int
+
+
 class Strategy:
     """AetherEdge live plugin for ETH LF Portfolio V9C reclaim-first routing."""
 
@@ -131,6 +141,7 @@ class Strategy:
         self.recovery_manual_required = False
         self.recovery_blocking_manual_required = False
         self.pending_entry: PendingEntryPlan | None = None
+        self.pending_add_after_stop_update: PendingAddAfterStopUpdatePlan | None = None
         self.bar_ready_events: list[BarReadyContext] = []
         self.last_decision_audit: dict[str, Any] | None = None
         self.recovery_alerts: list[str] = []
@@ -199,6 +210,7 @@ class Strategy:
             follower_close_signals = self._follower_close_signals_after_master_close(event_time_ms=event.event_time_ms)
             self.position.close_master(exit_time_ms=event.event_time_ms)
             self.pending_entry = None
+            self._clear_pending_add_after_stop_update(reason="master_close_event")
             signals.extend(follower_close_signals)
         elif self.position.in_pos and not is_master and _is_close_side(event.side, self.position.side):
             self.position.mark_leg_closed(exchange=exchange, sync_status="follower_closed")
@@ -213,8 +225,7 @@ class Strategy:
         event_time_ms: int | None,
     ) -> Sequence[TradeSignal]:
         if signal.action in {SignalAction.PLACE_STOP_LOSS_LONG, SignalAction.PLACE_STOP_LOSS_SHORT}:
-            self._handle_stop_order_results(signal=signal, results=results, event_time_ms=event_time_ms)
-            return []
+            return self._handle_stop_order_results(signal=signal, results=results, event_time_ms=event_time_ms)
         if signal.action is SignalAction.CANCEL_ALL_STOP_ORDERS:
             return []
         if signal.action not in {SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT, SignalAction.CLOSE_LONG, SignalAction.CLOSE_SHORT}:
@@ -280,6 +291,7 @@ class Strategy:
         self.recovery_blocking_manual_required = True
         self.recovery_alerts.append(f"entry_real_fill_missing_manual_required:{detail}")
         self.pending_entry = None
+        self._clear_pending_add_after_stop_update(reason="entry_fill_failure")
         logger.critical(
             "Entry real fill missing | action=%s detail=%s event_time_ms=%s",
             signal.action.value,
@@ -293,7 +305,7 @@ class Strategy:
         signal: TradeSignal,
         results: Sequence[ExchangeOrderResult],
         event_time_ms: int | None,
-    ) -> None:
+    ) -> list[TradeSignal]:
         target_exchanges = _target_exchanges(signal)
         if not target_exchanges:
             target_exchanges = tuple(result.exchange.value for result in results)
@@ -319,7 +331,8 @@ class Strategy:
                         break
             if not master_metadata_ok:
                 self.position.reject_pending_stop_replace()
-                return
+                self._clear_pending_add_after_stop_update(reason="stop_update_metadata_rejected")
+                return []
             if stop_price is not None:
                 self.position.confirm_pending_stop_replace(stop_price=stop_price)
             for result in successful:
@@ -328,8 +341,9 @@ class Strategy:
                     event_time_ms=event_time_ms,
                     initial_stop_pending=initial_stop_pending,
                 )
-            return
+            return self._deferred_add_after_confirmed_stop_update_signals()
         self.position.reject_pending_stop_replace()
+        self._clear_pending_add_after_stop_update(reason="stop_update_failed")
         self.recovery_manual_required = True
         self.recovery_blocking_manual_required = True
         errors = [
@@ -346,6 +360,7 @@ class Strategy:
             list(target_exchanges),
             errors,
         )
+        return []
 
     def _validate_master_position_reconcile_metadata(
         self,
@@ -541,6 +556,7 @@ class Strategy:
 
         self.position.close_master(exit_time_ms=master_close_event.event_time_ms)
         self.pending_entry = None
+        self._clear_pending_add_after_stop_update(reason="master_close_order_result")
         for exchange in follower_closed_exchanges:
             self.position.mark_leg_closed(exchange=exchange, sync_status="follower_closed")
         return follow_up
@@ -799,6 +815,7 @@ class Strategy:
                     "estimated_entry_price": str(estimated_entry),
                     "estimated_initial_stop": str(estimated_stop),
                     "micro_filter_action": context.micro.action,
+                    "micro_entry_risk_scale": str(context.micro.entry_risk_scale),
                     "await_master_fill_before_stop": True,
                     "execution_purpose": "normal_entry",
                     "position_id": position_id,
@@ -810,13 +827,16 @@ class Strategy:
         )
 
     def _position_lifecycle_signals(self, context: BarReadyContext) -> list[TradeSignal]:
+        self._clear_stale_pending_add_after_stop_update(context)
         self.position.update_favorable_extremes(high=context.kline.high, low=context.kline.low)
         self._stop_update_checked_bar_close_time_ms = None
         close_decision = self._close_decision_if_needed(context)
         if close_decision is not None:
+            self._clear_pending_add_after_stop_update(reason="position_close_decision")
             return self.signal_mapper.map_decision(close_decision)
         stop_signals = self._stop_update_signals_if_needed(context)
         if stop_signals:
+            self._defer_add_after_stop_update_if_needed(context)
             return stop_signals
         if self.position.pending_stop_replace:
             return []
@@ -859,21 +879,36 @@ class Strategy:
         )
 
     def _add_signal_if_needed(self, context: BarReadyContext) -> list[TradeSignal]:
-        if self.pending_entry is not None or not self.position.in_pos or self.position.risk_per_coin is None:
+        plan = self._build_add_plan_if_needed(
+            context,
+            stop_update_checked_at_ms=self._stop_update_checked_bar_close_time_ms,
+        )
+        if plan is None:
             return []
+        self.pending_entry = plan.entry
+        return self._add_signals_from_plan(plan, deferred_after_stop_update=False)
+
+    def _build_add_plan_if_needed(
+        self,
+        context: BarReadyContext,
+        *,
+        stop_update_checked_at_ms: int | None,
+    ) -> PendingAddAfterStopUpdatePlan | None:
+        if self.pending_entry is not None or not self.position.in_pos or self.position.risk_per_coin is None:
+            return None
         params = self.engine_params.get(self.position.entry_engine)
         if params is None or self.position.units >= params.max_units or self.position.first_entry is None:
-            return []
+            return None
         trigger_r = Decimal(str(self.position.units)) * params.add_every_r
         if self.position.side is Side.LONG:
             triggered = context.kline.high >= self.position.first_entry + trigger_r * self.position.risk_per_coin
         else:
             triggered = context.kline.low <= self.position.first_entry - trigger_r * self.position.risk_per_coin
         if not triggered:
-            return []
+            return None
         atr_value = _feature_decimal(context, self.position.entry_engine, "atr")
         if atr_value is None or atr_value <= 0:
-            return []
+            return None
         estimated_entry = context.kline.close
         stop_dist = max(params.initial_atr_mult * atr_value, self.position.risk_per_coin)
         estimated_stop = initial_stop_from_risk(side=self.position.side, entry_price=estimated_entry, risk_per_coin=stop_dist)
@@ -889,9 +924,9 @@ class Strategy:
         )
         qty = exchange_quantities.get(self.config.data_exchange, Decimal("0"))
         if qty <= 0:
-            return []
+            return None
         position_id = self.position.position_id or f"v9c-add-{context.kline.close_time_ms}-{self.position.entry_engine}-{self.position.side.name.lower()}"
-        self.pending_entry = PendingEntryPlan(
+        entry = PendingEntryPlan(
             position_id=position_id,
             side=self.position.side,
             engine=self.position.entry_engine,
@@ -904,32 +939,108 @@ class Strategy:
             risk_mult=context.routed_signal.risk_mult,
             quality_mult=context.routed_signal.quality_mult,
             is_add=True,
-            stop_update_checked_at_ms=self._stop_update_checked_bar_close_time_ms,
+            stop_update_checked_at_ms=stop_update_checked_at_ms,
         )
+        return PendingAddAfterStopUpdatePlan(
+            entry=entry,
+            exchange_quantities=dict(exchange_quantities),
+            stop_price=estimated_stop,
+            add_unit_number=self.position.units + 1,
+            position_qty=self.position.qty,
+            position_units=self.position.units,
+        )
+
+    def _add_signals_from_plan(
+        self,
+        plan: PendingAddAfterStopUpdatePlan,
+        *,
+        deferred_after_stop_update: bool,
+    ) -> list[TradeSignal]:
+        metadata: dict[str, Any] = {
+            "add_unit_number": plan.add_unit_number,
+            "micro_entry_risk_scale_applied": False,
+            "micro_entry_risk_scale": "1",
+            "execution_purpose": "normal_entry",
+            "position_id": plan.entry.position_id,
+            "target_exchanges": sorted(plan.exchange_quantities),
+            "exchange_quantities_base": _exchange_quantity_metadata(plan.exchange_quantities),
+            **self._sizing_equity_metadata(plan.exchange_quantities),
+        }
+        if deferred_after_stop_update:
+            metadata.update(
+                {
+                    "deferred_after_stop_update": True,
+                    "stop_update_confirmed_before_add": True,
+                    "stop_update_checked_at_ms": plan.entry.stop_update_checked_at_ms,
+                }
+            )
         return self.signal_mapper.map_decision(
             V8TradeDecision(
                 decision_type=V8DecisionType.ADD,
-                side=self.position.side,
+                side=plan.entry.side,
                 symbol=self.config.symbol,
-                quantity=qty,
-                stop_price=estimated_stop,
-                engine=self.position.entry_engine,
+                quantity=plan.entry.quantity,
+                stop_price=plan.stop_price,
+                engine=plan.entry.engine,
                 reason="V8_ADD_UNIT",
-                bar_close_time_ms=context.kline.close_time_ms,
-                entry_risk_scale=self.config.global_risk_scale,
-                risk_mult=context.routed_signal.risk_mult,
-                quality_mult=context.routed_signal.quality_mult,
-                metadata={
-                    "add_unit_number": self.position.units + 1,
-                    "micro_entry_risk_scale_applied": False,
-                    "execution_purpose": "normal_entry",
-                    "position_id": position_id,
-                    "target_exchanges": sorted(exchange_quantities),
-                    "exchange_quantities_base": _exchange_quantity_metadata(exchange_quantities),
-                    **self._sizing_equity_metadata(exchange_quantities),
-                },
+                bar_close_time_ms=plan.entry.bar_close_time_ms,
+                entry_risk_scale=plan.entry.entry_risk_scale,
+                risk_mult=plan.entry.risk_mult,
+                quality_mult=plan.entry.quality_mult,
+                metadata=metadata,
             )
         )
+
+    def _defer_add_after_stop_update_if_needed(self, context: BarReadyContext) -> None:
+        plan = self._build_add_plan_if_needed(
+            context,
+            stop_update_checked_at_ms=context.kline.close_time_ms,
+        )
+        if plan is None:
+            self._clear_pending_add_after_stop_update(reason="no_same_bar_add_plan")
+            return
+        self.pending_add_after_stop_update = plan
+
+    def _deferred_add_after_confirmed_stop_update_signals(self) -> list[TradeSignal]:
+        plan = self.pending_add_after_stop_update
+        if plan is None:
+            return []
+        self.pending_add_after_stop_update = None
+        if self.pending_entry is not None:
+            return []
+        if not self.position.in_pos or self.position.side is not plan.entry.side:
+            return []
+        if self.position.position_id != plan.entry.position_id:
+            return []
+        if self.position.entry_engine != plan.entry.engine:
+            return []
+        if self.position.pending_stop_replace:
+            return []
+        if self.recovery_blocking_manual_required:
+            return []
+        if self.position.units != plan.position_units or self.position.qty != plan.position_qty:
+            return []
+        self.pending_entry = plan.entry
+        return self._add_signals_from_plan(plan, deferred_after_stop_update=True)
+
+    def _clear_pending_add_after_stop_update(self, *, reason: str) -> None:
+        if self.pending_add_after_stop_update is not None:
+            logger.info("Clearing deferred add-after-stop-update plan | reason=%s", reason)
+        self.pending_add_after_stop_update = None
+
+    def _clear_stale_pending_add_after_stop_update(self, context: BarReadyContext) -> None:
+        plan = self.pending_add_after_stop_update
+        if plan is None:
+            return
+        stale = (
+            plan.entry.bar_close_time_ms != context.kline.close_time_ms
+            or not self.position.in_pos
+            or self.position.side is not plan.entry.side
+            or self.position.position_id != plan.entry.position_id
+            or self.position.entry_engine != plan.entry.engine
+        )
+        if stale:
+            self._clear_pending_add_after_stop_update(reason="stale_or_position_changed")
 
     def _stop_update_signals_if_needed(self, context: BarReadyContext) -> list[TradeSignal]:
         if not self.position.in_pos or self.position.first_entry is None or self.position.avg_entry is None or self.position.risk_per_coin is None:

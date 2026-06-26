@@ -13,3 +13,4 @@ data/
 /.agents/
 /.tmp/
 /.tmp_pytest/
+/reports/

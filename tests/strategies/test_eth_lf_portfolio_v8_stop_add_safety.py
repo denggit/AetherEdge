@@ -24,13 +24,13 @@ INITIAL_STOP = Decimal("1686.4243161302636550")
 PROTECTED_STOP = Decimal("1613.6875683869736345")
 
 
-def test_stop_update_takes_priority_over_add_on_same_closed_bar() -> None:
+def test_stop_update_defers_add_on_same_closed_bar() -> None:
     strategy = _started_short_strategy()
     context = _bar_ready_context(
         close=Decimal("1583.72"),
         high=Decimal("1625"),
         low=Decimal("1550"),
-        atr=None,
+        atr=Decimal("10"),
     )
 
     signals = strategy._position_lifecycle_signals(context)
@@ -42,6 +42,118 @@ def test_stop_update_takes_priority_over_add_on_same_closed_bar() -> None:
     assert signals[1].trigger_price == PROTECTED_STOP
     assert not any(signal.action is SignalAction.OPEN_SHORT for signal in signals)
     assert strategy.pending_entry is None
+    assert strategy.pending_add_after_stop_update is not None
+    assert strategy.pending_add_after_stop_update.entry.stop_update_checked_at_ms == context.kline.close_time_ms
+
+
+def test_live_defers_add_until_stop_update_confirmed_when_same_bar_backtest_allows_both() -> None:
+    strategy = _started_short_strategy()
+    context = _bar_ready_context(
+        close=Decimal("1583.72"),
+        high=Decimal("1625"),
+        low=Decimal("1550"),
+        atr=Decimal("10"),
+    )
+
+    stop_signals = strategy._position_lifecycle_signals(context)
+    follow_up = asyncio.run(
+        strategy.on_order_results(
+            signal=stop_signals[1],
+            results=[_successful_stop_result(PROTECTED_STOP)],
+            source="test",
+            event_time_ms=5,
+        )
+    )
+
+    assert [signal.action for signal in follow_up] == [SignalAction.OPEN_SHORT]
+    assert follow_up[0].metadata["deferred_after_stop_update"] is True
+    assert follow_up[0].metadata["stop_update_confirmed_before_add"] is True
+    assert strategy.pending_entry is not None
+    assert strategy.pending_entry.is_add is True
+    assert strategy.pending_add_after_stop_update is None
+
+
+def test_live_does_not_execute_deferred_add_when_stop_update_fails() -> None:
+    strategy = _started_short_strategy()
+    context = _bar_ready_context(
+        close=Decimal("1583.72"),
+        high=Decimal("1625"),
+        low=Decimal("1550"),
+        atr=Decimal("10"),
+    )
+
+    stop_signals = strategy._position_lifecycle_signals(context)
+    follow_up = asyncio.run(
+        strategy.on_order_results(
+            signal=stop_signals[1],
+            results=[
+                ExchangeOrderResult(
+                    exchange=ExchangeName.OKX,
+                    ok=False,
+                    error="exchange rejected stop",
+                )
+            ],
+            source="test",
+            event_time_ms=5,
+        )
+    )
+
+    assert follow_up == []
+    assert strategy.pending_entry is None
+    assert strategy.pending_add_after_stop_update is None
+    assert strategy.recovery_manual_required is True
+
+
+def test_live_add_after_stop_confirmed_replaces_stop_for_new_total_position() -> None:
+    strategy = _started_short_strategy()
+    context = _bar_ready_context(
+        close=Decimal("1583.72"),
+        high=Decimal("1625"),
+        low=Decimal("1550"),
+        atr=Decimal("10"),
+    )
+
+    stop_signals = strategy._position_lifecycle_signals(context)
+    add_signals = asyncio.run(
+        strategy.on_order_results(
+            signal=stop_signals[1],
+            results=[_successful_stop_result(PROTECTED_STOP)],
+            source="test",
+            event_time_ms=5,
+        )
+    )
+    add_signal = add_signals[0]
+    add_qty = add_signal.quantity
+    assert add_qty is not None
+
+    stop_after_add = asyncio.run(
+        strategy.on_order_results(
+            signal=add_signal,
+            results=[
+                ExchangeOrderResult(
+                    exchange=ExchangeName.OKX,
+                    ok=True,
+                    status=OrderStatus.FILLED,
+                    side=OrderSide.SELL,
+                    quantity=add_qty,
+                    filled_quantity=add_qty,
+                    avg_fill_price=Decimal("1583.72"),
+                    raw={"quantity_semantics": "base_asset"},
+                )
+            ],
+            source="test",
+            event_time_ms=6,
+        )
+    )
+
+    assert strategy.position.units == 2
+    assert strategy.position.qty == Decimal("2.55") + add_qty
+    assert [signal.action for signal in stop_after_add] == [
+        SignalAction.CANCEL_ALL_STOP_ORDERS,
+        SignalAction.PLACE_STOP_LOSS_SHORT,
+    ]
+    assert stop_after_add[1].quantity == strategy.position.qty
+    assert stop_after_add[1].trigger_price == PROTECTED_STOP
 
 
 def test_master_add_fill_does_not_expand_old_stop_quantity_without_stop_check() -> None:
@@ -487,6 +599,23 @@ def _stop_signal(stop_price: Decimal):
         quantity=Decimal("2.55"),
         trigger_price=stop_price,
         metadata={"target_exchanges": ["okx"]},
+    )
+
+
+def _successful_stop_result(stop_price: Decimal) -> ExchangeOrderResult:
+    return ExchangeOrderResult(
+        exchange=ExchangeName.OKX,
+        ok=True,
+        order_id="okx-stop-1",
+        status=OrderStatus.NEW,
+        filled_quantity=Decimal("0"),
+        raw={
+            "exchange_position_source": "stop_post_check",
+            "exchange_position_entry_price": str(FIRST_ENTRY),
+            "exchange_position_base_quantity": "2.55",
+            "exchange_position_side": "short",
+            "confirmed_stop_price": str(stop_price),
+        },
     )
 
 
