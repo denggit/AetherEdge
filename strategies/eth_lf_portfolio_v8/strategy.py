@@ -307,8 +307,15 @@ class Strategy:
         ]
         if target_exchanges and len(successful) == len(set(target_exchanges)):
             stop_price = self.position.desired_stop_price or signal.trigger_price
+            initial_stop_pending = self.position.confirmed_stop_price is None
             if stop_price is not None:
                 self.position.confirm_pending_stop_replace(stop_price=stop_price)
+            for result in successful:
+                self._reconcile_master_position_from_exchange_result(
+                    result=result,
+                    event_time_ms=event_time_ms,
+                    initial_stop_pending=initial_stop_pending,
+                )
             return
         self.position.reject_pending_stop_replace()
         self.recovery_manual_required = True
@@ -326,6 +333,97 @@ class Strategy:
             event_time_ms,
             list(target_exchanges),
             errors,
+        )
+
+    def _reconcile_master_position_from_exchange_result(
+        self,
+        *,
+        result: ExchangeOrderResult,
+        event_time_ms: int | None,
+        initial_stop_pending: bool = False,
+    ) -> None:
+        if result.exchange.value != self.config.data_exchange:
+            return
+        raw = dict(result.raw)
+        entry_price = _dec_or_none(raw.get("exchange_position_entry_price"))
+        base_quantity = _dec_or_none(raw.get("exchange_position_base_quantity"))
+        native_quantity = _dec_or_none(raw.get("exchange_position_native_quantity"))
+        exchange_side = str(raw.get("exchange_position_side") or "").strip().lower()
+        local_side = _side_label(self.position.side)
+        if exchange_side and exchange_side != local_side:
+            self.recovery_manual_required = True
+            self.recovery_blocking_manual_required = True
+            self.recovery_alerts.append("master_position_side_mismatch_manual_required")
+            logger.critical(
+                "Master exchange position side mismatch | local_side=%s exchange_side=%s event_time_ms=%s",
+                local_side,
+                exchange_side,
+                event_time_ms,
+            )
+            return
+
+        if entry_price is None or entry_price <= 0:
+            self.recovery_manual_required = True
+            self.recovery_alerts.append("master_position_entry_price_missing_manual_required")
+            logger.warning(
+                "Master exchange position entry price missing after stop confirm | exchange=%s raw_keys=%s event_time_ms=%s",
+                result.exchange.value,
+                sorted(raw),
+                event_time_ms,
+            )
+            return
+        if base_quantity is None or base_quantity <= 0:
+            self.recovery_manual_required = True
+            self.recovery_alerts.append("master_position_quantity_missing_manual_required")
+            logger.warning(
+                "Master exchange position quantity missing after stop confirm | exchange=%s native_quantity=%s convert_error=%s event_time_ms=%s",
+                result.exchange.value,
+                native_quantity,
+                raw.get("exchange_position_base_quantity_convert_error"),
+                event_time_ms,
+            )
+            return
+
+        old_avg_entry = self.position.avg_entry
+        old_qty = self.position.qty
+        if old_avg_entry is not None and old_avg_entry > 0 and _relative_diff(old_avg_entry, entry_price) >= Decimal("0.005"):
+            self.recovery_manual_required = True
+            self.recovery_alerts.append("master_avg_entry_large_diff_manual_required")
+            logger.warning(
+                "Master exchange avg entry differs from local canonical position | old_avg_entry=%s new_avg_entry=%s event_time_ms=%s",
+                old_avg_entry,
+                entry_price,
+                event_time_ms,
+            )
+        if old_qty > 0 and _relative_diff(old_qty, base_quantity) >= Decimal("0.005"):
+            self.recovery_manual_required = True
+            self.recovery_alerts.append("master_qty_large_diff_manual_required")
+            logger.warning(
+                "Master exchange quantity differs from local canonical position | old_qty=%s new_qty=%s event_time_ms=%s",
+                old_qty,
+                base_quantity,
+                event_time_ms,
+            )
+
+        self.position.avg_entry = entry_price
+        if self.position.first_entry is None or initial_stop_pending:
+            self.position.first_entry = entry_price
+        self.position.qty = base_quantity
+        if self.position.initial_sl is not None:
+            self.position.risk_per_coin = abs(self.position.avg_entry - self.position.initial_sl)
+        master_leg = self.position.legs.get(self.config.data_exchange)
+        if master_leg is not None and master_leg.is_open:
+            master_leg.avg_fill_price = entry_price
+            master_leg.base_qty = base_quantity
+            if native_quantity is not None and native_quantity > 0:
+                master_leg.native_qty = native_quantity
+        logger.info(
+            "Master exchange position reconciled | source=master_exchange_position old_avg_entry=%s new_avg_entry=%s old_qty=%s new_qty=%s event_time_ms=%s",
+            old_avg_entry,
+            entry_price,
+            old_qty,
+            base_quantity,
+            event_time_ms,
         )
 
     def _handle_close_order_result_events(self, *, signal: TradeSignal, events: Sequence[AccountEvent]) -> Sequence[TradeSignal]:
@@ -1011,7 +1109,18 @@ class Strategy:
             if reverse_qty > 0:
                 self.position.legs[exchange] = self.position.legs.get(exchange) or self.position.mark_leg_closed(exchange=exchange, sync_status="reverse_position_manual_required")
                 self.position.legs[exchange].sync_status = "reverse_position_manual_required"
+                self.recovery_manual_required = True
+                self.recovery_blocking_manual_required = True
                 self.recovery_alerts.append(f"follower_reverse_position:{exchange}")
+                self.recovery_alerts.append(f"follower_position_side_mismatch_manual_required:{exchange}")
+                logger.critical(
+                    "Follower position side mismatch blocks stop repair | exchange=%s master_side=%s reverse_base_quantity=%s reverse_native_quantity=%s position_id=%s",
+                    exchange,
+                    _side_label(side),
+                    reverse_qty,
+                    _reverse_native_qty,
+                    self.position.position_id,
+                )
                 continue
             if same_qty <= 0 and target_qty > 0:
                 self.position.mark_leg_closed(exchange=exchange, sync_status="missing")
@@ -1196,18 +1305,28 @@ class Strategy:
             for order in validation.unsupported_bot_exit_orders:
                 self.recovery_alerts.append(f"unsupported_take_profit_or_trailing_manual_required:{exchange}:{order.order_id or order.client_order_id or 'unknown'}")
         if any(check.order is None and check.invalid_reason == "missing_bot_owned_stop" for check in validation.checks):
-            self.recovery_manual_required = True
-            self.recovery_blocking_manual_required = True
-            self.recovery_alerts.append(f"critical_stop_missing_while_in_position_manual_required:{exchange}")
-            logger.critical(
-                "Stop missing while position is active | exchange=%s position_id=%s quantity=%s stop_price=%s",
-                exchange,
-                self.position.position_id,
-                quantity,
-                stop_price,
-            )
+            if exchange == self.config.data_exchange:
+                self.recovery_manual_required = True
+                self.recovery_blocking_manual_required = True
+                self.recovery_alerts.append(f"critical_stop_missing_while_in_position_manual_required:{exchange}")
+                logger.critical(
+                    "Stop missing while position is active | exchange=%s position_id=%s quantity=%s stop_price=%s",
+                    exchange,
+                    self.position.position_id,
+                    quantity,
+                    stop_price,
+                )
+            else:
+                logger.warning(
+                    "Follower stop missing; scheduling repair | exchange=%s position_id=%s quantity=%s stop_price=%s",
+                    exchange,
+                    self.position.position_id,
+                    quantity,
+                    stop_price,
+                )
         if validation.should_keep_existing_stop:
             return signals
+        repair_metadata = self._follower_stop_repair_metadata(validation=validation, exchange=exchange)
         if validation.should_cancel_and_replace_bot_stops:
             action = "manual_required" if validation.has_unknown_exit_orders else "cancel_replace"
             logger.info(
@@ -1238,6 +1357,7 @@ class Strategy:
                     stop_price=stop_price,
                     reason=reason,
                     bar_close_time_ms=None,
+                    metadata_overrides=repair_metadata,
                 )
             )
             cancel_count = len(validation.bot_owned_orders)
@@ -1249,6 +1369,7 @@ class Strategy:
                     stop_price=stop_price,
                     reason=reason,
                     bar_close_time_ms=None,
+                    metadata_overrides=repair_metadata,
                 )
             )
             cancel_count = 0
@@ -1266,6 +1387,24 @@ class Strategy:
             stop_price,
         )
         return signals
+
+    def _follower_stop_repair_metadata(
+        self,
+        *,
+        validation: RecoveryExitValidationResult,
+        exchange: str,
+    ) -> dict[str, Any] | None:
+        if exchange == self.config.data_exchange:
+            return None
+        return {
+            "execution_purpose": "follower_stop_repair",
+            "target_exchanges": [exchange],
+            "canonical_source_exchange": self.config.data_exchange,
+            "canonical_stop_price": str(validation.canonical_stop_price),
+            "follower_position_native_quantity": str(validation.current_position_native_quantity),
+            "follower_position_base_quantity": str(validation.current_position_base_quantity),
+            "repair_reason": _follower_stop_repair_reason(validation),
+        }
 
     def _cleanup_missing_follower_stops(self, *, snapshot: PlatformSnapshot | None, exchange: str, position_id: str | None) -> list[TradeSignal]:
         if snapshot is None:
@@ -1343,6 +1482,7 @@ class Strategy:
         bar_close_time_ms: int | None,
         exchange_quantities: Mapping[str, Decimal] | None = None,
         reference_price: Decimal | None = None,
+        metadata_overrides: Mapping[str, Any] | None = None,
     ) -> list[TradeSignal]:
         if not self._stop_is_exchange_valid(
             stop_price=stop_price,
@@ -1361,6 +1501,7 @@ class Strategy:
                 bar_close_time_ms=bar_close_time_ms,
                 exchange_quantities=exchange_quantities,
                 reference_price=reference_price,
+                metadata_overrides=metadata_overrides,
             ),
         ]
 
@@ -1386,6 +1527,7 @@ class Strategy:
         bar_close_time_ms: int | None,
         exchange_quantities: Mapping[str, Decimal] | None = None,
         reference_price: Decimal | None = None,
+        metadata_overrides: Mapping[str, Any] | None = None,
     ) -> list[TradeSignal]:
         if not self._stop_is_exchange_valid(
             stop_price=stop_price,
@@ -1410,10 +1552,14 @@ class Strategy:
                     "stop_price_source": "master_canonical",
                     "execution_purpose": "stop_sync",
                     "replace_mode": "cancel_then_place_validated",
+                    "stop_replace_atomic_supported": False,
+                    "stop_replace_mode": "cancel_then_place_validated",
+                    "stop_replace_non_atomic_reason": "no_targeted_stop_cancel_capability",
                     "desired_stop_price": str(stop_price),
                     "confirmed_stop_price": None if self.position.stop_price is None else str(self.position.stop_price),
                     "position_id": self.position.position_id,
                     **({"exchange_quantities_base": _exchange_quantity_metadata(exchange_quantities)} if exchange_quantities else {}),
+                    **dict(metadata_overrides or {}),
                 },
             )
         )[0]
@@ -1645,6 +1791,29 @@ def _snapshot_sizing_equity(snapshot: PlatformSnapshot) -> Decimal:
 
 def _exchange_quantity_metadata(values: Mapping[str, Decimal]) -> dict[str, str]:
     return {str(exchange): str(quantity) for exchange, quantity in values.items() if quantity > 0}
+
+
+def _relative_diff(old: Decimal, new: Decimal) -> Decimal:
+    if old == 0:
+        return Decimal("0")
+    return abs(new - old) / abs(old)
+
+
+def _follower_stop_repair_reason(validation: RecoveryExitValidationResult) -> str:
+    reasons = {check.invalid_reason for check in validation.checks if check.invalid_reason}
+    if "missing_bot_owned_stop" in reasons:
+        return "missing_bot_owned_stop"
+    if "quantity_below_position" in reasons:
+        return "under_protected:quantity_too_small"
+    if "trigger_price_mismatch" in reasons:
+        return "price_mismatch"
+    if "wrong_side" in reasons or "wrong_position_side" in reasons:
+        return "stop_side_mismatch"
+    if len(validation.bot_owned_orders) > 1:
+        return "duplicate_bot_owned_stop"
+    if reasons:
+        return ",".join(sorted(reasons))
+    return validation.primary_invalid_reason or "stop_coverage_repair"
 
 
 def _default_engine_execution_params() -> dict[str, EngineExecutionParams]:

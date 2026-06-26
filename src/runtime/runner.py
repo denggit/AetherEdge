@@ -2335,6 +2335,13 @@ class LiveRuntimeRunner:
                     market_profile=market_profile,
                 )
                 if validation.should_keep_existing_stop:
+                    exchange_position_metadata = _exchange_position_metadata(
+                        active_pos=active_pos,
+                        exchange=exchange,
+                        symbol=self.app_config.symbol,
+                        market_profile=market_profile,
+                        converter=converter,
+                    )
                     verified.append(
                         ExchangeOrderResult(
                             exchange=result.exchange,
@@ -2351,6 +2358,7 @@ class LiveRuntimeRunner:
                             raw={
                                 **dict(result.raw),
                                 "stop_post_check_attempts": attempt,
+                                **exchange_position_metadata,
                             },
                         )
                     )
@@ -2848,6 +2856,43 @@ def _position_side_from_quantity(quantity: Decimal) -> PositionSide | None:
     if quantity < 0:
         return PositionSide.SHORT
     return None
+
+
+def _exchange_position_metadata(
+    *,
+    active_pos: Position,
+    exchange: ExchangeName,
+    symbol: str,
+    market_profile,
+    converter: NativeQuantityConverter,
+) -> dict[str, Any]:
+    native_qty = abs(active_pos.quantity)
+    side = _position_side_from_quantity(active_pos.quantity)
+    if side is None and active_pos.side in {PositionSide.LONG, PositionSide.SHORT}:
+        side = active_pos.side
+    metadata: dict[str, Any] = {
+        "exchange_position_source": "stop_post_check",
+        "exchange_position_side": None if side is None else side.value,
+        "exchange_position_native_quantity": native_qty,
+        "exchange_position_entry_price": active_pos.entry_price,
+    }
+    try:
+        metadata["exchange_position_base_quantity"] = converter.native_to_base_quantity(
+            exchange=exchange,
+            symbol=symbol,
+            native_quantity=native_qty,
+            market_profile=market_profile,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Stop post-check exchange position quantity conversion failed | exchange=%s symbol=%s native_quantity=%s error=%s",
+            exchange.value,
+            symbol,
+            native_qty,
+            exc,
+        )
+        metadata["exchange_position_base_quantity_convert_error"] = str(exc)
+    return metadata
 
 
 def _position_side_label(position: Position) -> str:

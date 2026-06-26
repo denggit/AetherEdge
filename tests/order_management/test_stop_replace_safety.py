@@ -62,6 +62,44 @@ def test_missing_exchange_stop_while_in_position_sets_manual_required() -> None:
     assert any(signal.action is SignalAction.PLACE_STOP_LOSS_SHORT for signal in signals)
 
 
+def test_stop_replace_metadata_marks_non_atomic_when_no_targeted_cancel() -> None:
+    strategy = _short_strategy()
+
+    signals = strategy._replace_stop_signals(
+        target_exchanges=["okx"],
+        quantity=Decimal("2.55"),
+        stop_price=Decimal("1670"),
+        reason="V8_PROTECTED_TRAILING_STOP_UPDATE",
+        bar_close_time_ms=8,
+    )
+
+    place = next(signal for signal in signals if signal.action is SignalAction.PLACE_STOP_LOSS_SHORT)
+    assert place.metadata["stop_replace_atomic_supported"] is False
+    assert place.metadata["stop_replace_mode"] == "cancel_then_place_validated"
+    assert place.metadata["stop_replace_non_atomic_reason"] == "no_targeted_stop_cancel_capability"
+    assert place.metadata["replace_mode"] == "cancel_then_place_validated"
+
+
+def test_stop_replace_never_places_new_then_cancel_all_without_targeted_cancel() -> None:
+    strategy = _short_strategy()
+
+    signals = strategy._replace_stop_signals(
+        target_exchanges=["okx"],
+        quantity=Decimal("2.55"),
+        stop_price=Decimal("1670"),
+        reason="V8_PROTECTED_TRAILING_STOP_UPDATE",
+        bar_close_time_ms=8,
+    )
+
+    seen_place = False
+    for signal in signals:
+        if signal.action in {SignalAction.PLACE_STOP_LOSS_LONG, SignalAction.PLACE_STOP_LOSS_SHORT}:
+            seen_place = True
+            assert signal.metadata.get("stop_replace_mode") != "place_new_then_cancel_all"
+        if seen_place:
+            assert signal.action is not SignalAction.CANCEL_ALL_STOP_ORDERS
+
+
 def _short_strategy() -> Strategy:
     strategy = Strategy()
     strategy.position.open_master(
