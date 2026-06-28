@@ -14,3 +14,4 @@ data/
 /.tmp/
 /.tmp_pytest/
 /reports/
+/.codex_tmp/
