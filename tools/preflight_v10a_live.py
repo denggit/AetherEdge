@@ -125,15 +125,15 @@ class PreflightReport:
 
     @property
     def fail_count(self) -> int:
-        return sum(check.status == "FAIL" for check in self.checks)
+        return sum(check.status.upper() == "FAIL" for check in self.checks)
 
     @property
     def warn_count(self) -> int:
-        return sum(check.status == "WARN" for check in self.checks)
+        return sum(check.status.upper() == "WARN" for check in self.checks)
 
     @property
     def skipped_count(self) -> int:
-        return sum(check.status == "SKIPPED" for check in self.checks)
+        return sum(check.status.upper() == "SKIPPED" for check in self.checks)
 
     @property
     def pass_count(self) -> int:
@@ -1143,7 +1143,7 @@ async def _check_single_exchange_read(
     has_position = False
     try:
         positions = await client.fetch_positions(market)
-        non_zero = [p for p in positions if p.quantity > 0]
+        non_zero = [p for p in positions if _position_quantity_non_zero(p)]
         report.add(
             "EXCHANGE_READ",
             "PASS",
@@ -1249,7 +1249,9 @@ async def _check_single_exchange_read(
     clean_slate = not has_position and not has_open_orders and not has_stop_orders
     leverage_info = None
     try:
-        leverage_info = await client.fetch_leverage(market)
+        leverage_info = await client.fetch_leverage(
+            market, margin_mode=expected_margin_mode
+        )
         report.add(
             "EXCHANGE_READ",
             "PASS",
@@ -1389,6 +1391,17 @@ def _make_exchange_config(
         live_trading_enabled=live_trading_str in ("true", "1", "yes", "on"),
         default_margin_mode=margin_mode,
     )
+
+
+def _position_quantity_non_zero(position: object) -> bool:
+    value = getattr(position, "quantity", None)
+    if value is None:
+        return False
+    try:
+        qty = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return True
+    return qty != 0
 
 
 def _nested(values: Mapping[str, object], section: str, key: str) -> object | None:

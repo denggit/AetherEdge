@@ -624,6 +624,7 @@ class FakeExchangeClient:
         self._position_mode = PositionMode(position_mode)
         self._raise_on = dict(raise_on or {})
         self.write_calls: list[tuple[str, object]] = []
+        self.fetch_leverage_calls: list[object] = []
 
     @property
     def exchange(self):
@@ -649,6 +650,7 @@ class FakeExchangeClient:
 
     async def fetch_leverage(self, symbol: str, *, margin_mode=None):
         self._check_raise("fetch_leverage")
+        self.fetch_leverage_calls.append(margin_mode)
         return self._leverage_info
 
     async def fetch_position_mode(self):
@@ -901,6 +903,47 @@ def test_exchange_read_existing_position_fails(tmp_path, monkeypatch) -> None:
     assert "non-zero" in _one(report, "no_existing_position:okx").detail
 
 
+def test_exchange_read_short_position_fails(tmp_path, monkeypatch) -> None:
+    """Short position with negative quantity must still FAIL no_existing_position."""
+    env_file, _ = _write_env(tmp_path)
+    pos = _make_position("okx", quantity=-1.0)
+    fake_okx = FakeExchangeClient("okx", positions=[pos])
+    fake_binance = FakeExchangeClient("binance")
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        return fake_okx if str(exchange).strip().lower() == "okx" else fake_binance
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client", _fake_create
+    )
+    report = run_preflight(
+        env_file=env_file, environ={}, repo_root=tmp_path,
+        expect_real_live=True, skip_exchange_read=False,
+    )
+    assert _one(report, "no_existing_position:okx").status == "FAIL"
+    assert "non-zero" in _one(report, "no_existing_position:okx").detail
+
+
+def test_exchange_read_zero_position_passes(tmp_path, monkeypatch) -> None:
+    """Zero-quantity position must PASS no_existing_position."""
+    env_file, _ = _write_env(tmp_path)
+    pos = _make_position("okx", quantity=0.0)
+    fake_okx = FakeExchangeClient("okx", positions=[pos])
+    fake_binance = FakeExchangeClient("binance")
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        return fake_okx if str(exchange).strip().lower() == "okx" else fake_binance
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client", _fake_create
+    )
+    report = run_preflight(
+        env_file=env_file, environ={}, repo_root=tmp_path,
+        expect_real_live=True, skip_exchange_read=False,
+    )
+    assert _one(report, "no_existing_position:okx").status == "PASS"
+
+
 def test_exchange_read_positions_api_error_fails(tmp_path, monkeypatch) -> None:
     env_file, _ = _write_env(tmp_path)
     fake_okx = FakeExchangeClient(
@@ -1143,6 +1186,59 @@ def test_exchange_read_margin_mode_unavailable_warns(
     check = _one(report, "margin_mode_read:okx")
     assert check.status == "WARN"
     assert "unable to verify margin mode" in check.detail
+
+
+# ---------------------------------------------------------------------------
+# Exchange read – fetch_leverage margin_mode parameter
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_leverage_receives_margin_mode_isolated(
+    tmp_path, monkeypatch
+) -> None:
+    """When MARGIN_MODE=isolated, fetch_leverage must receive MarginMode.ISOLATED."""
+    from src.platform.exchanges.models import MarginMode
+
+    env_file, _ = _write_env(tmp_path)
+    fake_okx = FakeExchangeClient("okx", leverage=10, margin_mode="isolated")
+    fake_binance = FakeExchangeClient("binance", leverage=10, margin_mode="isolated")
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        return fake_okx if str(exchange).strip().lower() == "okx" else fake_binance
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client", _fake_create
+    )
+    run_preflight(
+        env_file=env_file, environ={}, repo_root=tmp_path,
+        expect_real_live=True, skip_exchange_read=False,
+    )
+    assert len(fake_okx.fetch_leverage_calls) >= 1
+    assert fake_okx.fetch_leverage_calls[0] == MarginMode.ISOLATED
+
+
+def test_fetch_leverage_receives_margin_mode_cross(
+    tmp_path, monkeypatch
+) -> None:
+    """When MARGIN_MODE=cross, fetch_leverage must receive MarginMode.CROSS."""
+    from src.platform.exchanges.models import MarginMode
+
+    env_file, _ = _write_env(tmp_path, {"MARGIN_MODE": "cross"})
+    fake_okx = FakeExchangeClient("okx", leverage=10, margin_mode="cross")
+    fake_binance = FakeExchangeClient("binance", leverage=10, margin_mode="cross")
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        return fake_okx if str(exchange).strip().lower() == "okx" else fake_binance
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client", _fake_create
+    )
+    run_preflight(
+        env_file=env_file, environ={}, repo_root=tmp_path,
+        expect_real_live=True, skip_exchange_read=False,
+    )
+    assert len(fake_okx.fetch_leverage_calls) >= 1
+    assert fake_okx.fetch_leverage_calls[0] == MarginMode.CROSS
 
 
 # ---------------------------------------------------------------------------
@@ -1625,3 +1721,26 @@ def test_new_fields_do_not_change_original_check_results(tmp_path: Path) -> None
         "strategy_load",
     ):
         assert _one(report, name).status == "PASS"
+
+
+# ---------------------------------------------------------------------------
+# Status counts – case insensitive
+# ---------------------------------------------------------------------------
+
+
+def test_status_counts_case_insensitive() -> None:
+    """fail_count / warn_count / skipped_count / pass_count use .upper()."""
+    report = PreflightReport(expect_real_live=False)
+    report.add("TEST", "fail", "lower_fail", "")
+    report.add("TEST", "warn", "lower_warn", "")
+    report.add("TEST", "skipped", "lower_skipped", "")
+    report.add("TEST", "pass", "lower_pass", "")
+    report.add("TEST", "FAIL", "upper_fail", "")
+    report.add("TEST", "WARN", "upper_warn", "")
+    report.add("TEST", "SKIPPED", "upper_skipped", "")
+    report.add("TEST", "PASS", "upper_pass", "")
+
+    assert report.fail_count == 2
+    assert report.warn_count == 2
+    assert report.skipped_count == 2
+    assert report.pass_count == 2
