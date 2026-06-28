@@ -39,9 +39,8 @@ class ReferenceDecision:
 def _coinbacktest_v10a_reference(case: MinimalV10ACase) -> ReferenceDecision:
     """Minimal oracle abstracted from the V10/V10A backtest gate functions.
 
-    The production contract uses strict ``current > threshold``. Parity samples
-    intentionally avoid equality, so they also agree with the reference file's
-    literal ``Series.ge(threshold)`` implementation.
+    FAST range speed follows the reference file's literal
+    ``Series.ge(threshold)`` implementation.
     """
 
     blocked_by_v10 = (
@@ -64,7 +63,7 @@ def _coinbacktest_v10a_reference(case: MinimalV10ACase) -> ReferenceDecision:
     is_fast = bool(
         available
         and threshold is not None
-        and float(case.current_rf_bar_count) > threshold
+        and float(case.current_rf_bar_count) >= threshold
     )
     blocked_by_v10a = (
         case.engine == "MOMENTUM_V3"
@@ -151,6 +150,15 @@ PARITY_CASES = (
         micro_filter_action="NEUTRAL",
         past_rf_bar_counts=(2, 3, 4),
         current_rf_bar_count=9,
+        expected_block=True,
+    ),
+    MinimalV10ACase(
+        name="v10a_momentum_short_equal_to_past_q75_blocks",
+        engine="MOMENTUM_V3",
+        side=Side.SHORT,
+        micro_filter_action="NEUTRAL",
+        past_rf_bar_counts=(4, 4, 4),
+        current_rf_bar_count=4,
         expected_block=True,
     ),
     MinimalV10ACase(

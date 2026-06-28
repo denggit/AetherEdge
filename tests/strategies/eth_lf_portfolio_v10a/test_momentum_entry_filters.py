@@ -188,8 +188,26 @@ def test_v10a_blocks_momentum_short_above_past_q75() -> None:
     assert routed.metadata["blocked_by_v10a_momentum_short_fast_speed"] is True
 
 
-def test_v10a_does_not_block_momentum_short_at_or_below_threshold() -> None:
-    speed = _speed(count=4, threshold=4.0, available=True, fast=False)
+def test_v10a_blocks_momentum_short_at_threshold_equality() -> None:
+    tracker = PastOnlyRangeSpeedTracker(window_bars=4, min_periods=3, fast_quantile=0.75)
+    tracker.evaluate_and_observe(4)
+    tracker.evaluate_and_observe(4)
+    tracker.evaluate_and_observe(4)
+    speed = tracker.evaluate_and_observe(4)
+
+    routed = PortfolioRouter().select(
+        [_candidate(engine="MOMENTUM_V3", side=Side.SHORT)],
+        range_speed=speed,
+    )
+
+    assert speed.fast_threshold == pytest.approx(4.0)
+    assert speed.is_fast_range_speed is True
+    assert routed.side is Side.FLAT
+    assert routed.metadata["blocked_by_v10a_momentum_short_fast_speed"] is True
+
+
+def test_v10a_does_not_block_momentum_short_below_threshold() -> None:
+    speed = _speed(count=3, threshold=4.0, available=True, fast=False)
 
     routed = PortfolioRouter().select(
         [_candidate(engine="MOMENTUM_V3", side=Side.SHORT)],
@@ -243,7 +261,7 @@ def test_range_speed_matches_shifted_pandas_rolling_quantile() -> None:
         else:
             assert result.available is True
             assert result.fast_threshold == pytest.approx(float(threshold))
-            assert result.is_fast_range_speed is (float(result.rf_bar_count) > float(threshold))
+            assert result.is_fast_range_speed is (float(result.rf_bar_count) >= float(threshold))
 
 
 def test_range_speed_insufficient_history_falls_back_without_block() -> None:

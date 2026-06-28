@@ -36,7 +36,7 @@ Before applying that unchanged priority order, the router removes:
 - `MOMENTUM_V3 LONG` candidates whose candidate-side micro action is
   `NOT_ALIGNED_RISK_REDUCED`;
 - `MOMENTUM_V3 SHORT` candidates whose current completed 4H `rf_bar_count` is
-  strictly greater than the Q75 threshold from prior completed buckets.
+  greater than or equal to the Q75 threshold from prior completed buckets.
 
 The range-speed defaults are a 1080-bucket rolling window, 100 minimum prior
 periods, and quantile 0.75. The tracker compares before observing the current

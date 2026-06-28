@@ -37,7 +37,7 @@ class PastOnlyRangeSpeedTracker:
         past_values = [value for value in self._history if value is not None and math.isfinite(value)]
         available = rf_bar_count is not None and len(past_values) >= self.min_periods
         threshold = _linear_quantile(past_values, self.fast_quantile) if available else None
-        is_fast = bool(available and threshold is not None and float(rf_bar_count) > threshold)
+        is_fast = bool(available and threshold is not None and float(rf_bar_count) >= threshold)
         result = RangeSpeedEvaluation(
             rf_bar_count=rf_bar_count,
             fast_threshold=threshold,
