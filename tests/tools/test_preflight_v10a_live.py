@@ -9,6 +9,7 @@ import pytest
 
 from tools.preflight_v10a_live import (
     EXPECTED_STRATEGY,
+    PreflightReport,
     main,
     parse_args,
     render_report,
@@ -678,3 +679,170 @@ def test_email_alert_disabled_missing_email_fields_ok(tmp_path: Path) -> None:
     for key in ("EMAIL_SENDER", "EMAIL_PASSWORD", "EMAIL_RECEIVER"):
         assert not report.named(f"{key} present")
         assert not report.named(f"{key} missing")
+
+
+# ---------------------------------------------------------------------------
+# Render report summary / failures / warnings output
+# ---------------------------------------------------------------------------
+
+
+def test_render_report_contains_summary_section(tmp_path: Path) -> None:
+    report = _run(tmp_path)
+    output = render_report(report)
+
+    assert "SUMMARY:" in output
+    assert "PASS:" in output
+    assert "WARN:" in output
+    assert "FAIL:" in output
+    assert "SKIPPED:" in output
+
+
+def test_render_report_lists_failures_when_fail_exists(tmp_path: Path) -> None:
+    report = _run(
+        tmp_path, {"AETHER_DRY_RUN": "true", "AETHER_LIVE_TRADING": "false"}
+    )
+    output = render_report(report)
+
+    assert report.fail_count > 0
+    assert "FAILURES:" in output
+    assert "none" not in output.split("FAILURES:")[1].split("WARNINGS:")[0]
+
+
+def test_render_report_lists_warnings_when_warn_exists(tmp_path: Path) -> None:
+    report = _run(tmp_path)
+    output = render_report(report)
+
+    assert report.warn_count > 0
+    assert "WARNINGS:" in output
+    assert "none" not in output.split("WARNINGS:")[1].split("FINAL:")[0]
+
+
+def test_render_report_final_is_last_lines(tmp_path: Path) -> None:
+    report = _run(tmp_path)
+    output = render_report(report)
+    lines = output.splitlines()
+
+    assert lines[-2] == "FINAL:"
+    assert lines[-1] == report.final_status
+
+
+def test_render_report_no_fail_shows_none(tmp_path: Path) -> None:
+    report = _run(tmp_path)
+    assert report.fail_count == 0
+
+    output = render_report(report)
+    # Extract text between FAILURES: and WARNINGS:
+    failures_section = output.split("FAILURES:")[1].split("WARNINGS:")[0]
+    assert "none" in failures_section
+
+
+def test_render_report_no_warn_shows_none() -> None:
+    report = PreflightReport(expect_real_live=False)
+    report.add("ENV", "PASS", "check_a", "")
+    report.add("ENV", "PASS", "check_b", "")
+
+    output = render_report(report)
+    warnings_section = output.split("WARNINGS:")[1].split("FINAL:")[0]
+    assert "none" in warnings_section
+
+
+# ---------------------------------------------------------------------------
+# JSON report summary / failures / warnings fields
+# ---------------------------------------------------------------------------
+
+
+def test_json_report_contains_summary_failures_warnings(tmp_path: Path) -> None:
+    env_file, _ = _write_env(tmp_path)
+    report = run_preflight(
+        env_file=env_file,
+        environ={},
+        repo_root=tmp_path,
+        expect_real_live=True,
+    )
+    report_path = tmp_path / "report.json"
+    write_json_report(report_path, report)
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert "summary" in payload
+    assert "failures" in payload
+    assert "warnings" in payload
+    assert isinstance(payload["summary"], dict)
+    assert isinstance(payload["failures"], list)
+    assert isinstance(payload["warnings"], list)
+
+
+def test_json_summary_numbers_match_counts(tmp_path: Path) -> None:
+    env_file, _ = _write_env(tmp_path)
+    report = run_preflight(
+        env_file=env_file,
+        environ={},
+        repo_root=tmp_path,
+        expect_real_live=True,
+    )
+    report_path = tmp_path / "report.json"
+    write_json_report(report_path, report)
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+
+    s = payload["summary"]
+    assert s["pass"] == sum(
+        1 for c in payload["checks"] if c["status"] == "PASS"
+    )
+    # Align with existing top-level counts
+    assert s["fail"] == payload["fail_count"]
+    assert s["warn"] == payload["warn_count"]
+    assert s["skipped"] == payload["skipped_count"]
+
+
+def test_failures_warnings_not_leak_secrets_in_json(tmp_path: Path) -> None:
+    secret = "MY-SECRET-DO-NOT-LEAK"
+    env_file, values = _write_env(
+        tmp_path,
+        {"OKX_API_KEY": secret},
+    )
+    report = run_preflight(
+        env_file=env_file,
+        environ={},
+        repo_root=tmp_path,
+        expect_real_live=True,
+    )
+    # Add checks whose detail fields contain the secret
+    report.add("TEST", "WARN", "probe_warn", f"detail-with-{secret}")
+    report.add("TEST", "FAIL", "probe_fail", f"another-detail-with-{secret}")
+
+    report_path = tmp_path / "report.json"
+    write_json_report(report_path, report)
+    raw = report_path.read_text(encoding="utf-8")
+
+    assert secret not in raw
+
+    payload = json.loads(raw)
+    for f in payload["failures"]:
+        assert secret not in f.get("detail", "")
+    for w in payload["warnings"]:
+        assert secret not in w.get("detail", "")
+
+
+def test_new_fields_do_not_change_original_check_results(tmp_path: Path) -> None:
+    """Existing preflight checks produce the same per-check statuses."""
+    env_file, _ = _write_env(tmp_path)
+    report = run_preflight(
+        env_file=env_file,
+        environ={},
+        repo_root=tmp_path,
+        expect_real_live=True,
+    )
+
+    # Same assertions as existing test_correct_real_live_env_returns_pass
+    assert report.ok is True
+    assert report.expect_real_live is True
+    assert "PASS_READY_FOR_MANUAL_LIVE_START" in render_report(report)
+
+    # Spot-check a few key checks still pass
+    for name in (
+        "AETHER_RUNTIME_MODE",
+        "AETHER_DRY_RUN",
+        "AETHER_LIVE_TRADING",
+        "leverage_match",
+        "strategy_load",
+    ):
+        assert _one(report, name).status == "PASS"

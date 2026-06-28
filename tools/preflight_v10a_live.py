@@ -132,6 +132,26 @@ class PreflightReport:
     def skipped_count(self) -> int:
         return sum(check.status == "SKIPPED" for check in self.checks)
 
+    @property
+    def pass_count(self) -> int:
+        return sum(check.status.upper() == "PASS" for check in self.checks)
+
+    @property
+    def failures(self) -> list[dict[str, str]]:
+        return [
+            {"section": c.section, "name": c.name, "detail": c.detail}
+            for c in self.checks
+            if c.status.upper() == "FAIL"
+        ]
+
+    @property
+    def warnings(self) -> list[dict[str, str]]:
+        return [
+            {"section": c.section, "name": c.name, "detail": c.detail}
+            for c in self.checks
+            if c.status.upper() == "WARN"
+        ]
+
     def named(self, name: str) -> list[CheckResult]:
         return [check for check in self.checks if check.name == name]
 
@@ -144,6 +164,14 @@ class PreflightReport:
             "fail_count": self.fail_count,
             "warn_count": self.warn_count,
             "skipped_count": self.skipped_count,
+            "summary": {
+                "pass": self.pass_count,
+                "warn": self.warn_count,
+                "fail": self.fail_count,
+                "skipped": self.skipped_count,
+            },
+            "failures": self.failures,
+            "warnings": self.warnings,
             "checks": [check.to_dict() for check in self.checks],
             "manual_checklist": list(self.manual_checklist),
         }
@@ -235,7 +263,33 @@ def render_report(report: PreflightReport) -> str:
         lines.append("")
     lines.append("MANUAL CHECKLIST:")
     lines.extend(f"- {item}" for item in report.manual_checklist)
-    lines.extend(["", "FINAL:", report.final_status])
+    lines.append("")
+    lines.append("SUMMARY:")
+    lines.append(f"PASS: {report.pass_count}")
+    lines.append(f"WARN: {report.warn_count}")
+    lines.append(f"FAIL: {report.fail_count}")
+    lines.append(f"SKIPPED: {report.skipped_count}")
+    lines.append("")
+    lines.append("FAILURES:")
+    if report.failures:
+        for i, f in enumerate(report.failures, 1):
+            lines.append(f"{i}. [{f['section']}] {f['name']}")
+            lines.append(f"   {f['detail']}")
+            lines.append("")
+    else:
+        lines.append("none")
+        lines.append("")
+    lines.append("WARNINGS:")
+    if report.warnings:
+        for i, w in enumerate(report.warnings, 1):
+            lines.append(f"{i}. [{w['section']}] {w['name']}")
+            lines.append(f"   {w['detail']}")
+            lines.append("")
+    else:
+        lines.append("none")
+        lines.append("")
+    lines.append("FINAL:")
+    lines.append(report.final_status)
     return "\n".join(lines)
 
 
