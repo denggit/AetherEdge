@@ -234,6 +234,11 @@ class FakeAccountClient:
     def __init__(self, exchange: ExchangeName, *, positions=()) -> None:
         self.exchange = exchange
         self.positions = list(positions)
+        self.margin_mode = None
+        self.leverage = Decimal("1")
+        self.leverage_margin_mode = None
+        self.set_margin_mode_calls: list = []
+        self.set_leverage_calls: list = []
 
     async def fetch_balance(self, asset="USDT"):
         return Balance(exchange=self.exchange, asset=asset, total=Decimal("1000"), available=Decimal("1000"))
@@ -242,7 +247,30 @@ class FakeAccountClient:
         return list(self.positions)
 
     async def fetch_leverage(self, *, margin_mode=None):
-        return LeverageInfo(exchange=self.exchange, symbol=self.symbol, raw_symbol=self.symbol, leverage=Decimal("1"))
+        return LeverageInfo(
+            exchange=self.exchange,
+            symbol=self.symbol,
+            raw_symbol=self.symbol,
+            leverage=self.leverage,
+            margin_mode=self.leverage_margin_mode,
+        )
+
+    async def set_margin_mode(self, margin_mode):
+        self.margin_mode = margin_mode
+        self.set_margin_mode_calls.append(margin_mode)
+        return {}
+
+    async def set_leverage(self, leverage, *, margin_mode=None):
+        self.leverage = Decimal(str(leverage))
+        self.leverage_margin_mode = margin_mode
+        self.set_leverage_calls.append((self.leverage, margin_mode))
+        return LeverageInfo(
+            exchange=self.exchange,
+            symbol=self.symbol,
+            raw_symbol=self.symbol,
+            leverage=self.leverage,
+            margin_mode=margin_mode,
+        )
 
     async def fetch_position_mode(self):
         return PositionMode.ONE_WAY
