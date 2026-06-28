@@ -17,6 +17,15 @@ class MarketDataSet(str, Enum):
     RANGE_BARS = "range_bars"
 
 
+class RangeCoverageStatus(str, Enum):
+    """Quality of trade coverage behind one fixed-time range aggregate."""
+
+    COMPLETE = "COMPLETE"
+    COLD_START_PARTIAL = "COLD_START_PARTIAL"
+    RECOVERED_DEGRADED_MINOR = "RECOVERED_DEGRADED_MINOR"
+    RECOVERED_INCOMPLETE = "RECOVERED_INCOMPLETE"
+
+
 @dataclass(frozen=True)
 class TimeRange:
     """Inclusive millisecond time range used by warmup and storage services."""

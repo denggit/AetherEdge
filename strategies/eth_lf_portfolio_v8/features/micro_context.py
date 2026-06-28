@@ -35,6 +35,21 @@ class MicroContextEngine:
             return MicroDecision(signal_side=side, context_available=False, aligned=False, contra=False, entry_risk_scale=Decimal("1"), action="NO_SIGNAL")
         if mode == "off":
             return MicroDecision(signal_side=side, context_available=False, aligned=False, contra=False, entry_risk_scale=Decimal("1"), action="OFF")
+        coverage_status = (
+            "COMPLETE"
+            if aggregate is None
+            else str(aggregate.coverage_status).strip().upper()
+        )
+        if coverage_status in {"COLD_START_PARTIAL", "RECOVERED_INCOMPLETE"}:
+            return MicroDecision(
+                signal_side=side,
+                context_available=False,
+                aligned=False,
+                contra=False,
+                entry_risk_scale=Decimal("1"),
+                action="NEUTRAL",
+                metadata={"range_coverage_status": coverage_status},
+            )
         if aggregate is None or aggregate.bar_count < self.config.min_range_bars:
             return MicroDecision(signal_side=side, context_available=False, aligned=False, contra=False, entry_risk_scale=Decimal("1"), action="NEUTRAL")
 
@@ -67,6 +82,16 @@ class MicroContextEngine:
         else:
             raise ValueError(f"Unsupported micro context mode: {self.config.mode}")
 
+        if (
+            coverage_status == "RECOVERED_DEGRADED_MINOR"
+            and action
+            not in {"NOT_ALIGNED_RISK_REDUCED", "CONTRA_RISK_REDUCED"}
+        ):
+            aligned = False
+            contra = False
+            risk_scale = Decimal("1")
+            action = "NEUTRAL"
+
         return MicroDecision(
             signal_side=side,
             context_available=True,
@@ -80,5 +105,6 @@ class MicroContextEngine:
                 "rf_close_pos": str(aggregate.close_pos),
                 "rf_taker_buy_ratio": str(aggregate.taker_buy_ratio),
                 "rf_micro_return_pct": str(aggregate.micro_return_pct),
+                "range_coverage_status": coverage_status,
             },
         )

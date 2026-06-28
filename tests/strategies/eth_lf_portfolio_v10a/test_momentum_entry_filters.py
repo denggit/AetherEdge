@@ -52,7 +52,13 @@ def _speed(*, count: int | None, threshold: float | None, available: bool, fast:
     )
 
 
-def _aggregate(*, bar_count: int = 10) -> RangeAggregateContext:
+def _aggregate(
+    *,
+    bar_count: int = 10,
+    coverage_status: str = "COMPLETE",
+    imbalance: Decimal = Decimal("0"),
+    close_pos: Decimal = Decimal("0.5"),
+) -> RangeAggregateContext:
     return RangeAggregateContext(
         symbol="ETH-USDT-PERP",
         exchange="okx",
@@ -70,9 +76,10 @@ def _aggregate(*, bar_count: int = 10) -> RangeAggregateContext:
         delta_notional_sum=Decimal("0"),
         notional_sum=Decimal("100"),
         micro_return_pct=Decimal("0"),
-        imbalance=Decimal("0"),
+        imbalance=imbalance,
         taker_buy_ratio=Decimal("0.5"),
-        close_pos=Decimal("0.5"),
+        close_pos=close_pos,
+        coverage_status=coverage_status,
     )
 
 
@@ -204,6 +211,122 @@ def test_v10a_blocks_momentum_short_at_threshold_equality() -> None:
     assert speed.is_fast_range_speed is True
     assert routed.side is Side.FLAT
     assert routed.metadata["blocked_by_v10a_momentum_short_fast_speed"] is True
+
+
+def test_complete_coverage_blocks_at_normal_threshold() -> None:
+    tracker = PastOnlyRangeSpeedTracker(
+        window_bars=4, min_periods=3, fast_quantile=0.75
+    )
+    tracker.warmup((20, 20, 20))
+
+    speed = tracker.evaluate_and_observe(20, coverage_status="COMPLETE")
+    routed = PortfolioRouter().select(
+        [_candidate(engine="MOMENTUM_V3", side=Side.SHORT)],
+        range_speed=speed,
+    )
+
+    assert routed.side is Side.FLAT
+
+
+def test_degraded_minor_blocks_only_at_threshold_times_margin() -> None:
+    tracker = PastOnlyRangeSpeedTracker(
+        window_bars=4, min_periods=3, fast_quantile=0.75
+    )
+    tracker.warmup((20, 20, 20))
+
+    near = tracker.evaluate_and_observe(
+        20,
+        coverage_status="RECOVERED_DEGRADED_MINOR",
+        degraded_fast_margin=1.05,
+    )
+    at_margin = tracker.evaluate_and_observe(
+        21,
+        coverage_status="RECOVERED_DEGRADED_MINOR",
+        degraded_fast_margin=1.05,
+    )
+
+    near_route = PortfolioRouter().select(
+        [_candidate(engine="MOMENTUM_V3", side=Side.SHORT)],
+        range_speed=near,
+    )
+    margin_route = PortfolioRouter().select(
+        [_candidate(engine="MOMENTUM_V3", side=Side.SHORT)],
+        range_speed=at_margin,
+    )
+    assert near_route.side is Side.SHORT
+    assert margin_route.side is Side.FLAT
+    assert margin_route.metadata["v10a_fast_speed_degraded_margin"] == pytest.approx(1.05)
+
+
+@pytest.mark.parametrize(
+    "coverage_status",
+    ["COLD_START_PARTIAL", "RECOVERED_INCOMPLETE"],
+)
+def test_incomplete_coverage_makes_fast_speed_unavailable(
+    coverage_status: str,
+) -> None:
+    tracker = PastOnlyRangeSpeedTracker(
+        window_bars=4, min_periods=3, fast_quantile=0.75
+    )
+    tracker.warmup((1, 1, 1))
+    speed = tracker.evaluate_and_observe(
+        999, coverage_status=coverage_status
+    )
+
+    routed = PortfolioRouter().select(
+        [_candidate(engine="MOMENTUM_V3", side=Side.SHORT)],
+        range_speed=speed,
+    )
+
+    assert routed.side is Side.SHORT
+    assert routed.metadata["v10a_fast_speed_available"] is False
+    assert routed.metadata["v10a_fast_speed_unavailable_reason"] == coverage_status
+
+
+@pytest.mark.parametrize(
+    "coverage_status",
+    ["COLD_START_PARTIAL", "RECOVERED_INCOMPLETE"],
+)
+def test_micro_context_falls_back_neutral_for_incomplete_coverage(
+    coverage_status: str,
+) -> None:
+    decision = MicroContextEngine().evaluate(
+        signal_side=Side.LONG,
+        aggregate=_aggregate(
+            coverage_status=coverage_status,
+            imbalance=Decimal("-0.10"),
+            close_pos=Decimal("0.20"),
+        ),
+    )
+
+    assert decision.action == "NEUTRAL"
+    assert decision.context_available is False
+    assert decision.entry_risk_scale == Decimal("1")
+
+
+def test_micro_context_degraded_minor_keeps_only_downside_filtering() -> None:
+    engine = MicroContextEngine()
+    contra = engine.evaluate(
+        signal_side=Side.LONG,
+        aggregate=_aggregate(
+            coverage_status="RECOVERED_DEGRADED_MINOR",
+            imbalance=Decimal("-0.10"),
+            close_pos=Decimal("0.20"),
+        ),
+    )
+    aligned = engine.evaluate(
+        signal_side=Side.LONG,
+        aggregate=_aggregate(
+            coverage_status="RECOVERED_DEGRADED_MINOR",
+            imbalance=Decimal("0.10"),
+            close_pos=Decimal("0.80"),
+        ),
+    )
+
+    assert contra.action == "CONTRA_RISK_REDUCED"
+    assert contra.entry_risk_scale < Decimal("1")
+    assert aligned.action == "NEUTRAL"
+    assert aligned.aligned is False
 
 
 def test_v10a_does_not_block_momentum_short_below_threshold() -> None:

@@ -12,6 +12,7 @@ import argparse
 import json
 import sqlite3
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -64,6 +65,7 @@ SECTION_ORDER = (
     "RUNTIME_REQUIREMENTS",
     "ENV_STRATEGY_PARAM_BOUNDARY",
     "STATE",
+    "RANGE_STATE",
     "EXCHANGE_READ",
 )
 DEFAULT_MANUAL_CHECKLIST = (
@@ -206,6 +208,7 @@ def run_preflight(
         _check_runtime_requirements(report, strategy, effective_env)
     _check_strategy_env_boundary(report, raw_env)
     _check_state_dbs(report, effective_env, root)
+    _check_range_state(report, effective_env, root)
     _check_exchange_read_availability(report, check_exchange_read)
     return report
 
@@ -706,6 +709,156 @@ def _inspect_state_tables(
         )
 
 
+def _check_range_state(
+    report: PreflightReport,
+    env: Mapping[str, str],
+    repo_root: Path,
+) -> None:
+    configured = env.get(
+        "AETHER_RANGE_CHECKPOINT_DB",
+        "data/state/range_builder_checkpoint.sqlite3",
+    )
+    path = _resolve_path(configured, repo_root)
+    if not path.is_file():
+        report.add(
+            "RANGE_STATE",
+            "WARN",
+            "range_checkpoint_db",
+            f"missing: {path}",
+        )
+        report.add(
+            "RANGE_STATE",
+            "WARN",
+            "completed_range_aggregate_history_count",
+            "0",
+        )
+        report.add(
+            "RANGE_STATE",
+            "WARN",
+            "complete_range_history_min_periods",
+            "V10A short-speed block unavailable until range history reaches min_periods",
+        )
+        report.add(
+            "RANGE_STATE",
+            "WARN",
+            "current_bucket_checkpoint",
+            "first current bucket will be COLD_START_PARTIAL",
+        )
+        return
+
+    report.add("RANGE_STATE", "PASS", "range_checkpoint_db", str(path))
+    try:
+        uri = f"{path.resolve().as_uri()}?mode=ro&immutable=1"
+        with sqlite3.connect(uri, uri=True) as connection:
+            connection.execute("PRAGMA query_only = ON")
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            if "completed_range_aggregates" not in tables:
+                total_count = complete_count = 0
+            else:
+                row = connection.execute(
+                    """
+                    SELECT COUNT(*),
+                           SUM(CASE WHEN coverage_status = 'COMPLETE' THEN 1 ELSE 0 END)
+                    FROM completed_range_aggregates
+                    WHERE exchange = ? AND symbol = ? AND range_pct = ?
+                    """,
+                    (
+                        _normalized(env.get("AETHER_DATA_EXCHANGE")) or "okx",
+                        env.get("AETHER_MARKET", "ETH-USDT-PERP"),
+                        _normalized_decimal_text(
+                            env.get("AETHER_RANGE_PCT", "0.002")
+                        ),
+                    ),
+                ).fetchone()
+                total_count = int(row[0] or 0)
+                complete_count = int(row[1] or 0)
+            report.add(
+                "RANGE_STATE",
+                "PASS" if total_count else "WARN",
+                "completed_range_aggregate_history_count",
+                str(total_count),
+            )
+            report.add(
+                "RANGE_STATE",
+                "PASS" if complete_count >= 100 else "WARN",
+                "complete_range_history_min_periods",
+                (
+                    f"COMPLETE={complete_count} min_periods=100"
+                    if complete_count >= 100
+                    else "V10A short-speed block unavailable until range history reaches min_periods "
+                    f"(COMPLETE={complete_count}, min_periods=100)"
+                ),
+            )
+
+            now_ms = int(time.time() * 1000)
+            bucket_ms = 4 * 60 * 60 * 1000
+            current_bucket_ms = (now_ms // bucket_ms) * bucket_ms
+            checkpoint = None
+            if "range_builder_checkpoints" in tables:
+                checkpoint = connection.execute(
+                    """
+                    SELECT checkpoint_updated_at_ms, coverage_status, missing_gap_ms
+                    FROM range_builder_checkpoints
+                    WHERE exchange = ? AND symbol = ? AND range_pct = ?
+                      AND bucket_start_ms = ?
+                    """,
+                    (
+                        _normalized(env.get("AETHER_DATA_EXCHANGE")) or "okx",
+                        env.get("AETHER_MARKET", "ETH-USDT-PERP"),
+                        _normalized_decimal_text(
+                            env.get("AETHER_RANGE_PCT", "0.002")
+                        ),
+                        current_bucket_ms,
+                    ),
+                ).fetchone()
+            if checkpoint is None:
+                report.add(
+                    "RANGE_STATE",
+                    "WARN",
+                    "current_bucket_checkpoint",
+                    "first current bucket will be COLD_START_PARTIAL",
+                )
+            else:
+                age_ms = max(0, now_ms - int(checkpoint[0]))
+                max_minor_age_ms = int(
+                    env.get(
+                        "AETHER_RANGE_CHECKPOINT_MAX_AGE_FOR_RECOVERED_MINOR_MS",
+                        "60000",
+                    )
+                )
+                status = "PASS" if age_ms <= max_minor_age_ms else "WARN"
+                detail = (
+                    "watchdog restart can recover current bucket as "
+                    "RECOVERED_DEGRADED_MINOR"
+                    if status == "PASS"
+                    else "checkpoint is too old for RECOVERED_DEGRADED_MINOR"
+                )
+                report.add(
+                    "RANGE_STATE",
+                    status,
+                    "current_bucket_checkpoint",
+                    f"{detail}; age_ms={age_ms}",
+                )
+                report.add(
+                    "RANGE_STATE",
+                    status,
+                    "current_bucket_checkpoint_age_ms",
+                    str(age_ms),
+                )
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        report.add(
+            "RANGE_STATE",
+            "WARN",
+            "range_checkpoint_db_read_only_inspection",
+            f"unable to inspect safely: {exc}; check manually",
+        )
+
+
 def _inspect_journal_tables(
     report: PreflightReport,
     connection: sqlite3.Connection,
@@ -830,6 +983,13 @@ def _decimal_equal(left: object | None, right: object | None) -> bool:
         and right_decimal is not None
         and left_decimal == right_decimal
     )
+
+
+def _normalized_decimal_text(value: object) -> str:
+    parsed = _parse_decimal(value)
+    if parsed is None:
+        return str(value)
+    return format(parsed.normalize(), "f")
 
 
 def _sensitive_values(raw_env: Mapping[str, str]) -> tuple[str, ...]:

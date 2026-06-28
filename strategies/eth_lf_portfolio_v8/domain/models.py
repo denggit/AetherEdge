@@ -56,6 +56,10 @@ class RangeAggregateContext:
     imbalance: Decimal
     taker_buy_ratio: Decimal
     close_pos: Decimal
+    coverage_status: str = "COMPLETE"
+    missing_gap_ms: int = 0
+    range_recovered_from_checkpoint: bool = False
+    range_checkpoint_age_ms: int | None = None
 
 
 @dataclass(frozen=True)

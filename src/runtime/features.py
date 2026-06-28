@@ -53,7 +53,16 @@ def range_bar_closed_feature(bar: RangeBar, *, exchange) -> MarketFeatureEvent:
     )
 
 
-def range_aggregate_feature(aggregate: RangeBarAggregate, *, exchange, timeframe: str = "4h") -> MarketFeatureEvent:
+def range_aggregate_feature(
+    aggregate: RangeBarAggregate,
+    *,
+    exchange,
+    timeframe: str = "4h",
+    coverage_status: str = "COMPLETE",
+    missing_gap_ms: int = 0,
+    range_recovered_from_checkpoint: bool = False,
+    range_checkpoint_age_ms: int | None = None,
+) -> MarketFeatureEvent:
     return MarketFeatureEvent(
         event_type=MarketFeatureEventType.RANGE_AGGREGATE,
         symbol=aggregate.symbol,
@@ -77,6 +86,12 @@ def range_aggregate_feature(aggregate: RangeBarAggregate, *, exchange, timeframe
             "imbalance": _d(aggregate.imbalance),
             "taker_buy_ratio": _d(aggregate.taker_buy_ratio),
             "close_pos": _d(aggregate.close_pos),
+            "coverage_status": coverage_status,
+            "missing_gap_ms": max(0, int(missing_gap_ms)),
+            "range_recovered_from_checkpoint": bool(
+                range_recovered_from_checkpoint
+            ),
+            "range_checkpoint_age_ms": range_checkpoint_age_ms,
         },
     )
 
@@ -91,6 +106,10 @@ def range_aggregate_unavailable_feature(
     bucket_end_ms: int,
     reference_price: Decimal,
     reason: str,
+    coverage_status: str = "COLD_START_PARTIAL",
+    missing_gap_ms: int = 0,
+    range_recovered_from_checkpoint: bool = False,
+    range_checkpoint_age_ms: int | None = None,
 ) -> MarketFeatureEvent:
     price = Decimal(str(reference_price))
     return MarketFeatureEvent(
@@ -119,6 +138,12 @@ def range_aggregate_unavailable_feature(
             "context_available": False,
             "incomplete": True,
             "reason": reason,
+            "coverage_status": coverage_status,
+            "missing_gap_ms": max(0, int(missing_gap_ms)),
+            "range_recovered_from_checkpoint": bool(
+                range_recovered_from_checkpoint
+            ),
+            "range_checkpoint_age_ms": range_checkpoint_age_ms,
         },
     )
 

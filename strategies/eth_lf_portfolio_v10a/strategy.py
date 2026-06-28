@@ -141,6 +141,8 @@ class Strategy:
             min_periods=self.config.entry_filters.range_speed_min_periods,
             fast_quantile=self.config.entry_filters.range_speed_fast_quantile,
         )
+        self.range_speed_degraded_fast_margin = 1.05
+        self.range_speed_history_warmup_count = 0
         self.feature_builder = V8LiveFeatureBuilder()
         self.position = V8PositionState()
         self.router = PortfolioRouter(
@@ -168,6 +170,32 @@ class Strategy:
         self._stop_update_blocked_bar_close_time_ms: int | None = None
         self.recovered = False
         self.started = False
+
+    def configure_range_coverage(
+        self,
+        *,
+        degraded_fast_margin: float = 1.05,
+    ) -> None:
+        """Accept runtime infrastructure policy without reading env or storage."""
+
+        self.range_speed_degraded_fast_margin = max(
+            1.0, float(degraded_fast_margin)
+        )
+
+    def warmup_range_speed_history(self, rf_bar_counts: Sequence[int]) -> int:
+        """Warm the past-only tracker from ordered COMPLETE aggregates."""
+
+        count = self.range_speed_tracker.warmup(
+            tuple(int(value) for value in rf_bar_counts)
+        )
+        self.range_speed_history_warmup_count += count
+        if self.range_speed_tracker.complete_history_count < self.config.entry_filters.range_speed_min_periods:
+            logger.warning(
+                "V10A short-speed block unavailable until range history reaches min_periods | complete_history=%s min_periods=%s",
+                self.range_speed_tracker.complete_history_count,
+                self.config.entry_filters.range_speed_min_periods,
+            )
+        return count
 
     def runtime_requirements(self) -> Mapping[str, Any]:
         return dict(self.config.runtime_requirements)
@@ -609,7 +637,13 @@ class Strategy:
                 engine_features=engine_features,
             )
             range_speed = self.range_speed_tracker.evaluate_and_observe(
-                None if aggregate is None else aggregate.bar_count
+                None if aggregate is None else aggregate.bar_count,
+                coverage_status=(
+                    "COLD_START_PARTIAL"
+                    if aggregate is None
+                    else aggregate.coverage_status
+                ),
+                degraded_fast_margin=self.range_speed_degraded_fast_margin,
             )
             routed = self.router.evaluate(bootstrap_context, range_speed=range_speed)
             micro = self.micro_engine.evaluate(signal_side=routed.side, aggregate=aggregate)
@@ -689,9 +723,17 @@ class Strategy:
             reason = "micro_blocked"
 
         aggregate = context.range_aggregate
+        coverage_status = (
+            "COLD_START_PARTIAL"
+            if aggregate is None
+            else str(aggregate.coverage_status).strip().upper()
+        )
         range_min_required = self.config.micro_context.min_range_bars
         range_bar_count = None if aggregate is None else aggregate.bar_count
-        if aggregate is None:
+        if aggregate is None or coverage_status in {
+            "COLD_START_PARTIAL",
+            "RECOVERED_INCOMPLETE",
+        }:
             range_available = False
             range_status = "unavailable"
         elif aggregate.bar_count < range_min_required:
@@ -767,6 +809,15 @@ class Strategy:
             "range_speed_historical_periods": int(
                 gate_audit.get("range_speed_historical_periods", 0)
             ),
+            "range_speed_history_warmup_count": int(
+                self.range_speed_history_warmup_count
+            ),
+            "v10a_fast_speed_unavailable_reason": gate_audit.get(
+                "v10a_fast_speed_unavailable_reason"
+            ),
+            "v10a_fast_speed_degraded_margin": float(
+                gate_audit.get("v10a_fast_speed_degraded_margin", 1.0)
+            ),
             "range_speed_rolling_window_bars": self.config.entry_filters.range_speed_rolling_window_bars,
             "range_speed_min_periods": self.config.entry_filters.range_speed_min_periods,
             "range_speed_fast_quantile": self.config.entry_filters.range_speed_fast_quantile,
@@ -781,6 +832,20 @@ class Strategy:
 
             "range_available": range_available,
             "range_status": range_status,
+            "range_coverage_status": coverage_status,
+            "range_missing_gap_ms": (
+                0 if aggregate is None else aggregate.missing_gap_ms
+            ),
+            "range_recovered_from_checkpoint": bool(
+                aggregate is not None
+                and aggregate.range_recovered_from_checkpoint
+            ),
+            "range_checkpoint_age_ms": (
+                None if aggregate is None else aggregate.range_checkpoint_age_ms
+            ),
+            "range_degraded_usage_mode": _range_degraded_usage_mode(
+                coverage_status
+            ),
             "range_bar_count": range_bar_count,
             "range_min_required": range_min_required,
             "range_imbalance": None if not range_available else str(aggregate.imbalance),
@@ -914,7 +979,11 @@ class Strategy:
         range_exit = None
         if not exit_channel and not opposite and hold_bars is not None and self.position.avg_entry is not None and self.position.risk_per_coin is not None:
             aggregate = context.range_aggregate
-            range_context_available = aggregate is not None and aggregate.bar_count >= self.config.micro_context.min_range_bars
+            range_context_available = (
+                aggregate is not None
+                and str(aggregate.coverage_status).strip().upper() == "COMPLETE"
+                and aggregate.bar_count >= self.config.micro_context.min_range_bars
+            )
             range_exit = evaluate_range_exit(
                 side=self.position.side,
                 avg_entry=self.position.avg_entry,
@@ -2252,6 +2321,14 @@ def _side_label(side: Side) -> str:
     if side is Side.SHORT:
         return "short"
     return "flat"
+
+
+def _range_degraded_usage_mode(coverage_status: str) -> str:
+    if coverage_status == "COMPLETE":
+        return "FULL"
+    if coverage_status == "RECOVERED_DEGRADED_MINOR":
+        return "CONSERVATIVE_FILTER_ONLY"
+    return "UNAVAILABLE"
 
 
 def _side_from_position(position: Position) -> Side:

@@ -43,6 +43,13 @@ class LiveRuntimeConfig:
     closed_bar_retry_interval_ms: int = 5_000
     closed_bar_missing_alert_after_ms: int = 120_000
     range_pct: Decimal = Decimal("0.002")
+    range_checkpoint_db_path: str = "data/state/range_builder_checkpoint.sqlite3"
+    range_checkpoint_interval_ms: int = 1_000
+    range_checkpoint_every_closed_bars: int = 10
+    range_checkpoint_writer_max_pending: int = 8
+    range_checkpoint_max_age_for_recovered_minor_ms: int = 60_000
+    range_checkpoint_max_age_for_restore_ms: int = 300_000
+    degraded_fast_margin: float = 1.05
     producer_stale_timeout_ms: int = 60_000
     master_follower_policy: MasterFollowerPolicyConfig | None = None
     startup_catchup: StartupCatchupConfig = StartupCatchupConfig()
@@ -85,6 +92,53 @@ def live_runtime_config_from_app(
         closed_bar_retry_interval_ms=int(env.get("AETHER_CLOSED_BAR_RETRY_INTERVAL_MS", defaults.get("closed_bar_retry_interval_ms", 5_000))),
         closed_bar_missing_alert_after_ms=int(env.get("AETHER_CLOSED_BAR_MISSING_ALERT_AFTER_MS", defaults.get("closed_bar_missing_alert_after_ms", 120_000))),
         range_pct=Decimal(str(env.get("AETHER_RANGE_PCT", defaults.get("range_pct", "0.002")))),
+        range_checkpoint_db_path=str(
+            env.get(
+                "AETHER_RANGE_CHECKPOINT_DB",
+                defaults.get(
+                    "range_checkpoint_db_path",
+                    "data/state/range_builder_checkpoint.sqlite3",
+                ),
+            )
+        ),
+        range_checkpoint_interval_ms=int(
+            env.get(
+                "AETHER_RANGE_CHECKPOINT_INTERVAL_MS",
+                defaults.get("range_checkpoint_interval_ms", 1_000),
+            )
+        ),
+        range_checkpoint_every_closed_bars=int(
+            env.get(
+                "AETHER_RANGE_CHECKPOINT_EVERY_CLOSED_BARS",
+                defaults.get("range_checkpoint_every_closed_bars", 10),
+            )
+        ),
+        range_checkpoint_writer_max_pending=int(
+            env.get(
+                "AETHER_RANGE_CHECKPOINT_WRITER_MAX_PENDING",
+                defaults.get("range_checkpoint_writer_max_pending", 8),
+            )
+        ),
+        range_checkpoint_max_age_for_recovered_minor_ms=int(
+            env.get(
+                "AETHER_RANGE_CHECKPOINT_MAX_AGE_FOR_RECOVERED_MINOR_MS",
+                defaults.get(
+                    "range_checkpoint_max_age_for_recovered_minor_ms", 60_000
+                ),
+            )
+        ),
+        range_checkpoint_max_age_for_restore_ms=int(
+            env.get(
+                "AETHER_RANGE_CHECKPOINT_MAX_AGE_FOR_RESTORE_MS",
+                defaults.get("range_checkpoint_max_age_for_restore_ms", 300_000),
+            )
+        ),
+        degraded_fast_margin=float(
+            env.get(
+                "AETHER_RANGE_DEGRADED_FAST_MARGIN",
+                defaults.get("degraded_fast_margin", 1.05),
+            )
+        ),
         producer_stale_timeout_ms=int(env.get("AETHER_PRODUCER_STALE_TIMEOUT_MS", defaults.get("producer_stale_timeout_ms", 60_000))),
         master_follower_policy=MasterFollowerPolicyConfig.from_env(
             app_exchanges=app_config.exchanges,

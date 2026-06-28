@@ -869,7 +869,11 @@ class Strategy:
         range_exit = None
         if not exit_channel and not opposite and hold_bars is not None and self.position.avg_entry is not None and self.position.risk_per_coin is not None:
             aggregate = context.range_aggregate
-            range_context_available = aggregate is not None and aggregate.bar_count >= self.config.micro_context.min_range_bars
+            range_context_available = (
+                aggregate is not None
+                and str(aggregate.coverage_status).strip().upper() == "COMPLETE"
+                and aggregate.bar_count >= self.config.micro_context.min_range_bars
+            )
             range_exit = evaluate_range_exit(
                 side=self.position.side,
                 avg_entry=self.position.avg_entry,

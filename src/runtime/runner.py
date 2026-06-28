@@ -11,7 +11,14 @@ from src.app import AppConfig, AppContext
 from src.app.alerts import AppAlert
 from src.market_data.derived import RangeBarAggregator, RangeBarBuilder
 from src.market_data.events import MarketFeatureEvent
-from src.market_data.models import MarketDataSet, RangeBar, RangeBarAggregate, TimeRange, WarmupRequest
+from src.market_data.models import MarketDataSet, RangeBar, RangeBarAggregate, RangeCoverageStatus, TimeRange, WarmupRequest
+from src.market_data.range_checkpoint import (
+    RangeBuilderCheckpoint,
+    RangeCheckpointRecovery,
+    RangeCheckpointWriter,
+    SqliteRangeCheckpointStore,
+    aggregate_snapshot,
+)
 from src.market_data.storage import SqliteKlineStore, SqliteRangeBarStore
 from src.market_data.warmup.gap_detector import interval_to_ms
 from src.market_data.warmup.service import KlineWarmupService
@@ -165,6 +172,8 @@ class LiveRuntimeRunner:
         self._range_bar_store = self.services.get("range_bar_store")
         self._range_bar_builder = self.services.get("range_bar_builder")
         self._range_bar_aggregator = self.services.get("range_bar_aggregator")
+        self._range_checkpoint_store = self.services.get("range_checkpoint_store")
+        self._range_checkpoint_writer = self.services.get("range_checkpoint_writer")
         self._producer_monitor: ProducerHealthMonitor = self.services.get("producer_monitor") or ProducerHealthMonitor()
         self._producer_supervisor: ProducerSupervisor = self.services.get("producer_supervisor") or ProducerSupervisor(
             monitor=self._producer_monitor,
@@ -184,6 +193,13 @@ class LiveRuntimeRunner:
             missing_alert_after_ms=self._closed_bar_missing_alert_after_ms,
         )
         self._rangebar_trust_start_bucket_ms: int | None = None
+        self._initial_range_bucket_ms: int | None = None
+        self._initial_range_recovery: RangeCheckpointRecovery | None = None
+        self._range_bars_by_bucket: dict[int, list[RangeBar]] = {}
+        self._last_range_checkpoint_submit_ms = 0
+        self._range_bars_since_checkpoint = 0
+        self._range_checkpoint_snapshot_warned = False
+        self._range_builder_reset_at_bucket_ms: int | None = None
         self._intent_factory = self.services.get("intent_factory") or LiveOrderIntentFactory(
             strategy_id=self.app_config.strategy,
             target_exchanges=self.app_config.exchanges,
@@ -210,6 +226,8 @@ class LiveRuntimeRunner:
         self._heartbeat_service = RuntimeHeartbeatService()
         self._startup_catchup_decision: StartupCatchupDecision | None = None
         self._startup_catchup_evaluated = False
+        self._range_speed_warmup_excluded_previous = False
+        self._startup_catchup_range_observed = False
 
     async def run(self, *, max_market_events: int | None = None) -> LiveRuntimeStats:
         logger.info(
@@ -246,6 +264,7 @@ class LiveRuntimeRunner:
         finally:
             await self._stop_sync_tasks()
             await self._stop_producers()
+            await self._stop_range_checkpoint_writer()
             await self.context.alerts.stop()
 
     async def start(self) -> RuntimeHealth:
@@ -464,6 +483,7 @@ class LiveRuntimeRunner:
                     bucket_end_ms=open_time_ms + self._closed_bar_interval_ms - 1,
                     reference_price=closed_kline.close,
                     reason=reason,
+                    coverage_status=RangeCoverageStatus.RECOVERED_INCOMPLETE.value,
                 )
                 await self.process_market_feature(unavailable)
                 features.append(unavailable)
@@ -475,7 +495,13 @@ class LiveRuntimeRunner:
         range_aggregates = self._load_range_aggregates_for_bucket(open_time_ms)
         if range_aggregates:
             best_range_bar_count = max((int(aggregate.bar_count) for aggregate in range_aggregates), default=0)
-            if not is_mid_bucket_restart or best_range_bar_count >= min_range_bars:
+            if (
+                not is_mid_bucket_restart
+                or (
+                    self._initial_range_recovery is None
+                    and best_range_bar_count >= min_range_bars
+                )
+            ):
                 if is_mid_bucket_restart:
                     logger.info(
                         "Range aggregate loaded despite mid-bucket restart | symbol=%s interval=%s bucket_start_ms=%s bucket_end_ms=%s trust_start_bucket_ms=%s range_bar_count=%s min_range_bars=%s",
@@ -521,11 +547,49 @@ class LiveRuntimeRunner:
                 bucket_end_ms=open_time_ms + self._closed_bar_interval_ms - 1,
                 reference_price=closed_kline.close,
                 reason="live_trade_collection_started_mid_bucket",
+                coverage_status=self._range_coverage_for_bucket(
+                    open_time_ms
+                ).coverage_status,
+                missing_gap_ms=self._range_coverage_for_bucket(
+                    open_time_ms
+                ).missing_gap_ms,
+                range_recovered_from_checkpoint=self._range_coverage_for_bucket(
+                    open_time_ms
+                ).recovered_from_checkpoint,
+                range_checkpoint_age_ms=self._range_coverage_for_bucket(
+                    open_time_ms
+                ).checkpoint_age_ms,
             )
             await self.process_market_feature(unavailable)
             features.append(unavailable)
             self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_kline)
             return features
+
+        if (
+            self._initial_range_recovery is not None
+            and not range_aggregates
+            and self.requirements.range_bars.enabled
+            and self.requirements.trades.enabled
+        ):
+            coverage = self._range_coverage_for_bucket(open_time_ms)
+            unavailable = range_aggregate_unavailable_feature(
+                symbol=self.app_config.symbol,
+                exchange=self.app_config.data_exchange,
+                timeframe=self._range_aggregate_interval,
+                range_pct=self._range_pct,
+                bucket_start_ms=open_time_ms,
+                bucket_end_ms=open_time_ms
+                + self._closed_bar_interval_ms
+                - 1,
+                reference_price=closed_kline.close,
+                reason="no_completed_range_bars",
+                coverage_status=coverage.coverage_status,
+                missing_gap_ms=coverage.missing_gap_ms,
+                range_recovered_from_checkpoint=coverage.recovered_from_checkpoint,
+                range_checkpoint_age_ms=coverage.checkpoint_age_ms,
+            )
+            await self.process_market_feature(unavailable)
+            features.append(unavailable)
 
         self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_kline)
         return features
@@ -555,7 +619,26 @@ class LiveRuntimeRunner:
                 )
                 continue
             self._executed_range_aggregate_buckets.add(key)
-            event = range_aggregate_feature(aggregate, exchange=self.app_config.data_exchange, timeframe=self._range_aggregate_interval)
+            coverage = self._range_coverage_for_bucket(
+                aggregate.bucket_start_ms
+            )
+            event = range_aggregate_feature(
+                aggregate,
+                exchange=self.app_config.data_exchange,
+                timeframe=self._range_aggregate_interval,
+                coverage_status=coverage.coverage_status,
+                missing_gap_ms=coverage.missing_gap_ms,
+                range_recovered_from_checkpoint=coverage.recovered_from_checkpoint,
+                range_checkpoint_age_ms=coverage.checkpoint_age_ms,
+            )
+            await asyncio.to_thread(
+                self._get_range_checkpoint_store().save_completed_aggregate,
+                exchange=self.app_config.data_exchange.value,
+                aggregate=aggregate,
+                coverage_status=coverage.coverage_status,
+                missing_gap_ms=coverage.missing_gap_ms,
+                completed_at_ms=int(time.time() * 1000),
+            )
             self.stats.range_aggregates_created += 1
             await self.process_market_feature(event)
             events.append(event)
@@ -570,6 +653,7 @@ class LiveRuntimeRunner:
         self._set_health(RuntimePhase.WARMING_UP, healthy=True)
         await self._bootstrap_account_config_if_enabled()
         await self._run_warmup()
+        await self._warmup_range_speed_history()
         self._set_health(RuntimePhase.CATCHING_UP, healthy=True, warmup_complete=True)
         snapshots = await self._run_recovery()
         # ── State convergence: reconcile exchange truth against local state ──
@@ -582,6 +666,7 @@ class LiveRuntimeRunner:
         #     closed 4H bar.  Only eligible inside the fresh-open window
         #     (first 5 min of a new 4H candle). ──
         await self._evaluate_startup_catchup_once(snapshots[0])
+        await self._finish_range_speed_warmup_after_catchup()
         # ── Start heartbeat service ──
         self._heartbeat_service.start(
             runtime_id=f"{self.app_config.strategy}::{self.app_config.symbol}",
@@ -641,20 +726,151 @@ class LiveRuntimeRunner:
             return
         now_ms = int(time.time() * 1000)
         current_bucket = (now_ms // self._closed_bar_interval_ms) * self._closed_bar_interval_ms
-        start_lag_tolerance_ms = int(os.getenv("AETHER_TRUST_CURRENT_BUCKET_START_LAG_MS", "10000"))
-        if now_ms - current_bucket <= start_lag_tolerance_ms:
+        self._initial_range_bucket_ms = current_bucket
+        store = self._get_range_checkpoint_store()
+        recovery = store.recover_current_bucket(
+            exchange=self.app_config.data_exchange.value,
+            symbol=self.app_config.symbol,
+            range_pct=str(self._range_pct),
+            bucket_start_ms=current_bucket,
+            now_ms=now_ms,
+            max_age_for_recovered_minor_ms=self.runtime_config.range_checkpoint_max_age_for_recovered_minor_ms,
+            max_age_for_restore_ms=self.runtime_config.range_checkpoint_max_age_for_restore_ms,
+        )
+        rows = self._get_range_bar_store().load(
+            symbol=self.app_config.symbol,
+            range_pct=str(self._range_pct),
+            time_range=TimeRange(
+                current_bucket,
+                current_bucket + self._closed_bar_interval_ms - 1,
+            ),
+        )
+        self._range_bars_by_bucket[current_bucket] = list(rows)
+        if recovery.checkpoint is not None:
+            try:
+                self._range_bar_builder = RangeBarBuilder.restore_state(
+                    recovery.checkpoint.builder_state
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning(
+                    "Range builder checkpoint restore failed; current bucket disabled | symbol=%s bucket_start_ms=%s error=%s",
+                    self.app_config.symbol,
+                    current_bucket,
+                    exc,
+                )
+                recovery = RangeCheckpointRecovery(
+                    coverage_status=RangeCoverageStatus.RECOVERED_INCOMPLETE.value,
+                    checkpoint=None,
+                    checkpoint_age_ms=recovery.checkpoint_age_ms,
+                    missing_gap_ms=recovery.missing_gap_ms,
+                    recovered_from_checkpoint=False,
+                )
+        self._initial_range_recovery = recovery
+        self._range_builder_reset_at_bucket_ms = (
+            current_bucket + self._closed_bar_interval_ms
+        )
+        if recovery.coverage_status == RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value:
             self._rangebar_trust_start_bucket_ms = current_bucket
         else:
             self._rangebar_trust_start_bucket_ms = current_bucket + self._closed_bar_interval_ms
+        configure_coverage = getattr(
+            self.context.strategy, "configure_range_coverage", None
+        )
+        if callable(configure_coverage):
+            configure_coverage(
+                degraded_fast_margin=self.runtime_config.degraded_fast_margin
+            )
+        self._get_range_checkpoint_writer().start()
         logger.info(
-            "Rangebar trust window initialized | symbol=%s interval=%s now_ms=%s current_bucket_ms=%s trust_start_bucket_ms=%s start_lag_tolerance_ms=%s",
+            "Rangebar checkpoint recovery initialized | symbol=%s interval=%s now_ms=%s current_bucket_ms=%s trust_start_bucket_ms=%s coverage_status=%s checkpoint_age_ms=%s recovered=%s missing_gap_ms=%s",
             self.app_config.symbol,
             self._closed_bar_interval,
             now_ms,
             current_bucket,
             self._rangebar_trust_start_bucket_ms,
-            start_lag_tolerance_ms,
+            recovery.coverage_status,
+            recovery.checkpoint_age_ms,
+            recovery.recovered_from_checkpoint,
+            recovery.missing_gap_ms,
         )
+
+    async def _warmup_range_speed_history(self) -> None:
+        if not self.requirements.range_bars.enabled:
+            return
+        warmup = getattr(
+            self.context.strategy, "warmup_range_speed_history", None
+        )
+        if not callable(warmup):
+            return
+        now_ms = int(time.time() * 1000)
+        current_bucket = (
+            now_ms // self._closed_bar_interval_ms
+        ) * self._closed_bar_interval_ms
+        catchup_config = self.runtime_config.startup_catchup
+        within_catchup_window = (
+            catchup_config.enabled
+            and now_ms - current_bucket
+            <= catchup_config.fresh_open_window_seconds * 1000
+        )
+        self._range_speed_warmup_excluded_previous = within_catchup_window
+        before_bucket_end_ms = (
+            current_bucket - 1
+            if within_catchup_window
+            else current_bucket + self._closed_bar_interval_ms - 1
+        )
+        limit = int(
+            getattr(
+                getattr(self.context.strategy, "config", None),
+                "entry_filters",
+                None,
+            ).range_speed_rolling_window_bars
+        )
+        rows = await asyncio.to_thread(
+            self._get_range_checkpoint_store().load_complete_history,
+            exchange=self.app_config.data_exchange.value,
+            symbol=self.app_config.symbol,
+            range_pct=str(self._range_pct),
+            before_bucket_end_ms=before_bucket_end_ms,
+            limit=limit,
+        )
+        loaded = warmup([row.rf_bar_count for row in rows])
+        min_periods = int(
+            self.context.strategy.config.entry_filters.range_speed_min_periods
+        )
+        log = logger.info if loaded >= min_periods else logger.warning
+        log(
+            "V10A range-speed history warmup | complete_history=%s min_periods=%s available=%s",
+            loaded,
+            min_periods,
+            loaded >= min_periods,
+        )
+
+    async def _finish_range_speed_warmup_after_catchup(self) -> None:
+        if (
+            not self._range_speed_warmup_excluded_previous
+            or self._startup_catchup_range_observed
+        ):
+            return
+        warmup = getattr(
+            self.context.strategy, "warmup_range_speed_history", None
+        )
+        if not callable(warmup):
+            return
+        now_ms = int(time.time() * 1000)
+        current_bucket = (
+            now_ms // self._closed_bar_interval_ms
+        ) * self._closed_bar_interval_ms
+        previous_end = current_bucket - 1
+        rows = await asyncio.to_thread(
+            self._get_range_checkpoint_store().load_complete_history,
+            exchange=self.app_config.data_exchange.value,
+            symbol=self.app_config.symbol,
+            range_pct=str(self._range_pct),
+            before_bucket_end_ms=current_bucket,
+            limit=1,
+        )
+        if rows and rows[-1].bucket_end_ms == previous_end:
+            warmup([rows[-1].rf_bar_count])
 
     async def _run_warmup(self) -> None:
         warmup_services = self.services.get("warmup_services") or self.services.get("warmup_service")
@@ -1351,6 +1567,20 @@ class LiveRuntimeRunner:
                 aggregate,
                 exchange=self.app_config.data_exchange,
                 timeframe=self._range_aggregate_interval,
+                coverage_status=self._range_coverage_for_bucket(
+                    aggregate.bucket_start_ms
+                ).coverage_status,
+            )
+            coverage = self._range_coverage_for_bucket(
+                aggregate.bucket_start_ms
+            )
+            await asyncio.to_thread(
+                self._get_range_checkpoint_store().save_completed_aggregate,
+                exchange=self.app_config.data_exchange.value,
+                aggregate=aggregate,
+                coverage_status=coverage.coverage_status,
+                missing_gap_ms=coverage.missing_gap_ms,
+                completed_at_ms=int(time.time() * 1000),
             )
             events.append(event)
         return events
@@ -1547,6 +1777,7 @@ class LiveRuntimeRunner:
         preview_events.extend(range_events)
         preview_state = self._capture_startup_preview_state()
         signals = await self._preview_strategy_market_features(preview_events)
+        self._startup_catchup_range_observed = bool(range_events)
         logger.info(
             "Startup catchup strategy preview | total_signals=%s",
             len(signals),
@@ -2035,14 +2266,105 @@ class LiveRuntimeRunner:
         if not self.requirements.range_bars.enabled:
             return
         builder = self._get_range_bar_builder()
+        trade_time_ms = _event_time_ms(trade)
+        if (
+            trade_time_ms is not None
+            and self._range_builder_reset_at_bucket_ms is not None
+            and trade_time_ms >= self._range_builder_reset_at_bucket_ms
+        ):
+            discard_active = getattr(builder, "discard_active_bar", None)
+            if callable(discard_active):
+                discard_active()
+            else:
+                builder = self._get_range_bar_builder()
+                if hasattr(builder, "active"):
+                    builder.active = None
+            logger.info(
+                "Discarded restart-spanning active range bar at first clean bucket | bucket_start_ms=%s",
+                self._range_builder_reset_at_bucket_ms,
+            )
+            self._range_builder_reset_at_bucket_ms = None
         closed = builder.on_trade(trade)
-        if not closed:
-            return
-        store = self._get_range_bar_store()
-        for bar in closed:
-            await asyncio.to_thread(store.save, [bar])
-            self.stats.range_bars_closed += 1
-            await self.process_market_feature(range_bar_closed_feature(bar, exchange=trade.exchange))
+        if closed:
+            store = self._get_range_bar_store()
+            for bar in closed:
+                await asyncio.to_thread(store.save, [bar])
+                bucket_start = (
+                    bar.end_time_ms // self._closed_bar_interval_ms
+                ) * self._closed_bar_interval_ms
+                self._range_bars_by_bucket.setdefault(
+                    bucket_start, []
+                ).append(bar)
+                self._range_bars_since_checkpoint += 1
+                self.stats.range_bars_closed += 1
+                await self.process_market_feature(range_bar_closed_feature(bar, exchange=trade.exchange))
+        self._submit_range_checkpoint_if_due(trade)
+
+    def _submit_range_checkpoint_if_due(self, trade: MarketTrade) -> bool:
+        now_ms = int(time.time() * 1000)
+        interval_due = (
+            now_ms - self._last_range_checkpoint_submit_ms
+            >= self.runtime_config.range_checkpoint_interval_ms
+        )
+        bars_due = (
+            self._range_bars_since_checkpoint
+            >= self.runtime_config.range_checkpoint_every_closed_bars
+        )
+        if not interval_due and not bars_due:
+            return False
+        snapshot_state = getattr(
+            self._get_range_bar_builder(), "snapshot_state", None
+        )
+        if not callable(snapshot_state):
+            if not self._range_checkpoint_snapshot_warned:
+                logger.warning(
+                    "Range checkpoint disabled: builder has no snapshot_state()"
+                )
+                self._range_checkpoint_snapshot_warned = True
+            return False
+        trade_time_ms = _event_time_ms(trade)
+        if trade_time_ms is None:
+            return False
+        bucket_start_ms = (
+            trade_time_ms // self._closed_bar_interval_ms
+        ) * self._closed_bar_interval_ms
+        bucket_end_ms = (
+            bucket_start_ms + self._closed_bar_interval_ms - 1
+        )
+        bars = self._range_bars_by_bucket.get(bucket_start_ms, [])
+        aggregates = self._get_range_bar_aggregator().aggregate(
+            bars, bucket_ms=self._closed_bar_interval_ms
+        )
+        aggregate = next(
+            (
+                row
+                for row in aggregates
+                if row.bucket_start_ms == bucket_start_ms
+            ),
+            None,
+        )
+        coverage = self._range_coverage_for_bucket(bucket_start_ms)
+        checkpoint = RangeBuilderCheckpoint(
+            exchange=trade.exchange.value,
+            symbol=trade.symbol,
+            range_pct=str(self._range_pct),
+            bucket_start_ms=bucket_start_ms,
+            bucket_end_ms=bucket_end_ms,
+            last_trade_id=trade.trade_id,
+            last_trade_ts_ms=trade_time_ms,
+            last_ws_recv_ts_ms=now_ms,
+            range_bar_count=len(bars),
+            aggregate=aggregate_snapshot(aggregate),
+            builder_state=dict(snapshot_state()),
+            coverage_status=coverage.coverage_status,
+            missing_gap_ms=coverage.missing_gap_ms,
+            checkpoint_updated_at_ms=now_ms,
+        )
+        accepted = self._get_range_checkpoint_writer().submit(checkpoint)
+        if accepted:
+            self._last_range_checkpoint_submit_ms = now_ms
+            self._range_bars_since_checkpoint = 0
+        return accepted
 
     async def _call_strategy_market_event(self, event: MarketEvent) -> Sequence[TradeSignal]:
         strategy = self.context.strategy
@@ -2826,6 +3148,59 @@ class LiveRuntimeRunner:
         if self._range_bar_aggregator is None:
             self._range_bar_aggregator = RangeBarAggregator()
         return self._range_bar_aggregator
+
+    def _get_range_checkpoint_store(self) -> SqliteRangeCheckpointStore:
+        if self._range_checkpoint_store is None:
+            self._range_checkpoint_store = SqliteRangeCheckpointStore(
+                self.runtime_config.range_checkpoint_db_path
+            )
+        return self._range_checkpoint_store
+
+    def _get_range_checkpoint_writer(self) -> RangeCheckpointWriter:
+        if self._range_checkpoint_writer is None:
+            loop = asyncio.get_running_loop()
+
+            def on_error(exc: BaseException) -> None:
+                logger.warning("Range checkpoint write failed | error=%s", exc)
+                loop.call_soon_threadsafe(
+                    self.context.alerts.emit,
+                    AppAlert(
+                        subject="AetherEdge range checkpoint write failed",
+                        content=str(exc),
+                        severity="warning",
+                    ),
+                )
+
+            self._range_checkpoint_writer = RangeCheckpointWriter(
+                self._get_range_checkpoint_store(),
+                max_pending=self.runtime_config.range_checkpoint_writer_max_pending,
+                on_error=on_error,
+            )
+        return self._range_checkpoint_writer
+
+    async def _stop_range_checkpoint_writer(self) -> None:
+        writer = self._range_checkpoint_writer
+        if writer is None:
+            return
+        stop = getattr(writer, "stop", None)
+        if callable(stop):
+            await asyncio.to_thread(stop, flush=True)
+
+    def _range_coverage_for_bucket(
+        self, bucket_start_ms: int
+    ) -> RangeCheckpointRecovery:
+        if (
+            self._initial_range_bucket_ms == bucket_start_ms
+            and self._initial_range_recovery is not None
+        ):
+            return self._initial_range_recovery
+        return RangeCheckpointRecovery(
+            coverage_status=RangeCoverageStatus.COMPLETE.value,
+            checkpoint=None,
+            checkpoint_age_ms=None,
+            missing_gap_ms=0,
+            recovered_from_checkpoint=False,
+        )
 
     def _set_health(
         self,

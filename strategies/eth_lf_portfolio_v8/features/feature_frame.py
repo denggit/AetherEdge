@@ -50,6 +50,16 @@ def parse_range_aggregate(event: MarketFeatureEvent) -> RangeAggregateContext:
         imbalance=_d(data["imbalance"]),
         taker_buy_ratio=_d(data["taker_buy_ratio"]),
         close_pos=_d(data["close_pos"]),
+        coverage_status=str(data.get("coverage_status", "COMPLETE")),
+        missing_gap_ms=int(data.get("missing_gap_ms", 0)),
+        range_recovered_from_checkpoint=bool(
+            data.get("range_recovered_from_checkpoint", False)
+        ),
+        range_checkpoint_age_ms=(
+            None
+            if data.get("range_checkpoint_age_ms") is None
+            else int(data["range_checkpoint_age_ms"])
+        ),
     )
 
 

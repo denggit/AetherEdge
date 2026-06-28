@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any, Mapping
 
 from src.market_data.models import RangeBar
 from src.platform.data.models import MarketTrade, TradeSide
@@ -63,6 +64,85 @@ class RangeBarBuilder:
         if self.active is None or self.active.last_time_ms is None:
             return None
         return self._close_bar(self.active, end_time_ms=self.active.last_time_ms)
+
+    def discard_active_bar(self) -> None:
+        """Drop only the in-progress bar while preserving ID sequences."""
+
+        self.active = None
+
+    def snapshot_state(self) -> Mapping[str, Any]:
+        """Return a JSON-safe, complete snapshot of the streaming builder."""
+
+        active = None
+        if self.active is not None:
+            active = {
+                "symbol": self.active.symbol,
+                "range_pct": str(self.active.range_pct),
+                "bar_id": self.active.bar_id,
+                "start_time_ms": self.active.start_time_ms,
+                "open": str(self.active.open),
+                "high": str(self.active.high),
+                "low": str(self.active.low),
+                "close": str(self.active.close),
+                "volume": str(self.active.volume),
+                "buy_notional": str(self.active.buy_notional),
+                "sell_notional": str(self.active.sell_notional),
+                "trade_count": self.active.trade_count,
+                "last_time_ms": self.active.last_time_ms,
+            }
+        return {
+            "version": 1,
+            "range_pct": str(self.range_pct),
+            "contract_value": str(self.contract_value),
+            "active": active,
+            "day_seq": dict(self._day_seq),
+        }
+
+    @classmethod
+    def restore_state(cls, state: Mapping[str, Any]) -> "RangeBarBuilder":
+        """Restore a builder snapshot without replaying or fetching trades."""
+
+        if int(state.get("version", 0)) != 1:
+            raise ValueError("unsupported range builder checkpoint version")
+        builder = cls(
+            range_pct=Decimal(str(state["range_pct"])),
+            contract_value=Decimal(str(state["contract_value"])),
+        )
+        raw_day_seq = state.get("day_seq", {})
+        if not isinstance(raw_day_seq, Mapping):
+            raise ValueError("range builder day_seq must be a mapping")
+        builder._day_seq = {
+            str(day): int(seq)
+            for day, seq in raw_day_seq.items()
+            if int(seq) >= 0
+        }
+        raw_active = state.get("active")
+        if raw_active is not None:
+            if not isinstance(raw_active, Mapping):
+                raise ValueError("range builder active state must be a mapping")
+            active_range_pct = Decimal(str(raw_active["range_pct"]))
+            if active_range_pct != builder.range_pct:
+                raise ValueError("active range_pct does not match builder range_pct")
+            builder.active = _ActiveRangeBar(
+                symbol=str(raw_active["symbol"]),
+                range_pct=active_range_pct,
+                bar_id=int(raw_active["bar_id"]),
+                start_time_ms=int(raw_active["start_time_ms"]),
+                open=Decimal(str(raw_active["open"])),
+                high=Decimal(str(raw_active["high"])),
+                low=Decimal(str(raw_active["low"])),
+                close=Decimal(str(raw_active["close"])),
+                volume=Decimal(str(raw_active["volume"])),
+                buy_notional=Decimal(str(raw_active["buy_notional"])),
+                sell_notional=Decimal(str(raw_active["sell_notional"])),
+                trade_count=int(raw_active["trade_count"]),
+                last_time_ms=(
+                    None
+                    if raw_active.get("last_time_ms") is None
+                    else int(raw_active["last_time_ms"])
+                ),
+            )
+        return builder
 
     def seed_from_bars(self, bars) -> None:
         """Seed per-day sequence counters from persisted bars after restart."""

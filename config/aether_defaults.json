@@ -20,5 +20,12 @@
   "closed_bar_retry_interval_ms": 5000,
   "closed_bar_missing_alert_after_ms": 120000,
   "range_pct": "0.002",
+  "range_checkpoint_db_path": "data/state/range_builder_checkpoint.sqlite3",
+  "range_checkpoint_interval_ms": 1000,
+  "range_checkpoint_every_closed_bars": 10,
+  "range_checkpoint_writer_max_pending": 8,
+  "range_checkpoint_max_age_for_recovered_minor_ms": 60000,
+  "range_checkpoint_max_age_for_restore_ms": 300000,
+  "degraded_fast_margin": 1.05,
   "producer_stale_timeout_ms": 60000
 }

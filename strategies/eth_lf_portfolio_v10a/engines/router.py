@@ -195,6 +195,15 @@ class PortfolioRouter:
             "rf_bar_count_fast_threshold": None if range_speed is None else range_speed.fast_threshold,
             "is_fast_range_speed": bool(range_speed is not None and range_speed.is_fast_range_speed),
             "range_speed_historical_periods": 0 if range_speed is None else range_speed.historical_periods,
+            "range_speed_history_warmup_count": 0 if range_speed is None else range_speed.historical_periods,
+            "v10a_fast_speed_unavailable_reason": (
+                "range_speed_not_evaluated"
+                if range_speed is None
+                else range_speed.unavailable_reason
+            ),
+            "v10a_fast_speed_degraded_margin": (
+                1.0 if range_speed is None else range_speed.degraded_fast_margin
+            ),
             "range_speed_rolling_window_bars": cfg.range_speed_rolling_window_bars,
             "range_speed_min_periods": cfg.range_speed_min_periods,
             "range_speed_fast_quantile": cfg.range_speed_fast_quantile,

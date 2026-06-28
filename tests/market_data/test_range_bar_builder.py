@@ -50,3 +50,20 @@ def test_range_bar_builder_snapshot_open_bar_does_not_reset_active_state():
     assert snapshot is not None
     assert snapshot.open == Decimal("1000")
     assert builder.snapshot_open_bar() is not None
+
+
+def test_range_bar_builder_snapshot_restore_preserves_active_bar_and_sequence():
+    builder = RangeBarBuilder(range_pct="0.002", contract_value="0.01")
+    builder.on_trade(_trade("1000", 1_700_000_000_000))
+    builder.on_trade(
+        _trade("1001", 1_700_000_001_000, side=TradeSide.SELL)
+    )
+
+    restored = RangeBarBuilder.restore_state(builder.snapshot_state())
+    closed = restored.on_trade(_trade("1002", 1_700_000_002_000))
+
+    assert len(closed) == 1
+    assert closed[0].volume == Decimal("30")
+    assert closed[0].trade_count == 3
+    assert closed[0].buy_notional == Decimal("200.2")
+    assert closed[0].sell_notional == Decimal("100.10")

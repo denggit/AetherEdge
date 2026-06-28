@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from src.order_management.models import ExchangeOrderResult
 from src.platform import ExchangeName
 from src.signals import SignalAction
@@ -48,6 +50,34 @@ def test_range_exit_short_produces_close_short() -> None:
 
     assert [signal.action for signal in signals] == [SignalAction.CLOSE_SHORT]
     assert signals[0].reason == "RANGE_EXIT_NEXT_OPEN"
+
+
+@pytest.mark.parametrize(
+    "coverage_status",
+    [
+        "COLD_START_PARTIAL",
+        "RECOVERED_DEGRADED_MINOR",
+        "RECOVERED_INCOMPLETE",
+    ],
+)
+def test_range_exit_does_not_trigger_without_complete_coverage(
+    coverage_status: str,
+) -> None:
+    strategy = _started_strategy(Side.LONG)
+    context = _bar_ready_context(
+        side=Side.LONG,
+        close=Decimal("114"),
+        high=Decimal("140"),
+        low=Decimal("98"),
+        coverage_status=coverage_status,
+    )
+
+    signals = strategy._position_lifecycle_signals(context)
+
+    assert not any(
+        signal.metadata.get("range_exit_triggered") is True
+        for signal in signals
+    )
 
 
 def test_range_exit_priority_is_below_channel_and_opposite() -> None:
@@ -206,6 +236,7 @@ def _bar_ready_context(
     close_time_ms: int = 3 * H4,
     exit_channel: bool = False,
     opposite: bool = False,
+    coverage_status: str = "COMPLETE",
 ) -> BarReadyContext:
     if side is Side.LONG:
         imbalance = Decimal("-0.06")
@@ -250,6 +281,7 @@ def _bar_ready_context(
             imbalance=imbalance,
             taker_buy_ratio=Decimal("0.53"),
             close_pos=close_pos,
+            coverage_status=coverage_status,
         ),
         micro=MicroDecision(
             signal_side=side,

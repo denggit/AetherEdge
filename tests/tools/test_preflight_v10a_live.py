@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -371,6 +372,145 @@ def test_nonstandard_closed_bar_buffer_warns(tmp_path: Path) -> None:
 
     assert report.ok is True
     assert _one(report, "AETHER_CLOSED_BAR_BUFFER_MS").status == "WARN"
+
+
+def _create_range_state_db(
+    tmp_path: Path,
+    *,
+    complete_history: int,
+    current_checkpoint: bool,
+) -> None:
+    path = tmp_path / "data" / "state" / "range_builder_checkpoint.sqlite3"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE completed_range_aggregates (
+                exchange TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                range_pct TEXT NOT NULL,
+                bucket_start_ms INTEGER NOT NULL,
+                bucket_end_ms INTEGER NOT NULL,
+                rf_bar_count INTEGER NOT NULL,
+                imbalance TEXT,
+                close_pos TEXT,
+                taker_buy_ratio TEXT,
+                micro_return_pct TEXT,
+                delta_notional_sum TEXT,
+                notional_sum TEXT,
+                coverage_status TEXT NOT NULL,
+                missing_gap_ms INTEGER NOT NULL DEFAULT 0,
+                completed_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (exchange, symbol, range_pct, bucket_end_ms)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE range_builder_checkpoints (
+                exchange TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                range_pct TEXT NOT NULL,
+                bucket_start_ms INTEGER NOT NULL,
+                bucket_end_ms INTEGER NOT NULL,
+                last_trade_id TEXT,
+                last_trade_ts_ms INTEGER,
+                last_ws_recv_ts_ms INTEGER,
+                range_bar_count INTEGER NOT NULL,
+                aggregate_json TEXT NOT NULL,
+                builder_state_json TEXT NOT NULL,
+                coverage_status TEXT NOT NULL,
+                missing_gap_ms INTEGER NOT NULL DEFAULT 0,
+                checkpoint_updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (exchange, symbol, range_pct, bucket_start_ms)
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO completed_range_aggregates (
+                exchange, symbol, range_pct, bucket_start_ms, bucket_end_ms,
+                rf_bar_count, coverage_status, completed_at_ms
+            ) VALUES ('okx', 'ETH-USDT-PERP', '0.002', ?, ?, 10, 'COMPLETE', ?)
+            """,
+            [
+                (index * 100, index * 100 + 99, index * 100 + 100)
+                for index in range(complete_history)
+            ],
+        )
+        if current_checkpoint:
+            now_ms = int(time.time() * 1000)
+            bucket_ms = 4 * 60 * 60 * 1000
+            bucket_start_ms = (now_ms // bucket_ms) * bucket_ms
+            connection.execute(
+                """
+                INSERT INTO range_builder_checkpoints (
+                    exchange, symbol, range_pct, bucket_start_ms, bucket_end_ms,
+                    range_bar_count, aggregate_json, builder_state_json,
+                    coverage_status, checkpoint_updated_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "okx",
+                    "ETH-USDT-PERP",
+                    "0.002",
+                    bucket_start_ms,
+                    bucket_start_ms + bucket_ms - 1,
+                    10,
+                    "{}",
+                    "{}",
+                    "COMPLETE",
+                    now_ms,
+                ),
+            )
+
+
+def test_range_history_at_min_periods_passes(tmp_path: Path) -> None:
+    _create_range_state_db(
+        tmp_path, complete_history=100, current_checkpoint=False
+    )
+
+    report = _run(tmp_path)
+
+    assert _one(report, "completed_range_aggregate_history_count").status == "PASS"
+    assert _one(report, "complete_range_history_min_periods").status == "PASS"
+
+
+def test_range_history_below_min_periods_warns(tmp_path: Path) -> None:
+    _create_range_state_db(
+        tmp_path, complete_history=99, current_checkpoint=False
+    )
+
+    report = _run(tmp_path)
+
+    check = _one(report, "complete_range_history_min_periods")
+    assert check.status == "WARN"
+    assert "unavailable until range history reaches min_periods" in check.detail
+
+
+def test_no_current_range_checkpoint_warns_cold_start(tmp_path: Path) -> None:
+    _create_range_state_db(
+        tmp_path, complete_history=100, current_checkpoint=False
+    )
+
+    report = _run(tmp_path)
+
+    check = _one(report, "current_bucket_checkpoint")
+    assert check.status == "WARN"
+    assert "COLD_START_PARTIAL" in check.detail
+
+
+def test_fresh_current_range_checkpoint_is_recoverable(tmp_path: Path) -> None:
+    _create_range_state_db(
+        tmp_path, complete_history=100, current_checkpoint=True
+    )
+
+    report = _run(tmp_path)
+
+    check = _one(report, "current_bucket_checkpoint")
+    assert check.status == "PASS"
+    assert "RECOVERED_DEGRADED_MINOR" in check.detail
+    assert _one(report, "current_bucket_checkpoint_age_ms").status == "PASS"
 
 
 def test_tool_source_has_no_forbidden_write_operation() -> None:
