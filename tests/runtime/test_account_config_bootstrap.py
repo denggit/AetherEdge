@@ -221,6 +221,144 @@ async def test_set_then_fetch_mismatch_fails() -> None:
 
 
 @pytest.mark.asyncio
+async def test_binance_leverage_readback_unavailable_clean_slate_verified() -> None:
+    """Binance: fetch_leverage returns leverage=None but set_leverage API confirms the target."""
+    account = FakeAccount(
+        ExchangeName.BINANCE,
+        leverage=Decimal("3"),
+        margin_mode=MarginMode.CROSS,
+        leverage_readback_none=True,
+    )
+    execution = FakeExecution(ExchangeName.BINANCE)
+
+    result = (
+        await bootstrap_account_config(
+            targets=[_target(ExchangeName.BINANCE)],
+            account_clients=[account],
+            execution_clients=[execution],
+            apply=True,
+            dry_run=False,
+        )
+    )[0]
+
+    assert result.applied is True
+    assert result.verified is True
+    assert result.reason == "applied_leverage_readback_unavailable_clean_slate"
+    assert result.error is None
+    # raise_on_failed_account_config must NOT raise for this tolerated fallback.
+    raise_on_failed_account_config([result])
+
+
+@pytest.mark.asyncio
+async def test_leverage_readback_explicit_mismatch_fails_even_when_readback_unavailable() -> None:
+    """If after.leverage is explicitly read but wrong, fail regardless of readback capability."""
+    account = FakeAccount(
+        ExchangeName.BINANCE,
+        leverage=Decimal("3"),
+        margin_mode=MarginMode.CROSS,
+        mismatch_after_set=True,
+    )
+    execution = FakeExecution(ExchangeName.BINANCE)
+
+    result = (
+        await bootstrap_account_config(
+            targets=[_target(ExchangeName.BINANCE)],
+            account_clients=[account],
+            execution_clients=[execution],
+            apply=True,
+            dry_run=False,
+        )
+    )[0]
+
+    assert result.applied is True
+    assert result.verified is False
+    assert result.reason == "verification_mismatch"
+    with pytest.raises(AccountConfigBootstrapError):
+        raise_on_failed_account_config([result])
+
+
+@pytest.mark.asyncio
+async def test_margin_mode_mismatch_fails_when_leverage_readback_unavailable() -> None:
+    """Margin mode mismatch still fails even when leverage readback is unavailable."""
+    account = FakeAccount(
+        ExchangeName.BINANCE,
+        leverage=Decimal("15"),
+        margin_mode=MarginMode.CROSS,
+        mismatch_after_set=True,
+        leverage_readback_none=True,
+    )
+    execution = FakeExecution(ExchangeName.BINANCE)
+
+    result = (
+        await bootstrap_account_config(
+            targets=[_target(ExchangeName.BINANCE)],
+            account_clients=[account],
+            execution_clients=[execution],
+            apply=True,
+            dry_run=False,
+        )
+    )[0]
+
+    assert result.applied is True
+    assert result.verified is False
+    assert result.reason == "verification_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_position_blocks_apply_even_when_leverage_readback_unavailable() -> None:
+    """Existing position still blocks apply regardless of readback capability."""
+    account = FakeAccount(
+        ExchangeName.BINANCE,
+        leverage=Decimal("3"),
+        margin_mode=MarginMode.CROSS,
+        positions=[_position(ExchangeName.BINANCE)],
+        leverage_readback_none=True,
+    )
+    execution = FakeExecution(ExchangeName.BINANCE)
+
+    result = (
+        await bootstrap_account_config(
+            targets=[_target(ExchangeName.BINANCE)],
+            account_clients=[account],
+            execution_clients=[execution],
+            apply=True,
+            dry_run=False,
+        )
+    )[0]
+
+    assert result.verified is False
+    assert result.reason == "blocked_by_existing_position_or_order"
+    assert account.set_leverage_calls == []
+
+
+@pytest.mark.asyncio
+async def test_set_leverage_raises_still_fails() -> None:
+    """If set_leverage raises, the exception propagates (fail_on_error=True by default)."""
+
+    class FailingSetLeverageAccount(FakeAccount):
+        async def set_leverage(self, leverage, *, margin_mode=MarginMode.CROSS):
+            self.set_leverage_calls.append((leverage, margin_mode))
+            raise RuntimeError("set_leverage failed")
+
+    account = FailingSetLeverageAccount(
+        ExchangeName.BINANCE,
+        leverage=Decimal("3"),
+        margin_mode=MarginMode.CROSS,
+        leverage_readback_none=True,
+    )
+    execution = FakeExecution(ExchangeName.BINANCE)
+
+    with pytest.raises(RuntimeError, match="set_leverage failed"):
+        await bootstrap_account_config(
+            targets=[_target(ExchangeName.BINANCE)],
+            account_clients=[account],
+            execution_clients=[execution],
+            apply=True,
+            dry_run=False,
+        )
+
+
+@pytest.mark.asyncio
 async def test_live_runtime_startup_hook_applies_account_config_from_env(monkeypatch) -> None:
     monkeypatch.setenv("AETHER_LIVE_TRADING", "true")
     monkeypatch.setenv("OKX_SANDBOX", "false")
@@ -270,12 +408,14 @@ class FakeAccount:
         margin_mode: MarginMode,
         positions=(),
         mismatch_after_set: bool = False,
+        leverage_readback_none: bool = False,
     ) -> None:
         self.exchange = exchange
         self.leverage = leverage
         self.margin_mode = margin_mode
         self.positions = list(positions)
         self.mismatch_after_set = mismatch_after_set
+        self.leverage_readback_none = leverage_readback_none
         self.set_margin_mode_calls: list[MarginMode] = []
         self.set_leverage_calls: list[tuple[Decimal, MarginMode]] = []
 
@@ -290,7 +430,7 @@ class FakeAccount:
             exchange=self.exchange,
             symbol=self.symbol,
             raw_symbol=self.symbol,
-            leverage=self.leverage,
+            leverage=None if self.leverage_readback_none else self.leverage,
             margin_mode=self.margin_mode,
         )
 
@@ -305,7 +445,15 @@ class FakeAccount:
         if not self.mismatch_after_set:
             self.leverage = leverage
             self.margin_mode = margin_mode
-        return await self.fetch_leverage(margin_mode=margin_mode)
+        # set_leverage API response always includes the leverage (or falls
+        # back to the request value) — distinct from the read-only fetch.
+        return LeverageInfo(
+            exchange=self.exchange,
+            symbol=self.symbol,
+            raw_symbol=self.symbol,
+            leverage=leverage,
+            margin_mode=margin_mode,
+        )
 
     async def fetch_position_mode(self) -> PositionMode:
         return PositionMode.ONE_WAY

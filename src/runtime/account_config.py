@@ -249,8 +249,12 @@ async def _bootstrap_one(
     leverage_result = await account.set_leverage(target.leverage, margin_mode=target.margin_mode)
     after = await account.fetch_leverage(margin_mode=target.margin_mode)
     after_margin = _normalize_margin_mode(after.margin_mode)
-    verified = _matches(after, target)
-    error = None if verified else "account config verification mismatch after apply"
+    verified, reason, error = _resolve_verification(
+        after=after,
+        after_margin=after_margin,
+        target=target,
+        leverage_result=leverage_result,
+    )
 
     return AccountConfigBootstrapResult(
         exchange=target.exchange,
@@ -266,7 +270,7 @@ async def _bootstrap_one(
         open_stop_orders=open_stop_orders,
         applied=True,
         verified=verified,
-        reason="applied" if verified else "verification_mismatch",
+        reason=reason,
         error=error,
         raw={"set_margin_mode": margin_result, "set_leverage": leverage_result.raw, "fetch_leverage": after.raw},
     )
@@ -281,6 +285,51 @@ def raise_on_failed_account_config(results: Sequence[AccountConfigBootstrapResul
         for result in failures
     )
     raise AccountConfigBootstrapError(f"account config bootstrap failed: {detail}")
+
+
+def _resolve_verification(
+    *,
+    after: LeverageInfo,
+    after_margin: MarginMode | None,
+    target: AccountConfigTarget,
+    leverage_result: LeverageInfo,
+) -> tuple[bool, str | None, str | None]:
+    """Determine verification result after applying margin/leverage.
+
+    Returns ``(verified, reason, error)``.
+
+    Rules (in order):
+
+    1. If ``after.leverage`` was read back explicitly and does not match the
+       target, fail.
+    2. If ``after.margin_mode`` was read back explicitly and does not match
+       the target, fail.
+    3. If the exchange cannot read back leverage (``after.leverage is None``)
+       but margin mode matches and the *set_leverage* API response confirms
+       the target leverage, tolerate the missing readback (Binance).
+    4. Otherwise fail.
+    """
+    # Standard match: both leverage and margin mode read back correctly.
+    if _matches(after, target):
+        return True, "applied", None
+
+    # Leverage was read back explicitly and does not match target.
+    if after.leverage is not None and after.leverage != target.leverage:
+        return False, "verification_mismatch", "account config verification mismatch after apply"
+
+    # Margin mode was read back explicitly and does not match target.
+    if after_margin is not None and after_margin is not target.margin_mode:
+        return False, "verification_mismatch", "account config verification mismatch after apply"
+
+    # Leverage readback unavailable (after.leverage is None) but margin mode
+    # matches.  Trust the set_leverage API response — this is the Binance
+    # (and similar) path where the read-only leverage endpoint is unavailable.
+    if after.leverage is None and after_margin is target.margin_mode:
+        if leverage_result.leverage == target.leverage:
+            return True, "applied_leverage_readback_unavailable_clean_slate", None
+
+    # Any other mismatch.
+    return False, "verification_mismatch", "account config verification mismatch after apply"
 
 
 def _matches(info: LeverageInfo, target: AccountConfigTarget) -> bool:
