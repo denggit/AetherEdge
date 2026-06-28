@@ -9,6 +9,7 @@ or database state.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sqlite3
 import sys
@@ -24,6 +25,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.platform.config import load_env_config
+from src.platform.exchanges.factory import create_exchange_client
+from src.platform.exchanges.models import ExchangeConfig, MarginMode, PositionMode
 from src.strategy import load_strategy
 from strategies.eth_lf_portfolio_v10a import Strategy
 
@@ -199,7 +202,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--check-exchange-read",
         action="store_true",
-        help="Request safe exchange reads; skipped unless an isolated read-only adapter is available",
+        help="Request safe exchange reads even when --expect-real-live is not set",
+    )
+    parser.add_argument(
+        "--skip-exchange-read",
+        action="store_true",
+        help="Explicitly skip exchange read checks",
     )
     return parser.parse_args(argv)
 
@@ -211,6 +219,7 @@ def run_preflight(
     repo_root: str | Path = REPO_ROOT,
     expect_real_live: bool = False,
     check_exchange_read: bool = False,
+    skip_exchange_read: bool = False,
 ) -> PreflightReport:
     env_path = Path(env_file)
     root = Path(repo_root)
@@ -239,7 +248,13 @@ def run_preflight(
     _check_strategy_env_boundary(report, raw_env)
     _check_state_dbs(report, effective_env, root)
     _check_range_state(report, effective_env, root)
-    _check_exchange_read_availability(report, check_exchange_read)
+    _check_exchange_read(
+        report,
+        effective_env,
+        skip=skip_exchange_read,
+        expect_real_live=expect_real_live,
+        requested=check_exchange_read,
+    )
     return report
 
 
@@ -299,6 +314,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         env_file=args.env_file,
         expect_real_live=args.expect_real_live,
         check_exchange_read=args.check_exchange_read,
+        skip_exchange_read=args.skip_exchange_read,
     )
     if args.report:
         try:
@@ -546,13 +562,7 @@ def _check_leverage(report: PreflightReport, env: Mapping[str, str]) -> None:
             "leverage_match",
             f"OKX={okx_decimal} BINANCE={binance_decimal}",
         )
-        status = "WARN" if okx_decimal == Decimal("15") else "PASS"
-        detail = str(okx_decimal)
-        if status == "WARN":
-            detail += " confirm manually before real-live start"
-            report.manual_checklist.append("Confirm leverage 15x is intended if configured")
-        report.add("LEVERAGE", status, "configured_leverage", detail)
-
+        _check_configured_leverage(report, okx_decimal)
     margin_mode = env.get("MARGIN_MODE")
     report.add(
         "LEVERAGE",
@@ -560,6 +570,30 @@ def _check_leverage(report: PreflightReport, env: Mapping[str, str]) -> None:
         "MARGIN_MODE",
         _display(margin_mode),
     )
+
+
+def _check_configured_leverage(report: PreflightReport, leverage: Decimal) -> None:
+    if leverage < 12:
+        report.add(
+            "LEVERAGE",
+            "WARN",
+            "configured_leverage",
+            f"{leverage} below expected strategy max leverage buffer",
+        )
+    elif leverage <= 20:
+        report.add(
+            "LEVERAGE",
+            "PASS",
+            "configured_leverage",
+            f"{leverage} expected buffer for strategy max leverage",
+        )
+    else:
+        report.add(
+            "LEVERAGE",
+            "WARN",
+            "configured_leverage",
+            f"{leverage} unusually high leverage; confirm manually",
+        )
 
 
 def _check_strategy(
@@ -998,22 +1032,362 @@ def _inspect_journal_tables(
         )
 
 
-def _check_exchange_read_availability(
+def _check_exchange_read(
     report: PreflightReport,
+    env: Mapping[str, str],
+    *,
+    skip: bool,
+    expect_real_live: bool,
     requested: bool,
 ) -> None:
-    if requested:
-        detail = (
-            "requested, but no isolated read-only V10A adapter is available; "
-            "no exchange client constructed"
+    if skip:
+        report.add(
+            "EXCHANGE_READ",
+            "SKIPPED",
+            "EXCHANGE_READ_CHECK_SKIPPED",
+            "explicitly skipped by --skip-exchange-read",
         )
+        return
+    should_run = expect_real_live or requested
+    if not should_run:
+        report.add(
+            "EXCHANGE_READ",
+            "SKIPPED",
+            "EXCHANGE_READ_CHECK_SKIPPED",
+            "not requested; no exchange client constructed",
+        )
+        return
+    try:
+        asyncio.run(_run_exchange_read_checks(report, env))
+    except Exception as exc:
+        report.add(
+            "EXCHANGE_READ",
+            "FAIL",
+            "exchange_read",
+            f"unexpected error during exchange read checks: {exc}",
+        )
+
+
+async def _run_exchange_read_checks(
+    report: PreflightReport,
+    env: Mapping[str, str],
+) -> None:
+    market = env.get("AETHER_MARKET", "ETH-USDT-PERP")
+    okx_leverage = _parse_decimal(env.get("OKX_LEVERAGE"))
+    binance_leverage = _parse_decimal(env.get("BINANCE_LEVERAGE"))
+    margin_mode_raw = _normalized(env.get("MARGIN_MODE", "isolated"))
+    try:
+        expected_margin_mode = MarginMode(margin_mode_raw)
+    except ValueError:
+        expected_margin_mode = MarginMode.ISOLATED
+
+    exchanges: list[tuple[str, Decimal | None]] = [
+        ("okx", okx_leverage),
+        ("binance", binance_leverage),
+    ]
+    for exchange_name, expected_lev in exchanges:
+        try:
+            config = _make_exchange_config(exchange_name, env)
+            client = create_exchange_client(exchange_name, config=config)
+        except Exception as exc:
+            report.add(
+                "EXCHANGE_READ",
+                "FAIL",
+                f"exchange_client:{exchange_name}",
+                f"failed to construct client: {exc}",
+            )
+            continue
+        await _check_single_exchange_read(
+            report, client, exchange_name, market, expected_lev, expected_margin_mode
+        )
+
+
+async def _check_single_exchange_read(
+    report: PreflightReport,
+    client: object,
+    exchange_name: str,
+    market: str,
+    expected_leverage: Decimal | None,
+    expected_margin_mode: object,
+) -> None:
+    # ------------------------------------------------------------------
+    # 1. Balance
+    # ------------------------------------------------------------------
+    try:
+        balance = await client.fetch_balance("USDT")
+        if balance.available <= 0:
+            report.add(
+                "EXCHANGE_READ",
+                "FAIL",
+                f"fetch_balance:{exchange_name}",
+                f"available={balance.available} <= 0",
+            )
+        else:
+            report.add(
+                "EXCHANGE_READ",
+                "PASS",
+                f"fetch_balance:{exchange_name}",
+                f"available={balance.available}",
+            )
+    except Exception as exc:
+        report.add(
+            "EXCHANGE_READ",
+            "FAIL",
+            f"fetch_balance:{exchange_name}",
+            str(exc),
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Positions
+    # ------------------------------------------------------------------
+    has_position = False
+    try:
+        positions = await client.fetch_positions(market)
+        non_zero = [p for p in positions if p.quantity > 0]
+        report.add(
+            "EXCHANGE_READ",
+            "PASS",
+            f"fetch_positions:{exchange_name}",
+            f"{len(positions)} position(s) returned",
+        )
+        if non_zero:
+            has_position = True
+            report.add(
+                "EXCHANGE_READ",
+                "FAIL",
+                f"no_existing_position:{exchange_name}",
+                f"{len(non_zero)} non-zero position(s)",
+            )
+        else:
+            report.add(
+                "EXCHANGE_READ",
+                "PASS",
+                f"no_existing_position:{exchange_name}",
+                "no existing position",
+            )
+    except Exception as exc:
+        report.add(
+            "EXCHANGE_READ",
+            "FAIL",
+            f"fetch_positions:{exchange_name}",
+            str(exc),
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Open orders
+    # ------------------------------------------------------------------
+    has_open_orders = False
+    try:
+        open_orders = await client.fetch_open_orders(market)
+        report.add(
+            "EXCHANGE_READ",
+            "PASS",
+            f"fetch_open_orders:{exchange_name}",
+            f"{len(open_orders)} order(s) returned",
+        )
+        if open_orders:
+            has_open_orders = True
+            report.add(
+                "EXCHANGE_READ",
+                "FAIL",
+                f"no_open_orders:{exchange_name}",
+                f"{len(open_orders)} open order(s)",
+            )
+        else:
+            report.add(
+                "EXCHANGE_READ",
+                "PASS",
+                f"no_open_orders:{exchange_name}",
+                "no open orders",
+            )
+    except Exception as exc:
+        report.add(
+            "EXCHANGE_READ",
+            "FAIL",
+            f"fetch_open_orders:{exchange_name}",
+            str(exc),
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Stop orders
+    # ------------------------------------------------------------------
+    has_stop_orders = False
+    try:
+        stop_orders = await client.fetch_open_stop_orders(market)
+        report.add(
+            "EXCHANGE_READ",
+            "PASS",
+            f"fetch_open_stop_orders:{exchange_name}",
+            f"{len(stop_orders)} order(s) returned",
+        )
+        if stop_orders:
+            has_stop_orders = True
+            report.add(
+                "EXCHANGE_READ",
+                "FAIL",
+                f"no_open_stop_orders:{exchange_name}",
+                f"{len(stop_orders)} open stop order(s)",
+            )
+        else:
+            report.add(
+                "EXCHANGE_READ",
+                "PASS",
+                f"no_open_stop_orders:{exchange_name}",
+                "no open stop orders",
+            )
+    except Exception as exc:
+        report.add(
+            "EXCHANGE_READ",
+            "FAIL",
+            f"fetch_open_stop_orders:{exchange_name}",
+            str(exc),
+        )
+
+    # ------------------------------------------------------------------
+    # 5. Leverage + Margin mode
+    # ------------------------------------------------------------------
+    clean_slate = not has_position and not has_open_orders and not has_stop_orders
+    leverage_info = None
+    try:
+        leverage_info = await client.fetch_leverage(market)
+        report.add(
+            "EXCHANGE_READ",
+            "PASS",
+            f"fetch_leverage:{exchange_name}",
+            "",
+        )
+    except Exception as exc:
+        report.add(
+            "EXCHANGE_READ",
+            "FAIL",
+            f"fetch_leverage:{exchange_name}",
+            str(exc),
+        )
+
+    if leverage_info is not None:
+        actual_lev = leverage_info.leverage
+        if actual_lev is not None:
+            if expected_leverage is not None and actual_lev == expected_leverage:
+                mm_detail = _margin_mode_detail(leverage_info)
+                report.add(
+                    "EXCHANGE_READ",
+                    "PASS",
+                    f"leverage_read:{exchange_name}",
+                    f"{actual_lev}{mm_detail}",
+                )
+            else:
+                report.add(
+                    "EXCHANGE_READ",
+                    "FAIL",
+                    f"leverage_read:{exchange_name}",
+                    f"actual={actual_lev} expected={expected_leverage}",
+                )
+        else:
+            if clean_slate:
+                report.add(
+                    "EXCHANGE_READ",
+                    "WARN",
+                    f"leverage_read:{exchange_name}",
+                    "unable to verify leverage from read-only API",
+                )
+            else:
+                report.add(
+                    "EXCHANGE_READ",
+                    "WARN",
+                    f"leverage_read:{exchange_name}",
+                    "unable to verify leverage; positions/orders exist",
+                )
+
+        # Margin mode from leverage_info
+        if leverage_info.margin_mode is not None:
+            actual_mm = leverage_info.margin_mode
+            if actual_mm == expected_margin_mode:
+                report.add(
+                    "EXCHANGE_READ",
+                    "PASS",
+                    f"margin_mode_read:{exchange_name}",
+                    actual_mm.value,
+                )
+            else:
+                report.add(
+                    "EXCHANGE_READ",
+                    "FAIL",
+                    f"margin_mode_read:{exchange_name}",
+                    f"actual={actual_mm.value} expected={expected_margin_mode.value}",
+                )
+        else:
+            report.add(
+                "EXCHANGE_READ",
+                "WARN",
+                f"margin_mode_read:{exchange_name}",
+                "unable to verify margin mode from read-only API",
+            )
     else:
-        detail = "not requested; no exchange client constructed"
-    report.add(
-        "EXCHANGE_READ",
-        "SKIPPED",
-        "EXCHANGE_READ_CHECK_SKIPPED",
-        detail,
+        # fetch_leverage failed entirely — margin mode also unavailable
+        if clean_slate:
+            report.add(
+                "EXCHANGE_READ",
+                "WARN",
+                f"margin_mode_read:{exchange_name}",
+                "unable to verify margin mode from read-only API",
+            )
+
+    # ------------------------------------------------------------------
+    # 6. Position mode
+    # ------------------------------------------------------------------
+    try:
+        pos_mode = await client.fetch_position_mode()
+        pm_value = pos_mode.value if isinstance(pos_mode, PositionMode) else str(pos_mode)
+        report.add(
+            "EXCHANGE_READ",
+            "PASS",
+            f"position_mode_read:{exchange_name}",
+            pm_value,
+        )
+        if pm_value != "one_way":
+            report.add(
+                "EXCHANGE_READ",
+                "WARN",
+                f"position_mode:{exchange_name}",
+                f"expected one_way, actual={pm_value}",
+            )
+    except Exception as exc:
+        report.add(
+            "EXCHANGE_READ",
+            "WARN",
+            f"position_mode_read:{exchange_name}",
+            str(exc),
+        )
+
+
+def _margin_mode_detail(leverage_info: object) -> str:
+    mm = getattr(leverage_info, "margin_mode", None)
+    if mm is None:
+        return ""
+    mm_value = mm.value if hasattr(mm, "value") else str(mm)
+    return f" {mm_value}"
+
+
+def _make_exchange_config(
+    exchange_name: str,
+    env: Mapping[str, str],
+) -> ExchangeConfig:
+    key = exchange_name.upper()
+    margin_mode_str = str(env.get("MARGIN_MODE", "isolated")).strip().lower()
+    try:
+        margin_mode = MarginMode(margin_mode_str)
+    except ValueError:
+        margin_mode = MarginMode.ISOLATED
+    sandbox_str = str(env.get(f"{key}_SANDBOX", "false")).strip().lower()
+    live_trading_str = str(env.get("AETHER_LIVE_TRADING", "false")).strip().lower()
+    return ExchangeConfig(
+        api_key=env.get(f"{key}_API_KEY", ""),
+        api_secret=env.get(f"{key}_SECRET_KEY", ""),
+        passphrase=env.get(f"{key}_PASSPHRASE", ""),
+        sandbox=sandbox_str in ("true", "1", "yes", "on"),
+        timeout_seconds=float(env.get("API_TIMEOUT_SECONDS", "10.0") or 10.0),
+        live_trading_enabled=live_trading_str in ("true", "1", "yes", "on"),
+        default_margin_mode=margin_mode,
     )
 
 

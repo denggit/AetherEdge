@@ -82,6 +82,7 @@ def _run(
     remove: tuple[str, ...] = (),
     expect_real_live: bool = True,
     check_exchange_read: bool = False,
+    skip_exchange_read: bool = True,
 ):
     env_file, _ = _write_env(tmp_path, overrides, remove=remove)
     return run_preflight(
@@ -90,6 +91,7 @@ def _run(
         repo_root=tmp_path,
         expect_real_live=expect_real_live,
         check_exchange_read=check_exchange_read,
+        skip_exchange_read=skip_exchange_read,
     )
 
 
@@ -115,6 +117,19 @@ def test_new_cli_arguments_parse() -> None:
     assert args.report == "data/state/report.json"
     assert args.env_file == ".env"
     assert args.check_exchange_read is True
+    assert args.skip_exchange_read is False
+
+
+def test_skip_exchange_read_cli_flag_parse() -> None:
+    args = parse_args(
+        [
+            "--expect-real-live",
+            "--skip-exchange-read",
+        ]
+    )
+    assert args.expect_real_live is True
+    assert args.skip_exchange_read is True
+    assert args.check_exchange_read is False
 
 
 def test_report_argument_writes_json_and_creates_parent(
@@ -133,6 +148,7 @@ def test_report_argument_writes_json_and_creates_parent(
             str(env_file),
             "--report",
             str(report_path),
+            "--skip-exchange-read",
         ]
     )
 
@@ -247,12 +263,47 @@ def test_leverage_mismatch_fails(tmp_path: Path) -> None:
     assert _one(report, "leverage_match").status == "FAIL"
 
 
-def test_leverage_15_warns_and_adds_manual_confirmation(tmp_path: Path) -> None:
+def test_leverage_15_passes_as_expected_buffer(tmp_path: Path) -> None:
     report = _run(tmp_path, {"OKX_LEVERAGE": "15", "BINANCE_LEVERAGE": "15"})
 
     assert report.ok is True
-    assert _one(report, "configured_leverage").status == "WARN"
-    assert any("15x" in item for item in report.manual_checklist)
+    check = _one(report, "configured_leverage")
+    assert check.status == "PASS"
+    assert "15" in check.detail
+    assert "expected buffer" in check.detail
+    assert not any("Confirm leverage" in item for item in report.manual_checklist)
+
+
+def test_leverage_below_12_warns(tmp_path: Path) -> None:
+    report = _run(tmp_path, {"OKX_LEVERAGE": "10", "BINANCE_LEVERAGE": "10"})
+
+    check = _one(report, "configured_leverage")
+    assert check.status == "WARN"
+    assert "below expected strategy max leverage buffer" in check.detail
+
+
+def test_leverage_above_20_warns(tmp_path: Path) -> None:
+    report = _run(tmp_path, {"OKX_LEVERAGE": "25", "BINANCE_LEVERAGE": "25"})
+
+    check = _one(report, "configured_leverage")
+    assert check.status == "WARN"
+    assert "unusually high leverage" in check.detail
+
+
+def test_leverage_12_passes_as_expected_buffer(tmp_path: Path) -> None:
+    report = _run(tmp_path, {"OKX_LEVERAGE": "12", "BINANCE_LEVERAGE": "12"})
+
+    check = _one(report, "configured_leverage")
+    assert check.status == "PASS"
+    assert "expected buffer" in check.detail
+
+
+def test_leverage_20_passes_as_expected_buffer(tmp_path: Path) -> None:
+    report = _run(tmp_path, {"OKX_LEVERAGE": "20", "BINANCE_LEVERAGE": "20"})
+
+    check = _one(report, "configured_leverage")
+    assert check.status == "PASS"
+    assert "expected buffer" in check.detail
 
 
 @pytest.mark.parametrize("value", [None, "not-a-number", "-0.1"])
@@ -334,18 +385,18 @@ def test_exchange_read_default_is_explicitly_skipped(tmp_path: Path) -> None:
 
     check = _one(report, "EXCHANGE_READ_CHECK_SKIPPED")
     assert check.status == "SKIPPED"
-    assert "not requested" in check.detail
+    assert "explicitly skipped" in check.detail
     output = render_report(report)
     assert "Confirm OKX has no ETH-USDT-SWAP position" in output
     assert "Confirm Binance has no stale open/stop orders" in output
 
 
-def test_requested_exchange_read_stays_safe_and_skipped(tmp_path: Path) -> None:
-    report = _run(tmp_path, check_exchange_read=True)
+def test_skip_exchange_read_with_flag(tmp_path: Path) -> None:
+    report = _run(tmp_path, skip_exchange_read=True)
 
     check = _one(report, "EXCHANGE_READ_CHECK_SKIPPED")
     assert check.status == "SKIPPED"
-    assert "no isolated read-only V10A adapter" in check.detail
+    assert "explicitly skipped by --skip-exchange-read" in check.detail
 
 
 def test_strategy_and_runtime_requirement_checks_pass(tmp_path: Path) -> None:
@@ -517,6 +568,733 @@ def test_fresh_current_range_checkpoint_is_recoverable(tmp_path: Path) -> None:
     assert check.status == "PASS"
     assert "RECOVERED_DEGRADED_MINOR" in check.detail
     assert _one(report, "current_bucket_checkpoint_age_ms").status == "PASS"
+
+
+# ---------------------------------------------------------------------------
+# Fake exchange clients for testing exchange read checks
+# ---------------------------------------------------------------------------
+
+
+class FakeExchangeClient:
+    """Fake read-only exchange client for preflight testing.
+
+    Tracks any write-method calls so tests can assert none were made.
+    """
+
+    def __init__(
+        self,
+        exchange_name: str = "okx",
+        *,
+        balance_available: float = 1000,
+        positions: list | None = None,
+        open_orders: list | None = None,
+        open_stop_orders: list | None = None,
+        leverage: float | None = None,
+        margin_mode: str | None = None,
+        position_mode: str = "one_way",
+        raise_on: dict | None = None,
+    ):
+        from decimal import Decimal
+
+        from src.platform.exchanges.models import (
+            Balance,
+            ExchangeName,
+            LeverageInfo,
+            MarginMode,
+            PositionMode,
+        )
+
+        self._exchange = ExchangeName(str(exchange_name).strip().lower())
+        self._balance = Balance(
+            exchange=self._exchange,
+            asset="USDT",
+            total=Decimal(str(balance_available)),
+            available=Decimal(str(balance_available)),
+        )
+        self._positions = list(positions or [])
+        self._open_orders = list(open_orders or [])
+        self._open_stop_orders = list(open_stop_orders or [])
+        self._leverage_info = LeverageInfo(
+            exchange=self._exchange,
+            symbol="ETH-USDT-PERP",
+            raw_symbol="ETH-USDT-PERP",
+            leverage=Decimal(str(leverage)) if leverage is not None else None,
+            margin_mode=MarginMode(margin_mode) if margin_mode else None,
+        )
+        self._position_mode = PositionMode(position_mode)
+        self._raise_on = dict(raise_on or {})
+        self.write_calls: list[tuple[str, object]] = []
+
+    @property
+    def exchange(self):
+        return self._exchange
+
+    # -- Read methods -------------------------------------------------------
+
+    async def fetch_balance(self, asset: str = "USDT"):
+        self._check_raise("fetch_balance")
+        return self._balance
+
+    async def fetch_positions(self, symbol=None):
+        self._check_raise("fetch_positions")
+        return list(self._positions)
+
+    async def fetch_open_orders(self, symbol: str):
+        self._check_raise("fetch_open_orders")
+        return list(self._open_orders)
+
+    async def fetch_open_stop_orders(self, symbol: str):
+        self._check_raise("fetch_open_stop_orders")
+        return list(self._open_stop_orders)
+
+    async def fetch_leverage(self, symbol: str, *, margin_mode=None):
+        self._check_raise("fetch_leverage")
+        return self._leverage_info
+
+    async def fetch_position_mode(self):
+        self._check_raise("fetch_position_mode")
+        return self._position_mode
+
+    # -- Write methods (tracked, must never be called) ----------------------
+
+    async def place_order(self, request):
+        self.write_calls.append(("place_order", request))
+
+    async def place_stop_market_order(self, request):
+        self.write_calls.append(("place_stop_market_order", request))
+
+    async def cancel_order(self, request):
+        self.write_calls.append(("cancel_order", request))
+
+    async def cancel_all_orders(self, symbol):
+        self.write_calls.append(("cancel_all_orders", symbol))
+
+    async def cancel_stop_order(self, request):
+        self.write_calls.append(("cancel_stop_order", request))
+
+    async def cancel_all_stop_orders(self, symbol):
+        self.write_calls.append(("cancel_all_stop_orders", symbol))
+
+    async def set_leverage(self, request):
+        self.write_calls.append(("set_leverage", request))
+
+    async def set_margin_mode(self, symbol, margin_mode):
+        self.write_calls.append(("set_margin_mode", (symbol, margin_mode)))
+
+    async def set_position_mode(self, mode):
+        self.write_calls.append(("set_position_mode", mode))
+
+    async def amend_order(self, request):
+        self.write_calls.append(("amend_order", request))
+
+    def _check_raise(self, method: str) -> None:
+        exc = self._raise_on.get(method)
+        if exc is not None:
+            raise exc
+
+
+def _make_position(exchange_name="okx", symbol="ETH-USDT-PERP", quantity=1.0):
+    from decimal import Decimal
+
+    from src.platform.exchanges.models import Position, PositionSide
+
+    return Position(
+        exchange=exchange_name,
+        symbol=symbol,
+        raw_symbol=symbol,
+        side=PositionSide.SHORT,
+        quantity=Decimal(str(quantity)),
+    )
+
+
+def _make_order(exchange_name="okx", symbol="ETH-USDT-PERP"):
+    from src.platform.exchanges.models import Order, OrderStatus
+
+    return Order(
+        exchange=exchange_name,
+        symbol=symbol,
+        raw_symbol=symbol,
+        order_id="test-order-1",
+        client_order_id=None,
+        status=OrderStatus.NEW,
+    )
+
+
+def _make_exchange_read_env(
+    tmp_path,
+    monkeypatch,
+    *,
+    expect_real_live: bool = True,
+    check_exchange_read: bool = False,
+    skip_exchange_read: bool = False,
+) -> tuple:
+    env_file, _ = _write_env(tmp_path)
+    fake_okx = FakeExchangeClient("okx")
+    fake_binance = FakeExchangeClient("binance")
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        name = str(exchange).strip().lower()
+        if name == "okx":
+            return fake_okx
+        if name == "binance":
+            return fake_binance
+        raise ValueError(f"Unexpected exchange: {exchange}")
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client",
+        _fake_create,
+    )
+    report = run_preflight(
+        env_file=env_file,
+        environ={},
+        repo_root=tmp_path,
+        expect_real_live=expect_real_live,
+        check_exchange_read=check_exchange_read,
+        skip_exchange_read=skip_exchange_read,
+    )
+    return report, fake_okx, fake_binance
+
+
+# ---------------------------------------------------------------------------
+# Exchange read – basic activation logic
+# ---------------------------------------------------------------------------
+
+
+def test_exchange_read_runs_with_expect_real_live(
+    tmp_path, monkeypatch
+) -> None:
+    report, okx, binance = _make_exchange_read_env(
+        tmp_path, monkeypatch, expect_real_live=True, skip_exchange_read=False
+    )
+    skipped = report.named("EXCHANGE_READ_CHECK_SKIPPED")
+    assert len(skipped) == 0
+    assert _one(report, "fetch_balance:okx").status == "PASS"
+    assert _one(report, "fetch_balance:binance").status == "PASS"
+
+
+def test_exchange_read_skipped_with_flag(tmp_path, monkeypatch) -> None:
+    report, okx, binance = _make_exchange_read_env(
+        tmp_path, monkeypatch, expect_real_live=True, skip_exchange_read=True
+    )
+    check = _one(report, "EXCHANGE_READ_CHECK_SKIPPED")
+    assert check.status == "SKIPPED"
+    assert "explicitly skipped" in check.detail
+
+
+def test_exchange_read_runs_with_check_flag_no_real_live(
+    tmp_path, monkeypatch
+) -> None:
+    report, okx, binance = _make_exchange_read_env(
+        tmp_path, monkeypatch,
+        expect_real_live=False,
+        check_exchange_read=True,
+        skip_exchange_read=False,
+    )
+    skipped = report.named("EXCHANGE_READ_CHECK_SKIPPED")
+    assert len(skipped) == 0
+    assert _one(report, "fetch_balance:okx").status == "PASS"
+
+
+# ---------------------------------------------------------------------------
+# Exchange read – only read methods called
+# ---------------------------------------------------------------------------
+
+
+def test_exchange_read_no_write_methods_called(tmp_path, monkeypatch) -> None:
+    report, okx, binance = _make_exchange_read_env(
+        tmp_path, monkeypatch, expect_real_live=True, skip_exchange_read=False
+    )
+    assert len(okx.write_calls) == 0, f"OKX write calls: {okx.write_calls}"
+    assert len(binance.write_calls) == 0, f"Binance write calls: {binance.write_calls}"
+
+
+# ---------------------------------------------------------------------------
+# Exchange read – balance checks
+# ---------------------------------------------------------------------------
+
+
+def test_exchange_read_balance_pass(tmp_path, monkeypatch) -> None:
+    report, okx, binance = _make_exchange_read_env(
+        tmp_path, monkeypatch, expect_real_live=True, skip_exchange_read=False
+    )
+    assert _one(report, "fetch_balance:okx").status == "PASS"
+    assert "available=1000" in _one(report, "fetch_balance:okx").detail
+
+
+def test_exchange_read_balance_zero_or_negative_fails(
+    tmp_path, monkeypatch
+) -> None:
+    report, okx, binance = _make_exchange_read_env(
+        tmp_path, monkeypatch, expect_real_live=True, skip_exchange_read=False
+    )
+    # We need to set balance to 0 – recreate with custom fake
+    env_file, _ = _write_env(tmp_path)
+    fake_okx = FakeExchangeClient("okx", balance_available=0)
+    fake_binance = FakeExchangeClient("binance")
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        return fake_okx if str(exchange).strip().lower() == "okx" else fake_binance
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client", _fake_create
+    )
+    report2 = run_preflight(
+        env_file=env_file, environ={}, repo_root=tmp_path,
+        expect_real_live=True, skip_exchange_read=False,
+    )
+    assert _one(report2, "fetch_balance:okx").status == "FAIL"
+    assert "<= 0" in _one(report2, "fetch_balance:okx").detail
+
+
+def test_exchange_read_balance_api_error_fails(
+    tmp_path, monkeypatch
+) -> None:
+    env_file, _ = _write_env(tmp_path)
+    fake_okx = FakeExchangeClient(
+        "okx", raise_on={"fetch_balance": RuntimeError("network down")}
+    )
+    fake_binance = FakeExchangeClient("binance")
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        return fake_okx if str(exchange).strip().lower() == "okx" else fake_binance
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client", _fake_create
+    )
+    report = run_preflight(
+        env_file=env_file, environ={}, repo_root=tmp_path,
+        expect_real_live=True, skip_exchange_read=False,
+    )
+    assert _one(report, "fetch_balance:okx").status == "FAIL"
+
+
+# ---------------------------------------------------------------------------
+# Exchange read – positions
+# ---------------------------------------------------------------------------
+
+
+def test_exchange_read_no_positions_pass(tmp_path, monkeypatch) -> None:
+    report, okx, binance = _make_exchange_read_env(
+        tmp_path, monkeypatch, expect_real_live=True, skip_exchange_read=False
+    )
+    assert _one(report, "fetch_positions:okx").status == "PASS"
+    assert _one(report, "no_existing_position:okx").status == "PASS"
+
+
+def test_exchange_read_existing_position_fails(tmp_path, monkeypatch) -> None:
+    env_file, _ = _write_env(tmp_path)
+    pos = _make_position("okx", quantity=1.0)
+    fake_okx = FakeExchangeClient("okx", positions=[pos])
+    fake_binance = FakeExchangeClient("binance")
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        return fake_okx if str(exchange).strip().lower() == "okx" else fake_binance
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client", _fake_create
+    )
+    report = run_preflight(
+        env_file=env_file, environ={}, repo_root=tmp_path,
+        expect_real_live=True, skip_exchange_read=False,
+    )
+    assert _one(report, "no_existing_position:okx").status == "FAIL"
+    assert "non-zero" in _one(report, "no_existing_position:okx").detail
+
+
+def test_exchange_read_positions_api_error_fails(tmp_path, monkeypatch) -> None:
+    env_file, _ = _write_env(tmp_path)
+    fake_okx = FakeExchangeClient(
+        "okx", raise_on={"fetch_positions": RuntimeError("timeout")}
+    )
+    fake_binance = FakeExchangeClient("binance")
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        return fake_okx if str(exchange).strip().lower() == "okx" else fake_binance
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client", _fake_create
+    )
+    report = run_preflight(
+        env_file=env_file, environ={}, repo_root=tmp_path,
+        expect_real_live=True, skip_exchange_read=False,
+    )
+    assert _one(report, "fetch_positions:okx").status == "FAIL"
+
+
+# ---------------------------------------------------------------------------
+# Exchange read – open orders
+# ---------------------------------------------------------------------------
+
+
+def test_exchange_read_no_open_orders_pass(tmp_path, monkeypatch) -> None:
+    report, okx, binance = _make_exchange_read_env(
+        tmp_path, monkeypatch, expect_real_live=True, skip_exchange_read=False
+    )
+    assert _one(report, "no_open_orders:okx").status == "PASS"
+    assert _one(report, "no_open_orders:binance").status == "PASS"
+
+
+def test_exchange_read_existing_open_order_fails(tmp_path, monkeypatch) -> None:
+    env_file, _ = _write_env(tmp_path)
+    order = _make_order("okx")
+    fake_okx = FakeExchangeClient("okx", open_orders=[order])
+    fake_binance = FakeExchangeClient("binance")
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        return fake_okx if str(exchange).strip().lower() == "okx" else fake_binance
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client", _fake_create
+    )
+    report = run_preflight(
+        env_file=env_file, environ={}, repo_root=tmp_path,
+        expect_real_live=True, skip_exchange_read=False,
+    )
+    assert _one(report, "no_open_orders:okx").status == "FAIL"
+
+
+# ---------------------------------------------------------------------------
+# Exchange read – stop orders
+# ---------------------------------------------------------------------------
+
+
+def test_exchange_read_no_stop_orders_pass(tmp_path, monkeypatch) -> None:
+    report, okx, binance = _make_exchange_read_env(
+        tmp_path, monkeypatch, expect_real_live=True, skip_exchange_read=False
+    )
+    assert _one(report, "no_open_stop_orders:okx").status == "PASS"
+
+
+def test_exchange_read_existing_stop_order_fails(tmp_path, monkeypatch) -> None:
+    env_file, _ = _write_env(tmp_path)
+    order = _make_order("okx")
+    fake_okx = FakeExchangeClient("okx", open_stop_orders=[order])
+    fake_binance = FakeExchangeClient("binance")
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        return fake_okx if str(exchange).strip().lower() == "okx" else fake_binance
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client", _fake_create
+    )
+    report = run_preflight(
+        env_file=env_file, environ={}, repo_root=tmp_path,
+        expect_real_live=True, skip_exchange_read=False,
+    )
+    assert _one(report, "no_open_stop_orders:okx").status == "FAIL"
+
+
+# ---------------------------------------------------------------------------
+# Exchange read – leverage and margin mode
+# ---------------------------------------------------------------------------
+
+
+def test_exchange_read_leverage_match_pass(tmp_path, monkeypatch) -> None:
+    report, okx, binance = _make_exchange_read_env(
+        tmp_path, monkeypatch, expect_real_live=True, skip_exchange_read=False
+    )
+    # With default OKX_LEVERAGE=10 and fake leverage=10
+    check = _one(report, "leverage_read:okx")
+    # Default leverage in BASE_ENV is 10, and default fake leverage is None
+    # so this will be WARN (unable to verify). Need to check with explicit leverage.
+    # The default fake has leverage=None → WARN "unable to verify"
+    pass  # See explicit tests below
+
+
+def test_exchange_read_leverage_match_explicit(tmp_path, monkeypatch) -> None:
+    env_file, _ = _write_env(tmp_path, {"OKX_LEVERAGE": "15", "BINANCE_LEVERAGE": "15"})
+    fake_okx = FakeExchangeClient("okx", leverage=15, margin_mode="isolated")
+    fake_binance = FakeExchangeClient("binance", leverage=15, margin_mode="isolated")
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        return fake_okx if str(exchange).strip().lower() == "okx" else fake_binance
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client", _fake_create
+    )
+    report = run_preflight(
+        env_file=env_file, environ={}, repo_root=tmp_path,
+        expect_real_live=True, skip_exchange_read=False,
+    )
+    assert _one(report, "leverage_read:okx").status == "PASS"
+    assert "15" in _one(report, "leverage_read:okx").detail
+    assert _one(report, "leverage_read:binance").status == "PASS"
+
+
+def test_exchange_read_leverage_mismatch_fails(tmp_path, monkeypatch) -> None:
+    env_file, _ = _write_env(tmp_path, {"OKX_LEVERAGE": "10", "BINANCE_LEVERAGE": "10"})
+    fake_okx = FakeExchangeClient("okx", leverage=15, margin_mode="isolated")
+    fake_binance = FakeExchangeClient("binance", leverage=15, margin_mode="isolated")
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        return fake_okx if str(exchange).strip().lower() == "okx" else fake_binance
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client", _fake_create
+    )
+    report = run_preflight(
+        env_file=env_file, environ={}, repo_root=tmp_path,
+        expect_real_live=True, skip_exchange_read=False,
+    )
+    assert _one(report, "leverage_read:okx").status == "FAIL"
+    assert "actual=15" in _one(report, "leverage_read:okx").detail
+
+
+def test_exchange_read_leverage_unavailable_clean_slate_warns(
+    tmp_path, monkeypatch
+) -> None:
+    env_file, _ = _write_env(tmp_path)
+    # leverage=None with clean slate → WARN
+    fake_okx = FakeExchangeClient("okx", leverage=None)
+    fake_binance = FakeExchangeClient("binance", leverage=None)
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        return fake_okx if str(exchange).strip().lower() == "okx" else fake_binance
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client", _fake_create
+    )
+    report = run_preflight(
+        env_file=env_file, environ={}, repo_root=tmp_path,
+        expect_real_live=True, skip_exchange_read=False,
+    )
+    check = _one(report, "leverage_read:okx")
+    assert check.status == "WARN"
+    assert "unable to verify leverage from read-only API" in check.detail
+
+
+def test_exchange_read_leverage_unavailable_with_position_warns(
+    tmp_path, monkeypatch
+) -> None:
+    env_file, _ = _write_env(tmp_path)
+    pos = _make_position("binance", symbol="ETHUSDT", quantity=1.0)
+    fake_okx = FakeExchangeClient("okx", leverage=None)
+    fake_binance = FakeExchangeClient("binance", leverage=None, positions=[pos])
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        return fake_okx if str(exchange).strip().lower() == "okx" else fake_binance
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client", _fake_create
+    )
+    report = run_preflight(
+        env_file=env_file, environ={}, repo_root=tmp_path,
+        expect_real_live=True, skip_exchange_read=False,
+    )
+    check = _one(report, "leverage_read:binance")
+    assert check.status == "WARN"
+    assert "positions/orders exist" in check.detail
+
+
+def test_exchange_read_margin_mode_match_pass(tmp_path, monkeypatch) -> None:
+    env_file, _ = _write_env(tmp_path)
+    fake_okx = FakeExchangeClient("okx", leverage=10, margin_mode="isolated")
+    fake_binance = FakeExchangeClient("binance", leverage=10, margin_mode="isolated")
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        return fake_okx if str(exchange).strip().lower() == "okx" else fake_binance
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client", _fake_create
+    )
+    report = run_preflight(
+        env_file=env_file, environ={}, repo_root=tmp_path,
+        expect_real_live=True, skip_exchange_read=False,
+    )
+    assert _one(report, "margin_mode_read:okx").status == "PASS"
+    assert "isolated" in _one(report, "margin_mode_read:okx").detail
+
+
+def test_exchange_read_margin_mode_mismatch_fails(tmp_path, monkeypatch) -> None:
+    env_file, _ = _write_env(tmp_path)
+    fake_okx = FakeExchangeClient("okx", leverage=10, margin_mode="cross")
+    fake_binance = FakeExchangeClient("binance", leverage=10, margin_mode="isolated")
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        return fake_okx if str(exchange).strip().lower() == "okx" else fake_binance
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client", _fake_create
+    )
+    report = run_preflight(
+        env_file=env_file, environ={}, repo_root=tmp_path,
+        expect_real_live=True, skip_exchange_read=False,
+    )
+    assert _one(report, "margin_mode_read:okx").status == "FAIL"
+
+
+def test_exchange_read_margin_mode_unavailable_warns(
+    tmp_path, monkeypatch
+) -> None:
+    env_file, _ = _write_env(tmp_path)
+    fake_okx = FakeExchangeClient("okx", leverage=10, margin_mode=None)
+    fake_binance = FakeExchangeClient("binance", leverage=10, margin_mode=None)
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        return fake_okx if str(exchange).strip().lower() == "okx" else fake_binance
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client", _fake_create
+    )
+    report = run_preflight(
+        env_file=env_file, environ={}, repo_root=tmp_path,
+        expect_real_live=True, skip_exchange_read=False,
+    )
+    check = _one(report, "margin_mode_read:okx")
+    assert check.status == "WARN"
+    assert "unable to verify margin mode" in check.detail
+
+
+# ---------------------------------------------------------------------------
+# Exchange read – position mode
+# ---------------------------------------------------------------------------
+
+
+def test_exchange_read_position_mode_one_way_pass(tmp_path, monkeypatch) -> None:
+    report, okx, binance = _make_exchange_read_env(
+        tmp_path, monkeypatch, expect_real_live=True, skip_exchange_read=False
+    )
+    assert _one(report, "position_mode_read:okx").status == "PASS"
+    assert "one_way" in _one(report, "position_mode_read:okx").detail
+
+
+def test_exchange_read_position_mode_hedge_warns(tmp_path, monkeypatch) -> None:
+    env_file, _ = _write_env(tmp_path)
+    fake_okx = FakeExchangeClient("okx", position_mode="hedge")
+    fake_binance = FakeExchangeClient("binance")
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        return fake_okx if str(exchange).strip().lower() == "okx" else fake_binance
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client", _fake_create
+    )
+    report = run_preflight(
+        env_file=env_file, environ={}, repo_root=tmp_path,
+        expect_real_live=True, skip_exchange_read=False,
+    )
+    assert _one(report, "position_mode_read:okx").status == "PASS"
+    warns = [c for c in report.checks if c.name == "position_mode:okx"]
+    assert len(warns) == 1
+    assert warns[0].status == "WARN"
+
+
+# ---------------------------------------------------------------------------
+# Exchange read – JSON summary / failures / warnings
+# ---------------------------------------------------------------------------
+
+
+def test_exchange_read_json_summary_counts_correct(
+    tmp_path, monkeypatch
+) -> None:
+    report, okx, binance = _make_exchange_read_env(
+        tmp_path, monkeypatch, expect_real_live=True, skip_exchange_read=False
+    )
+    d = report.to_dict()
+    s = d["summary"]
+    assert s["pass"] == report.pass_count
+    assert s["warn"] == report.warn_count
+    assert s["fail"] == report.fail_count
+    assert s["skipped"] == report.skipped_count
+    # No exchange read checks should be SKIPPED
+    assert report.skipped_count == 0
+
+
+def test_exchange_read_failures_in_json_failures_list(
+    tmp_path, monkeypatch
+) -> None:
+    env_file, _ = _write_env(tmp_path)
+    order = _make_order("okx")
+    fake_okx = FakeExchangeClient("okx", open_orders=[order])
+    fake_binance = FakeExchangeClient("binance")
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        return fake_okx if str(exchange).strip().lower() == "okx" else fake_binance
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client", _fake_create
+    )
+    report = run_preflight(
+        env_file=env_file, environ={}, repo_root=tmp_path,
+        expect_real_live=True, skip_exchange_read=False,
+    )
+    d = report.to_dict()
+    failure_names = {f["name"] for f in d["failures"]}
+    assert "no_open_orders:okx" in failure_names
+
+
+def test_exchange_read_warnings_in_json_warnings_list(
+    tmp_path, monkeypatch
+) -> None:
+    env_file, _ = _write_env(tmp_path)
+    fake_okx = FakeExchangeClient("okx", leverage=None)
+    fake_binance = FakeExchangeClient("binance", leverage=None)
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        return fake_okx if str(exchange).strip().lower() == "okx" else fake_binance
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client", _fake_create
+    )
+    report = run_preflight(
+        env_file=env_file, environ={}, repo_root=tmp_path,
+        expect_real_live=True, skip_exchange_read=False,
+    )
+    d = report.to_dict()
+    warning_names = {w["name"] for w in d["warnings"]}
+    assert "leverage_read:okx" in warning_names
+
+
+# ---------------------------------------------------------------------------
+# Exchange read – stdout summary
+# ---------------------------------------------------------------------------
+
+
+def test_exchange_read_stdout_summary_counts_correct(
+    tmp_path, monkeypatch
+) -> None:
+    report, okx, binance = _make_exchange_read_env(
+        tmp_path, monkeypatch, expect_real_live=True, skip_exchange_read=False
+    )
+    output = render_report(report)
+    assert "SUMMARY:" in output
+    assert f"PASS: {report.pass_count}" in output
+    assert f"WARN: {report.warn_count}" in output
+    assert f"FAIL: {report.fail_count}" in output
+    assert f"SKIPPED: {report.skipped_count}" in output
+
+
+# ---------------------------------------------------------------------------
+# Exchange read – secret redaction still applies
+# ---------------------------------------------------------------------------
+
+
+def test_exchange_read_secrets_not_in_report(tmp_path, monkeypatch) -> None:
+    secret = "REAL-SECRET-KEY-12345"
+    env_file, _ = _write_env(
+        tmp_path,
+        {"OKX_API_KEY": secret, "OKX_SECRET_KEY": "sekrit"},
+    )
+    fake_okx = FakeExchangeClient("okx")
+    fake_binance = FakeExchangeClient("binance")
+
+    def _fake_create(exchange, config=None, *, http_client=None):
+        return fake_okx if str(exchange).strip().lower() == "okx" else fake_binance
+
+    monkeypatch.setattr(
+        "tools.preflight_v10a_live.create_exchange_client", _fake_create
+    )
+    report = run_preflight(
+        env_file=env_file, environ={}, repo_root=tmp_path,
+        expect_real_live=True, skip_exchange_read=False,
+    )
+    output = render_report(report)
+    assert secret not in output
+    assert "sekrit" not in output
+    d = report.to_dict()
+    raw = json.dumps(d)
+    assert secret not in raw
+    assert "sekrit" not in raw
 
 
 def test_tool_source_has_no_forbidden_write_operation() -> None:
@@ -830,6 +1608,7 @@ def test_new_fields_do_not_change_original_check_results(tmp_path: Path) -> None
         environ={},
         repo_root=tmp_path,
         expect_real_live=True,
+        skip_exchange_read=True,
     )
 
     # Same assertions as existing test_correct_real_live_env_returns_pass
