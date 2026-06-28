@@ -49,6 +49,11 @@ BASE_ENV = {
     "BINANCE_LEVERAGE": "10",
     "AETHER_STATE_DB": "data/state/test_state.sqlite3",
     "AETHER_ORDER_JOURNAL_DB": "data/state/test_order_journal.sqlite3",
+    "OKX_API_KEY": "test-okx-api-key",
+    "OKX_SECRET_KEY": "test-okx-secret-key",
+    "OKX_PASSPHRASE": "test-okx-passphrase",
+    "BINANCE_API_KEY": "test-binance-api-key",
+    "BINANCE_SECRET_KEY": "test-binance-secret-key",
 }
 
 
@@ -529,3 +534,147 @@ def test_tool_source_has_no_forbidden_write_operation() -> None:
         "live_runtime start",
     ):
         assert forbidden not in source
+
+
+# ---------------------------------------------------------------------------
+# SQLite read-only inspection – immutable=1 removal
+# ---------------------------------------------------------------------------
+
+
+def test_sqlite_read_only_inspection_does_not_use_immutable() -> None:
+    source = (
+        Path(__file__).resolve().parents[2] / "tools" / "preflight_v10a_live.py"
+    ).read_text(encoding="utf-8")
+    assert "immutable=1" not in source
+
+
+def test_wal_uncheckpointed_pending_rows_visible_in_read_only(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "wal_state.sqlite3"
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute("CREATE TABLE orders (status TEXT NOT NULL)")
+        conn.execute("INSERT INTO orders(status) VALUES ('new')")
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("INSERT INTO orders(status) VALUES ('partially_filled')")
+
+    wal_path = Path(str(db_path) + "-wal")
+    assert wal_path.exists(), "WAL file must exist for this test to be meaningful"
+
+    before = db_path.read_bytes()
+    report = _run(tmp_path, {"AETHER_STATE_DB": "wal_state.sqlite3"})
+
+    assert not report.ok
+    check = _one(report, "state_db_pending_orders")
+    assert check.status == "FAIL"
+    assert "2" in check.detail
+    assert db_path.read_bytes() == before
+
+
+def test_read_only_inspection_preserves_db_bytes(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite3"
+    with sqlite3.connect(db_path) as connection:
+        connection.execute("CREATE TABLE orders (status TEXT NOT NULL)")
+        connection.execute("INSERT INTO orders(status) VALUES ('new')")
+    before = db_path.read_bytes()
+    report = _run(tmp_path, {"AETHER_STATE_DB": "state.sqlite3"})
+
+    assert report.ok is False
+    assert _one(report, "state_db_pending_orders").status == "FAIL"
+    assert db_path.read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# Credentials presence check
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "missing_key",
+    [
+        "OKX_API_KEY",
+        "OKX_SECRET_KEY",
+        "OKX_PASSPHRASE",
+        "BINANCE_API_KEY",
+        "BINANCE_SECRET_KEY",
+    ],
+)
+def test_missing_credential_fails(tmp_path: Path, missing_key: str) -> None:
+    report = _run(tmp_path, remove=(missing_key,))
+
+    check = _one(report, f"{missing_key} missing")
+    assert check.status == "FAIL"
+    assert check.section == "CREDENTIALS"
+
+
+def test_credentials_present_pass(tmp_path: Path) -> None:
+    report = _run(tmp_path)
+
+    for key in (
+        "OKX_API_KEY",
+        "OKX_SECRET_KEY",
+        "OKX_PASSPHRASE",
+        "BINANCE_API_KEY",
+        "BINANCE_SECRET_KEY",
+    ):
+        check = _one(report, f"{key} present")
+        assert check.status == "PASS"
+        assert check.section == "CREDENTIALS"
+
+
+def test_credentials_no_secret_in_report_or_stdout(tmp_path: Path) -> None:
+    secret = "MY-SECRET-API-KEY-DO-NOT-LEAK"
+    creds = {
+        "OKX_API_KEY": secret,
+        "OKX_SECRET_KEY": "another-secret-value",
+        "OKX_PASSPHRASE": "passphrase-secret",
+        "BINANCE_API_KEY": "binance-key-secret",
+        "BINANCE_SECRET_KEY": "binance-secret-secret",
+    }
+    report = run_preflight(
+        env_file=_write_env(tmp_path, creds)[0],
+        environ={},
+        repo_root=tmp_path,
+        expect_real_live=True,
+    )
+
+    # stdout must not leak secrets
+    output = render_report(report)
+    assert secret not in output
+    assert "another-secret-value" not in output
+    assert "passphrase-secret" not in output
+    assert "binance-key-secret" not in output
+    assert "binance-secret-secret" not in output
+
+    # JSON report must not leak secrets
+    report_path = tmp_path / "report.json"
+    write_json_report(report_path, report)
+    raw = report_path.read_text(encoding="utf-8")
+    assert secret not in raw
+    assert "another-secret-value" not in raw
+    assert "passphrase-secret" not in raw
+    assert "binance-key-secret" not in raw
+    assert "binance-secret-secret" not in raw
+
+
+def test_email_alert_enabled_missing_email_fields_fails(tmp_path: Path) -> None:
+    creds = {"AETHER_ENABLE_EMAIL_ALERT": "true"}
+    report = _run(tmp_path, creds)
+
+    for key in ("EMAIL_SENDER", "EMAIL_PASSWORD", "EMAIL_RECEIVER"):
+        check = _one(report, f"{key} missing")
+        assert check.status == "FAIL"
+        assert check.section == "CREDENTIALS"
+
+
+def test_email_alert_disabled_missing_email_fields_ok(tmp_path: Path) -> None:
+    creds = {"AETHER_ENABLE_EMAIL_ALERT": "false"}
+    report = _run(tmp_path, creds)
+
+    for key in ("EMAIL_SENDER", "EMAIL_PASSWORD", "EMAIL_RECEIVER"):
+        assert not report.named(f"{key} present")
+        assert not report.named(f"{key} missing")

@@ -57,6 +57,7 @@ SENSITIVE_ENV_KEYS = frozenset(
 )
 SECTION_ORDER = (
     "ENV",
+    "CREDENTIALS",
     "MASTER_FOLLOWER",
     "MARKET_STREAM",
     "RUNTIME_TIMING",
@@ -199,6 +200,7 @@ def run_preflight(
         report.add("ENV", "FAIL", "env_file", f"missing: {env_path}")
 
     _check_live_safety_gate(report, effective_env, expect_real_live)
+    _check_credentials(report, raw_env)
     _check_master_follower(report, effective_env)
     _check_market_stream(report, effective_env)
     _check_runtime_timing(report, effective_env)
@@ -285,6 +287,35 @@ def _check_live_safety_gate(
         if expect_real_live:
             detail += " required-for-real-live"
         report.add("ENV", status, key, detail)
+
+
+def _check_credentials(
+    report: PreflightReport,
+    raw_env: Mapping[str, str],
+) -> None:
+    required = (
+        "OKX_API_KEY",
+        "OKX_SECRET_KEY",
+        "OKX_PASSPHRASE",
+        "BINANCE_API_KEY",
+        "BINANCE_SECRET_KEY",
+    )
+    for key in required:
+        value = raw_env.get(key, "")
+        if value.strip():
+            report.add("CREDENTIALS", "PASS", f"{key} present")
+        else:
+            report.add("CREDENTIALS", "FAIL", f"{key} missing")
+
+    email_alert = raw_env.get("AETHER_ENABLE_EMAIL_ALERT", "").strip().lower()
+    if email_alert == "true":
+        email_keys = ("EMAIL_SENDER", "EMAIL_PASSWORD", "EMAIL_RECEIVER")
+        for key in email_keys:
+            value = raw_env.get(key, "")
+            if value.strip():
+                report.add("CREDENTIALS", "PASS", f"{key} present")
+            else:
+                report.add("CREDENTIALS", "FAIL", f"{key} missing")
 
 
 def _check_master_follower(report: PreflightReport, env: Mapping[str, str]) -> None:
@@ -643,7 +674,7 @@ def _inspect_sqlite_read_only(
     db_kind: str,
 ) -> None:
     try:
-        uri = f"{path.resolve().as_uri()}?mode=ro&immutable=1"
+        uri = f"{path.resolve().as_uri()}?mode=ro"
         with sqlite3.connect(uri, uri=True) as connection:
             connection.execute("PRAGMA query_only = ON")
             tables = {
@@ -748,7 +779,7 @@ def _check_range_state(
 
     report.add("RANGE_STATE", "PASS", "range_checkpoint_db", str(path))
     try:
-        uri = f"{path.resolve().as_uri()}?mode=ro&immutable=1"
+        uri = f"{path.resolve().as_uri()}?mode=ro"
         with sqlite3.connect(uri, uri=True) as connection:
             connection.execute("PRAGMA query_only = ON")
             tables = {
