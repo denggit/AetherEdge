@@ -16,6 +16,7 @@ from src.app import AppConfig, AppContext, AsyncAlertDispatcher, NoopAlertSink
 from src.market_data.derived import RangeBarAggregator, RangeBarBuilder
 from src.market_data.events import MarketFeatureEvent, MarketFeatureEventType
 from src.market_data.models import MarketDataSet, RangeBar, RangeBarAggregate, TimeRange, WarmupRequest, WarmupResult
+from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
 from src.market_data.storage import SqliteTradeStore
 from src.market_data.warmup.current_rangebar import CurrentRangeBarWarmupResult
 from src.platform import Balance, ExchangeName, LeverageInfo, Order, OrderSide, OrderStatus, Position, PositionMode, PositionSide
@@ -726,6 +727,7 @@ async def _run_smoke(tmp_path, *, binance_fail: bool):
             "range_bar_builder": RangeBarBuilder(range_pct=Decimal("0.002"), contract_value=Decimal("0.01")),
             "range_bar_store": store,
             "range_bar_aggregator": RangeBarAggregator(),
+            "range_checkpoint_store": SqliteRangeCheckpointStore(tmp_path / "range_checkpoint.sqlite3"),
             "closed_bar_scheduler": ClosedBarScheduler(interval_ms=H4, close_buffer_ms=60_000),
         },
         dry_run=False,
