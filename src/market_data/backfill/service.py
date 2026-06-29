@@ -10,6 +10,7 @@ from typing import Callable, Sequence
 
 from src.market_data.backfill.coverage import validate_trade_coverage
 from src.market_data.backfill.models import BackfillPlan, BackfillResult
+from src.market_data.backfill.scheduler import select_candidates
 from src.market_data.derived import RangeBarAggregator, RangeBarBuilder
 from src.market_data.models import RangeBar, RangeBarAggregate, RangeCoverageStatus, TimeRange
 from src.market_data.range_checkpoint import RangeBuilderCheckpoint, SqliteRangeCheckpointStore
@@ -35,6 +36,7 @@ class BackfillService:
     download_sleep_seconds: float = 2.0
     max_rest_tail_gap_minutes: int = 240
     max_rest_tail_buckets: int = 12
+    tail_cooldown_seconds: int = 600
     rest_tail_fetcher: RestTailFetcher | None = None
 
     def __post_init__(self) -> None:
@@ -47,23 +49,89 @@ class BackfillService:
         self.checkpoint_store = SqliteRangeCheckpointStore(self.checkpoint_db, busy_timeout_ms=self.busy_timeout_ms)
         self.aggregator = RangeBarAggregator()
 
-    def process_plan(self, plan: BackfillPlan, *, max_buckets: int = 1, now: datetime | None = None) -> BackfillResult:
+    def process_plan(
+        self,
+        plan: BackfillPlan,
+        *,
+        max_buckets: int = 1,
+        now: datetime | None = None,
+        tail_cooldown: dict[int, int] | None = None,
+    ) -> BackfillResult:
         result = BackfillResult()
-        targets = _recent_unique(
-            [
-                *plan.missing_bucket_starts,
-                *plan.dirty_bucket_starts,
-                *plan.incomplete_coverage_bucket_starts,
-            ]
-        )[: max(0, int(max_buckets))]
-        if not targets:
+        now = now or datetime.now(UTC)
+        max_buckets = max(0, int(max_buckets))
+
+        # Build prioritized candidate list with cooldown awareness.
+        from src.market_data.backfill.scheduler import TailCooldownTracker
+
+        tracker = TailCooldownTracker(
+            cooldown_buckets=dict(tail_cooldown) if tail_cooldown else {},
+            cooldown_seconds=self.tail_cooldown_seconds,
+        )
+        candidates, meta = select_candidates(
+            plan=plan,
+            max_buckets=max_buckets,
+            cooldown_tracker=tracker,
+            now=now,
+        )
+
+        # Populate result diagnostics.
+        result.candidate_bucket_count = int(meta.get("total", 0))
+        result.eligible_historical_bucket_count = int(meta.get("historical", 0))
+        result.eligible_tail_bucket_count = int(meta.get("tail", 0))
+        result.tail_cooldown_buckets = list(meta.get("cooldown", []))  # type: ignore[arg-type]
+        result.tail_deferred_buckets = list(meta.get("deferred", []))  # type: ignore[arg-type]
+
+        if not candidates:
             return result
 
+        # Try each candidate in isolation so one failure does not block others.
+        # Accumulate successful targets, then batch-rebuild for efficiency.
+        successful_targets: list[int] = []
+        for candidate in candidates:
+            if len(successful_targets) >= max_buckets:
+                break
+            try:
+                self._ensure_raw_trades(
+                    plan=plan, targets=[candidate], result=result, now=now
+                )
+            except sqlite3.OperationalError as exc:
+                if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                    result.locked = True
+                    result.errors.append(str(exc))
+                    return result
+                raise
+            except Exception as exc:  # noqa: BLE001 - worker daemon must keep running
+                result.errors.append(f"{type(exc).__name__}: {exc}")
+                _append_unique(result.skipped_buckets, candidate)
+                continue
+
+            if candidate in set(result.skipped_buckets):
+                # This candidate failed raw-trade acquisition; fall through to next.
+                continue
+
+            successful_targets.append(candidate)
+            _append_unique(result.selected_buckets, candidate)
+
+        if not successful_targets:
+            # Nothing succeeded. If every candidate was a current-day tail bucket,
+            # give the operator a clear signal rather than silent zero.
+            all_tail = (
+                result.eligible_tail_bucket_count > 0
+                and result.eligible_historical_bucket_count == 0
+                and len([s for s in getattr(plan, "dirty_bucket_starts", ())]) == 0
+            )
+            if all_tail:
+                result.errors.append(
+                    "no eligible historical buckets processed; all candidates skipped"
+                )
+            return result
+
+        # Batch rebuild all successful targets in one replay pass.
         try:
-            self._ensure_raw_trades(plan=plan, targets=targets, result=result, now=now or datetime.now(UTC))
-            rebuild_targets = [target for target in targets if target not in set(result.skipped_buckets)]
-            if rebuild_targets:
-                self._rebuild_targets(plan=plan, targets=rebuild_targets, result=result)
+            self._rebuild_targets(
+                plan=plan, targets=successful_targets, result=result
+            )
         except sqlite3.OperationalError as exc:
             if "locked" in str(exc).lower() or "busy" in str(exc).lower():
                 result.locked = True
@@ -73,6 +141,7 @@ class BackfillService:
         except Exception as exc:  # noqa: BLE001 - worker daemon must keep running
             result.errors.append(f"{type(exc).__name__}: {exc}")
             return result
+
         return result
 
     def _ensure_raw_trades(self, *, plan: BackfillPlan, targets: Sequence[int], result: BackfillResult, now: datetime) -> None:
