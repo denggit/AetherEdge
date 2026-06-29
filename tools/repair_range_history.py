@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sqlite3
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -19,6 +22,7 @@ from src.market_data.derived import RangeBarAggregator, RangeBarBuilder
 from src.market_data.models import RangeBar, RangeCoverageStatus, TimeRange
 from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
 from src.market_data.storage import SqliteRangeBarStore, SqliteTradeStore
+from src.platform.data.models import MarketDataSource, MarketTrade, TradeSide
 from src.platform.exchanges.models import ExchangeName
 from src.platform.markets import get_market_profile
 
@@ -26,6 +30,488 @@ from src.platform.markets import get_market_profile
 POLLUTION_CUTOFF_MS = 1_640_995_200_000  # 2022-01-01T00:00:00Z
 DEFAULT_CONTRACT_VALUE = Decimal("0.01")
 
+# ---------------------------------------------------------------------------
+# Live process detection
+# ---------------------------------------------------------------------------
+
+LIVE_PID_FILES = (
+    REPO_ROOT / "data" / "run" / "aether_live.pid",
+    REPO_ROOT / "data" / "run" / "aether_watchdog.pid",
+)
+
+LIVE_PROCESS_NAMES = (
+    "run_live.py",
+    "watchdog_live.py",
+)
+
+
+class LiveDetector:
+    """Checks whether an AetherEdge live process is currently running."""
+
+    def __init__(
+        self,
+        *,
+        pid_files: tuple[Path, ...] = LIVE_PID_FILES,
+        process_names: tuple[str, ...] = LIVE_PROCESS_NAMES,
+    ) -> None:
+        self._pid_files = pid_files
+        self._process_names = process_names
+
+    def is_live(self) -> bool:
+        """Return True if a live runtime process appears to be running."""
+        if self._pid_file_live():
+            return True
+        if self._process_list_live():
+            return True
+        return False
+
+    def _pid_file_live(self) -> bool:
+        for pid_file in self._pid_files:
+            if not pid_file.exists():
+                continue
+            raw = ""
+            try:
+                raw = pid_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if not raw:
+                continue
+            try:
+                pid = int(raw)
+            except ValueError:
+                continue
+            if self._is_pid_alive(pid):
+                return True
+        return False
+
+    @staticmethod
+    def _is_pid_alive(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        if os.name == "nt":
+            return LiveDetector._is_windows_pid_alive(pid)
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def _is_windows_pid_alive(pid: int) -> bool:
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        try:
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        except Exception:
+            return False
+        handle = kernel32.OpenProcess(process_query_limited_information, False, int(pid))
+        if not handle:
+            return False
+        kernel32.CloseHandle(handle)
+        return True
+
+    def _process_list_live(self) -> bool:
+        try:
+            if os.name == "nt":
+                return self._windows_process_list_live()
+            return self._posix_process_list_live()
+        except Exception:
+            return False
+
+    def _windows_process_list_live(self) -> bool:
+        import subprocess
+
+        completed = subprocess.run(
+            ("tasklist", "/FO", "CSV", "/NH"),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        if completed.returncode != 0:
+            return False
+        output = completed.stdout or ""
+        for name in self._process_names:
+            if name in output:
+                return True
+        return False
+
+    def _posix_process_list_live(self) -> bool:
+        import subprocess
+
+        completed = subprocess.run(
+            ("ps", "-eo", "comm,args"),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        if completed.returncode != 0:
+            return False
+        output = completed.stdout or ""
+        for name in self._process_names:
+            if name in output:
+                return True
+        return False
+
+
+# ---------------------------------------------------------------------------
+# OKX historical trades downloader (public REST, no API key)
+# ---------------------------------------------------------------------------
+
+OKX_HISTORY_TRADES_PATH = "/api/v5/market/history-trades"
+OKX_RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
+OKX_TOO_MANY_REQUESTS_CODE = "50011"
+
+
+@dataclass(frozen=True)
+class _OkxRawTrade:
+    trade_id: str
+    price: str
+    size: str
+    side: str
+    ts: str
+
+
+class OkxHistoricalTradeDownloader:
+    """Download public historical trades from OKX REST API.
+
+    Uses the public ``GET /api/v5/market/history-trades`` endpoint.
+    No API key is required.
+    """
+
+    def __init__(
+        self,
+        *,
+        base_url: str = "https://www.okx.com",
+        timeout_seconds: int = 20,
+        max_retries: int = 5,
+        sleep_seconds: float = 0.2,
+    ) -> None:
+        self._base_url = str(base_url).rstrip("/")
+        self._timeout = int(timeout_seconds)
+        self._max_retries = int(max_retries)
+        self._sleep_seconds = float(sleep_seconds)
+
+    def fetch_page(
+        self,
+        raw_symbol: str,
+        *,
+        after: str | None = None,
+        limit: int = 100,
+    ) -> tuple[list[_OkxRawTrade], str | None]:
+        params = f"instId={urllib.parse.quote(str(raw_symbol))}&limit={min(max(1, int(limit)), 100)}"
+        if after:
+            params += f"&after={urllib.parse.quote(str(after))}"
+        url = f"{self._base_url}{OKX_HISTORY_TRADES_PATH}?{params}"
+
+        last_error = ""
+        for attempt in range(1, self._max_retries + 1):
+            try:
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": "AetherEdge/repair-tool",
+                        "Accept": "application/json",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                    body = resp.read().decode("utf-8", errors="replace")
+                payload = json.loads(body)
+                code = str(payload.get("code", ""))
+                if code != "0":
+                    if code == OKX_TOO_MANY_REQUESTS_CODE and attempt < self._max_retries:
+                        time.sleep(self._retry_sleep(attempt))
+                        continue
+                    raise RuntimeError(
+                        f"OKX API error code={code} msg={payload.get('msg', '')}"
+                    )
+                raw_data = payload.get("data") or []
+                trades = [
+                    _OkxRawTrade(
+                        trade_id=str(item.get("tradeId", "")),
+                        price=str(item.get("px", "0")),
+                        size=str(item.get("sz", "0")),
+                        side=str(item.get("side", "")),
+                        ts=str(item.get("ts", "0")),
+                    )
+                    for item in raw_data
+                    if item.get("tradeId")
+                ]
+                next_after = trades[-1].trade_id if trades else None
+                return trades, next_after
+            except urllib.error.HTTPError as exc:
+                detail = ""
+                try:
+                    detail = exc.read().decode("utf-8", errors="replace")[:300]
+                except Exception:
+                    pass
+                last_error = f"HTTP {exc.code}: {detail}"
+                if exc.code in OKX_RETRYABLE_HTTP_CODES and attempt < self._max_retries:
+                    time.sleep(self._retry_sleep(attempt))
+                    continue
+                raise RuntimeError(f"OKX request failed: {last_error}") from exc
+            except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+                last_error = repr(exc)
+                if attempt < self._max_retries:
+                    time.sleep(self._retry_sleep(attempt))
+                    continue
+                raise RuntimeError(f"OKX request failed: {last_error}") from exc
+
+        raise RuntimeError(f"OKX request failed after {self._max_retries} attempts: {last_error}")
+
+    def _retry_sleep(self, attempt: int) -> float:
+        return min(self._sleep_seconds * (2 ** max(0, attempt - 1)), 30.0)
+
+    def download_bucket_trades(
+        self,
+        raw_symbol: str,
+        bucket_start_ms: int,
+        bucket_end_ms: int,
+        *,
+        limit: int = 100,
+        max_pages: int | None = None,
+    ) -> tuple[list[MarketTrade], int, bool]:
+        all_raw: list[_OkxRawTrade] = []
+        after: str | None = None
+        pages = 0
+        complete = False
+
+        while True:
+            if max_pages is not None and pages >= max_pages:
+                break
+            page, next_after = self.fetch_page(
+                raw_symbol, after=after, limit=limit
+            )
+            pages += 1
+            if not page:
+                break
+
+            in_range = [
+                t for t in page
+                if bucket_start_ms <= int(t.ts) <= bucket_end_ms
+            ]
+            all_raw.extend(in_range)
+
+            oldest_ts = min(int(t.ts) for t in page)
+            if oldest_ts < bucket_start_ms:
+                complete = True
+                break
+
+            if next_after is None:
+                break
+            after = next_after
+
+            if self._sleep_seconds > 0:
+                time.sleep(self._sleep_seconds)
+
+        trades = [
+            MarketTrade(
+                exchange=ExchangeName.OKX,
+                symbol="",
+                raw_symbol=raw_symbol,
+                price=Decimal(r.price),
+                quantity=Decimal(r.size),
+                side=TradeSide.BUY if r.side.lower() == "buy" else TradeSide.SELL,
+                trade_id=r.trade_id,
+                event_time_ms=int(r.ts),
+                trade_time_ms=int(r.ts),
+                source=MarketDataSource.REST,
+                raw={
+                    "tradeId": r.trade_id,
+                    "px": r.price,
+                    "sz": r.size,
+                    "side": r.side,
+                    "ts": r.ts,
+                },
+            )
+            for r in all_raw
+        ]
+        return trades, pages, complete
+
+
+# ---------------------------------------------------------------------------
+# Download coordination
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DownloadResult:
+    requested_buckets: int = 0
+    downloaded_buckets: int = 0
+    failed_buckets: int = 0
+    skipped_buckets: int = 0
+    downloaded_trade_count: int = 0
+    coverage_validated_buckets: int = 0
+    coverage_validation_failed_buckets: int = 0
+    coverage_validation_failed_examples: list[dict] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
+DownloadFunc = Callable[[str, int, int, int], tuple[list[MarketTrade], int, bool]]
+
+
+def _download_missing_trades(
+    *,
+    raw_symbol: str,
+    symbol: str,
+    missing_bucket_starts: list[int],
+    bucket_ms: int,
+    current_bucket_start_ms: int,
+    download_func: DownloadFunc,
+    trade_store: SqliteTradeStore,
+    limit: int,
+    coverage_edge_tolerance_ms: int,
+    coverage_max_gap_ms: int,
+    max_pages_per_bucket: int | None,
+) -> DownloadResult:
+    result = DownloadResult(requested_buckets=len(missing_bucket_starts))
+    ordered = sorted(missing_bucket_starts, reverse=True)
+
+    for bucket_start in ordered:
+        bucket_end = bucket_start + bucket_ms - 1
+
+        if bucket_start >= current_bucket_start_ms:
+            result.skipped_buckets += 1
+            continue
+
+        try:
+            trades, pages, complete = download_func(
+                raw_symbol, bucket_start, bucket_end, limit
+            )
+        except Exception as exc:
+            result.failed_buckets += 1
+            result.errors.append(
+                f"download_failed bucket_start_ms={bucket_start} error={exc}"
+            )
+            continue
+
+        if not trades:
+            result.failed_buckets += 1
+            result.errors.append(
+                f"no_trades_returned bucket_start_ms={bucket_start}"
+            )
+            continue
+
+        for t in trades:
+            object.__setattr__(t, "symbol", symbol)
+
+        trade_store.save(trades)
+        result.downloaded_trade_count += len(trades)
+
+        ok, reason = _validate_bucket_trade_coverage(
+            db_path=trade_store.path,
+            symbol=symbol,
+            bucket_start_ms=bucket_start,
+            bucket_end_ms=bucket_end,
+            edge_tolerance_ms=coverage_edge_tolerance_ms,
+            max_gap_ms=coverage_max_gap_ms,
+        )
+        if ok:
+            trade_store.mark_coverage(
+                symbol=symbol,
+                time_range=TimeRange(bucket_start, bucket_end),
+                source="historical",
+            )
+            result.downloaded_buckets += 1
+            result.coverage_validated_buckets += 1
+        else:
+            result.failed_buckets += 1
+            result.coverage_validation_failed_buckets += 1
+            result.coverage_validation_failed_examples.append({
+                "bucket_start_ms": bucket_start,
+                "bucket_end_ms": bucket_end,
+                "trades_downloaded": len(trades),
+                "pages": pages,
+                "reason": reason,
+            })
+
+    return result
+
+
+def _validate_bucket_trade_coverage(
+    *,
+    db_path: Path,
+    symbol: str,
+    bucket_start_ms: int,
+    bucket_end_ms: int,
+    edge_tolerance_ms: int,
+    max_gap_ms: int,
+) -> tuple[bool, str]:
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*),
+                   MIN(COALESCE(trade_time_ms, event_time_ms)),
+                   MAX(COALESCE(trade_time_ms, event_time_ms))
+            FROM trades
+            WHERE symbol = ?
+              AND COALESCE(trade_time_ms, event_time_ms) BETWEEN ? AND ?
+            """,
+            (symbol, bucket_start_ms, bucket_end_ms),
+        ).fetchone()
+    count = int(row[0] or 0)
+    earliest = row[1]
+    latest = row[2]
+
+    if count == 0:
+        return False, "no trades in bucket"
+
+    if earliest is None or latest is None:
+        return False, "no timestamps in bucket trades"
+
+    earliest_ms = int(earliest)
+    latest_ms = int(latest)
+
+    if earliest_ms > bucket_start_ms + edge_tolerance_ms:
+        return False, (
+            f"earliest trade {earliest_ms} too far from bucket_start {bucket_start_ms} "
+            f"(gap={earliest_ms - bucket_start_ms}ms > tolerance={edge_tolerance_ms}ms)"
+        )
+
+    if latest_ms < bucket_end_ms - edge_tolerance_ms:
+        return False, (
+            f"latest trade {latest_ms} too far from bucket_end {bucket_end_ms} "
+            f"(gap={bucket_end_ms - latest_ms}ms > tolerance={edge_tolerance_ms}ms)"
+        )
+
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT COALESCE(trade_time_ms, event_time_ms)
+            FROM trades
+            WHERE symbol = ?
+              AND COALESCE(trade_time_ms, event_time_ms) BETWEEN ? AND ?
+            ORDER BY COALESCE(trade_time_ms, event_time_ms) ASC
+            """,
+            (symbol, bucket_start_ms, bucket_end_ms),
+        ).fetchall()
+
+    prev: int | None = None
+    max_gap_found = 0
+    for (ts,) in rows:
+        ts_int = int(ts)
+        if prev is not None:
+            gap = ts_int - prev
+            if gap > max_gap_found:
+                max_gap_found = gap
+        prev = ts_int
+
+    if max_gap_found > max_gap_ms:
+        return False, (
+            f"max inter-trade gap {max_gap_found}ms exceeds threshold {max_gap_ms}ms"
+        )
+
+    return True, "ok"
+
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class CountMinMax:
@@ -45,6 +531,7 @@ class RepairSummary:
     start_ms: int
     end_ms: int
     bucket_count_target: int
+    # Trade-coverage classification
     trade_coverage_complete_buckets: int = 0
     missing_trade_coverage_buckets: int = 0
     missing_trade_coverage_examples: list[dict[str, int]] = field(default_factory=list)
@@ -53,9 +540,11 @@ class RepairSummary:
     empty_trade_buckets: int = 0
     empty_trade_bucket_examples: list[dict[str, int]] = field(default_factory=list)
     trades_loaded: int = 0
+    # Range bars
     range_bars_before_count: int = 0
     range_bars_rebuilt_count: int = 0
     range_bars_written_count: int = 0
+    # Aggregates
     aggregates_before_count: int = 0
     aggregates_before_min: int | None = None
     aggregates_before_max: int | None = None
@@ -69,22 +558,52 @@ class RepairSummary:
     dry_run: bool = False
     backup_paths: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Pollution
     legacy_or_test_polluted_completed_aggregates_detected: bool = False
-    polluted_completed_aggregates_deleted: int = 0
+    pollution_rows_deleted: int = 0
+    # Mode & scope
+    mode: str = "incremental"
+    force_rebuild_window: bool = False
+    clean_pollution: bool = False
     deleted_existing_aggregates: int = 0
     deleted_existing_range_bar_buckets: int = 0
     repair_range_bars: bool = False
     rebuild_aggregates: bool = True
     delete_existing_aggregates: bool = False
     delete_existing_range_bars: bool = False
+    # Incremental bucket tracking
+    buckets_already_complete: int = 0
+    buckets_downloaded: int = 0
+    buckets_repaired: int = 0
+    buckets_aggregate_upserted: int = 0
+    buckets_skipped_existing_complete: int = 0
+    # Contract
     contract_value: str = str(DEFAULT_CONTRACT_VALUE)
     contract_value_source: str = "fallback"
     builder_mode: str = "bucket_isolated"
+    # Download
+    download_missing_trades: bool = False
+    download_requested_buckets: int = 0
+    downloaded_buckets: int = 0
+    download_failed_buckets: int = 0
+    download_skipped_buckets: int = 0
+    downloaded_trade_count: int = 0
+    coverage_validated_buckets: int = 0
+    coverage_validation_failed_buckets: int = 0
+    coverage_validation_failed_examples: list[dict] = field(default_factory=list)
+    download_errors: list[str] = field(default_factory=list)
+    # Live protection
+    live_running_detected: bool = False
+    live_db_write_allowed: bool = False
 
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Offline repair tool for local range-speed history. No exchange APIs are called."
+        description="Offline repair tool for local range-speed history."
     )
     parser.add_argument("--symbol", default="ETH-USDT-PERP")
     parser.add_argument("--exchange", default="okx")
@@ -99,8 +618,36 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--contract-value", default=None)
     parser.add_argument("--repair-range-bars", nargs="?", const=True, default=False, type=_bool)
     parser.add_argument("--rebuild-aggregates", nargs="?", const=True, default=True, type=_bool)
-    parser.add_argument("--delete-existing-aggregates", nargs="?", const=True, default=False, type=_bool)
-    parser.add_argument("--delete-existing-range-bars", nargs="?", const=True, default=False, type=_bool)
+    # Mode & scope
+    parser.add_argument(
+        "--mode",
+        choices=("incremental", "rebuild-window"),
+        default="incremental",
+        help="Repair mode: incremental (bucket-scoped, default) or rebuild-window (full window).",
+    )
+    parser.add_argument(
+        "--force-rebuild-window",
+        nargs="?", const=True, default=False, type=_bool,
+        help="When set, allows window-level deletion of aggregates / range_bars. Requires --mode rebuild-window for full effect.",
+    )
+    parser.add_argument(
+        "--clean-pollution",
+        nargs="?", const=True, default=False, type=_bool,
+        help="Delete pollution rows (bucket_end_ms < 2022-01-01) without touching valid history.",
+    )
+    # Delete flags (behaviour depends on --mode)
+    parser.add_argument(
+        "--delete-existing-aggregates",
+        nargs="?", const=True, default=False, type=_bool,
+        help="In incremental mode: only delete aggregates for repaired buckets before upsert. "
+             "In rebuild-window mode with --force-rebuild-window: delete all aggregates in the window.",
+    )
+    parser.add_argument(
+        "--delete-existing-range-bars",
+        nargs="?", const=True, default=False, type=_bool,
+        help="In incremental mode: replace range bars per repaired bucket. "
+             "In rebuild-window mode with --force-rebuild-window: replace all range bars in the window.",
+    )
     parser.add_argument("--backup", nargs="?", const=True, default=True, type=_bool)
     parser.add_argument("--dry-run", nargs="?", const=True, default=False, type=_bool)
     parser.add_argument("--fail-under-min", nargs="?", const=True, default=False, type=_bool)
@@ -111,16 +658,54 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="bucket_isolated",
         help="Rebuild bars per bucket by default; continuous still never marks incomplete buckets COMPLETE.",
     )
+    # Download
+    parser.add_argument(
+        "--download-missing-trades",
+        nargs="?", const=True, default=False, type=_bool,
+        help="Download missing OKX historical trades before repair.",
+    )
+    parser.add_argument("--okx-base-url", default="https://www.okx.com")
+    parser.add_argument("--download-limit", type=int, default=100)
+    parser.add_argument("--download-sleep-seconds", type=float, default=0.2)
+    parser.add_argument("--download-max-retries", type=int, default=5)
+    parser.add_argument("--download-timeout-seconds", type=int, default=20)
+    parser.add_argument("--download-lookback-buckets", type=int, default=None)
+    parser.add_argument("--download-max-pages", type=int, default=None)
+    parser.add_argument(
+        "--skip-download-if-live", nargs="?", const=True, default=True, type=_bool,
+    )
+    parser.add_argument(
+        "--allow-live-db-write", nargs="?", const=True, default=False, type=_bool,
+    )
+    parser.add_argument("--coverage-edge-tolerance-ms", type=int, default=300_000)
+    parser.add_argument("--coverage-max-gap-ms", type=int, default=1_800_000)
     return parser.parse_args(argv)
 
 
-def run(args: argparse.Namespace, *, now_ms: int | None = None) -> tuple[RepairSummary, int]:
+# ---------------------------------------------------------------------------
+# Core logic
+# ---------------------------------------------------------------------------
+
+def run(
+    args: argparse.Namespace,
+    *,
+    now_ms: int | None = None,
+    download_func: DownloadFunc | None = None,
+    live_detector: LiveDetector | None = None,
+) -> tuple[RepairSummary, int]:
     bucket_ms = _parse_interval_ms(args.bucket_interval)
     now = int(now_ms if now_ms is not None else time.time() * 1000)
     current_bucket_start_ms = (now // bucket_ms) * bucket_ms
     end_ms = int(args.end_ms) if args.end_ms is not None else current_bucket_start_ms - 1
     end_ms = min(end_ms, current_bucket_start_ms - 1)
-    start_ms = int(args.start_ms) if args.start_ms is not None else current_bucket_start_ms - int(args.min_buckets) * bucket_ms
+
+    if args.start_ms is not None:
+        start_ms = int(args.start_ms)
+    elif args.download_lookback_buckets is not None:
+        start_ms = current_bucket_start_ms - int(args.download_lookback_buckets) * bucket_ms
+    else:
+        start_ms = current_bucket_start_ms - int(args.min_buckets) * bucket_ms
+
     target_range = TimeRange(start_ms, end_ms)
     bucket_starts = _complete_bucket_starts(start_ms, end_ms, bucket_ms)
     range_pct = _decimal_text(args.range_pct)
@@ -128,9 +713,18 @@ def run(args: argparse.Namespace, *, now_ms: int | None = None) -> tuple[RepairS
     market_db = _resolve_path(args.market_db)
     checkpoint_db = _resolve_path(args.checkpoint_db)
     contract_value, contract_source, contract_warning = _resolve_contract_value(
-        symbol=args.symbol,
-        exchange=exchange,
-        explicit=args.contract_value,
+        symbol=args.symbol, exchange=exchange, explicit=args.contract_value,
+    )
+
+    mode = str(args.mode)
+    force_rebuild = bool(args.force_rebuild_window)
+    clean_pollution = bool(args.clean_pollution)
+    download_missing = bool(args.download_missing_trades)
+    allow_live_write = bool(args.allow_live_db_write)
+    dry_run = bool(args.dry_run)
+    write_to_db = not dry_run and bool(
+        args.repair_range_bars or args.rebuild_aggregates
+        or args.delete_existing_aggregates or args.clean_pollution
     )
 
     summary = RepairSummary(
@@ -144,7 +738,7 @@ def run(args: argparse.Namespace, *, now_ms: int | None = None) -> tuple[RepairS
         end_ms=end_ms,
         bucket_count_target=len(bucket_starts),
         min_buckets=int(args.min_buckets),
-        dry_run=bool(args.dry_run),
+        dry_run=dry_run,
         repair_range_bars=bool(args.repair_range_bars),
         rebuild_aggregates=bool(args.rebuild_aggregates),
         delete_existing_aggregates=bool(args.delete_existing_aggregates),
@@ -152,40 +746,61 @@ def run(args: argparse.Namespace, *, now_ms: int | None = None) -> tuple[RepairS
         contract_value=str(contract_value),
         contract_value_source=contract_source,
         builder_mode=args.builder_mode,
+        download_missing_trades=download_missing,
+        live_db_write_allowed=allow_live_write,
+        mode=mode,
+        force_rebuild_window=force_rebuild,
+        clean_pollution=clean_pollution,
     )
     if contract_warning:
         summary.warnings.append(contract_warning)
     if end_ms < start_ms:
-        raise ValueError("end-ms must be greater than or equal to start-ms after excluding the current bucket")
+        raise ValueError(
+            "end-ms must be greater than or equal to start-ms after excluding the current bucket"
+        )
+
+    # --- live detection ---
+    detector = live_detector if live_detector is not None else LiveDetector()
+    live_running = detector.is_live()
+    summary.live_running_detected = live_running
+
+    if live_running and write_to_db and not allow_live_write:
+        _print_summary(summary)
+        print(
+            "\n[REPAIR-ABORT] Live process detected and --allow-live-db-write not set. "
+            "Exiting (exit code 3).\n"
+            "  Rerun with --allow-live-db-write to force writes, or stop the live process first.\n"
+            "  Dry-run is always allowed even when live.",
+            file=sys.stderr,
+        )
+        return summary, 3
+
+    if live_running and write_to_db and allow_live_write:
+        summary.warnings.append(
+            "WARNING live_running_detected_allow_live_db_write_active"
+        )
 
     trade_store = SqliteTradeStore(market_db)
     range_store = SqliteRangeBarStore(market_db)
     checkpoint_store = SqliteRangeCheckpointStore(checkpoint_db)
 
+    # --- read before state ---
     summary.range_bars_before_count = _range_bar_count(
-        market_db,
-        symbol=args.symbol,
-        range_pct=range_pct,
-        time_range=target_range,
+        market_db, symbol=args.symbol, range_pct=range_pct, time_range=target_range,
     )
     before = _completed_count_min_max(
-        checkpoint_db,
-        exchange=exchange,
-        symbol=args.symbol,
-        range_pct=range_pct,
+        checkpoint_db, exchange=exchange, symbol=args.symbol, range_pct=range_pct,
     )
     summary.aggregates_before_count = before.count
     summary.aggregates_before_min = before.min
     summary.aggregates_before_max = before.max
-    summary.legacy_or_test_polluted_completed_aggregates_detected = _polluted_count(
-        checkpoint_db,
-        exchange=exchange,
-        symbol=args.symbol,
-        range_pct=range_pct,
-    ) > 0
-    if summary.legacy_or_test_polluted_completed_aggregates_detected and not args.delete_existing_aggregates:
-        summary.warnings.append("polluted_completed_aggregates_remain_use_delete_existing_aggregates")
 
+    pollution_detected = _polluted_count(
+        checkpoint_db, exchange=exchange, symbol=args.symbol, range_pct=range_pct,
+    ) > 0
+    summary.legacy_or_test_polluted_completed_aggregates_detected = pollution_detected
+
+    # --- classify trade coverage ---
     complete_bucket_starts, missing_bucket_starts = _classify_trade_coverage(
         trade_store.coverage_ranges(symbol=args.symbol, time_range=target_range, source="historical"),
         bucket_starts=bucket_starts,
@@ -196,31 +811,137 @@ def run(args: argparse.Namespace, *, now_ms: int | None = None) -> tuple[RepairS
     summary.missing_trade_coverage_examples = _bucket_examples(missing_bucket_starts, bucket_ms)
     if missing_bucket_starts:
         summary.trades_exist_but_coverage_missing_examples = _trades_exist_examples(
-            market_db,
-            symbol=args.symbol,
-            bucket_starts=missing_bucket_starts,
-            bucket_ms=bucket_ms,
+            market_db, symbol=args.symbol, bucket_starts=missing_bucket_starts, bucket_ms=bucket_ms,
         )
         summary.trades_exist_but_coverage_missing = len(summary.trades_exist_but_coverage_missing_examples)
         if summary.trades_exist_but_coverage_missing:
             summary.warnings.append("trades_exist_but_coverage_missing")
 
-    write_requested = bool(args.repair_range_bars or args.rebuild_aggregates or args.delete_existing_aggregates)
-    if args.backup and not args.dry_run and write_requested:
+    # --- find buckets that already have COMPLETE aggregates ---
+    already_complete_buckets: set[int] = _find_buckets_with_complete_aggregates(
+        checkpoint_db, exchange=exchange, symbol=args.symbol, range_pct=range_pct,
+        bucket_starts=complete_bucket_starts,
+    )
+    summary.buckets_already_complete = len(already_complete_buckets)
+    summary.buckets_skipped_existing_complete = len(already_complete_buckets)
+
+    # --- determine which buckets need repair ---
+    # In incremental mode: only buckets with coverage but missing / stale aggregates.
+    # In rebuild-window mode with --force-rebuild-window: all complete-coverage buckets.
+    if mode == "incremental" and not force_rebuild:
+        needs_repair_coverage = [b for b in complete_bucket_starts if b not in already_complete_buckets]
+        needs_repair_set = set(needs_repair_coverage)
+    else:
+        needs_repair_coverage = list(complete_bucket_starts)
+        needs_repair_set = set(needs_repair_coverage)
+
+    # --- download missing trades ---
+    original_missing_set = set(missing_bucket_starts)
+    newly_downloaded: set[int] = set()
+
+    if download_missing and missing_bucket_starts:
+        if live_running and bool(args.skip_download_if_live):
+            summary.warnings.append("download_skipped_live_running")
+        else:
+            func: DownloadFunc
+            if download_func is not None:
+                func = download_func
+            else:
+                dl = OkxHistoricalTradeDownloader(
+                    base_url=args.okx_base_url,
+                    timeout_seconds=int(args.download_timeout_seconds),
+                    max_retries=int(args.download_max_retries),
+                    sleep_seconds=float(args.download_sleep_seconds),
+                )
+                func = dl.download_bucket_trades
+
+            dl_result = _download_missing_trades(
+                raw_symbol=args.raw_symbol,
+                symbol=args.symbol,
+                missing_bucket_starts=list(missing_bucket_starts),
+                bucket_ms=bucket_ms,
+                current_bucket_start_ms=current_bucket_start_ms,
+                download_func=func,
+                trade_store=trade_store,
+                limit=min(int(args.download_limit), 100),
+                coverage_edge_tolerance_ms=int(args.coverage_edge_tolerance_ms),
+                coverage_max_gap_ms=int(args.coverage_max_gap_ms),
+                max_pages_per_bucket=args.download_max_pages,
+            )
+            summary.download_requested_buckets = dl_result.requested_buckets
+            summary.downloaded_buckets = dl_result.downloaded_buckets
+            summary.download_failed_buckets = dl_result.failed_buckets
+            summary.download_skipped_buckets = dl_result.skipped_buckets
+            summary.downloaded_trade_count = dl_result.downloaded_trade_count
+            summary.coverage_validated_buckets = dl_result.coverage_validated_buckets
+            summary.coverage_validation_failed_buckets = dl_result.coverage_validation_failed_buckets
+            summary.coverage_validation_failed_examples = dl_result.coverage_validation_failed_examples
+            summary.download_errors = dl_result.errors
+
+            if dl_result.errors:
+                summary.warnings.append("download_errors_occurred")
+            if dl_result.coverage_validation_failed_buckets:
+                summary.warnings.append("downloaded_trades_failed_coverage_validation")
+
+            # Re-read coverage after download.
+            complete_bucket_starts, missing_bucket_starts = _classify_trade_coverage(
+                trade_store.coverage_ranges(
+                    symbol=args.symbol, time_range=target_range, source="historical"
+                ),
+                bucket_starts=bucket_starts,
+                bucket_ms=bucket_ms,
+            )
+            summary.trade_coverage_complete_buckets = len(complete_bucket_starts)
+            summary.missing_trade_coverage_buckets = len(missing_bucket_starts)
+            summary.missing_trade_coverage_examples = _bucket_examples(missing_bucket_starts, bucket_ms)
+
+            # Determine newly downloaded buckets (were missing, now have coverage).
+            newly_downloaded = set(complete_bucket_starts) & original_missing_set
+            # Newly downloaded buckets also need repair.
+            needs_repair_set |= newly_downloaded
+            needs_repair_coverage = [b for b in complete_bucket_starts if b in needs_repair_set]
+
+    summary.buckets_downloaded = len(newly_downloaded & needs_repair_set)
+
+    # --- clean pollution (independent of mode) ---
+    if clean_pollution or (args.delete_existing_aggregates and mode == "incremental" and pollution_detected):
+        pollution_deleted = _delete_pollution_rows(
+            checkpoint_db,
+            exchange=exchange,
+            symbol=args.symbol,
+            range_pct=range_pct,
+            dry_run=dry_run,
+        )
+        summary.pollution_rows_deleted = pollution_deleted
+
+    # --- backup ---
+    write_requested = bool(
+        args.repair_range_bars or args.rebuild_aggregates
+        or args.delete_existing_aggregates or args.clean_pollution
+    )
+    if args.backup and not dry_run and write_requested:
         summary.backup_paths = _backup_databases(market_db=market_db, checkpoint_db=checkpoint_db, now_ms=now)
 
+    # --- repair range bars (bucket-scoped) ---
+    buckets_to_repair_range: list[int] = []
     empty_bucket_starts: list[int] = []
+
     if args.repair_range_bars:
+        # In incremental mode: only repair buckets that need it.
+        # In rebuild-window mode: repair all complete-coverage buckets.
+        buckets_to_repair_range = sorted(needs_repair_set & set(complete_bucket_starts))
+
         rebuilt, written, trades_loaded, empty_buckets = _repair_range_bars(
             trade_store=trade_store,
             range_store=range_store,
             symbol=args.symbol,
             range_pct=range_pct,
-            bucket_starts=complete_bucket_starts,
+            bucket_starts=buckets_to_repair_range,
             bucket_ms=bucket_ms,
             contract_value=contract_value,
-            delete_existing=bool(args.delete_existing_range_bars),
-            dry_run=bool(args.dry_run),
+            # In incremental mode, always replace per bucket for idempotency.
+            delete_existing=bool(args.delete_existing_range_bars) or mode == "incremental",
+            dry_run=dry_run,
             builder_mode=args.builder_mode,
         )
         summary.range_bars_rebuilt_count = rebuilt
@@ -229,21 +950,41 @@ def run(args: argparse.Namespace, *, now_ms: int | None = None) -> tuple[RepairS
         summary.empty_trade_buckets = len(empty_buckets)
         summary.empty_trade_bucket_examples = _bucket_examples(empty_buckets, bucket_ms)
         empty_bucket_starts = empty_buckets
-        if args.delete_existing_range_bars and not args.dry_run:
-            summary.deleted_existing_range_bar_buckets = len(complete_bucket_starts)
+        summary.buckets_repaired = len(buckets_to_repair_range)
+        if args.delete_existing_range_bars and not dry_run:
+            summary.deleted_existing_range_bar_buckets = len(buckets_to_repair_range)
 
+    # --- rebuild aggregates (bucket-scoped upsert) ---
     if args.rebuild_aggregates:
-        if args.delete_existing_aggregates:
-            target_deleted, polluted_deleted = _delete_existing_aggregates(
+        # Determine which buckets to write aggregates for.
+        # In incremental mode: only buckets in needs_repair_set.
+        # In rebuild-window mode: all complete-coverage buckets.
+        agg_candidate_set = needs_repair_set if mode == "incremental" else set(complete_bucket_starts)
+
+        # If --delete-existing-aggregates + --force-rebuild-window + rebuild-window mode:
+        # window-level delete.
+        if args.delete_existing_aggregates and force_rebuild and mode == "rebuild-window":
+            window_deleted, _ = _delete_aggregates_window(
                 checkpoint_db,
                 exchange=exchange,
                 symbol=args.symbol,
                 range_pct=range_pct,
                 time_range=target_range,
-                dry_run=bool(args.dry_run),
+                dry_run=dry_run,
             )
-            summary.deleted_existing_aggregates = target_deleted
-            summary.polluted_completed_aggregates_deleted = polluted_deleted
+            summary.deleted_existing_aggregates = window_deleted
+        # If --delete-existing-aggregates in incremental mode: delete per-bucket before upsert.
+        elif args.delete_existing_aggregates and not dry_run:
+            for bucket_start in sorted(agg_candidate_set):
+                _delete_one_aggregate(
+                    checkpoint_db,
+                    exchange=exchange,
+                    symbol=args.symbol,
+                    range_pct=range_pct,
+                    bucket_start_ms=bucket_start,
+                    bucket_ms=bucket_ms,
+                )
+
         aggregates = RangeBarAggregator().aggregate(
             range_store.load(symbol=args.symbol, range_pct=range_pct, time_range=target_range),
             bucket_ms=bucket_ms,
@@ -252,12 +993,12 @@ def run(args: argparse.Namespace, *, now_ms: int | None = None) -> tuple[RepairS
         eligible = [
             aggregate
             for aggregate in aggregates
-            if aggregate.bucket_start_ms in complete_starts
+            if aggregate.bucket_start_ms in (agg_candidate_set & complete_starts)
             and aggregate.bar_count > 0
             and aggregate.bucket_end_ms <= end_ms
         ]
         summary.aggregates_built_count = len(eligible)
-        if not args.dry_run:
+        if not dry_run:
             for aggregate in eligible:
                 checkpoint_store.save_completed_aggregate(
                     exchange=exchange,
@@ -267,12 +1008,13 @@ def run(args: argparse.Namespace, *, now_ms: int | None = None) -> tuple[RepairS
                     completed_at_ms=now,
                 )
             summary.aggregates_written_count = len(eligible)
+        summary.buckets_aggregate_upserted = len(
+            set(a.bucket_start_ms for a in eligible)
+        )
 
+    # --- read after state ---
     after = _completed_count_min_max(
-        checkpoint_db,
-        exchange=exchange,
-        symbol=args.symbol,
-        range_pct=range_pct,
+        checkpoint_db, exchange=exchange, symbol=args.symbol, range_pct=range_pct,
     )
     summary.aggregates_after_count = after.count
     summary.aggregates_after_min = after.min
@@ -283,7 +1025,7 @@ def run(args: argparse.Namespace, *, now_ms: int | None = None) -> tuple[RepairS
 
     _print_summary(summary)
     if args.json_output:
-        _write_json_output(_resolve_path(args.json_output), summary, dry_run=bool(args.dry_run))
+        _write_json_output(_resolve_path(args.json_output), summary, dry_run=dry_run)
 
     exit_code = 2 if args.fail_under_min and not summary.enough_for_range_speed else 0
     return summary, exit_code
@@ -294,6 +1036,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     _, exit_code = run(args)
     return exit_code
 
+
+# ---------------------------------------------------------------------------
+# Repair helpers
+# ---------------------------------------------------------------------------
 
 def _repair_range_bars(
     *,
@@ -379,6 +1125,34 @@ def _complete_bucket_starts(start_ms: int, end_ms: int, bucket_ms: int) -> list[
     return starts
 
 
+def _find_buckets_with_complete_aggregates(
+    db_path: Path,
+    *,
+    exchange: str,
+    symbol: str,
+    range_pct: str,
+    bucket_starts: Sequence[int],
+) -> set[int]:
+    """Return the set of bucket_start_ms values that already have a COMPLETE aggregate row."""
+    if not bucket_starts:
+        return set()
+    # Build a parameterised query with IN (...)
+    placeholders = ",".join("?" for _ in bucket_starts)
+    pct = _decimal_text(range_pct)
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT bucket_start_ms
+            FROM completed_range_aggregates
+            WHERE exchange = ? AND symbol = ? AND range_pct = ?
+              AND coverage_status = ?
+              AND bucket_start_ms IN ({placeholders})
+            """,
+            (exchange, symbol, pct, RangeCoverageStatus.COMPLETE.value, *bucket_starts),
+        ).fetchall()
+    return {int(row[0]) for row in rows}
+
+
 def _range_bar_count(db_path: Path, *, symbol: str, range_pct: str, time_range: TimeRange) -> int:
     with sqlite3.connect(db_path) as conn:
         row = conn.execute(
@@ -422,7 +1196,39 @@ def _polluted_count(db_path: Path, *, exchange: str, symbol: str, range_pct: str
     return int(row[0] or 0)
 
 
-def _delete_existing_aggregates(
+def _delete_pollution_rows(
+    db_path: Path,
+    *,
+    exchange: str,
+    symbol: str,
+    range_pct: str,
+    dry_run: bool,
+) -> int:
+    """Delete only pollution rows (bucket_end_ms < POLLUTION_CUTOFF_MS)."""
+    with sqlite3.connect(db_path) as conn:
+        count = int(
+            conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM completed_range_aggregates
+                WHERE exchange = ? AND symbol = ? AND range_pct = ? AND bucket_end_ms < ?
+                """,
+                (exchange, symbol, range_pct, POLLUTION_CUTOFF_MS),
+            ).fetchone()[0]
+            or 0
+        )
+        if not dry_run and count > 0:
+            conn.execute(
+                """
+                DELETE FROM completed_range_aggregates
+                WHERE exchange = ? AND symbol = ? AND range_pct = ? AND bucket_end_ms < ?
+                """,
+                (exchange, symbol, range_pct, POLLUTION_CUTOFF_MS),
+            )
+    return count
+
+
+def _delete_aggregates_window(
     db_path: Path,
     *,
     exchange: str,
@@ -431,6 +1237,7 @@ def _delete_existing_aggregates(
     time_range: TimeRange,
     dry_run: bool,
 ) -> tuple[int, int]:
+    """Delete all aggregates in the target window. Only used in rebuild-window mode."""
     with sqlite3.connect(db_path) as conn:
         target_count = int(
             conn.execute(
@@ -455,21 +1262,44 @@ def _delete_existing_aggregates(
             or 0
         )
         if not dry_run:
-            conn.execute(
-                """
-                DELETE FROM completed_range_aggregates
-                WHERE exchange = ? AND symbol = ? AND range_pct = ? AND bucket_end_ms BETWEEN ? AND ?
-                """,
-                (exchange, symbol, range_pct, time_range.start_time_ms, time_range.end_time_ms),
-            )
-            conn.execute(
-                """
-                DELETE FROM completed_range_aggregates
-                WHERE exchange = ? AND symbol = ? AND range_pct = ? AND bucket_end_ms < ?
-                """,
-                (exchange, symbol, range_pct, POLLUTION_CUTOFF_MS),
-            )
+            if target_count > 0:
+                conn.execute(
+                    """
+                    DELETE FROM completed_range_aggregates
+                    WHERE exchange = ? AND symbol = ? AND range_pct = ? AND bucket_end_ms BETWEEN ? AND ?
+                    """,
+                    (exchange, symbol, range_pct, time_range.start_time_ms, time_range.end_time_ms),
+                )
+            if polluted_count > 0:
+                conn.execute(
+                    """
+                    DELETE FROM completed_range_aggregates
+                    WHERE exchange = ? AND symbol = ? AND range_pct = ? AND bucket_end_ms < ?
+                    """,
+                    (exchange, symbol, range_pct, POLLUTION_CUTOFF_MS),
+                )
     return target_count, polluted_count
+
+
+def _delete_one_aggregate(
+    db_path: Path,
+    *,
+    exchange: str,
+    symbol: str,
+    range_pct: str,
+    bucket_start_ms: int,
+    bucket_ms: int,
+) -> None:
+    """Delete a single bucket's aggregate row before upsert. Bucket-scoped."""
+    bucket_end_ms = bucket_start_ms + bucket_ms - 1
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            DELETE FROM completed_range_aggregates
+            WHERE exchange = ? AND symbol = ? AND range_pct = ? AND bucket_start_ms = ? AND bucket_end_ms = ?
+            """,
+            (exchange, symbol, _decimal_text(range_pct), bucket_start_ms, bucket_end_ms),
+        )
 
 
 def _trades_exist_examples(
@@ -552,9 +1382,15 @@ def _print_summary(summary: RepairSummary) -> None:
         "symbol",
         "exchange",
         "range_pct",
+        "mode",
         "start_ms",
         "end_ms",
         "bucket_count_target",
+        "buckets_already_complete",
+        "buckets_skipped_existing_complete",
+        "buckets_downloaded",
+        "buckets_repaired",
+        "buckets_aggregate_upserted",
         "trade_coverage_complete_buckets",
         "missing_trade_coverage_buckets",
         "trades_loaded",
@@ -569,9 +1405,22 @@ def _print_summary(summary: RepairSummary) -> None:
         "aggregates_after_count",
         "aggregates_after_min",
         "aggregates_after_max",
+        "pollution_rows_deleted",
         "min_buckets",
         "enough_for_range_speed",
         "dry_run",
+        "download_missing_trades",
+        "download_requested_buckets",
+        "downloaded_buckets",
+        "download_failed_buckets",
+        "download_skipped_buckets",
+        "downloaded_trade_count",
+        "coverage_validated_buckets",
+        "coverage_validation_failed_buckets",
+        "live_running_detected",
+        "live_db_write_allowed",
+        "force_rebuild_window",
+        "clean_pollution",
         "backup_paths",
         "warnings",
     ):
