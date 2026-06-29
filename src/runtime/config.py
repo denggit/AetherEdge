@@ -49,6 +49,16 @@ class LiveRuntimeConfig:
     range_checkpoint_writer_max_pending: int = 8
     range_checkpoint_max_age_for_recovered_minor_ms: int = 60_000
     range_checkpoint_max_age_for_restore_ms: int = 300_000
+    realtime_trade_recording_enabled: bool = True
+    realtime_trade_db_path: str = "data/market_data/aether_market_data.sqlite3"
+    realtime_trade_writer_batch_size: int = 1_000
+    realtime_trade_writer_flush_interval_ms: int = 1_000
+    realtime_trade_writer_queue_maxsize: int = 50_000
+    range_backfill_enabled: bool = True
+    range_backfill_autostart: bool = True
+    range_backfill_required_buckets: int = 100
+    range_backfill_lookback_buckets: int = 180
+    range_backfill_warning_interval_seconds: int = 600
     degraded_fast_margin: float = 1.05
     producer_stale_timeout_ms: int = 60_000
     master_follower_policy: MasterFollowerPolicyConfig | None = None
@@ -133,6 +143,16 @@ def live_runtime_config_from_app(
                 defaults.get("range_checkpoint_max_age_for_restore_ms", 300_000),
             )
         ),
+        realtime_trade_recording_enabled=_bool(env.get("AETHER_REALTIME_TRADE_RECORDING_ENABLED", defaults.get("realtime_trade_recording_enabled", True))),
+        realtime_trade_db_path=str(env.get("AETHER_REALTIME_TRADE_DB", defaults.get("realtime_trade_db_path", "data/market_data/aether_market_data.sqlite3"))),
+        realtime_trade_writer_batch_size=int(env.get("AETHER_REALTIME_TRADE_WRITER_BATCH_SIZE", defaults.get("realtime_trade_writer_batch_size", 1_000))),
+        realtime_trade_writer_flush_interval_ms=int(env.get("AETHER_REALTIME_TRADE_WRITER_FLUSH_INTERVAL_MS", defaults.get("realtime_trade_writer_flush_interval_ms", 1_000))),
+        realtime_trade_writer_queue_maxsize=int(env.get("AETHER_REALTIME_TRADE_WRITER_QUEUE_MAXSIZE", defaults.get("realtime_trade_writer_queue_maxsize", 50_000))),
+        range_backfill_enabled=_bool(env.get("AETHER_RANGE_BACKFILL_ENABLED", defaults.get("range_backfill_enabled", True))),
+        range_backfill_autostart=_bool(env.get("AETHER_RANGE_BACKFILL_AUTOSTART", defaults.get("range_backfill_autostart", True))),
+        range_backfill_required_buckets=int(env.get("AETHER_RANGE_BACKFILL_REQUIRED_BUCKETS", defaults.get("range_backfill_required_buckets", 100))),
+        range_backfill_lookback_buckets=int(env.get("AETHER_RANGE_BACKFILL_LOOKBACK_BUCKETS", defaults.get("range_backfill_lookback_buckets", 180))),
+        range_backfill_warning_interval_seconds=int(env.get("AETHER_RANGE_BACKFILL_WARNING_INTERVAL_SECONDS", defaults.get("range_backfill_warning_interval_seconds", 600))),
         degraded_fast_margin=float(
             env.get(
                 "AETHER_RANGE_DEGRADED_FAST_MARGIN",
