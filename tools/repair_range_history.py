@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import sqlite3
 import sys
 import time
-import urllib.error
-import urllib.request
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 from pathlib import Path
@@ -19,10 +18,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.market_data.derived import RangeBarAggregator, RangeBarBuilder
+from src.market_data.historical_trades import (
+    HistoricalTradeImportService,
+    validate_bucket_trade_coverage,
+)
 from src.market_data.models import RangeBar, RangeCoverageStatus, TimeRange
 from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
 from src.market_data.storage import SqliteRangeBarStore, SqliteTradeStore
-from src.platform.data.models import MarketDataSource, MarketTrade, TradeSide
+from src.platform.data.models import MarketTrade
 from src.platform.exchanges.models import ExchangeName
 from src.platform.markets import get_market_profile
 
@@ -160,181 +163,6 @@ class LiveDetector:
 
 
 # ---------------------------------------------------------------------------
-# OKX historical trades downloader (public REST, no API key)
-# ---------------------------------------------------------------------------
-
-OKX_HISTORY_TRADES_PATH = "/api/v5/market/history-trades"
-OKX_RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
-OKX_TOO_MANY_REQUESTS_CODE = "50011"
-
-
-@dataclass(frozen=True)
-class _OkxRawTrade:
-    trade_id: str
-    price: str
-    size: str
-    side: str
-    ts: str
-
-
-class OkxHistoricalTradeDownloader:
-    """Download public historical trades from OKX REST API.
-
-    Uses the public ``GET /api/v5/market/history-trades`` endpoint.
-    No API key is required.
-    """
-
-    def __init__(
-        self,
-        *,
-        base_url: str = "https://www.okx.com",
-        timeout_seconds: int = 20,
-        max_retries: int = 5,
-        sleep_seconds: float = 0.2,
-    ) -> None:
-        self._base_url = str(base_url).rstrip("/")
-        self._timeout = int(timeout_seconds)
-        self._max_retries = int(max_retries)
-        self._sleep_seconds = float(sleep_seconds)
-
-    def fetch_page(
-        self,
-        raw_symbol: str,
-        *,
-        after: str | None = None,
-        limit: int = 100,
-    ) -> tuple[list[_OkxRawTrade], str | None]:
-        params = f"instId={urllib.parse.quote(str(raw_symbol))}&limit={min(max(1, int(limit)), 100)}"
-        if after:
-            params += f"&after={urllib.parse.quote(str(after))}"
-        url = f"{self._base_url}{OKX_HISTORY_TRADES_PATH}?{params}"
-
-        last_error = ""
-        for attempt in range(1, self._max_retries + 1):
-            try:
-                req = urllib.request.Request(
-                    url,
-                    headers={
-                        "User-Agent": "AetherEdge/repair-tool",
-                        "Accept": "application/json",
-                    },
-                )
-                with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                    body = resp.read().decode("utf-8", errors="replace")
-                payload = json.loads(body)
-                code = str(payload.get("code", ""))
-                if code != "0":
-                    if code == OKX_TOO_MANY_REQUESTS_CODE and attempt < self._max_retries:
-                        time.sleep(self._retry_sleep(attempt))
-                        continue
-                    raise RuntimeError(
-                        f"OKX API error code={code} msg={payload.get('msg', '')}"
-                    )
-                raw_data = payload.get("data") or []
-                trades = [
-                    _OkxRawTrade(
-                        trade_id=str(item.get("tradeId", "")),
-                        price=str(item.get("px", "0")),
-                        size=str(item.get("sz", "0")),
-                        side=str(item.get("side", "")),
-                        ts=str(item.get("ts", "0")),
-                    )
-                    for item in raw_data
-                    if item.get("tradeId")
-                ]
-                next_after = trades[-1].trade_id if trades else None
-                return trades, next_after
-            except urllib.error.HTTPError as exc:
-                detail = ""
-                try:
-                    detail = exc.read().decode("utf-8", errors="replace")[:300]
-                except Exception:
-                    pass
-                last_error = f"HTTP {exc.code}: {detail}"
-                if exc.code in OKX_RETRYABLE_HTTP_CODES and attempt < self._max_retries:
-                    time.sleep(self._retry_sleep(attempt))
-                    continue
-                raise RuntimeError(f"OKX request failed: {last_error}") from exc
-            except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-                last_error = repr(exc)
-                if attempt < self._max_retries:
-                    time.sleep(self._retry_sleep(attempt))
-                    continue
-                raise RuntimeError(f"OKX request failed: {last_error}") from exc
-
-        raise RuntimeError(f"OKX request failed after {self._max_retries} attempts: {last_error}")
-
-    def _retry_sleep(self, attempt: int) -> float:
-        return min(self._sleep_seconds * (2 ** max(0, attempt - 1)), 30.0)
-
-    def download_bucket_trades(
-        self,
-        raw_symbol: str,
-        bucket_start_ms: int,
-        bucket_end_ms: int,
-        *,
-        limit: int = 100,
-        max_pages: int | None = None,
-    ) -> tuple[list[MarketTrade], int, bool]:
-        all_raw: list[_OkxRawTrade] = []
-        after: str | None = None
-        pages = 0
-        complete = False
-
-        while True:
-            if max_pages is not None and pages >= max_pages:
-                break
-            page, next_after = self.fetch_page(
-                raw_symbol, after=after, limit=limit
-            )
-            pages += 1
-            if not page:
-                break
-
-            in_range = [
-                t for t in page
-                if bucket_start_ms <= int(t.ts) <= bucket_end_ms
-            ]
-            all_raw.extend(in_range)
-
-            oldest_ts = min(int(t.ts) for t in page)
-            if oldest_ts < bucket_start_ms:
-                complete = True
-                break
-
-            if next_after is None:
-                break
-            after = next_after
-
-            if self._sleep_seconds > 0:
-                time.sleep(self._sleep_seconds)
-
-        trades = [
-            MarketTrade(
-                exchange=ExchangeName.OKX,
-                symbol="",
-                raw_symbol=raw_symbol,
-                price=Decimal(r.price),
-                quantity=Decimal(r.size),
-                side=TradeSide.BUY if r.side.lower() == "buy" else TradeSide.SELL,
-                trade_id=r.trade_id,
-                event_time_ms=int(r.ts),
-                trade_time_ms=int(r.ts),
-                source=MarketDataSource.REST,
-                raw={
-                    "tradeId": r.trade_id,
-                    "px": r.price,
-                    "sz": r.size,
-                    "side": r.side,
-                    "ts": r.ts,
-                },
-            )
-            for r in all_raw
-        ]
-        return trades, pages, complete
-
-
-# ---------------------------------------------------------------------------
 # Download coordination
 # ---------------------------------------------------------------------------
 
@@ -462,6 +290,151 @@ def _download_missing_trades(
     return result
 
 
+def _run_rest_history_download(
+    *,
+    args: argparse.Namespace,
+    raw_symbol: str,
+    symbol: str,
+    missing_bucket_starts: list[int],
+    bucket_ms: int,
+    current_bucket_start_ms: int,
+    trade_store: SqliteTradeStore,
+    download_func: DownloadFunc | None,
+    dry_run: bool,
+    dry_run_dl_net: bool,
+) -> DownloadResult:
+    func: DownloadFunc
+    if download_func is not None:
+        func = download_func
+    elif dry_run and not dry_run_dl_net:
+        def _noop_downloader(
+            _rs: str, _bs: int, _be: int, _lim: int,
+        ) -> tuple[list[MarketTrade], int, bool]:
+            return [], 0, False
+
+        func = _noop_downloader
+    else:
+        raise RuntimeError("REST history download requires HistoricalTradeImportService or an injected download_func")
+
+    return _download_missing_trades(
+        raw_symbol=raw_symbol,
+        symbol=symbol,
+        missing_bucket_starts=missing_bucket_starts,
+        bucket_ms=bucket_ms,
+        current_bucket_start_ms=current_bucket_start_ms,
+        download_func=func,
+        trade_store=trade_store,
+        limit=min(int(args.download_limit), 100),
+        coverage_edge_tolerance_ms=int(args.coverage_edge_tolerance_ms),
+        coverage_max_gap_ms=int(args.coverage_max_gap_ms),
+        dry_run=dry_run,
+        dry_run_download_network=dry_run_dl_net,
+    )
+
+
+def _merge_import_summary(summary: RepairSummary, result) -> None:
+    summary.download_requested_buckets += result.requested_buckets
+    summary.downloaded_buckets += result.imported_buckets
+    summary.download_failed_buckets += result.failed_buckets
+    summary.download_skipped_buckets += result.skipped_buckets
+    summary.downloaded_trade_count += result.trades_saved
+    summary.would_download_buckets += result.would_download_buckets
+    summary.would_download_trade_count += result.would_download_trade_count
+    summary.coverage_validated_buckets += result.coverage_validated_buckets
+    summary.coverage_validation_failed_buckets += result.coverage_validation_failed_buckets
+    summary.coverage_validation_failed_examples.extend(result.coverage_validation_failed_examples)
+    summary.download_errors.extend(result.errors)
+    summary.raw_dates_required = result.raw_dates_required or summary.raw_dates_required
+    summary.raw_files_found.extend(result.raw_files_found)
+    summary.raw_files_downloaded.extend(result.raw_files_downloaded)
+    summary.raw_files_missing.extend(result.raw_files_missing)
+    summary.raw_rows_read += result.rows_read
+    summary.raw_trades_saved += result.trades_saved
+    summary.raw_import_errors.extend(result.errors)
+    if result.raw_manifest_path:
+        summary.raw_manifest_path = result.raw_manifest_path
+
+
+def _import_historical_trades(
+    *,
+    args: argparse.Namespace,
+    trade_store: SqliteTradeStore,
+    symbol: str,
+    raw_symbol: str,
+    exchange: str,
+    bucket_starts: list[int],
+    bucket_ms: int,
+    current_bucket_start_ms: int,
+    target_range: TimeRange,
+    trade_source: str,
+    dry_run: bool,
+    dry_run_dl_net: bool,
+):
+    timeout_seconds = (
+        int(args.download_timeout_seconds)
+        if trade_source == "rest_history"
+        else int(args.download_raw_timeout)
+    )
+    max_retries = (
+        int(args.download_max_retries)
+        if trade_source == "rest_history"
+        else int(args.download_raw_retries)
+    )
+    sleep_seconds = (
+        float(args.download_sleep_seconds)
+        if trade_source == "rest_history"
+        else float(args.download_raw_sleep_sec)
+    )
+    service = HistoricalTradeImportService(
+        trade_store=trade_store,
+        archive_client_kwargs={
+            key: value
+            for key, value in {
+                "base_url": args.okx_base_url,
+                "timeout_seconds": timeout_seconds,
+                "max_retries": max_retries,
+                "sleep_seconds": sleep_seconds,
+                "daily_trades_url_template": args.cdn_url_template,
+            }.items()
+            if value is not None
+        },
+        raw_kind=str(args.raw_kind),
+    )
+    return service.import_missing_buckets(
+        symbol=symbol,
+        raw_symbol=raw_symbol,
+        exchange=exchange,
+        bucket_starts=bucket_starts,
+        bucket_ms=bucket_ms,
+        time_range=target_range,
+        raw_root=_resolve_path(args.raw_root),
+        trade_source=trade_source,
+        dry_run=dry_run,
+        dry_run_download_network=dry_run_dl_net,
+        current_bucket_start_ms=current_bucket_start_ms,
+        overwrite_raw=bool(args.overwrite_raw),
+        raw_chunksize=int(args.raw_chunksize),
+        coverage_edge_tolerance_ms=int(args.coverage_edge_tolerance_ms),
+        coverage_max_gap_ms=int(args.coverage_max_gap_ms),
+        download_limit=min(int(args.download_limit), 100),
+        download_max_pages=args.download_max_pages,
+    )
+
+
+def _merge_rest_download_summary(summary: RepairSummary, result: DownloadResult) -> None:
+    summary.download_requested_buckets += result.requested_buckets
+    summary.downloaded_buckets += result.downloaded_buckets
+    summary.download_failed_buckets += result.failed_buckets
+    summary.download_skipped_buckets += result.skipped_buckets
+    summary.downloaded_trade_count += result.downloaded_trade_count
+    summary.would_download_buckets += result.would_download_buckets
+    summary.would_download_trade_count += result.would_download_trade_count
+    summary.coverage_validated_buckets += result.coverage_validated_buckets
+    summary.coverage_validation_failed_buckets += result.coverage_validation_failed_buckets
+    summary.coverage_validation_failed_examples.extend(result.coverage_validation_failed_examples)
+    summary.download_errors.extend(result.errors)
+
+
 def _validate_bucket_trade_coverage(
     *,
     db_path: Path,
@@ -471,71 +444,14 @@ def _validate_bucket_trade_coverage(
     edge_tolerance_ms: int,
     max_gap_ms: int,
 ) -> tuple[bool, str]:
-    with sqlite3.connect(db_path) as conn:
-        row = conn.execute(
-            """
-            SELECT COUNT(*),
-                   MIN(COALESCE(trade_time_ms, event_time_ms)),
-                   MAX(COALESCE(trade_time_ms, event_time_ms))
-            FROM trades
-            WHERE symbol = ?
-              AND COALESCE(trade_time_ms, event_time_ms) BETWEEN ? AND ?
-            """,
-            (symbol, bucket_start_ms, bucket_end_ms),
-        ).fetchone()
-    count = int(row[0] or 0)
-    earliest = row[1]
-    latest = row[2]
-
-    if count == 0:
-        return False, "no trades in bucket"
-
-    if earliest is None or latest is None:
-        return False, "no timestamps in bucket trades"
-
-    earliest_ms = int(earliest)
-    latest_ms = int(latest)
-
-    if earliest_ms > bucket_start_ms + edge_tolerance_ms:
-        return False, (
-            f"earliest trade {earliest_ms} too far from bucket_start {bucket_start_ms} "
-            f"(gap={earliest_ms - bucket_start_ms}ms > tolerance={edge_tolerance_ms}ms)"
-        )
-
-    if latest_ms < bucket_end_ms - edge_tolerance_ms:
-        return False, (
-            f"latest trade {latest_ms} too far from bucket_end {bucket_end_ms} "
-            f"(gap={bucket_end_ms - latest_ms}ms > tolerance={edge_tolerance_ms}ms)"
-        )
-
-    with sqlite3.connect(db_path) as conn:
-        rows = conn.execute(
-            """
-            SELECT COALESCE(trade_time_ms, event_time_ms)
-            FROM trades
-            WHERE symbol = ?
-              AND COALESCE(trade_time_ms, event_time_ms) BETWEEN ? AND ?
-            ORDER BY COALESCE(trade_time_ms, event_time_ms) ASC
-            """,
-            (symbol, bucket_start_ms, bucket_end_ms),
-        ).fetchall()
-
-    prev: int | None = None
-    max_gap_found = 0
-    for (ts,) in rows:
-        ts_int = int(ts)
-        if prev is not None:
-            gap = ts_int - prev
-            if gap > max_gap_found:
-                max_gap_found = gap
-        prev = ts_int
-
-    if max_gap_found > max_gap_ms:
-        return False, (
-            f"max inter-trade gap {max_gap_found}ms exceeds threshold {max_gap_ms}ms"
-        )
-
-    return True, "ok"
+    return validate_bucket_trade_coverage(
+        db_path=db_path,
+        symbol=symbol,
+        bucket_start_ms=bucket_start_ms,
+        bucket_end_ms=bucket_end_ms,
+        edge_tolerance_ms=edge_tolerance_ms,
+        max_gap_ms=max_gap_ms,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -560,6 +476,8 @@ class RepairSummary:
     start_ms: int
     end_ms: int
     bucket_count_target: int
+    preset: str = "none"
+    days: int | None = None
     # Trade-coverage classification
     trade_coverage_complete_buckets: int = 0
     missing_trade_coverage_buckets: int = 0
@@ -613,6 +531,8 @@ class RepairSummary:
     # Download
     download_missing_trades: bool = False
     dry_run_download_network: bool = False
+    trade_source: str = "okx_cdn_daily"
+    fallback_rest_history: bool = False
     download_requested_buckets: int = 0
     downloaded_buckets: int = 0
     download_failed_buckets: int = 0
@@ -624,6 +544,14 @@ class RepairSummary:
     coverage_validation_failed_buckets: int = 0
     coverage_validation_failed_examples: list[dict] = field(default_factory=list)
     download_errors: list[str] = field(default_factory=list)
+    raw_dates_required: list[str] = field(default_factory=list)
+    raw_files_found: list[str] = field(default_factory=list)
+    raw_files_downloaded: list[str] = field(default_factory=list)
+    raw_files_missing: list[str] = field(default_factory=list)
+    raw_rows_read: int = 0
+    raw_trades_saved: int = 0
+    raw_import_errors: list[str] = field(default_factory=list)
+    raw_manifest_path: str = ""
     # Live protection
     live_running_detected: bool = False
     live_db_write_allowed: bool = False
@@ -641,9 +569,16 @@ class RepairSummary:
 # ---------------------------------------------------------------------------
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    argv_list = list(argv) if argv is not None else sys.argv[1:]
     parser = argparse.ArgumentParser(
         description="Offline repair tool for local range-speed history."
     )
+    parser.add_argument(
+        "--preset",
+        choices=("none", "v10b-check", "v10b-bootstrap", "v10b-incremental"),
+        default="none",
+    )
+    parser.add_argument("--days", type=int, default=None)
     parser.add_argument("--symbol", default="ETH-USDT-PERP")
     parser.add_argument("--exchange", default="okx")
     parser.add_argument("--raw-symbol", default="ETH-USDT-SWAP")
@@ -700,6 +635,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     # Download
     parser.add_argument(
+        "--trade-source",
+        choices=("okx_cdn_daily", "local_raw", "rest_history"),
+        default="okx_cdn_daily",
+    )
+    parser.add_argument(
+        "--fallback-rest-history",
+        nargs="?", const=True, default=False, type=_bool,
+        help="Fallback to OKX REST history-trades after raw import misses coverage.",
+    )
+    parser.add_argument(
         "--download-missing-trades",
         nargs="?", const=True, default=False, type=_bool,
         help="Download missing OKX historical trades before repair.",
@@ -717,6 +662,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--download-timeout-seconds", type=int, default=20)
     parser.add_argument("--download-lookback-buckets", type=int, default=None)
     parser.add_argument("--download-max-pages", type=int, default=None)
+    parser.add_argument("--raw-root", default="data/okx/raw")
+    parser.add_argument("--raw-kind", default="trades")
+    parser.add_argument("--cdn-url-template", default=None)
+    parser.add_argument("--overwrite-raw", nargs="?", const=True, default=False, type=_bool)
+    parser.add_argument("--download-raw-timeout", type=int, default=60)
+    parser.add_argument("--download-raw-retries", type=int, default=3)
+    parser.add_argument("--download-raw-sleep-sec", type=float, default=2.0)
+    parser.add_argument("--raw-chunksize", type=int, default=300_000)
     parser.add_argument(
         "--skip-download-if-live", nargs="?", const=True, default=True, type=_bool,
     )
@@ -741,7 +694,89 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--coverage-edge-tolerance-ms", type=int, default=300_000)
     parser.add_argument("--coverage-max-gap-ms", type=int, default=1_800_000)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv_list)
+    _apply_preset_and_days(args, argv_list)
+    return args
+
+
+def _apply_preset_and_days(args: argparse.Namespace, argv: Sequence[str]) -> None:
+    explicit = _explicit_cli_options(argv)
+    preset_values: dict[str, object] = {}
+    if args.preset == "v10b-check":
+        preset_values = {
+            "symbol": "ETH-USDT-PERP",
+            "raw_symbol": "ETH-USDT-SWAP",
+            "range_pct": "0.002",
+            "bucket_interval": "4h",
+            "min_buckets": 180,
+            "download_lookback_buckets": 180,
+            "dry_run": True,
+            "download_missing_trades": False,
+            "repair_range_bars": False,
+            "rebuild_aggregates": False,
+        }
+    elif args.preset == "v10b-bootstrap":
+        preset_values = {
+            "symbol": "ETH-USDT-PERP",
+            "raw_symbol": "ETH-USDT-SWAP",
+            "range_pct": "0.002",
+            "bucket_interval": "4h",
+            "min_buckets": 180,
+            "download_lookback_buckets": 180,
+            "trade_source": "okx_cdn_daily",
+            "download_missing_trades": True,
+            "repair_range_bars": True,
+            "rebuild_aggregates": True,
+            "mode": "rebuild-window",
+            "force_rebuild_window": True,
+            "delete_existing_aggregates": True,
+            "delete_existing_range_bars": True,
+            "clean_pollution": True,
+            "abort_if_download_failed": True,
+            "min_download_success_ratio": 0.95,
+            "min_complete_coverage_buckets": 180,
+        }
+    elif args.preset == "v10b-incremental":
+        preset_values = {
+            "symbol": "ETH-USDT-PERP",
+            "raw_symbol": "ETH-USDT-SWAP",
+            "range_pct": "0.002",
+            "bucket_interval": "4h",
+            "min_buckets": 180,
+            "download_lookback_buckets": 180,
+            "trade_source": "okx_cdn_daily",
+            "download_missing_trades": True,
+            "repair_range_bars": True,
+            "rebuild_aggregates": True,
+            "mode": "incremental",
+            "clean_pollution": True,
+            "force_rebuild_window": False,
+            "delete_existing_aggregates": False,
+            "delete_existing_range_bars": False,
+        }
+    for name, value in preset_values.items():
+        if name not in explicit:
+            setattr(args, name, value)
+
+    if args.days is not None:
+        bucket_hours = _parse_interval_ms(args.bucket_interval) / (60 * 60_000)
+        buckets = int(math.ceil(int(args.days) * 24 / bucket_hours))
+        if "download_lookback_buckets" not in explicit:
+            args.download_lookback_buckets = buckets
+        if "min_buckets" not in explicit:
+            args.min_buckets = buckets
+        if args.min_complete_coverage_buckets is None or "min_complete_coverage_buckets" not in explicit:
+            args.min_complete_coverage_buckets = buckets
+
+
+def _explicit_cli_options(argv: Sequence[str]) -> set[str]:
+    options: set[str] = set()
+    for raw in argv:
+        if not str(raw).startswith("--"):
+            continue
+        name = str(raw)[2:].split("=", 1)[0].replace("-", "_")
+        options.add(name)
+    return options
 
 
 # ---------------------------------------------------------------------------
@@ -785,6 +820,7 @@ def run(
     allow_live_write = bool(args.allow_live_db_write)
     dry_run = bool(args.dry_run)
     dry_run_dl_net = bool(args.dry_run_download_network)
+    trade_source = str(args.trade_source)
 
     # ---- will_write_db: any operation that mutates the database ----
     will_write_db = not dry_run and bool(
@@ -806,6 +842,8 @@ def run(
         start_ms=start_ms,
         end_ms=end_ms,
         bucket_count_target=len(bucket_starts),
+        preset=str(args.preset),
+        days=args.days,
         min_buckets=int(args.min_buckets),
         dry_run=dry_run,
         repair_range_bars=bool(args.repair_range_bars),
@@ -817,6 +855,8 @@ def run(
         builder_mode=args.builder_mode,
         download_missing_trades=download_missing,
         dry_run_download_network=dry_run_dl_net,
+        trade_source=trade_source,
+        fallback_rest_history=bool(args.fallback_rest_history),
         live_db_write_allowed=allow_live_write,
         mode=mode,
         force_rebuild_window=force_rebuild,
@@ -920,56 +960,128 @@ def run(
     if download_missing and missing_bucket_starts:
         if live_running and bool(args.skip_download_if_live):
             summary.warnings.append("download_skipped_live_running")
-        else:
-            func: DownloadFunc
-            if download_func is not None:
-                func = download_func
-            elif dry_run and not dry_run_dl_net:
-                # Dry-run without network: use a no-op func to avoid real HTTP.
-                def _noop_downloader(
-                    _rs: str, _bs: int, _be: int, _lim: int,
-                ) -> tuple[list[MarketTrade], int, bool]:
-                    return [], 0, False
+        elif download_func is None and trade_source in {"okx_cdn_daily", "local_raw"}:
+            raw_result = _import_historical_trades(
+                args=args,
+                trade_store=trade_store,
+                symbol=args.symbol,
+                raw_symbol=args.raw_symbol,
+                exchange=exchange,
+                bucket_starts=list(missing_bucket_starts),
+                bucket_ms=bucket_ms,
+                current_bucket_start_ms=current_bucket_start_ms,
+                target_range=target_range,
+                trade_source=trade_source,
+                dry_run=dry_run,
+                dry_run_dl_net=dry_run_dl_net,
+            )
+            _merge_import_summary(summary, raw_result)
 
-                func = _noop_downloader
-            else:
-                dl = OkxHistoricalTradeDownloader(
-                    base_url=args.okx_base_url,
-                    timeout_seconds=int(args.download_timeout_seconds),
-                    max_retries=int(args.download_max_retries),
-                    sleep_seconds=float(args.download_sleep_seconds),
+            if raw_result.errors:
+                summary.warnings.append("raw_import_errors_occurred")
+            if raw_result.coverage_validation_failed_buckets:
+                summary.warnings.append("downloaded_trades_failed_coverage_validation")
+
+            if not dry_run:
+                complete_bucket_starts, missing_bucket_starts = _classify_trade_coverage(
+                    trade_store.coverage_ranges(
+                        symbol=args.symbol, time_range=target_range, source="historical"
+                    ),
+                    bucket_starts=bucket_starts,
+                    bucket_ms=bucket_ms,
                 )
-                _dl_max_pages = args.download_max_pages
+                summary.trade_coverage_complete_buckets = len(complete_bucket_starts)
+                summary.missing_trade_coverage_buckets = len(missing_bucket_starts)
+                summary.missing_trade_coverage_examples = _bucket_examples(missing_bucket_starts, bucket_ms)
 
-                def _okx_download_func(
-                    raw_symbol: str,
-                    bucket_start_ms: int,
-                    bucket_end_ms: int,
-                    limit: int,
-                ) -> tuple[list[MarketTrade], int, bool]:
-                    return dl.download_bucket_trades(
-                        raw_symbol,
-                        bucket_start_ms,
-                        bucket_end_ms,
-                        limit=limit,
-                        max_pages=_dl_max_pages,
+                newly_downloaded = set(complete_bucket_starts) & original_missing_set
+                needs_repair_set |= newly_downloaded
+                needs_repair_coverage = [b for b in complete_bucket_starts if b in needs_repair_set]
+
+            if (
+                missing_bucket_starts
+                and bool(args.fallback_rest_history)
+                and not (dry_run and not dry_run_dl_net)
+            ):
+                summary.warnings.append("fallback_rest_history_attempted")
+                rest_result = _import_historical_trades(
+                    args=args,
+                    trade_store=trade_store,
+                    symbol=args.symbol,
+                    raw_symbol=args.raw_symbol,
+                    exchange=exchange,
+                    bucket_starts=list(missing_bucket_starts),
+                    bucket_ms=bucket_ms,
+                    current_bucket_start_ms=current_bucket_start_ms,
+                    target_range=target_range,
+                    trade_source="rest_history",
+                    dry_run=dry_run,
+                    dry_run_dl_net=dry_run_dl_net,
+                )
+                _merge_import_summary(summary, rest_result)
+                if not dry_run:
+                    complete_bucket_starts, missing_bucket_starts = _classify_trade_coverage(
+                        trade_store.coverage_ranges(
+                            symbol=args.symbol, time_range=target_range, source="historical"
+                        ),
+                        bucket_starts=bucket_starts,
+                        bucket_ms=bucket_ms,
                     )
+                    summary.trade_coverage_complete_buckets = len(complete_bucket_starts)
+                    summary.missing_trade_coverage_buckets = len(missing_bucket_starts)
+                    summary.missing_trade_coverage_examples = _bucket_examples(missing_bucket_starts, bucket_ms)
 
-                func = _okx_download_func
+                    newly_downloaded = set(complete_bucket_starts) & original_missing_set
+                    needs_repair_set |= newly_downloaded
+                    needs_repair_coverage = [b for b in complete_bucket_starts if b in needs_repair_set]
+        elif download_func is None:
+            rest_result = _import_historical_trades(
+                args=args,
+                trade_store=trade_store,
+                symbol=args.symbol,
+                raw_symbol=args.raw_symbol,
+                exchange=exchange,
+                bucket_starts=list(missing_bucket_starts),
+                bucket_ms=bucket_ms,
+                current_bucket_start_ms=current_bucket_start_ms,
+                target_range=target_range,
+                trade_source="rest_history",
+                dry_run=dry_run,
+                dry_run_dl_net=dry_run_dl_net,
+            )
+            _merge_import_summary(summary, rest_result)
+            if rest_result.errors:
+                summary.warnings.append("download_errors_occurred")
+            if rest_result.coverage_validation_failed_buckets:
+                summary.warnings.append("downloaded_trades_failed_coverage_validation")
 
-            dl_result = _download_missing_trades(
+            if not dry_run:
+                complete_bucket_starts, missing_bucket_starts = _classify_trade_coverage(
+                    trade_store.coverage_ranges(
+                        symbol=args.symbol, time_range=target_range, source="historical"
+                    ),
+                    bucket_starts=bucket_starts,
+                    bucket_ms=bucket_ms,
+                )
+                summary.trade_coverage_complete_buckets = len(complete_bucket_starts)
+                summary.missing_trade_coverage_buckets = len(missing_bucket_starts)
+                summary.missing_trade_coverage_examples = _bucket_examples(missing_bucket_starts, bucket_ms)
+
+                newly_downloaded = set(complete_bucket_starts) & original_missing_set
+                needs_repair_set |= newly_downloaded
+                needs_repair_coverage = [b for b in complete_bucket_starts if b in needs_repair_set]
+        else:
+            dl_result = _run_rest_history_download(
+                args=args,
                 raw_symbol=args.raw_symbol,
                 symbol=args.symbol,
                 missing_bucket_starts=list(missing_bucket_starts),
                 bucket_ms=bucket_ms,
                 current_bucket_start_ms=current_bucket_start_ms,
-                download_func=func,
                 trade_store=trade_store,
-                limit=min(int(args.download_limit), 100),
-                coverage_edge_tolerance_ms=int(args.coverage_edge_tolerance_ms),
-                coverage_max_gap_ms=int(args.coverage_max_gap_ms),
+                download_func=download_func,
                 dry_run=dry_run,
-                dry_run_download_network=dry_run_dl_net,
+                dry_run_dl_net=dry_run_dl_net,
             )
             summary.download_requested_buckets = dl_result.requested_buckets
             summary.downloaded_buckets = dl_result.downloaded_buckets
@@ -1509,6 +1621,8 @@ def _print_summary(summary: RepairSummary) -> None:
         "symbol",
         "exchange",
         "range_pct",
+        "preset",
+        "days",
         "mode",
         "start_ms",
         "end_ms",
@@ -1538,6 +1652,8 @@ def _print_summary(summary: RepairSummary) -> None:
         "dry_run",
         "dry_run_download_network",
         "download_missing_trades",
+        "trade_source",
+        "fallback_rest_history",
         "download_requested_buckets",
         "downloaded_buckets",
         "download_failed_buckets",
@@ -1547,6 +1663,14 @@ def _print_summary(summary: RepairSummary) -> None:
         "would_download_trade_count",
         "coverage_validated_buckets",
         "coverage_validation_failed_buckets",
+        "raw_dates_required",
+        "raw_files_found",
+        "raw_files_downloaded",
+        "raw_files_missing",
+        "raw_rows_read",
+        "raw_trades_saved",
+        "raw_import_errors",
+        "raw_manifest_path",
         "live_running_detected",
         "live_db_write_allowed",
         "force_rebuild_window",
