@@ -369,7 +369,6 @@ def _download_missing_trades(
     limit: int,
     coverage_edge_tolerance_ms: int,
     coverage_max_gap_ms: int,
-    max_pages_per_bucket: int | None,
     dry_run: bool = False,
     dry_run_download_network: bool = False,
 ) -> DownloadResult:
@@ -628,6 +627,13 @@ class RepairSummary:
     # Live protection
     live_running_detected: bool = False
     live_db_write_allowed: bool = False
+    # Destructive rebuild guard
+    destructive_rebuild_aborted: bool = False
+    destructive_rebuild_abort_reason: str = ""
+    abort_if_download_failed: bool = True
+    min_download_success_ratio: float = 0.95
+    min_complete_coverage_buckets: int = 100
+    allow_destructive_empty_rebuild: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -717,6 +723,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--allow-live-db-write", nargs="?", const=True, default=False, type=_bool,
     )
+    parser.add_argument(
+        "--abort-if-download-failed", nargs="?", const=True, default=True, type=_bool,
+        help="Abort destructive rebuild if download success rate is too low (default: true).",
+    )
+    parser.add_argument(
+        "--min-download-success-ratio", type=float, default=0.95,
+        help="Minimum download success ratio before destructive rebuild is allowed (default: 0.95).",
+    )
+    parser.add_argument(
+        "--min-complete-coverage-buckets", type=int, default=None,
+        help="Minimum complete-coverage buckets required for destructive rebuild (default: --min-buckets).",
+    )
+    parser.add_argument(
+        "--allow-destructive-empty-rebuild", nargs="?", const=True, default=False, type=_bool,
+        help="Allow destructive rebuild even with zero downloaded buckets / low coverage (default: false).",
+    )
     parser.add_argument("--coverage-edge-tolerance-ms", type=int, default=300_000)
     parser.add_argument("--coverage-max-gap-ms", type=int, default=1_800_000)
     return parser.parse_args(argv)
@@ -799,6 +821,10 @@ def run(
         mode=mode,
         force_rebuild_window=force_rebuild,
         clean_pollution=clean_pollution,
+        abort_if_download_failed=bool(args.abort_if_download_failed),
+        min_download_success_ratio=float(args.min_download_success_ratio),
+        min_complete_coverage_buckets=int(args.min_complete_coverage_buckets) if args.min_complete_coverage_buckets is not None else int(args.min_buckets),
+        allow_destructive_empty_rebuild=bool(args.allow_destructive_empty_rebuild),
     )
     if contract_warning:
         summary.warnings.append(contract_warning)
@@ -913,7 +939,23 @@ def run(
                     max_retries=int(args.download_max_retries),
                     sleep_seconds=float(args.download_sleep_seconds),
                 )
-                func = dl.download_bucket_trades
+                _dl_max_pages = args.download_max_pages
+
+                def _okx_download_func(
+                    raw_symbol: str,
+                    bucket_start_ms: int,
+                    bucket_end_ms: int,
+                    limit: int,
+                ) -> tuple[list[MarketTrade], int, bool]:
+                    return dl.download_bucket_trades(
+                        raw_symbol,
+                        bucket_start_ms,
+                        bucket_end_ms,
+                        limit=limit,
+                        max_pages=_dl_max_pages,
+                    )
+
+                func = _okx_download_func
 
             dl_result = _download_missing_trades(
                 raw_symbol=args.raw_symbol,
@@ -926,7 +968,6 @@ def run(
                 limit=min(int(args.download_limit), 100),
                 coverage_edge_tolerance_ms=int(args.coverage_edge_tolerance_ms),
                 coverage_max_gap_ms=int(args.coverage_max_gap_ms),
-                max_pages_per_bucket=args.download_max_pages,
                 dry_run=dry_run,
                 dry_run_download_network=dry_run_dl_net,
             )
@@ -966,6 +1007,50 @@ def run(
                 needs_repair_coverage = [b for b in complete_bucket_starts if b in needs_repair_set]
 
     summary.buckets_downloaded = len(newly_downloaded & needs_repair_set)
+
+    # ---- destructive rebuild guard ----
+    _min_coverage = int(args.min_complete_coverage_buckets) if args.min_complete_coverage_buckets is not None else int(args.min_buckets)
+    if (
+        mode == "rebuild-window"
+        and force_rebuild
+        and download_missing
+        and not dry_run
+        and not bool(args.allow_destructive_empty_rebuild)
+        and bool(args.abort_if_download_failed)
+    ):
+        abort_reasons: list[str] = []
+
+        # (a) Zero downloaded buckets with missing coverage
+        if summary.downloaded_buckets == 0 and summary.missing_trade_coverage_buckets > 0:
+            abort_reasons.append(
+                "zero_downloaded_buckets_with_missing_coverage"
+            )
+
+        # (b) Failed downloads and success ratio below threshold
+        if summary.download_failed_buckets > 0:
+            total_attempted = max(summary.download_requested_buckets, 1)
+            success_ratio = summary.downloaded_buckets / total_attempted
+            if success_ratio < float(args.min_download_success_ratio):
+                abort_reasons.append(
+                    f"download_success_ratio_{success_ratio:.2f}_below_min_{float(args.min_download_success_ratio)}"
+                )
+
+        # (c) Complete coverage buckets below minimum
+        if summary.trade_coverage_complete_buckets < _min_coverage:
+            abort_reasons.append(
+                f"complete_coverage_buckets_{summary.trade_coverage_complete_buckets}_below_min_{_min_coverage}"
+            )
+
+        if abort_reasons:
+            summary.destructive_rebuild_aborted = True
+            summary.destructive_rebuild_abort_reason = "; ".join(abort_reasons)
+            summary.warnings.append(
+                "destructive_rebuild_aborted_due_to_incomplete_download"
+            )
+            _print_summary(summary)
+            if args.json_output:
+                _write_json_output(_resolve_path(args.json_output), summary, dry_run=dry_run)
+            return summary, 4
 
     # ---- clean pollution (independent of mode) ----
     if clean_pollution or (args.delete_existing_aggregates and mode == "incremental" and pollution_detected):
@@ -1466,6 +1551,8 @@ def _print_summary(summary: RepairSummary) -> None:
         "live_db_write_allowed",
         "force_rebuild_window",
         "clean_pollution",
+        "destructive_rebuild_aborted",
+        "destructive_rebuild_abort_reason",
         "backup_paths",
         "warnings",
     ):
