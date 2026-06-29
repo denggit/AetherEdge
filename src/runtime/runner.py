@@ -206,6 +206,9 @@ class LiveRuntimeRunner:
         )
         self._last_snapshot: PlatformSnapshot | None = self.services.get("snapshot")
         self._last_snapshots: tuple[PlatformSnapshot, ...] = ()
+        self._last_account_snapshot_log_state: dict[tuple[str, str], tuple[Decimal, Decimal]] = {}
+        self._last_account_snapshot_log_ms: dict[tuple[str, str], int] = {}
+        self._account_snapshot_log_keepalive_seconds = _account_snapshot_log_keepalive_seconds_from_env()
         self._last_market_queue_full_log_ms = 0
         self._last_market_queue_full_alert_ms = 0
         self._last_market_queue_backlog_log_ms = 0
@@ -2164,9 +2167,55 @@ class LiveRuntimeRunner:
         if not callable(handler):
             return
         await handler(snapshot)
-        logger.info(
-            "Strategy account snapshot refreshed | exchange=%s sync_type=%s available=%s total=%s",
-            snapshot.balance.exchange.value,
+
+        exchange = snapshot.balance.exchange.value
+        key = (exchange, sync_type)
+        state = (snapshot.balance.available, snapshot.balance.total)
+        previous_state = self._last_account_snapshot_log_state.get(key)
+        now_ms = int(time.monotonic() * 1000)
+        self._last_account_snapshot_log_state[key] = state
+
+        if previous_state is None:
+            self._last_account_snapshot_log_ms[key] = now_ms
+            logger.info(
+                "Strategy account snapshot refreshed | exchange=%s sync_type=%s available=%s total=%s reason=first_snapshot",
+                exchange,
+                sync_type,
+                snapshot.balance.available,
+                snapshot.balance.total,
+            )
+            return
+
+        if state != previous_state:
+            self._last_account_snapshot_log_ms[key] = now_ms
+            logger.info(
+                "Strategy account snapshot refreshed | exchange=%s sync_type=%s available=%s total=%s reason=balance_changed previous_available=%s previous_total=%s",
+                exchange,
+                sync_type,
+                snapshot.balance.available,
+                snapshot.balance.total,
+                previous_state[0],
+                previous_state[1],
+            )
+            return
+
+        keepalive_seconds = self._account_snapshot_log_keepalive_seconds
+        last_info_ms = self._last_account_snapshot_log_ms[key]
+        if keepalive_seconds > 0 and now_ms - last_info_ms >= keepalive_seconds * 1000:
+            self._last_account_snapshot_log_ms[key] = now_ms
+            logger.info(
+                "Strategy account snapshot refreshed | exchange=%s sync_type=%s available=%s total=%s reason=keepalive_unchanged keepalive_seconds=%g",
+                exchange,
+                sync_type,
+                snapshot.balance.available,
+                snapshot.balance.total,
+                keepalive_seconds,
+            )
+            return
+
+        logger.debug(
+            "Account snapshot unchanged | exchange=%s sync_type=%s available=%s total=%s",
+            exchange,
             sync_type,
             snapshot.balance.available,
             snapshot.balance.total,
@@ -3258,6 +3307,23 @@ def _stop_post_check_attempts_from_env() -> int:
         )
         return 3
     return max(1, value)
+
+
+def _account_snapshot_log_keepalive_seconds_from_env() -> float:
+    """Parse account snapshot INFO keepalive seconds, where zero disables it."""
+    raw = os.getenv("AETHER_ACCOUNT_SNAPSHOT_LOG_KEEPALIVE_SECONDS", "").strip()
+    if not raw:
+        return 3600
+    try:
+        value = float(raw)
+    except (ValueError, TypeError):
+        logger.warning(
+            "Invalid account snapshot log keepalive env value; using default | env=%s raw=%r default=3600",
+            "AETHER_ACCOUNT_SNAPSHOT_LOG_KEEPALIVE_SECONDS",
+            os.getenv("AETHER_ACCOUNT_SNAPSHOT_LOG_KEEPALIVE_SECONDS", ""),
+        )
+        return 3600
+    return max(0.0, value)
 
 
 def _stop_post_check_delay_from_env() -> float:

@@ -47,10 +47,15 @@ def _feature_requirements():
     })
 
 
-def _snapshot(exchange: ExchangeName = ExchangeName.OKX) -> PlatformSnapshot:
+def _snapshot(
+    exchange: ExchangeName = ExchangeName.OKX,
+    *,
+    total: Decimal | str = "1000",
+    available: Decimal | str = "1000",
+) -> PlatformSnapshot:
     return PlatformSnapshot(
         symbol="ETH-USDT-PERP",
-        balance=Balance(exchange=exchange, asset="USDT", total=Decimal("1000"), available=Decimal("1000")),
+        balance=Balance(exchange=exchange, asset="USDT", total=Decimal(total), available=Decimal(available)),
         positions=[],
         open_orders=[],
         open_stop_orders=[],
@@ -1003,6 +1008,99 @@ async def test_account_sync_refreshes_strategy_account_snapshot():
         (ExchangeName.BINANCE, Decimal("300"), Decimal("280")),
     ]
     assert {snapshot.balance.exchange for snapshot in runner._last_snapshots} == {ExchangeName.OKX, ExchangeName.BINANCE}
+
+
+@pytest.mark.asyncio
+async def test_account_snapshot_logging_tracks_balance_by_exchange_and_sync_type(caplog, monkeypatch):
+    monkeypatch.setenv("AETHER_ACCOUNT_SNAPSHOT_LOG_KEEPALIVE_SECONDS", "0")
+    strategy = FeatureStrategy()
+    runner = _runner(strategy)
+    caplog.set_level(logging.DEBUG)
+
+    await runner._on_account_snapshot_synced(
+        _snapshot(total="1000.00", available="900.00"),
+        "account_periodic",
+    )
+    await runner._on_account_snapshot_synced(
+        _snapshot(total="1000", available="900"),
+        "account_periodic",
+    )
+    await runner._on_account_snapshot_synced(
+        _snapshot(total="1000", available="901"),
+        "account_periodic",
+    )
+    await runner._on_account_snapshot_synced(
+        _snapshot(total="1001", available="901"),
+        "account_periodic",
+    )
+    await runner._on_account_snapshot_synced(
+        _snapshot(ExchangeName.BINANCE, total="1001", available="901"),
+        "account_periodic",
+    )
+    await runner._on_account_snapshot_synced(
+        _snapshot(total="1001", available="901"),
+        "post_order_account",
+    )
+
+    info_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.INFO and "Strategy account snapshot refreshed" in record.getMessage()
+    ]
+    debug_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.DEBUG and "Account snapshot unchanged" in record.getMessage()
+    ]
+
+    assert len(info_messages) == 5
+    assert sum("reason=first_snapshot" in message for message in info_messages) == 3
+    assert sum("reason=balance_changed" in message for message in info_messages) == 2
+    assert any(
+        "available=901" in message
+        and "previous_available=900" in message
+        and "previous_total=1000" in message
+        for message in info_messages
+    )
+    assert any(
+        "total=1001" in message
+        and "previous_available=901" in message
+        and "previous_total=1000" in message
+        for message in info_messages
+    )
+    assert len(debug_messages) == 1
+    assert "available=900 total=1000" in debug_messages[0]
+    assert all("reason=keepalive_unchanged" not in message for message in info_messages)
+    assert len(strategy.account_snapshots) == 6
+    assert {snapshot.balance.exchange for snapshot in runner._last_snapshots} == {
+        ExchangeName.OKX,
+        ExchangeName.BINANCE,
+    }
+    assert runner._last_snapshot == strategy.account_snapshots[-1]
+
+
+@pytest.mark.asyncio
+async def test_account_snapshot_logging_emits_unchanged_keepalive(caplog, monkeypatch):
+    monkeypatch.setenv("AETHER_ACCOUNT_SNAPSHOT_LOG_KEEPALIVE_SECONDS", "1")
+    strategy = FeatureStrategy()
+    runner = _runner(strategy)
+    caplog.set_level(logging.INFO)
+    snapshot = _snapshot(total="1000", available="900")
+
+    await runner._on_account_snapshot_synced(snapshot, "account_periodic")
+    key = (ExchangeName.OKX.value, "account_periodic")
+    runner._last_account_snapshot_log_ms[key] = int(time.monotonic() * 1000) - 1_001
+    await runner._on_account_snapshot_synced(snapshot, "account_periodic")
+
+    info_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.INFO and "Strategy account snapshot refreshed" in record.getMessage()
+    ]
+    assert len(info_messages) == 2
+    assert "reason=first_snapshot" in info_messages[0]
+    assert "reason=keepalive_unchanged keepalive_seconds=1" in info_messages[1]
+    assert len(strategy.account_snapshots) == 2
 
 
 @pytest.mark.asyncio
