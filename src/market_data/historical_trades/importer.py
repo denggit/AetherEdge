@@ -135,8 +135,17 @@ class HistoricalTradeImportService:
                     overwrite=overwrite_raw,
                 )
             except Exception as exc:
-                summary.raw_files_missing.append(str(raw_path))
-                summary.errors.append(f"raw_download_failed date={date_text} path={raw_path} error={exc}")
+                status = "download_failed"
+                if _is_raw_404(exc):
+                    if _is_incomplete_raw_day(raw_date, current_bucket_start_ms):
+                        status = "skipped_incomplete_day"
+                        summary.raw_files_skipped_incomplete_day.append(str(raw_path))
+                    else:
+                        status = "not_yet_published"
+                        summary.raw_files_not_yet_published.append(str(raw_path))
+                else:
+                    summary.raw_files_missing.append(str(raw_path))
+                    summary.errors.append(f"raw_download_failed date={date_text} path={raw_path} error={exc}")
                 self._append_manifest(
                     manifest_path,
                     DownloadedArchive(
@@ -145,7 +154,7 @@ class HistoricalTradeImportService:
                         path=str(raw_path),
                         sha256=None,
                         size=None,
-                        status="download_failed",
+                        status=status,
                         error=str(exc),
                     ),
                 )
@@ -419,3 +428,25 @@ def _trade_time_ms(trade) -> int | None:
     if trade.trade_time_ms is not None:
         return trade.trade_time_ms
     return trade.event_time_ms
+
+
+def _is_raw_404(exc: Exception) -> bool:
+    raw = repr(exc)
+    text = str(exc)
+    return (
+        "HTTP Error 404" in raw
+        or "HTTP Error 404" in text
+        or "HTTPError 404" in raw
+        or "HTTPError 404" in text
+        or "HTTP 404" in raw
+        or "HTTP 404" in text
+        or "code=404" in raw
+        or "code=404" in text
+    )
+
+
+def _is_incomplete_raw_day(raw_date: date, current_bucket_start_ms: int | None) -> bool:
+    if current_bucket_start_ms is None:
+        return False
+    current_utc_day = datetime.fromtimestamp(current_bucket_start_ms / 1000, tz=UTC).date()
+    return raw_date >= current_utc_day

@@ -55,6 +55,21 @@ def _rows_for_bucket(bucket_start: int, *, sparse: bool = False) -> list[dict[st
     ]
 
 
+def _real_header_rows_for_bucket(bucket_start: int) -> list[dict[str, object]]:
+    rows = _rows_for_bucket(bucket_start)
+    return [
+        {
+            "instrument_name": RAW_SYMBOL,
+            "trade_id": row["tradeId"],
+            "side": row["side"],
+            "price": row["px"],
+            "size": row["sz"],
+            "created_time": row["ts"],
+        }
+        for row in rows
+    ]
+
+
 def _write_raw_zip(raw_root: Path, date_text: str, rows: list[dict[str, object]]) -> Path:
     path = _raw_zip_path(raw_root, date_text)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -111,6 +126,37 @@ def test_local_raw_zip_exists_does_not_download_and_marks_coverage(tmp_path: Pat
 
     assert summary.imported_buckets == 1
     assert summary.raw_files_found == [str(_raw_zip_path(raw_root, "2024-01-01"))]
+    assert _coverage_rows(market_db) == [(SYMBOL, base, base + H4 - 1, "historical")]
+
+
+def test_importer_parses_okx_cdn_created_time_header_and_marks_coverage(tmp_path: Path) -> None:
+    raw_root = tmp_path / "raw"
+    market_db = tmp_path / "market.sqlite3"
+    base = _ms(2024, 1, 1)
+    _write_raw_zip(raw_root, "2024-01-01", _real_header_rows_for_bucket(base))
+
+    service = HistoricalTradeImportService(
+        trade_store=SqliteTradeStore(market_db),
+        archive_client=OkxHistoricalTradesArchiveClient(),
+    )
+    summary = service.import_missing_buckets(
+        symbol=SYMBOL,
+        raw_symbol=RAW_SYMBOL,
+        exchange="okx",
+        bucket_starts=[base],
+        bucket_ms=H4,
+        time_range=TimeRange(base, base + H4 - 1),
+        raw_root=raw_root,
+        trade_source="local_raw",
+        dry_run=False,
+        dry_run_download_network=False,
+        current_bucket_start_ms=base + 2 * H4,
+    )
+
+    assert summary.rows_read > 0
+    assert summary.trades_saved > 0
+    assert summary.coverage_validated_buckets == 1
+    assert summary.errors == []
     assert _coverage_rows(market_db) == [(SYMBOL, base, base + H4 - 1, "historical")]
 
 

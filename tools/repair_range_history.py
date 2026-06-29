@@ -348,6 +348,8 @@ def _merge_import_summary(summary: RepairSummary, result) -> None:
     summary.raw_files_found.extend(result.raw_files_found)
     summary.raw_files_downloaded.extend(result.raw_files_downloaded)
     summary.raw_files_missing.extend(result.raw_files_missing)
+    summary.raw_files_not_yet_published.extend(result.raw_files_not_yet_published)
+    summary.raw_files_skipped_incomplete_day.extend(result.raw_files_skipped_incomplete_day)
     summary.raw_rows_read += result.rows_read
     summary.raw_trades_saved += result.trades_saved
     summary.raw_import_errors.extend(result.errors)
@@ -548,6 +550,8 @@ class RepairSummary:
     raw_files_found: list[str] = field(default_factory=list)
     raw_files_downloaded: list[str] = field(default_factory=list)
     raw_files_missing: list[str] = field(default_factory=list)
+    raw_files_not_yet_published: list[str] = field(default_factory=list)
+    raw_files_skipped_incomplete_day: list[str] = field(default_factory=list)
     raw_rows_read: int = 0
     raw_trades_saved: int = 0
     raw_import_errors: list[str] = field(default_factory=list)
@@ -1675,6 +1679,8 @@ def _print_summary(summary: RepairSummary) -> None:
         "raw_files_found",
         "raw_files_downloaded",
         "raw_files_missing",
+        "raw_files_not_yet_published",
+        "raw_files_skipped_incomplete_day",
         "raw_rows_read",
         "raw_trades_saved",
         "raw_import_errors",

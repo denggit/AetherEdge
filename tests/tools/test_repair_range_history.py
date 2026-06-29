@@ -196,6 +196,15 @@ def _raw_rows_for_bucket(bucket_start: int, *, prefix: str = "raw", columns: str
                 "side": "buy" if i % 2 == 0 else "sell",
                 "timestamp": ts,
             })
+        elif columns == "real_header":
+            rows.append({
+                "instrument_name": RAW_SYMBOL,
+                "trade_id": f"{prefix}_{i}",
+                "side": "buy" if i % 2 == 0 else "sell",
+                "price": price,
+                "size": "1",
+                "created_time": ts,
+            })
         else:
             rows.append({
                 "tradeId": f"{prefix}_{i}",
@@ -2188,6 +2197,46 @@ def test_dry_run_download_network_can_download_raw_but_not_write_db(tmp_path: Pa
     assert _coverage_rows(tmp_path / "market.sqlite3") == []
 
 
+def test_current_utc_day_raw_404_is_skipped_but_destructive_guard_preserves_aggregates(tmp_path: Path) -> None:
+    raw_root = tmp_path / "raw"
+    checkpoint_db = tmp_path / "checkpoint.sqlite3"
+    market_db = tmp_path / "market.sqlite3"
+    SqliteTradeStore(market_db)
+    SqliteRangeBarStore(market_db)
+    base = _ms(2026, 6, 30)
+    SqliteRangeCheckpointStore(checkpoint_db).save_completed_aggregate(
+        exchange="okx",
+        aggregate=_aggregate(base),
+        coverage_status=RangeCoverageStatus.COMPLETE.value,
+        completed_at_ms=base + H4,
+    )
+
+    def fake_404(self, raw_symbol, date, destination: Path, *, overwrite: bool = False):
+        raise RuntimeError("HTTP Error 404: Not Found")
+
+    with patch.object(OkxHistoricalTradesArchiveClient, "download_daily_trades_zip", new=fake_404):
+        args = _args(
+            tmp_path,
+            "--mode", "rebuild-window",
+            "--force-rebuild-window",
+            "--download-missing-trades",
+            "--delete-existing-aggregates",
+            "--raw-root", str(raw_root),
+            "--skip-download-if-live", "false",
+            "--start-ms", str(base), "--end-ms", str(base + H4 - 1),
+        )
+        summary, exit_code = repair_range_history.run(args, now_ms=base + 2 * H4)
+
+    assert exit_code == 4
+    assert summary.raw_files_skipped_incomplete_day == [str(_raw_zip_path(raw_root, "2026-06-30"))]
+    assert summary.raw_import_errors == []
+    assert summary.destructive_rebuild_aborted is True
+    assert "zero_downloaded_buckets_with_missing_coverage" in summary.destructive_rebuild_abort_reason
+    rows = _completed_rows(checkpoint_db)
+    assert len(rows) == 1
+    assert rows[0][3] == base
+
+
 def test_synthetic_okx_raw_zip_imports_trades_and_common_columns(tmp_path: Path) -> None:
     raw_root = tmp_path / "raw"
     base = _ms(2024, 1, 1)
@@ -2242,6 +2291,27 @@ def test_raw_import_supports_alias_columns_and_timestamp_formats(tmp_path: Path)
         )
     }
     assert {"ms", "sec", "iso"}.issubset(ids)
+
+
+def test_raw_import_supports_real_okx_cdn_created_time_header(tmp_path: Path) -> None:
+    raw_root = tmp_path / "raw"
+    base = _ms(2024, 1, 1)
+    _write_raw_zip(raw_root, "2024-01-01", _raw_rows_for_bucket(base, columns="real_header"))
+
+    args = _args(
+        tmp_path,
+        "--download-missing-trades",
+        "--raw-root", str(raw_root),
+        "--skip-download-if-live", "false",
+        "--start-ms", str(base), "--end-ms", str(base + H4 - 1),
+    )
+    summary, exit_code = repair_range_history.run(args, now_ms=base + 2 * H4)
+
+    assert exit_code == 0
+    assert summary.raw_rows_read == 13
+    assert summary.raw_trades_saved == 13
+    assert summary.coverage_validated_buckets == 1
+    assert summary.raw_import_errors == []
 
 
 def test_raw_import_marks_coverage_repairs_range_bars_and_rebuilds_aggregates(tmp_path: Path) -> None:
