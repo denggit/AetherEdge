@@ -232,6 +232,12 @@ class BackfillService:
                 aggregate=aggregate,
                 completed_at_ms=int(time.time() * 1000),
             )
+            self._clear_dirty_bucket(
+                exchange=plan.exchange,
+                symbol=plan.symbol,
+                range_pct=plan.range_pct,
+                bucket_start_ms=bucket_start,
+            )
             result.aggregates_upserted += 1
             result.processed_buckets += 1
 
@@ -283,6 +289,16 @@ class BackfillService:
             completed_at_ms=completed_at_ms,
         )
 
+    def _clear_dirty_bucket(self, *, exchange: str, symbol: str, range_pct: str, bucket_start_ms: int) -> None:
+        with sqlite3.connect(self.checkpoint_db, timeout=max(self.busy_timeout_ms / 1000, 0.0)) as conn:
+            conn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
+            if not _table_exists(conn, "range_backfill_dirty_buckets"):
+                return
+            conn.execute(
+                "DELETE FROM range_backfill_dirty_buckets WHERE exchange=? AND symbol=? AND range_pct=? AND bucket_start_ms=?",
+                (str(exchange).lower(), symbol, _decimal_text(range_pct), bucket_start_ms),
+            )
+
     def _validate_bucket_trade_coverage(self, symbol: str, start: int, end: int, result: BackfillResult):
         validation = validate_trade_coverage(
             trade_store=self.trade_store,
@@ -321,6 +337,11 @@ def _utc_day_start_ms(ts_ms: int) -> int:
 
 def _trade_time_ms(trade: MarketTrade) -> int | None:
     return trade.trade_time_ms if trade.trade_time_ms is not None else trade.event_time_ms
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+    return row is not None
 
 
 def _decimal_text(value: Decimal | str) -> str:

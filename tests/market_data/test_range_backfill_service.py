@@ -309,6 +309,145 @@ def _aggregate(start: int) -> RangeBarAggregate:
     )
 
 
+def _insert_dirty(checkpoint_db: Path, start: int) -> None:
+    with sqlite3.connect(checkpoint_db) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS range_backfill_dirty_buckets (
+                exchange TEXT, symbol TEXT, range_pct TEXT, bucket_start_ms INTEGER,
+                bucket_end_ms INTEGER, reason TEXT, updated_at_ms INTEGER,
+                PRIMARY KEY(exchange, symbol, range_pct, bucket_start_ms)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO range_backfill_dirty_buckets VALUES (
+                'okx','ETH-USDT-PERP','0.002',?,?, 'test', ?
+            )
+            """,
+            (start, start + H4 - 1, start + H4),
+        )
+
+
+def _dirty_row_exists(checkpoint_db: Path, start: int) -> bool:
+    with sqlite3.connect(checkpoint_db) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM range_backfill_dirty_buckets WHERE exchange='okx' AND symbol='ETH-USDT-PERP' AND range_pct='0.002' AND bucket_start_ms=?",
+            (start,),
+        ).fetchone()
+    return row is not None
+
+
+def test_dirty_bucket_cleared_after_rebuild(tmp_path: Path) -> None:
+    checkpoint_db = tmp_path / "checkpoint.sqlite3"
+    _insert_dirty(checkpoint_db, START)
+
+    service = BackfillService(
+        market_db=tmp_path / "market.sqlite3",
+        checkpoint_db=checkpoint_db,
+        raw_root=tmp_path / "raw",
+        coverage_max_gap_ms=H4,
+        edge_tolerance_ms=5_000,
+    )
+    _save_trades(
+        service.trade_store,
+        [
+            _trade(START + 1_000, "100", "a"),
+            _trade(START + 2_000, "100.3", "b"),
+            _trade(START + H4 - 1_000, "100.6", "c"),
+        ],
+    )
+
+    plan = BackfillPlan(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP",
+        range_pct="0.002",
+        bucket_ms=H4,
+        latest_closed_bucket_start_ms=START,
+        latest_closed_bucket_end_ms=START + H4 - 1,
+        required_bucket_starts=(START,),
+        complete_bucket_starts=(),
+        missing_bucket_starts=(),
+        dirty_bucket_starts=(START,),
+        incomplete_coverage_bucket_starts=(),
+        continuous_complete_buckets_from_latest=0,
+        range_speed_ready=False,
+        nearest_missing_bucket_start_ms=START,
+        reason="dirty",
+    )
+
+    result = service.process_plan(plan, max_buckets=1)
+
+    assert result.aggregates_upserted == 1
+    assert result.processed_buckets == 1
+
+    with sqlite3.connect(checkpoint_db) as conn:
+        row = conn.execute(
+            "SELECT coverage_status FROM completed_range_aggregates WHERE exchange='okx' AND symbol='ETH-USDT-PERP'"
+        ).fetchone()
+    assert row is not None
+    assert row[0] == "COMPLETE"
+
+    assert not _dirty_row_exists(checkpoint_db, START)
+
+    from src.market_data.backfill.scanner import BackfillScanner
+
+    scan = BackfillScanner(checkpoint_db=checkpoint_db, market_db=tmp_path / "market.sqlite3").scan(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP",
+        range_pct="0.002",
+        bucket_ms=H4,
+        required_buckets=1,
+        lookback_buckets=2,
+        current_time_ms=START + H4 + 1,
+    )
+    assert scan.range_speed_ready is True
+    assert scan.continuous_complete_buckets_from_latest >= 1
+    assert scan.dirty_bucket_starts == ()
+
+
+def test_dirty_bucket_retained_on_validation_failure(tmp_path: Path) -> None:
+    checkpoint_db = tmp_path / "checkpoint.sqlite3"
+    _insert_dirty(checkpoint_db, START)
+
+    service = BackfillService(
+        market_db=tmp_path / "market.sqlite3",
+        checkpoint_db=checkpoint_db,
+        raw_root=tmp_path / "raw",
+        coverage_max_gap_ms=1_000,  # very tight, single trade won't cover H4 bucket
+        edge_tolerance_ms=5_000,
+    )
+
+    plan = BackfillPlan(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP",
+        range_pct="0.002",
+        bucket_ms=H4,
+        latest_closed_bucket_start_ms=START,
+        latest_closed_bucket_end_ms=START + H4 - 1,
+        required_bucket_starts=(START,),
+        complete_bucket_starts=(),
+        missing_bucket_starts=(),
+        dirty_bucket_starts=(START,),
+        incomplete_coverage_bucket_starts=(),
+        continuous_complete_buckets_from_latest=0,
+        range_speed_ready=False,
+        nearest_missing_bucket_start_ms=START,
+        reason="dirty",
+    )
+
+    result = service.process_plan(plan, max_buckets=1)
+
+    assert result.aggregates_upserted == 0
+    assert result.processed_buckets == 0
+
+    assert _dirty_row_exists(checkpoint_db, START)
+
+
 def _trade(ts: int, price: str, trade_id: str) -> MarketTrade:
     return MarketTrade(
         exchange=ExchangeName.OKX,
