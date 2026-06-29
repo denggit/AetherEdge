@@ -1583,15 +1583,23 @@ def _backup_databases(*, market_db: Path, checkpoint_db: Path, now_ms: int) -> l
         if not db_path.exists():
             continue
         backup_path = db_path.with_name(f"{db_path.name}.{stamp}.bak")
-        shutil.copy2(db_path, backup_path)
-        backups.append(str(backup_path))
+        if _copy_if_present(db_path, backup_path):
+            backups.append(str(backup_path))
         for suffix in ("-wal", "-shm"):
             sidecar = Path(str(db_path) + suffix)
             if sidecar.exists():
                 sidecar_backup = Path(str(backup_path) + suffix)
-                shutil.copy2(sidecar, sidecar_backup)
-                backups.append(str(sidecar_backup))
+                if _copy_if_present(sidecar, sidecar_backup):
+                    backups.append(str(sidecar_backup))
     return backups
+
+
+def _copy_if_present(source: Path, destination: Path) -> bool:
+    try:
+        shutil.copy2(source, destination)
+        return True
+    except FileNotFoundError:
+        return False
 
 
 def _resolve_contract_value(*, symbol: str, exchange: str, explicit: str | None) -> tuple[Decimal, str, str | None]:
