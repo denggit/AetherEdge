@@ -1,84 +1,58 @@
-# ETH LF Portfolio V10A AetherEdge Plugin
+# ETH LF Portfolio V10B AetherEdge Plugin
 
-Live strategy plugin for the V9E range-exit overlay portfolio with V10/V10A
-Momentum entry gates.
-
-The Python package path is intentionally kept as:
+V10B keeps the V10A portfolio, entry filters, routing, sizing, add-on, and
+range-exit behavior unchanged and adds one all-engine swing structural stop:
 
 ```text
-strategies.eth_lf_portfolio_v10a:Strategy
+struct_stop_all_swing_n21_buf0p0_trig0p0_h0
 ```
 
-The internal `strategy_id` is:
+Plugin path:
 
 ```text
-eth_lf_portfolio_v10a_momentum_micro_short_speed_filter
+strategies.eth_lf_portfolio_v10b:Strategy
 ```
 
-## Portfolio routing
-
-V9E keeps the V9C reclaim-first conflict-routing priority:
+Strategy identity:
 
 ```text
-BULL_RECLAIM_V2 > MOMENTUM_V3 > BEAR_V3_ONLY
+strategy_id: eth_lf_portfolio_v10b_all_swing_structural_stop
+strategy_version: V10B
 ```
 
-Current priorities:
+## Structural stop
 
-```text
-BULL_RECLAIM_V2: 150
-MOMENTUM_V3: 100
-BEAR_V3_ONLY: 50
-```
+On every completed 4H strategy bar, after all current-bar exit decisions:
 
-Before applying that unchanged priority order, the router removes:
+- long uses the lowest low of the latest 21 completed 4H bars;
+- short uses the highest high of the latest 21 completed 4H bars;
+- no candidate exists before a full 21-bar window;
+- the candidate must tighten the confirmed stop and beat the V10A stop;
+- the candidate must remain on the protective side of the completed close;
+- rounding is followed by the same direction and close checks;
+- an accepted stop affects only subsequent bars and order-management rounds.
 
-- `MOMENTUM_V3 LONG` candidates whose candidate-side micro action is
-  `NOT_ALIGNED_RISK_REDUCED`;
-- `MOMENTUM_V3 SHORT` candidates whose current completed 4H `rf_bar_count` is
-  greater than or equal to the Q75 threshold from prior completed buckets.
+The canonical candidate is calculated from OKX master strategy state. The
+standard stop-sync signal carries that one canonical price to the open master
+and follower legs; Binance does not calculate a separate structural level.
 
-The range-speed defaults are a 1080-bucket rolling window, 100 minimum prior
-periods, and quantile 0.75. The tracker compares before observing the current
-bucket, so the threshold is past-only. Missing count or insufficient history
-sets `v10a_fast_speed_available=false` and does not block.
+If structural evaluation, rounding, or validation fails, the strategy keeps or
+updates the existing V10A stop. It never cancels the V10A stop merely because
+the V10B candidate failed.
 
 ## Runtime boundary
 
-The strategy plugin:
+The plugin consumes normalized closed-kline/range feature events and emits
+standard `TradeSignal` stop-sync intents. It does not call exchange adapters.
+Startup hydration uses the existing 365-day/2000-record closed-kline warmup,
+which is more than the 21 bars required for the structural window.
 
-- consumes closed 4H kline and 4H range aggregate `MarketFeatureEvent` objects;
-- emits standard `TradeSignal` objects only;
-- does not import OKX/Binance raw adapters;
-- does not manage generic range-bar storage or order journal internals.
+## Start
 
-## Default requirements
+From PowerShell at the repository root:
 
-```json
-{
-  "closed_kline": {"enabled": true, "interval": "4h", "warmup_days": 365},
-  "trades": {"enabled": true, "stream_enabled": true},
-  "range_bars": {"enabled": true, "range_pct": "0.002", "aggregate_interval": "4h"},
-  "order_book": {"enabled": false},
-  "account_state": {"poll_enabled": true, "poll_interval_seconds": 300},
-  "order_state": {"poll_when_position_enabled": true, "poll_interval_seconds": 20}
-}
+```powershell
+$env:PYTHONPATH="."
+$env:AETHER_STRATEGY="strategies.eth_lf_portfolio_v10b:Strategy"
+python scripts/run_live.py
 ```
-
-
-## Range Exit Overlay
-
-V9E adds only the range/footprint protective exit overlay on top of the frozen
-V9C baseline. It does not change entries, sizing, stops, priority, or add logic.
-
-The live implementation supports only immediate closed-bar range exit with
-`RANGE_EXIT_NEXT_OPEN` semantics. Delayed range exit is not implemented and
-non-zero `range_exit.delay_bars` is rejected at config load.
-
-## Live trades warmup policy
-
-V9E does not use REST historical trade warmup in live runtime. Range bars are built only from live websocket trades. If the process starts in the middle of a 4H bucket, that first bucket is treated as micro context unavailable; subsequent fully captured buckets use rangebar/micro risk scaling normally.
-
-The V10A rolling range-speed history is process-local. With the default
-`range_speed_min_periods=100`, short-speed blocking remains unavailable until
-100 valid completed 4H range aggregates have been observed after startup.

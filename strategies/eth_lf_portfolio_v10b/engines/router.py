@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Any, Iterable, Mapping, Protocol
 
 from strategies.eth_lf_portfolio_v8.domain.models import BarReadyContext, EngineSignal, RoutedSignal, Side
-from strategies.eth_lf_portfolio_v10a.features.range_speed import RangeSpeedEvaluation
+from strategies.eth_lf_portfolio_v10b.features.range_speed import RangeSpeedEvaluation
 
 
 class V8Engine(Protocol):

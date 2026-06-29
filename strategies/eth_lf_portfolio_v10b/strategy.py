@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -20,20 +20,27 @@ from src.platform.snapshot import PlatformSnapshot
 from src.signals import SignalAction, TradeSignal
 from src.strategy import StrategyRecoveryContext
 from strategies.eth_lf_portfolio_v8.domain.models import BarReadyContext, Side, V8DecisionType, V8TradeDecision
-from strategies.eth_lf_portfolio_v8.domain.position_state import V8PositionState
+from strategies.eth_lf_portfolio_v10b.domain.position_state import V8PositionState
 from strategies.eth_lf_portfolio_v8.engines.bear_v3 import BearV3OnlyEngine
 from strategies.eth_lf_portfolio_v8.engines.bull_reclaim_v2 import BullReclaimV2Engine
 from strategies.eth_lf_portfolio_v8.engines.momentum_v3 import MomentumV3Engine
-from strategies.eth_lf_portfolio_v10a.engines.router import MomentumEntryFilterConfig, PortfolioRouter
+from strategies.eth_lf_portfolio_v10b.engines.router import MomentumEntryFilterConfig, PortfolioRouter
 from strategies.eth_lf_portfolio_v8.execution.signal_mapper import SignalMapperConfig, V8SignalMapper
 from strategies.eth_lf_portfolio_v8.execution.range_exit import RangeExitConfig, evaluate_range_exit
 from strategies.eth_lf_portfolio_v8.execution.sizing import RiskSizingConfig, V8RiskSizer
-from strategies.eth_lf_portfolio_v8.execution.stops import initial_stop_from_risk, is_better_stop, protected_stop, validate_exchange_stop
-from strategies.eth_lf_portfolio_v8.features.buffer import V8FeatureBuffer
+from strategies.eth_lf_portfolio_v10b.execution.stops import initial_stop_from_risk, is_better_stop, protected_stop, validate_exchange_stop
+from strategies.eth_lf_portfolio_v10b.execution.structural_stop import (
+    STRUCTURAL_STOP_SOURCE,
+    STRUCTURAL_STOP_VARIANT,
+    StructuralStopConfig,
+    StructuralStopDecision,
+    evaluate_swing_structural_stop,
+)
+from strategies.eth_lf_portfolio_v10b.features.buffer import V8FeatureBuffer
 from strategies.eth_lf_portfolio_v8.features.feature_frame import parse_closed_kline, parse_range_aggregate
 from strategies.eth_lf_portfolio_v8.features.live_features import V8LiveFeatureBuilder
 from strategies.eth_lf_portfolio_v8.features.micro_context import MicroContextConfig, MicroContextEngine
-from strategies.eth_lf_portfolio_v10a.features.range_speed import PastOnlyRangeSpeedTracker
+from strategies.eth_lf_portfolio_v10b.features.range_speed import PastOnlyRangeSpeedTracker
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
@@ -42,23 +49,28 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class V8Config:
+class V10BConfig:
     strategy_id: str
+    strategy_version: str
+    display_name: str
     symbol: str
     data_exchange: str
     runtime_requirements: Mapping[str, Any]
     micro_context: MicroContextConfig
     range_exit: RangeExitConfig
     entry_filters: MomentumEntryFilterConfig
+    structural_stop: StructuralStopConfig
     global_risk_scale: Decimal
 
     @classmethod
-    def from_file(cls, path: str | Path = DEFAULT_CONFIG_PATH) -> "V8Config":
+    def from_file(cls, path: str | Path = DEFAULT_CONFIG_PATH) -> "V10BConfig":
         data = json.loads(Path(path).read_text(encoding="utf-8"))
         micro = data.get("micro_context", {})
         range_exit = RangeExitConfig.from_mapping(data.get("range_exit", {}))
         return cls(
-            strategy_id=str(data.get("strategy_id", "eth_lf_portfolio_v8")),
+            strategy_id=str(data.get("strategy_id", "eth_lf_portfolio_v10b_all_swing_structural_stop")),
+            strategy_version=str(data.get("strategy_version", "V10B")),
+            display_name=str(data.get("display_name", "ETH LF Portfolio V10B All-Swing Structural Stop")),
             symbol=str(data.get("symbol", "ETH-USDT-PERP")),
             data_exchange=str(data.get("data_exchange", "okx")).strip().lower(),
             runtime_requirements=data.get("runtime_requirements", {}),
@@ -74,6 +86,7 @@ class V8Config:
             ),
             range_exit=range_exit,
             entry_filters=MomentumEntryFilterConfig.from_mapping(data),
+            structural_stop=StructuralStopConfig.from_mapping(data.get("structural_stop", {})),
             global_risk_scale=Decimal(str(data.get("risk", {}).get("global_risk_scale", "1.3"))),
         )
 
@@ -128,12 +141,12 @@ class PendingAddAfterStopUpdatePlan:
 
 
 class Strategy:
-    """AetherEdge live plugin for ETH LF Portfolio V10A entry filters."""
+    """AetherEdge live plugin for V10B all-swing structural stops."""
 
     raw_trade_callbacks_enabled = False
 
     def __init__(self, config_path: str | Path | None = None) -> None:
-        self.config = V8Config.from_file(config_path or DEFAULT_CONFIG_PATH)
+        self.config = V10BConfig.from_file(config_path or DEFAULT_CONFIG_PATH)
         self.buffer = V8FeatureBuffer()
         self.micro_engine = MicroContextEngine(self.config.micro_context)
         self.range_speed_tracker = PastOnlyRangeSpeedTracker(
@@ -166,6 +179,8 @@ class Strategy:
         self.stop_safety_alerts: list[str] = []
         self.last_stop_reject_reason: str | None = None
         self.last_stop_reject_metadata: dict[str, Any] | None = None
+        self.last_structural_stop_audit: dict[str, Any] | None = None
+        self.structural_stop_audits: list[dict[str, Any]] = []
         self._stop_update_checked_bar_close_time_ms: int | None = None
         self._stop_update_blocked_bar_close_time_ms: int | None = None
         self.recovered = False
@@ -191,7 +206,7 @@ class Strategy:
         self.range_speed_history_warmup_count += count
         if self.range_speed_tracker.complete_history_count < self.config.entry_filters.range_speed_min_periods:
             logger.warning(
-                "V10A short-speed block unavailable until range history reaches min_periods | complete_history=%s min_periods=%s",
+                "V10B short-speed block unavailable until range history reaches min_periods | complete_history=%s min_periods=%s",
                 self.range_speed_tracker.complete_history_count,
                 self.config.entry_filters.range_speed_min_periods,
             )
@@ -203,6 +218,21 @@ class Strategy:
     async def on_start(self, snapshot: PlatformSnapshot) -> Sequence[TradeSignal]:
         self.started = True
         self._refresh_account_equity(snapshot)
+        if self.config.structural_stop.enabled:
+            available = len(self._closed_strategy_bars())
+            log = logger.info if available >= self.config.structural_stop.lookback_bars else logger.warning
+            if available < self.config.structural_stop.lookback_bars:
+                self.stop_safety_alerts.append("structural_stop_warmup_insufficient")
+            log(
+                "V10B structural stop startup coverage | strategy=%s strategy_version=%s "
+                "available_closed_bars=%s required_closed_bars=%s canonical_exchange=%s ready=%s",
+                self.config.strategy_id,
+                self.config.strategy_version,
+                available,
+                self.config.structural_stop.lookback_bars,
+                self.config.data_exchange,
+                available >= self.config.structural_stop.lookback_bars,
+            )
         return []
 
     async def recover(self, context: StrategyRecoveryContext) -> Sequence[TradeSignal]:
@@ -745,6 +775,8 @@ class Strategy:
 
         return {
             "strategy_id": self.config.strategy_id,
+            "strategy_version": self.config.strategy_version,
+            "display_name": self.config.display_name,
             "symbol": self.config.symbol,
             "bar_open_time_ms": context.kline.open_time_ms,
             "bar_close_time_ms": context.kline.close_time_ms,
@@ -760,6 +792,7 @@ class Strategy:
             "pending_entry": self.pending_entry is not None,
             "stop_reject_reason": self.last_stop_reject_reason,
             "stop_reject_metadata": self.last_stop_reject_metadata,
+            "structural_stop_audit": self.last_structural_stop_audit,
 
             "open": str(context.kline.open),
             "high": str(context.kline.high),
@@ -953,6 +986,11 @@ class Strategy:
         close_decision = self._close_decision_if_needed(context)
         if close_decision is not None:
             self._clear_pending_add_after_stop_update(reason="position_close_decision")
+            self._evaluate_structural_stop(
+                context,
+                base_v10a_stop=self.position.stop_price,
+                current_bar_exit=True,
+            )
             return self.signal_mapper.map_decision(close_decision)
         stop_signals = self._stop_update_signals_if_needed(context)
         if stop_signals:
@@ -1194,10 +1232,46 @@ class Strategy:
             self._clear_pending_add_after_stop_update(reason="stale_or_position_changed")
 
     def _stop_update_signals_if_needed(self, context: BarReadyContext) -> list[TradeSignal]:
-        if not self.position.in_pos or self.position.first_entry is None or self.position.avg_entry is None or self.position.risk_per_coin is None:
+        if not self.position.in_pos:
+            return []
+        if (
+            self.position.first_entry is None
+            or self.position.avg_entry is None
+            or self.position.risk_per_coin is None
+        ):
+            if self.config.structural_stop.enabled:
+                alert = "structural_stop_skipped:incomplete_position_state"
+                self.stop_safety_alerts.append(alert)
+                logger.warning(
+                    "V10B structural stop skipped for incomplete position state | "
+                    "strategy=%s bar_close_time=%s side=%s entry_engine=%s old_stop=%s "
+                    "first_entry=%s avg_entry=%s risk_per_coin=%s canonical_exchange=%s",
+                    self.config.strategy_id,
+                    context.kline.close_time_ms,
+                    _side_label(self.position.side),
+                    self.position.entry_engine,
+                    self.position.stop_price,
+                    self.position.first_entry,
+                    self.position.avg_entry,
+                    self.position.risk_per_coin,
+                    self.config.data_exchange,
+                )
             return []
         params = self.engine_params.get(self.position.entry_engine)
         if params is None:
+            if self.config.structural_stop.enabled:
+                self.stop_safety_alerts.append(
+                    "structural_stop_skipped:unknown_entry_engine"
+                )
+                logger.warning(
+                    "V10B structural stop skipped for incomplete position state | strategy=%s "
+                    "bar_close_time=%s side=%s entry_engine=%s old_stop=%s",
+                    self.config.strategy_id,
+                    context.kline.close_time_ms,
+                    _side_label(self.position.side),
+                    self.position.entry_engine,
+                    self.position.stop_price,
+                )
             return []
         atr_value = _feature_decimal(context, self.position.entry_engine, "atr")
         candidates: list[Decimal] = []
@@ -1221,16 +1295,60 @@ class Strategy:
         )
         if protected is not None:
             candidates.append(protected)
-        if not candidates:
+        base_v10a_stop = self.position.stop_price
+        if candidates:
+            if self.position.side is Side.LONG:
+                base_candidate = max(candidates)
+            elif self.position.side is Side.SHORT:
+                base_candidate = min(candidates)
+            else:
+                base_candidate = None
+            if is_better_stop(
+                side=self.position.side,
+                current_stop=self.position.stop_price,
+                candidate=base_candidate,
+            ):
+                base_v10a_stop = base_candidate
+
+        structural = self._evaluate_structural_stop(
+            context,
+            base_v10a_stop=base_v10a_stop,
+            current_bar_exit=self._active_stop_touched(context),
+        )
+        candidate = (
+            structural.final_stop
+            if structural is not None and structural.accepted
+            else base_v10a_stop
+        )
+        if not is_better_stop(
+            side=self.position.side,
+            current_stop=self.position.stop_price,
+            candidate=candidate,
+        ):
             return []
-        if self.position.side is Side.LONG:
-            candidate = max(candidates)
-        elif self.position.side is Side.SHORT:
-            candidate = min(candidates)
-        else:
-            return []
-        if not is_better_stop(side=self.position.side, current_stop=self.position.stop_price, candidate=candidate):
-            return []
+        assert candidate is not None
+        structural_selected = bool(
+            structural is not None
+            and structural.accepted
+            and structural.final_stop == candidate
+        )
+        reason = (
+            STRUCTURAL_STOP_SOURCE
+            if structural_selected
+            else "V8_PROTECTED_TRAILING_STOP_UPDATE"
+        )
+        metadata_overrides: dict[str, Any] = {}
+        if structural_selected and structural is not None:
+            metadata_overrides = {
+                "stop_source": STRUCTURAL_STOP_SOURCE,
+                "structural_stop_variant": STRUCTURAL_STOP_VARIANT,
+                "structural_stop_audit": structural.as_audit_fields(),
+                "effective_from_next_bar": True,
+                "canonical_exchange": self.config.data_exchange,
+                "canonical_source_exchange": self.config.data_exchange,
+                "canonical_stop_price": str(candidate),
+                "follower_behavior": "Binance follows canonical stop",
+            }
         exchange_quantities = self._open_leg_quantities()
         target_exchanges = sorted(exchange_quantities)
         if not target_exchanges:
@@ -1240,18 +1358,205 @@ class Strategy:
             target_exchanges=target_exchanges,
             quantity=exchange_quantities.get(self.config.data_exchange, self.position.qty),
             stop_price=candidate,
-            reason="V8_PROTECTED_TRAILING_STOP_UPDATE",
+            reason=reason,
             bar_close_time_ms=context.kline.close_time_ms,
             exchange_quantities=exchange_quantities,
             reference_price=context.kline.close,
+            metadata_overrides=metadata_overrides,
         )
+        if not signals and structural_selected and base_v10a_stop is not None:
+            logger.error(
+                "V10B structural stop signal build failed; falling back to V10A stop | "
+                "strategy=%s old_stop=%s structural_stop=%s base_v10a_stop=%s side=%s "
+                "bar_close_time=%s canonical_exchange=%s",
+                self.config.strategy_id,
+                self.position.stop_price,
+                candidate,
+                base_v10a_stop,
+                _side_label(self.position.side),
+                context.kline.close_time_ms,
+                self.config.data_exchange,
+            )
+            self.stop_safety_alerts.append("structural_stop_update_failed_fallback_v10a")
+            if is_better_stop(
+                side=self.position.side,
+                current_stop=self.position.stop_price,
+                candidate=base_v10a_stop,
+            ):
+                signals = self._replace_stop_signals(
+                    target_exchanges=target_exchanges,
+                    quantity=exchange_quantities.get(self.config.data_exchange, self.position.qty),
+                    stop_price=base_v10a_stop,
+                    reason="V8_PROTECTED_TRAILING_STOP_UPDATE",
+                    bar_close_time_ms=context.kline.close_time_ms,
+                    exchange_quantities=exchange_quantities,
+                    reference_price=context.kline.close,
+                )
+                if signals:
+                    candidate = base_v10a_stop
+                    reason = "V8_PROTECTED_TRAILING_STOP_UPDATE"
+                    structural_selected = False
         if signals:
             self.position.mark_pending_stop_replace(
                 desired_stop_price=candidate,
-                reason="V8_PROTECTED_TRAILING_STOP_UPDATE",
+                reason=reason,
                 bar_close_time_ms=context.kline.close_time_ms,
             )
+            if structural_selected:
+                logger.info(
+                    "V10B structural stop update | strategy=%s old_stop=%s new_stop=%s "
+                    "source=%s side=%s bar_close_time=%s canonical_exchange=%s "
+                    "follower_behavior=%s effective_from_next_bar=true",
+                    self.config.strategy_id,
+                    self.position.stop_price,
+                    candidate,
+                    STRUCTURAL_STOP_SOURCE,
+                    _side_label(self.position.side),
+                    context.kline.close_time_ms,
+                    self.config.data_exchange,
+                    "Binance follows canonical stop",
+                )
         return signals
+
+    def _evaluate_structural_stop(
+        self,
+        context: BarReadyContext,
+        *,
+        base_v10a_stop: Decimal | None,
+        current_bar_exit: bool,
+    ) -> StructuralStopDecision | None:
+        config = self.config.structural_stop
+        if not config.enabled:
+            return None
+        mfe_r = self._position_mfe_r()
+        try:
+            closed_bars = self._closed_strategy_bars(
+                through_close_time_ms=context.kline.close_time_ms,
+                timeframe=context.kline.timeframe,
+            )
+            precondition_reject_reason = None
+            if str(context.kline.exchange).lower() != self.config.data_exchange:
+                precondition_reject_reason = "non_canonical_exchange_bar"
+            elif (
+                not closed_bars
+                or closed_bars[-1].close_time_ms != context.kline.close_time_ms
+            ):
+                precondition_reject_reason = "current_closed_bar_missing"
+            decision = evaluate_swing_structural_stop(
+                closed_bars=closed_bars,
+                side=self.position.side,
+                old_stop=self.position.stop_price,
+                base_v10a_stop=base_v10a_stop,
+                current_close=context.kline.close,
+                atr=_feature_decimal(context, self.position.entry_engine, "atr"),
+                engine=self.position.entry_engine,
+                hold_bars=self._holding_bars(context.kline.close_time_ms),
+                mfe_r=mfe_r,
+                bar_close_time=context.kline.close_time_ms,
+                config=config,
+                current_bar_exit=current_bar_exit,
+                precondition_reject_reason=precondition_reject_reason,
+                strategy=self.config.strategy_id,
+            )
+            if decision.accepted and decision.rounded_candidate is not None:
+                exchange_validation = validate_exchange_stop(
+                    side=self.position.side,
+                    stop_price=decision.rounded_candidate,
+                    reference_price=context.kline.close,
+                    tick_size=config.price_tick,
+                )
+                if not exchange_validation.valid:
+                    decision = replace(
+                        decision,
+                        accepted=False,
+                        reject_reason=f"rounding_or_exchange_validation:{exchange_validation.reason}",
+                        final_stop=base_v10a_stop,
+                        stop_source="V10A_STOP",
+                    )
+            self._record_structural_stop_audit(decision)
+            return decision
+        except Exception as exc:
+            alert = f"structural_stop_evaluation_failed:{type(exc).__name__}"
+            self.stop_safety_alerts.append(alert)
+            logger.exception(
+                "V10B structural stop evaluation failed; preserving V10A stop | "
+                "strategy=%s bar_close_time=%s side=%s entry_engine=%s old_stop=%s "
+                "base_v10a_stop=%s canonical_exchange=%s error=%s",
+                self.config.strategy_id,
+                context.kline.close_time_ms,
+                _side_label(self.position.side),
+                self.position.entry_engine,
+                self.position.stop_price,
+                base_v10a_stop,
+                self.config.data_exchange,
+                exc,
+            )
+            return None
+
+    def _record_structural_stop_audit(self, decision: StructuralStopDecision) -> None:
+        fields = decision.as_audit_fields()
+        self.last_structural_stop_audit = fields
+        self.structural_stop_audits.append(fields)
+        if decision.reject_reason == "insufficient_closed_bars":
+            log = logger.warning
+        elif decision.reject_reason in {
+            "unknown_position_side",
+            "missing_entry_engine",
+            "missing_old_stop",
+            "missing_current_close",
+            "missing_hold_bars",
+            "missing_mfe_r",
+            "non_canonical_exchange_bar",
+            "current_closed_bar_missing",
+        }:
+            self.stop_safety_alerts.append(
+                f"structural_stop_skipped:{decision.reject_reason}"
+            )
+            log = logger.warning
+        elif decision.accepted:
+            log = logger.info
+        else:
+            log = logger.debug
+        log("V10B structural stop audit | %s", json.dumps(fields, sort_keys=True))
+
+    def _closed_strategy_bars(
+        self,
+        *,
+        through_close_time_ms: int | None = None,
+        timeframe: str = "4h",
+    ) -> list[Any]:
+        normalized_timeframe = str(timeframe or "4h").lower()
+        rows = [
+            row
+            for close_time_ms, row in self.buffer.closed_klines.items()
+            if (through_close_time_ms is None or close_time_ms <= through_close_time_ms)
+            and str(row.timeframe).lower() == normalized_timeframe
+            and str(row.exchange).lower() == self.config.data_exchange
+        ]
+        return sorted(rows, key=lambda row: row.close_time_ms)
+
+    def _position_mfe_r(self) -> Decimal | None:
+        if (
+            self.position.first_entry is None
+            or self.position.risk_per_coin is None
+            or self.position.risk_per_coin <= 0
+        ):
+            return None
+        if self.position.side is Side.LONG:
+            return (self.position.max_fav - self.position.first_entry) / self.position.risk_per_coin
+        if self.position.side is Side.SHORT:
+            return (self.position.first_entry - self.position.max_fav) / self.position.risk_per_coin
+        return None
+
+    def _active_stop_touched(self, context: BarReadyContext) -> bool:
+        stop = self.position.stop_price
+        if stop is None or stop <= 0:
+            return False
+        if self.position.side is Side.LONG:
+            return context.kline.low <= stop
+        if self.position.side is Side.SHORT:
+            return context.kline.high >= stop
+        return False
 
     def _handle_master_entry_fill(self, *, event: AccountEvent, filled_qty: Decimal) -> list[TradeSignal]:
         assert self.pending_entry is not None

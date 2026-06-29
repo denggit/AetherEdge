@@ -1,5 +1,7 @@
 {
-  "strategy_id": "eth_lf_portfolio_v10a_momentum_micro_short_speed_filter",
+  "strategy_id": "eth_lf_portfolio_v10b_all_swing_structural_stop",
+  "strategy_version": "V10B",
+  "display_name": "ETH LF Portfolio V10B All-Swing Structural Stop",
   "symbol": "ETH-USDT-PERP",
   "data_exchange": "okx",
   "execution_policy": {
@@ -77,6 +79,18 @@
     "contra_imbalance": "0.05",
     "bad_close_pos": "0.35",
     "require_reversal": true
+  },
+  "structural_stop": {
+    "enabled": true,
+    "engine_scope": "ALL",
+    "source": "swing",
+    "lookback_bars": 21,
+    "buffer_atr": 0.0,
+    "trigger_mfe_r": 0.0,
+    "min_hold_bars": 0,
+    "require_full_window": true,
+    "closed_bar_only": true,
+    "effective_from_next_bar": true
   },
   "risk": {
     "global_risk_scale": "1.3"
