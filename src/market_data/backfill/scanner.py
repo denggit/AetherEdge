@@ -44,13 +44,10 @@ class BackfillScanner:
             starts=starts_desc,
         )
         dirty = self._dirty_starts(exchange=exchange, symbol=symbol, range_pct=range_pct, starts=starts_desc)
-        coverage_missing = self._incomplete_coverage_starts(symbol=symbol, starts=starts_desc, bucket_ms=bucket_ms)
-        bars_present = self._range_bar_bucket_starts(symbol=symbol, range_pct=range_pct, starts=starts_desc, bucket_ms=bucket_ms)
-
         complete_required = tuple(sorted(required_set & complete_all))
         missing = tuple(start for start in required_desc if start not in complete_all)
         dirty_required = tuple(start for start in required_desc if start in dirty)
-        incomplete_required = tuple(start for start in required_desc if start in complete_all and start in coverage_missing and start not in bars_present)
+        incomplete_required: tuple[int, ...] = ()
 
         continuous = 0
         for start in required_desc:

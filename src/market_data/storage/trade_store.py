@@ -71,9 +71,28 @@ class SqliteTradeStore:
             return None
         return int(row[0])
 
-    def mark_coverage(self, *, symbol: str, time_range: TimeRange, source: str = "historical") -> None:
+    def mark_coverage(
+        self,
+        *,
+        symbol: str,
+        time_range: TimeRange,
+        source: str = "historical",
+        coverage_status: str = "COMPLETE",
+    ) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
+            columns = _table_columns(conn, "trade_coverage")
+            if "coverage_status" in columns:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO trade_coverage (
+                        symbol, start_time_ms, end_time_ms, source, coverage_status, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (symbol, time_range.start_time_ms, time_range.end_time_ms, source, str(coverage_status), now),
+                )
+                return
             conn.execute(
                 """
                 INSERT OR REPLACE INTO trade_coverage (symbol, start_time_ms, end_time_ms, source, updated_at)
@@ -82,16 +101,32 @@ class SqliteTradeStore:
                 (symbol, time_range.start_time_ms, time_range.end_time_ms, source, now),
             )
 
-    def coverage_ranges(self, *, symbol: str, time_range: TimeRange, source: str = "historical") -> list[TimeRange]:
+    def coverage_ranges(
+        self,
+        *,
+        symbol: str,
+        time_range: TimeRange,
+        source: str | None = "historical",
+        coverage_status: str | None = "COMPLETE",
+    ) -> list[TimeRange]:
         with self._connect() as conn:
+            columns = _table_columns(conn, "trade_coverage")
+            filters = ["symbol = ?", "end_time_ms >= ?", "start_time_ms <= ?"]
+            params: list[object] = [symbol, time_range.start_time_ms, time_range.end_time_ms]
+            if source is not None:
+                filters.append("source = ?")
+                params.append(source)
+            if coverage_status is not None and "coverage_status" in columns:
+                filters.append("coverage_status = ?")
+                params.append(str(coverage_status))
             rows = conn.execute(
-                """
+                f"""
                 SELECT start_time_ms, end_time_ms
                 FROM trade_coverage
-                WHERE symbol = ? AND source = ? AND end_time_ms >= ? AND start_time_ms <= ?
+                WHERE {' AND '.join(filters)}
                 ORDER BY start_time_ms ASC, end_time_ms ASC
                 """,
-                (symbol, source, time_range.start_time_ms, time_range.end_time_ms),
+                tuple(params),
             ).fetchall()
         clipped = [
             TimeRange(max(time_range.start_time_ms, int(row[0])), min(time_range.end_time_ms, int(row[1])))
@@ -127,12 +162,17 @@ class SqliteTradeStore:
                     start_time_ms INTEGER NOT NULL,
                     end_time_ms INTEGER NOT NULL,
                     source TEXT NOT NULL,
+                    coverage_status TEXT NOT NULL DEFAULT 'COMPLETE',
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(symbol, start_time_ms, end_time_ms, source)
                 )
                 """
             )
+            columns = _table_columns(conn, "trade_coverage")
+            if "coverage_status" not in columns:
+                conn.execute("ALTER TABLE trade_coverage ADD COLUMN coverage_status TEXT NOT NULL DEFAULT 'COMPLETE'")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_coverage_lookup ON trade_coverage(symbol, source, start_time_ms, end_time_ms)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_coverage_status_lookup ON trade_coverage(symbol, source, coverage_status, start_time_ms, end_time_ms)")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=max(self.busy_timeout_ms / 1000, 0.0))
@@ -200,3 +240,7 @@ def _merge_ranges(ranges: list[TimeRange]) -> list[TimeRange]:
         else:
             merged.append(item)
     return merged
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}

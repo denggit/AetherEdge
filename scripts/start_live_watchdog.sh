@@ -157,7 +157,10 @@ try:
     print(
         "range backfill status: "
         f"range_speed_ready={data.get('range_speed_ready')} "
-        f"missing_bucket_count={data.get('missing_bucket_count')}"
+        f"missing_bucket_count={data.get('missing_bucket_count')} "
+        f"continuous_complete_buckets_from_latest={data.get('continuous_complete_buckets_from_latest')} "
+        f"tail_fetch_failed_buckets={data.get('tail_fetch_failed_buckets')} "
+        f"archive_errors_count={data.get('archive_errors_count')}"
     )
 except Exception as exc:
     print(f"range backfill status: unreadable error={exc}")

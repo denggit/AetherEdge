@@ -56,6 +56,14 @@ class BackfillResult:
     range_bars_saved: int = 0
     aggregates_upserted: int = 0
     skipped_buckets: list[int] = field(default_factory=list)
+    tail_fetch_requested_buckets: list[int] = field(default_factory=list)
+    tail_fetch_succeeded_buckets: list[int] = field(default_factory=list)
+    tail_fetch_failed_buckets: list[int] = field(default_factory=list)
+    tail_fetch_trades_saved: int = 0
+    coverage_validated_buckets: list[int] = field(default_factory=list)
+    coverage_failed_buckets: list[int] = field(default_factory=list)
+    archive_errors: list[str] = field(default_factory=list)
+    tail_errors: list[str] = field(default_factory=list)
     locked: bool = False
     errors: list[str] = field(default_factory=list)
 
@@ -67,6 +75,14 @@ class BackfillResult:
             "range_bars_saved": self.range_bars_saved,
             "aggregates_upserted": self.aggregates_upserted,
             "skipped_buckets": list(self.skipped_buckets),
+            "tail_fetch_requested_buckets": list(self.tail_fetch_requested_buckets),
+            "tail_fetch_succeeded_buckets": list(self.tail_fetch_succeeded_buckets),
+            "tail_fetch_failed_buckets": list(self.tail_fetch_failed_buckets),
+            "tail_fetch_trades_saved": self.tail_fetch_trades_saved,
+            "coverage_validated_buckets": list(self.coverage_validated_buckets),
+            "coverage_failed_buckets": list(self.coverage_failed_buckets),
+            "archive_errors": list(self.archive_errors),
+            "tail_errors": list(self.tail_errors),
             "locked": self.locked,
             "errors": list(self.errors),
         }

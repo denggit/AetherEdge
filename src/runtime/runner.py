@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence
 
 from src.app import AppConfig, AppContext
 from src.app.alerts import AppAlert
+from src.market_data.backfill.scanner import BackfillScanner
 from src.market_data.derived import RangeBarAggregator, RangeBarBuilder
 from src.market_data.events import MarketFeatureEvent
 from src.market_data.models import MarketDataSet, RangeBar, RangeBarAggregate, RangeCoverageStatus, TimeRange, WarmupRequest
@@ -817,21 +818,6 @@ class LiveRuntimeRunner:
         if not callable(warmup):
             return
         now_ms = int(time.time() * 1000)
-        current_bucket = (
-            now_ms // self._closed_bar_interval_ms
-        ) * self._closed_bar_interval_ms
-        catchup_config = self.runtime_config.startup_catchup
-        within_catchup_window = (
-            catchup_config.enabled
-            and now_ms - current_bucket
-            <= catchup_config.fresh_open_window_seconds * 1000
-        )
-        self._range_speed_warmup_excluded_previous = within_catchup_window
-        before_bucket_end_ms = (
-            current_bucket - 1
-            if within_catchup_window
-            else current_bucket + self._closed_bar_interval_ms - 1
-        )
         limit = int(
             getattr(
                 getattr(self.context.strategy, "config", None),
@@ -839,33 +825,71 @@ class LiveRuntimeRunner:
                 None,
             ).range_speed_rolling_window_bars
         )
-        rows = await asyncio.to_thread(
-            self._get_range_checkpoint_store().load_complete_history,
-            exchange=self.app_config.data_exchange.value,
-            symbol=self.app_config.symbol,
-            range_pct=str(self._range_pct),
-            before_bucket_end_ms=before_bucket_end_ms,
-            limit=limit,
-        )
-        loaded = warmup([row.rf_bar_count for row in rows])
         min_periods = int(
             self.context.strategy.config.entry_filters.range_speed_min_periods
         )
-        log = logger.info if loaded >= min_periods else logger.warning
-        if loaded >= min_periods or self._should_log_range_speed_warning(now_ms):
-            supervisor = self._range_backfill_supervisor
-            status = supervisor.read_status() if supervisor is not None and hasattr(supervisor, "read_status") else None
-            plan = status.get("plan", {}) if isinstance(status, dict) else {}
-            log(
-                "V10A range-speed history warmup | complete_history=%s min_periods=%s available=%s continuous_complete_buckets_from_latest=%s nearest_missing_bucket=%s backfill_worker_pid=%s backfill_worker_status_json=%s",
-                loaded,
-                min_periods,
-                loaded >= min_periods,
-                plan.get("continuous_complete_buckets_from_latest") if isinstance(plan, dict) else None,
-                plan.get("nearest_missing_bucket_start_ms") if isinstance(plan, dict) else None,
-                self._range_backfill_worker_pid,
-                getattr(supervisor, "status_json", None),
-            )
+        self._range_speed_warmup_excluded_previous = False
+        try:
+            raw_symbol = self.context.data.market_profile.raw_symbol(self.app_config.data_exchange)
+        except Exception:
+            raw_symbol = self.app_config.symbol
+        required = max(1, min_periods)
+        lookback = max(required, int(limit), int(self.runtime_config.range_backfill_lookback_buckets))
+        plan = await asyncio.to_thread(
+            BackfillScanner(
+                checkpoint_db=self.runtime_config.range_checkpoint_db_path,
+                market_db=self.runtime_config.realtime_trade_db_path,
+            ).scan,
+            exchange=self.app_config.data_exchange.value,
+            symbol=self.app_config.symbol,
+            raw_symbol=raw_symbol,
+            range_pct=str(self._range_pct),
+            bucket_ms=self._closed_bar_interval_ms,
+            required_buckets=required,
+            lookback_buckets=lookback,
+            current_time_ms=now_ms,
+        )
+        continuous = int(plan.continuous_complete_buckets_from_latest)
+        latest_start = plan.latest_closed_bucket_start_ms
+        nearest_missing = plan.nearest_missing_bucket_start_ms
+        supervisor = self._range_backfill_supervisor
+        status_path = getattr(supervisor, "status_json", None)
+        if continuous < min_periods:
+            if self._should_log_range_speed_warning(now_ms):
+                logger.warning(
+                    "V10A range-speed history warmup unavailable | continuous_complete_buckets_from_latest=%s min_periods=%s latest_closed_bucket_start_ms=%s nearest_missing_bucket_start_ms=%s backfill_worker_pid=%s backfill_worker_status_json=%s",
+                    continuous,
+                    min_periods,
+                    latest_start,
+                    nearest_missing,
+                    self._range_backfill_worker_pid,
+                    status_path,
+                )
+            return
+
+        feed_count = min(max(1, int(limit)), continuous)
+        bucket_starts_desc = [
+            latest_start - i * self._closed_bar_interval_ms
+            for i in range(feed_count)
+        ]
+        rows = await asyncio.to_thread(
+            self._get_range_checkpoint_store().load_complete_history_for_buckets,
+            exchange=self.app_config.data_exchange.value,
+            symbol=self.app_config.symbol,
+            range_pct=str(self._range_pct),
+            bucket_starts=tuple(bucket_starts_desc),
+        )
+        loaded = warmup([row.rf_bar_count for row in rows])
+        logger.info(
+            "V10A range-speed history warmup ready | complete_history=%s min_periods=%s continuous_complete_buckets_from_latest=%s latest_closed_bucket_start_ms=%s nearest_missing_bucket_start_ms=%s backfill_worker_pid=%s backfill_worker_status_json=%s",
+            loaded,
+            min_periods,
+            continuous,
+            latest_start,
+            nearest_missing,
+            self._range_backfill_worker_pid,
+            status_path,
+        )
 
     async def _finish_range_speed_warmup_after_catchup(self) -> None:
         if (

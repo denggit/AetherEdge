@@ -11,6 +11,7 @@ from typing import TextIO
 from src.market_data.backfill.scanner import BackfillScanner
 from src.market_data.backfill.service import BackfillService
 from src.market_data.warmup.gap_detector import interval_to_ms
+from src.platform.exchanges.okx.rest_tail_trades import OkxRestTailTradesFetcher
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ class RangeBackfillWorker:
             download_sleep_seconds=self.download_sleep_seconds,
             max_rest_tail_gap_minutes=self.max_rest_tail_gap_minutes,
             max_rest_tail_buckets=self.max_rest_tail_buckets,
+            rest_tail_fetcher=OkxRestTailTradesFetcher(symbol=self.symbol),
         )
         plan = scanner.scan(
             exchange=self.exchange,
@@ -68,6 +70,9 @@ class RangeBackfillWorker:
             "result": result.to_dict(),
             "range_speed_ready": plan.range_speed_ready,
             "missing_bucket_count": plan.missing_bucket_count,
+            "continuous_complete_buckets_from_latest": plan.continuous_complete_buckets_from_latest,
+            "tail_fetch_failed_buckets": list(result.tail_fetch_failed_buckets),
+            "archive_errors_count": len(result.archive_errors),
         }
         self.write_status(status)
         return status
@@ -76,7 +81,43 @@ class RangeBackfillWorker:
         last_warning = 0.0
         cycles = 0
         while True:
-            status = self.run_once()
+            try:
+                status = self.run_once()
+            except Exception as exc:  # noqa: BLE001 - daemon must survive one bad cycle
+                logger.exception("range backfill worker cycle failed")
+                status = {
+                    "updated_at_ms": int(time.time() * 1000),
+                    "mode": "daemon",
+                    "pid": os.getpid(),
+                    "plan": {},
+                    "result": {
+                        "processed_buckets": 0,
+                        "downloaded_days": 0,
+                        "imported_trades": 0,
+                        "range_bars_saved": 0,
+                        "aggregates_upserted": 0,
+                        "skipped_buckets": [],
+                        "tail_fetch_requested_buckets": [],
+                        "tail_fetch_succeeded_buckets": [],
+                        "tail_fetch_failed_buckets": [],
+                        "tail_fetch_trades_saved": 0,
+                        "coverage_validated_buckets": [],
+                        "coverage_failed_buckets": [],
+                        "archive_errors": [],
+                        "tail_errors": [],
+                        "locked": False,
+                        "errors": [f"{type(exc).__name__}: {exc}"],
+                    },
+                    "range_speed_ready": False,
+                    "missing_bucket_count": None,
+                    "continuous_complete_buckets_from_latest": None,
+                    "tail_fetch_failed_buckets": [],
+                    "archive_errors_count": 0,
+                }
+                try:
+                    self.write_status(status)
+                except Exception:
+                    logger.exception("range backfill worker failed to write error status")
             plan = status.get("plan", {})
             if isinstance(plan, dict) and not bool(plan.get("range_speed_ready")):
                 now = time.monotonic()
@@ -187,6 +228,8 @@ def print_summary(status: dict[str, object], *, stream: TextIO) -> None:
                 "continuous_complete_buckets_from_latest": plan.get("continuous_complete_buckets_from_latest") if isinstance(plan, dict) else None,
                 "processed_buckets": result.get("processed_buckets") if isinstance(result, dict) else None,
                 "locked": result.get("locked") if isinstance(result, dict) else None,
+                "tail_fetch_failed_buckets": result.get("tail_fetch_failed_buckets") if isinstance(result, dict) else None,
+                "archive_errors_count": len(result.get("archive_errors", [])) if isinstance(result, dict) else None,
             },
             ensure_ascii=False,
             sort_keys=True,

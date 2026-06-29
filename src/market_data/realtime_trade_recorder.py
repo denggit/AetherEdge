@@ -103,7 +103,8 @@ class RealtimeTradeRecorder:
                 self.store.mark_coverage(
                     symbol=batch[0].symbol,
                     time_range=TimeRange(times[0], times[-1]),
-                    source="realtime",
+                    source="realtime_segment",
+                    coverage_status="SEGMENT",
                 )
         except sqlite3.OperationalError as exc:
             self.failures += 1

@@ -297,6 +297,40 @@ class SqliteRangeCheckpointStore:
             ).fetchall()
         return [_completed_from_row(row) for row in rows]
 
+    def load_complete_history_for_buckets(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        range_pct: str,
+        bucket_starts: Sequence[int],
+    ) -> list[CompletedRangeAggregate]:
+        starts = tuple(dict.fromkeys(int(start) for start in bucket_starts))
+        if not starts:
+            return []
+        placeholders = ",".join("?" for _ in starts)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT exchange, symbol, range_pct, bucket_start_ms, bucket_end_ms,
+                       rf_bar_count, imbalance, close_pos, taker_buy_ratio,
+                       micro_return_pct, delta_notional_sum, notional_sum,
+                       coverage_status, missing_gap_ms, completed_at_ms
+                FROM completed_range_aggregates
+                WHERE exchange = ? AND symbol = ? AND range_pct = ?
+                  AND coverage_status = ? AND bucket_start_ms IN ({placeholders})
+                ORDER BY bucket_start_ms ASC
+                """,
+                (
+                    str(exchange).lower(),
+                    symbol,
+                    _decimal_text(range_pct),
+                    RangeCoverageStatus.COMPLETE.value,
+                    *starts,
+                ),
+            ).fetchall()
+        return [_completed_from_row(row) for row in rows]
+
     def history_counts(
         self,
         *,
