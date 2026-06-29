@@ -58,7 +58,6 @@ class LiveDetector:
         self._process_names = process_names
 
     def is_live(self) -> bool:
-        """Return True if a live runtime process appears to be running."""
         if self._pid_file_live():
             return True
         if self._process_list_live():
@@ -350,6 +349,9 @@ class DownloadResult:
     coverage_validation_failed_buckets: int = 0
     coverage_validation_failed_examples: list[dict] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # Dry-run stats (counts what WOULD be done)
+    would_download_buckets: int = 0
+    would_download_trade_count: int = 0
 
 
 DownloadFunc = Callable[[str, int, int, int], tuple[list[MarketTrade], int, bool]]
@@ -368,7 +370,19 @@ def _download_missing_trades(
     coverage_edge_tolerance_ms: int,
     coverage_max_gap_ms: int,
     max_pages_per_bucket: int | None,
+    dry_run: bool = False,
+    dry_run_download_network: bool = False,
 ) -> DownloadResult:
+    """Download trades for missing-coverage buckets, save, and mark coverage.
+
+    When *dry_run* is True:
+      - If *dry_run_download_network* is False (default): skip all network
+        calls; only populate ``would_download_*`` counters.
+      - If *dry_run_download_network* is True: make network calls to validate
+        the download logic but NEVER persist trades or coverage.
+      - In either case, **never** calls ``trade_store.save()`` or
+        ``trade_store.mark_coverage()``.
+    """
     result = DownloadResult(requested_buckets=len(missing_bucket_starts))
     ordered = sorted(missing_bucket_starts, reverse=True)
 
@@ -377,6 +391,12 @@ def _download_missing_trades(
 
         if bucket_start >= current_bucket_start_ms:
             result.skipped_buckets += 1
+            continue
+
+        # --- dry-run without network: report what WOULD be attempted ---
+        if dry_run and not dry_run_download_network:
+            result.would_download_buckets += 1
+            result.would_download_trade_count += 0  # unknown without network
             continue
 
         try:
@@ -397,6 +417,16 @@ def _download_missing_trades(
             )
             continue
 
+        # --- dry-run with network: validate but DO NOT persist ---
+        if dry_run:
+            result.would_download_buckets += 1
+            result.would_download_trade_count += len(trades)
+            # Simulate coverage validation without persisting.
+            # We can't run _validate_bucket_trade_coverage against the real DB
+            # because trades were never saved.  Just count as "would cover".
+            continue
+
+        # --- normal (non-dry-run) path: persist ---
         for t in trades:
             object.__setattr__(t, "symbol", symbol)
 
@@ -583,11 +613,14 @@ class RepairSummary:
     builder_mode: str = "bucket_isolated"
     # Download
     download_missing_trades: bool = False
+    dry_run_download_network: bool = False
     download_requested_buckets: int = 0
     downloaded_buckets: int = 0
     download_failed_buckets: int = 0
     download_skipped_buckets: int = 0
     downloaded_trade_count: int = 0
+    would_download_buckets: int = 0
+    would_download_trade_count: int = 0
     coverage_validated_buckets: int = 0
     coverage_validation_failed_buckets: int = 0
     coverage_validation_failed_examples: list[dict] = field(default_factory=list)
@@ -628,7 +661,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--force-rebuild-window",
         nargs="?", const=True, default=False, type=_bool,
-        help="When set, allows window-level deletion of aggregates / range_bars. Requires --mode rebuild-window for full effect.",
+        help="When set, allows window-level deletion of aggregates / range_bars. Requires --mode rebuild-window for "
+             "full effect.",
     )
     parser.add_argument(
         "--clean-pollution",
@@ -663,6 +697,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--download-missing-trades",
         nargs="?", const=True, default=False, type=_bool,
         help="Download missing OKX historical trades before repair.",
+    )
+    parser.add_argument(
+        "--dry-run-download-network",
+        nargs="?", const=True, default=False, type=_bool,
+        help="When --dry-run is set, allow real OKX network requests for download validation "
+             "(DB writes are still forbidden). Default: false.",
     )
     parser.add_argument("--okx-base-url", default="https://www.okx.com")
     parser.add_argument("--download-limit", type=int, default=100)
@@ -722,9 +762,16 @@ def run(
     download_missing = bool(args.download_missing_trades)
     allow_live_write = bool(args.allow_live_db_write)
     dry_run = bool(args.dry_run)
-    write_to_db = not dry_run and bool(
-        args.repair_range_bars or args.rebuild_aggregates
-        or args.delete_existing_aggregates or args.clean_pollution
+    dry_run_dl_net = bool(args.dry_run_download_network)
+
+    # ---- will_write_db: any operation that mutates the database ----
+    will_write_db = not dry_run and bool(
+        download_missing
+        or args.repair_range_bars
+        or args.rebuild_aggregates
+        or args.delete_existing_aggregates
+        or args.delete_existing_range_bars
+        or clean_pollution
     )
 
     summary = RepairSummary(
@@ -747,6 +794,7 @@ def run(
         contract_value_source=contract_source,
         builder_mode=args.builder_mode,
         download_missing_trades=download_missing,
+        dry_run_download_network=dry_run_dl_net,
         live_db_write_allowed=allow_live_write,
         mode=mode,
         force_rebuild_window=force_rebuild,
@@ -759,12 +807,12 @@ def run(
             "end-ms must be greater than or equal to start-ms after excluding the current bucket"
         )
 
-    # --- live detection ---
+    # ---- live detection (uses will_write_db) ----
     detector = live_detector if live_detector is not None else LiveDetector()
     live_running = detector.is_live()
     summary.live_running_detected = live_running
 
-    if live_running and write_to_db and not allow_live_write:
+    if live_running and will_write_db and not allow_live_write:
         _print_summary(summary)
         print(
             "\n[REPAIR-ABORT] Live process detected and --allow-live-db-write not set. "
@@ -775,7 +823,7 @@ def run(
         )
         return summary, 3
 
-    if live_running and write_to_db and allow_live_write:
+    if live_running and will_write_db and allow_live_write:
         summary.warnings.append(
             "WARNING live_running_detected_allow_live_db_write_active"
         )
@@ -784,7 +832,7 @@ def run(
     range_store = SqliteRangeBarStore(market_db)
     checkpoint_store = SqliteRangeCheckpointStore(checkpoint_db)
 
-    # --- read before state ---
+    # ---- read before state ----
     summary.range_bars_before_count = _range_bar_count(
         market_db, symbol=args.symbol, range_pct=range_pct, time_range=target_range,
     )
@@ -800,7 +848,7 @@ def run(
     ) > 0
     summary.legacy_or_test_polluted_completed_aggregates_detected = pollution_detected
 
-    # --- classify trade coverage ---
+    # ---- classify trade coverage ----
     complete_bucket_starts, missing_bucket_starts = _classify_trade_coverage(
         trade_store.coverage_ranges(symbol=args.symbol, time_range=target_range, source="historical"),
         bucket_starts=bucket_starts,
@@ -817,7 +865,7 @@ def run(
         if summary.trades_exist_but_coverage_missing:
             summary.warnings.append("trades_exist_but_coverage_missing")
 
-    # --- find buckets that already have COMPLETE aggregates ---
+    # ---- find buckets that already have COMPLETE aggregates ----
     already_complete_buckets: set[int] = _find_buckets_with_complete_aggregates(
         checkpoint_db, exchange=exchange, symbol=args.symbol, range_pct=range_pct,
         bucket_starts=complete_bucket_starts,
@@ -825,9 +873,7 @@ def run(
     summary.buckets_already_complete = len(already_complete_buckets)
     summary.buckets_skipped_existing_complete = len(already_complete_buckets)
 
-    # --- determine which buckets need repair ---
-    # In incremental mode: only buckets with coverage but missing / stale aggregates.
-    # In rebuild-window mode with --force-rebuild-window: all complete-coverage buckets.
+    # ---- determine which buckets need repair ----
     if mode == "incremental" and not force_rebuild:
         needs_repair_coverage = [b for b in complete_bucket_starts if b not in already_complete_buckets]
         needs_repair_set = set(needs_repair_coverage)
@@ -835,7 +881,13 @@ def run(
         needs_repair_coverage = list(complete_bucket_starts)
         needs_repair_set = set(needs_repair_coverage)
 
-    # --- download missing trades ---
+    # =====================================================================
+    # BACKUP must happen BEFORE any DB writes (download, repair, etc.)
+    # =====================================================================
+    if args.backup and will_write_db:
+        summary.backup_paths = _backup_databases(market_db=market_db, checkpoint_db=checkpoint_db, now_ms=now)
+
+    # ---- download missing trades (AFTER backup) ----
     original_missing_set = set(missing_bucket_starts)
     newly_downloaded: set[int] = set()
 
@@ -846,6 +898,14 @@ def run(
             func: DownloadFunc
             if download_func is not None:
                 func = download_func
+            elif dry_run and not dry_run_dl_net:
+                # Dry-run without network: use a no-op func to avoid real HTTP.
+                def _noop_downloader(
+                    _rs: str, _bs: int, _be: int, _lim: int,
+                ) -> tuple[list[MarketTrade], int, bool]:
+                    return [], 0, False
+
+                func = _noop_downloader
             else:
                 dl = OkxHistoricalTradeDownloader(
                     base_url=args.okx_base_url,
@@ -867,12 +927,16 @@ def run(
                 coverage_edge_tolerance_ms=int(args.coverage_edge_tolerance_ms),
                 coverage_max_gap_ms=int(args.coverage_max_gap_ms),
                 max_pages_per_bucket=args.download_max_pages,
+                dry_run=dry_run,
+                dry_run_download_network=dry_run_dl_net,
             )
             summary.download_requested_buckets = dl_result.requested_buckets
             summary.downloaded_buckets = dl_result.downloaded_buckets
             summary.download_failed_buckets = dl_result.failed_buckets
             summary.download_skipped_buckets = dl_result.skipped_buckets
             summary.downloaded_trade_count = dl_result.downloaded_trade_count
+            summary.would_download_buckets = dl_result.would_download_buckets
+            summary.would_download_trade_count = dl_result.would_download_trade_count
             summary.coverage_validated_buckets = dl_result.coverage_validated_buckets
             summary.coverage_validation_failed_buckets = dl_result.coverage_validation_failed_buckets
             summary.coverage_validation_failed_examples = dl_result.coverage_validation_failed_examples
@@ -883,27 +947,27 @@ def run(
             if dl_result.coverage_validation_failed_buckets:
                 summary.warnings.append("downloaded_trades_failed_coverage_validation")
 
-            # Re-read coverage after download.
-            complete_bucket_starts, missing_bucket_starts = _classify_trade_coverage(
-                trade_store.coverage_ranges(
-                    symbol=args.symbol, time_range=target_range, source="historical"
-                ),
-                bucket_starts=bucket_starts,
-                bucket_ms=bucket_ms,
-            )
-            summary.trade_coverage_complete_buckets = len(complete_bucket_starts)
-            summary.missing_trade_coverage_buckets = len(missing_bucket_starts)
-            summary.missing_trade_coverage_examples = _bucket_examples(missing_bucket_starts, bucket_ms)
+            # Re-read coverage after download (only when NOT dry-run, since
+            # dry-run does not persist).
+            if not dry_run:
+                complete_bucket_starts, missing_bucket_starts = _classify_trade_coverage(
+                    trade_store.coverage_ranges(
+                        symbol=args.symbol, time_range=target_range, source="historical"
+                    ),
+                    bucket_starts=bucket_starts,
+                    bucket_ms=bucket_ms,
+                )
+                summary.trade_coverage_complete_buckets = len(complete_bucket_starts)
+                summary.missing_trade_coverage_buckets = len(missing_bucket_starts)
+                summary.missing_trade_coverage_examples = _bucket_examples(missing_bucket_starts, bucket_ms)
 
-            # Determine newly downloaded buckets (were missing, now have coverage).
-            newly_downloaded = set(complete_bucket_starts) & original_missing_set
-            # Newly downloaded buckets also need repair.
-            needs_repair_set |= newly_downloaded
-            needs_repair_coverage = [b for b in complete_bucket_starts if b in needs_repair_set]
+                newly_downloaded = set(complete_bucket_starts) & original_missing_set
+                needs_repair_set |= newly_downloaded
+                needs_repair_coverage = [b for b in complete_bucket_starts if b in needs_repair_set]
 
     summary.buckets_downloaded = len(newly_downloaded & needs_repair_set)
 
-    # --- clean pollution (independent of mode) ---
+    # ---- clean pollution (independent of mode) ----
     if clean_pollution or (args.delete_existing_aggregates and mode == "incremental" and pollution_detected):
         pollution_deleted = _delete_pollution_rows(
             checkpoint_db,
@@ -914,21 +978,11 @@ def run(
         )
         summary.pollution_rows_deleted = pollution_deleted
 
-    # --- backup ---
-    write_requested = bool(
-        args.repair_range_bars or args.rebuild_aggregates
-        or args.delete_existing_aggregates or args.clean_pollution
-    )
-    if args.backup and not dry_run and write_requested:
-        summary.backup_paths = _backup_databases(market_db=market_db, checkpoint_db=checkpoint_db, now_ms=now)
-
-    # --- repair range bars (bucket-scoped) ---
+    # ---- repair range bars (bucket-scoped) ----
     buckets_to_repair_range: list[int] = []
     empty_bucket_starts: list[int] = []
 
     if args.repair_range_bars:
-        # In incremental mode: only repair buckets that need it.
-        # In rebuild-window mode: repair all complete-coverage buckets.
         buckets_to_repair_range = sorted(needs_repair_set & set(complete_bucket_starts))
 
         rebuilt, written, trades_loaded, empty_buckets = _repair_range_bars(
@@ -939,7 +993,6 @@ def run(
             bucket_starts=buckets_to_repair_range,
             bucket_ms=bucket_ms,
             contract_value=contract_value,
-            # In incremental mode, always replace per bucket for idempotency.
             delete_existing=bool(args.delete_existing_range_bars) or mode == "incremental",
             dry_run=dry_run,
             builder_mode=args.builder_mode,
@@ -954,15 +1007,10 @@ def run(
         if args.delete_existing_range_bars and not dry_run:
             summary.deleted_existing_range_bar_buckets = len(buckets_to_repair_range)
 
-    # --- rebuild aggregates (bucket-scoped upsert) ---
+    # ---- rebuild aggregates (bucket-scoped upsert) ----
     if args.rebuild_aggregates:
-        # Determine which buckets to write aggregates for.
-        # In incremental mode: only buckets in needs_repair_set.
-        # In rebuild-window mode: all complete-coverage buckets.
         agg_candidate_set = needs_repair_set if mode == "incremental" else set(complete_bucket_starts)
 
-        # If --delete-existing-aggregates + --force-rebuild-window + rebuild-window mode:
-        # window-level delete.
         if args.delete_existing_aggregates and force_rebuild and mode == "rebuild-window":
             window_deleted, _ = _delete_aggregates_window(
                 checkpoint_db,
@@ -973,7 +1021,6 @@ def run(
                 dry_run=dry_run,
             )
             summary.deleted_existing_aggregates = window_deleted
-        # If --delete-existing-aggregates in incremental mode: delete per-bucket before upsert.
         elif args.delete_existing_aggregates and not dry_run:
             for bucket_start in sorted(agg_candidate_set):
                 _delete_one_aggregate(
@@ -1012,7 +1059,7 @@ def run(
             set(a.bucket_start_ms for a in eligible)
         )
 
-    # --- read after state ---
+    # ---- read after state ----
     after = _completed_count_min_max(
         checkpoint_db, exchange=exchange, symbol=args.symbol, range_pct=range_pct,
     )
@@ -1133,10 +1180,8 @@ def _find_buckets_with_complete_aggregates(
     range_pct: str,
     bucket_starts: Sequence[int],
 ) -> set[int]:
-    """Return the set of bucket_start_ms values that already have a COMPLETE aggregate row."""
     if not bucket_starts:
         return set()
-    # Build a parameterised query with IN (...)
     placeholders = ",".join("?" for _ in bucket_starts)
     pct = _decimal_text(range_pct)
     with sqlite3.connect(db_path) as conn:
@@ -1204,7 +1249,6 @@ def _delete_pollution_rows(
     range_pct: str,
     dry_run: bool,
 ) -> int:
-    """Delete only pollution rows (bucket_end_ms < POLLUTION_CUTOFF_MS)."""
     with sqlite3.connect(db_path) as conn:
         count = int(
             conn.execute(
@@ -1237,7 +1281,6 @@ def _delete_aggregates_window(
     time_range: TimeRange,
     dry_run: bool,
 ) -> tuple[int, int]:
-    """Delete all aggregates in the target window. Only used in rebuild-window mode."""
     with sqlite3.connect(db_path) as conn:
         target_count = int(
             conn.execute(
@@ -1290,7 +1333,6 @@ def _delete_one_aggregate(
     bucket_start_ms: int,
     bucket_ms: int,
 ) -> None:
-    """Delete a single bucket's aggregate row before upsert. Bucket-scoped."""
     bucket_end_ms = bucket_start_ms + bucket_ms - 1
     with sqlite3.connect(db_path) as conn:
         conn.execute(
@@ -1409,12 +1451,15 @@ def _print_summary(summary: RepairSummary) -> None:
         "min_buckets",
         "enough_for_range_speed",
         "dry_run",
+        "dry_run_download_network",
         "download_missing_trades",
         "download_requested_buckets",
         "downloaded_buckets",
         "download_failed_buckets",
         "download_skipped_buckets",
         "downloaded_trade_count",
+        "would_download_buckets",
+        "would_download_trade_count",
         "coverage_validated_buckets",
         "coverage_validation_failed_buckets",
         "live_running_detected",
