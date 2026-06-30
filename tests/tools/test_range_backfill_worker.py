@@ -15,9 +15,9 @@ def test_worker_cli_defaults_parse() -> None:
     assert request.direction == "recent-to-oldest"
     assert request.required_buckets == 100
     assert request.save_raw_trades is False
-    assert request.chunk_sleep_seconds == 0.05
-    assert request.max_seconds_per_cycle == 120
-    assert request.max_trades_per_cycle == 2_000_000
+    assert request.chunk_sleep_seconds == 0.1
+    assert request.max_seconds_per_cycle == 30
+    assert request.max_trades_per_cycle == 300_000
 
 
 def test_live_worker_default_once_false_and_prebuild_once_true() -> None:

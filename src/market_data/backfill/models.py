@@ -64,6 +64,8 @@ class RangeBackfillRequest:
     chunk_sleep_seconds: float = 0.0
     max_seconds_per_cycle: float = 0.0
     max_trades_per_cycle: int = 0
+    max_chunks_per_cycle: int = 0
+    progress_seconds: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,9 @@ class RangeBackfillSummary:
     missing_before: int
     missing_after: int
     downloaded_files: int = 0
+    raw_rows: int = 0
+    filtered_rows: int = 0
+    dropped_rows: int = 0
     trades_loaded: int = 0
     range_bars_written: int = 0
     aggregates_written: int = 0

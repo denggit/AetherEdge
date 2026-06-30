@@ -33,9 +33,9 @@ class RangeBackfillSupervisorConfig:
     market_db_path: Path = Path("data/market_data/aether_market_data.sqlite3")
     checkpoint_db_path: Path = Path("data/state/range_builder_checkpoint.sqlite3")
     save_raw_trades: bool = False
-    chunk_sleep_seconds: float = 0.05
-    max_seconds_per_cycle: float = 120.0
-    max_trades_per_cycle: int = 2_000_000
+    chunk_sleep_seconds: float = 0.1
+    max_seconds_per_cycle: float = 30.0
+    max_trades_per_cycle: int = 300_000
     repo_root: Path = Path(".")
 
 

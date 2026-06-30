@@ -69,9 +69,9 @@ class LiveRuntimeConfig:
     range_backfill_chunksize: int = 50_000
     range_backfill_raw_root: str = "data/okx/raw/trades"
     range_backfill_save_raw_trades: bool = False
-    range_backfill_chunk_sleep_seconds: float = 0.05
-    range_backfill_max_seconds_per_cycle: float = 120.0
-    range_backfill_max_trades_per_cycle: int = 2_000_000
+    range_backfill_chunk_sleep_seconds: float = 0.1
+    range_backfill_max_seconds_per_cycle: float = 30.0
+    range_backfill_max_trades_per_cycle: int = 300_000
     market_data_db_path: str = "data/market_data/aether_market_data.sqlite3"
     master_follower_policy: MasterFollowerPolicyConfig | None = None
     startup_catchup: StartupCatchupConfig = StartupCatchupConfig()
@@ -180,9 +180,9 @@ def live_runtime_config_from_app(
         range_backfill_chunksize=int(env.get("AETHER_RANGE_BACKFILL_CHUNKSIZE", defaults.get("range_backfill_chunksize", 50_000))),
         range_backfill_raw_root=str(env.get("AETHER_RANGE_BACKFILL_RAW_ROOT", defaults.get("range_backfill_raw_root", "data/okx/raw/trades"))),
         range_backfill_save_raw_trades=_bool(env.get("AETHER_RANGE_BACKFILL_SAVE_RAW_TRADES", defaults.get("range_backfill_save_raw_trades", False))),
-        range_backfill_chunk_sleep_seconds=float(env.get("AETHER_RANGE_BACKFILL_CHUNK_SLEEP_SECONDS", defaults.get("range_backfill_chunk_sleep_seconds", 0.05))),
-        range_backfill_max_seconds_per_cycle=float(env.get("AETHER_RANGE_BACKFILL_MAX_SECONDS_PER_CYCLE", defaults.get("range_backfill_max_seconds_per_cycle", 120))),
-        range_backfill_max_trades_per_cycle=int(env.get("AETHER_RANGE_BACKFILL_MAX_TRADES_PER_CYCLE", defaults.get("range_backfill_max_trades_per_cycle", 2_000_000))),
+        range_backfill_chunk_sleep_seconds=float(env.get("AETHER_RANGE_BACKFILL_CHUNK_SLEEP_SECONDS", defaults.get("range_backfill_chunk_sleep_seconds", 0.1))),
+        range_backfill_max_seconds_per_cycle=float(env.get("AETHER_RANGE_BACKFILL_MAX_SECONDS_PER_CYCLE", defaults.get("range_backfill_max_seconds_per_cycle", 30))),
+        range_backfill_max_trades_per_cycle=int(env.get("AETHER_RANGE_BACKFILL_MAX_TRADES_PER_CYCLE", defaults.get("range_backfill_max_trades_per_cycle", 300_000))),
         market_data_db_path=str(env.get("AETHER_MARKET_DATA_DB", defaults.get("market_data_db_path", "data/market_data/aether_market_data.sqlite3"))),
         master_follower_policy=MasterFollowerPolicyConfig.from_env(
             app_exchanges=app_config.exchanges,

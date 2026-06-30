@@ -340,16 +340,22 @@ def test_state_db_path_missing_fails(tmp_path: Path, key: str) -> None:
     assert _one(report, key).status == "FAIL"
 
 
-def test_existing_state_db_warns_backup_manually(tmp_path: Path) -> None:
+def test_existing_state_db_creates_central_backup(tmp_path: Path, capsys) -> None:
     db_path = tmp_path / "state.sqlite3"
     with sqlite3.connect(db_path) as connection:
         connection.execute("CREATE TABLE harmless (id INTEGER)")
     report = _run(tmp_path, {"AETHER_STATE_DB": "state.sqlite3"})
 
+    output = capsys.readouterr().out
     check = _one(report, "AETHER_STATE_DB")
+    backups = sorted((tmp_path / "data" / "state" / "backups").glob("state.*.sqlite3"))
     assert report.ok is True
     assert check.status == "WARN"
-    assert "backup manually" in check.detail
+    assert "backup created at" in check.detail
+    assert len(backups) == 1
+    assert f"backup={backups[0]}" in output
+    assert not list((tmp_path / "data" / "state" / "backups").glob("*-wal"))
+    assert not list((tmp_path / "data" / "state" / "backups").glob("*-shm"))
     assert _one(report, "state_db_pending_orders").status == "SKIPPED"
 
 

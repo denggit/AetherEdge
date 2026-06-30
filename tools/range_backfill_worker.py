@@ -82,20 +82,20 @@ def request_from_args(args: argparse.Namespace) -> RangeBackfillRequest:
         chunk_sleep_seconds=_mode_float_default(
             args.chunk_sleep_seconds,
             mode=mode,
-            live_default=float(_env("AETHER_RANGE_BACKFILL_CHUNK_SLEEP_SECONDS", "0.05")),
+            live_default=float(_env("AETHER_RANGE_BACKFILL_CHUNK_SLEEP_SECONDS", "0.1")),
             prebuild_default=0.0,
         ),
         max_seconds_per_cycle=_mode_float_default(
             args.max_seconds_per_cycle,
             mode=mode,
-            live_default=float(_env("AETHER_RANGE_BACKFILL_MAX_SECONDS_PER_CYCLE", "120")),
+            live_default=float(_env("AETHER_RANGE_BACKFILL_MAX_SECONDS_PER_CYCLE", "30")),
             prebuild_default=0.0,
         ),
         max_trades_per_cycle=int(
             _mode_float_default(
                 args.max_trades_per_cycle,
                 mode=mode,
-                live_default=float(_env("AETHER_RANGE_BACKFILL_MAX_TRADES_PER_CYCLE", "2000000")),
+                live_default=float(_env("AETHER_RANGE_BACKFILL_MAX_TRADES_PER_CYCLE", "300000")),
                 prebuild_default=0.0,
             )
         ),

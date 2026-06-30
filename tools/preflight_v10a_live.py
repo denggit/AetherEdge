@@ -3,7 +3,7 @@
 
 The tool validates local configuration and inspects existing SQLite files
 through read-only connections. It never starts the runtime or mutates exchange
-or database state.
+or source database state.
 """
 
 from __future__ import annotations
@@ -28,11 +28,13 @@ from src.platform.config import load_env_config
 from src.platform.exchanges.factory import create_exchange_client
 from src.platform.exchanges.models import ExchangeConfig, MarginMode, PositionMode
 from src.strategy import load_strategy
+from src.utils.sqlite_backup import backup_sqlite_database
 from strategies.eth_lf_portfolio_v10a import Strategy
 
 
 EXPECTED_STRATEGY = "strategies.eth_lf_portfolio_v10a:Strategy"
 EXPECTED_STRATEGY_ID = "eth_lf_portfolio_v10a_momentum_micro_short_speed_filter"
+SQLITE_BACKUP_KEEP = 5
 FORBIDDEN_STRATEGY_ENV_KEYS = (
     "enable_momentum_long_not_aligned_block",
     "enable_momentum_short_fast_speed_block",
@@ -747,13 +749,29 @@ def _check_state_dbs(
         if not path.is_file():
             report.add("STATE", "PASS", env_key, f"{path} not present")
             continue
+        try:
+            backup_detail = f"backup created at {_backup_sqlite_for_preflight(path=path, repo_root=repo_root)}"
+        except (OSError, sqlite3.Error) as exc:
+            backup_detail = f"backup failed: {exc}"
         report.add(
             "STATE",
             "WARN",
             env_key,
-            f"{path} backup manually before live start",
+            f"{path} {backup_detail}",
         )
         _inspect_sqlite_read_only(report, path, db_kind)
+
+
+def _backup_sqlite_for_preflight(*, path: Path, repo_root: Path) -> Path:
+    return backup_sqlite_database(
+        path,
+        backup_dir=repo_root / "data" / "state" / "backups",
+        keep=SQLITE_BACKUP_KEEP,
+        before_backup=lambda backup_path: print(
+            f"SQLite backup path | source={path} backup={backup_path}",
+            flush=True,
+        ),
+    )
 
 
 def _inspect_sqlite_read_only(

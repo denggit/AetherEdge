@@ -4,7 +4,11 @@ from datetime import date
 from io import BytesIO
 import zipfile
 
-from src.market_data.historical_trades.importer import iter_trade_csv_chunks, normalize_okx_trade_chunk
+from src.market_data.historical_trades.importer import (
+    filter_okx_trade_chunk_by_time,
+    iter_trade_csv_chunks,
+    normalize_okx_trade_chunk,
+)
 from src.market_data.historical_trades.okx_archive import OkxHistoricalTradeArchive, OkxHistoricalTradeDownloadError, okx_raw_symbol_from_canonical
 
 
@@ -46,6 +50,48 @@ def test_importer_reads_zip_and_normalizes_trades(tmp_path) -> None:
     assert len(chunks) == 2
     assert [trade.trade_id for trade in trades] == ["a", "c"]
     assert trades[0].trade_time_ms == 1780272000000
+
+
+def test_importer_filters_raw_rows_before_normalizing() -> None:
+    chunk = [
+        {"created_time": "2019-12-31T23:59:59Z", "px": "99", "sz": "1", "side": "buy"},
+        {"created_time": "2026-06-01T00:00:00Z", "px": "100", "sz": "1", "side": "buy"},
+        {"created_time": "2026-06-02T00:00:00Z", "px": "101", "sz": "1", "side": "sell"},
+    ]
+
+    filtered = filter_okx_trade_chunk_by_time(
+        chunk,
+        start_time_ms=1780272000000,
+        end_time_ms=1780272000000,
+        max_valid_trade_time_ms=1780444800000,
+    )
+    trades = normalize_okx_trade_chunk(
+        filtered.rows,
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP",
+    )
+
+    assert filtered.raw_rows == 3
+    assert filtered.filtered_rows == 1
+    assert filtered.dropped_rows == 2
+    assert len(trades) == 1
+    assert trades[0].trade_time_ms == 1780272000000
+
+
+def test_importer_supports_okx_headerless_default_order(tmp_path) -> None:
+    path = tmp_path / "ETH-USDT-SWAP-trades-2026-06-01.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "trades.csv",
+            "ETH-USDT-SWAP,a,100,2,buy,1780272000000\n"
+            "ETH-USDT-SWAP,b,101,3,sell,1780272000100\n",
+        )
+
+    chunks = list(iter_trade_csv_chunks(path, chunksize=10))
+    trades = [trade for chunk in chunks for trade in normalize_okx_trade_chunk(chunk, symbol="ETH-USDT-PERP", raw_symbol="ETH-USDT-SWAP")]
+
+    assert [trade.trade_id for trade in trades] == ["a", "b"]
+    assert [str(trade.price) for trade in trades] == ["100", "101"]
 
 
 def test_okx_downloader_uses_user_agent(tmp_path, monkeypatch) -> None:
