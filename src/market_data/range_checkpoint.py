@@ -12,6 +12,7 @@ from typing import Any, Callable, Mapping, Sequence
 from src.market_data.models import RangeBarAggregate, RangeCoverageStatus
 
 DEFAULT_RANGE_CHECKPOINT_DB = "data/state/range_builder_checkpoint.sqlite3"
+MIN_VALID_COMPLETED_AGGREGATE_MS = 1_700_000_000_000
 
 
 @dataclass(frozen=True)
@@ -206,7 +207,9 @@ class SqliteRangeCheckpointStore:
         coverage_status: str,
         missing_gap_ms: int = 0,
         completed_at_ms: int,
-    ) -> None:
+    ) -> bool:
+        if not _completed_aggregate_is_valid(aggregate):
+            return False
         with self._connect() as conn:
             conn.execute(
                 """
@@ -248,6 +251,7 @@ class SqliteRangeCheckpointStore:
                     int(completed_at_ms),
                 ),
             )
+        return True
 
     def load_complete_history(
         self,
@@ -274,7 +278,11 @@ class SqliteRangeCheckpointStore:
                            coverage_status, missing_gap_ms, completed_at_ms
                     FROM completed_range_aggregates
                     WHERE exchange = ? AND symbol = ? AND range_pct = ?
-                      AND coverage_status = ? AND bucket_end_ms < ?
+                      AND coverage_status = ?
+                      AND bucket_start_ms >= ?
+                      AND bucket_end_ms >= ?
+                      AND bucket_end_ms > bucket_start_ms
+                      AND bucket_end_ms < ?
                     ORDER BY bucket_end_ms DESC
                     LIMIT ?
                 )
@@ -285,6 +293,8 @@ class SqliteRangeCheckpointStore:
                     symbol,
                     _decimal_text(range_pct),
                     RangeCoverageStatus.COMPLETE.value,
+                    MIN_VALID_COMPLETED_AGGREGATE_MS,
+                    MIN_VALID_COMPLETED_AGGREGATE_MS,
                     before_bucket_end_ms,
                     limit,
                 ),
@@ -301,10 +311,12 @@ class SqliteRangeCheckpointStore:
     ) -> tuple[int, int]:
         where_end = "" if before_bucket_end_ms is None else " AND bucket_end_ms < ?"
         params: list[object] = [
+            RangeCoverageStatus.COMPLETE.value,
             str(exchange).lower(),
             symbol,
             _decimal_text(range_pct),
-            RangeCoverageStatus.COMPLETE.value,
+            MIN_VALID_COMPLETED_AGGREGATE_MS,
+            MIN_VALID_COMPLETED_AGGREGATE_MS,
         ]
         if before_bucket_end_ms is not None:
             params.append(before_bucket_end_ms)
@@ -314,9 +326,13 @@ class SqliteRangeCheckpointStore:
                 SELECT COUNT(*),
                        SUM(CASE WHEN coverage_status = ? THEN 1 ELSE 0 END)
                 FROM completed_range_aggregates
-                WHERE exchange = ? AND symbol = ? AND range_pct = ?{where_end}
+                WHERE exchange = ? AND symbol = ? AND range_pct = ?
+                  AND bucket_start_ms >= ?
+                  AND bucket_end_ms >= ?
+                  AND bucket_end_ms > bucket_start_ms
+                  {where_end}
                 """,
-                (params[3], params[0], params[1], params[2], *params[4:]),
+                params,
             ).fetchone()
         return int(row[0] or 0), int(row[1] or 0)
 
@@ -497,6 +513,16 @@ def aggregate_snapshot(aggregate: RangeBarAggregate | None) -> Mapping[str, Any]
         "taker_buy_ratio": str(aggregate.taker_buy_ratio),
         "close_pos": str(aggregate.close_pos),
     }
+
+
+def _completed_aggregate_is_valid(aggregate: RangeBarAggregate) -> bool:
+    bucket_start_ms = int(aggregate.bucket_start_ms)
+    bucket_end_ms = int(aggregate.bucket_end_ms)
+    return not (
+        bucket_start_ms < MIN_VALID_COMPLETED_AGGREGATE_MS
+        or bucket_end_ms < MIN_VALID_COMPLETED_AGGREGATE_MS
+        or bucket_end_ms <= bucket_start_ms
+    )
 
 
 def _checkpoint_from_row(row: Sequence[object]) -> RangeBuilderCheckpoint:

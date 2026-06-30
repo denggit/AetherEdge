@@ -8,7 +8,12 @@ import subprocess
 import sys
 
 from src.market_data.backfill.scanner import RangeBackfillScanner
-from src.market_data.backfill.status_store import RangeBackfillStatusStore, now_ms
+from src.market_data.backfill.status_store import (
+    RangeBackfillStatusStore,
+    now_ms,
+    process_id_exists,
+    worker_heartbeat_ms,
+)
 from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
 from src.utils.log import get_logger
 
@@ -18,12 +23,15 @@ REASON_AVAILABLE = "available"
 REASON_INSUFFICIENT_HISTORY = "insufficient_history"
 REASON_ARCHIVE_GAP_BACKFILLING = "archive_gap_backfilling"
 REASON_ARCHIVE_GAP_NO_PROGRESS = "archive_gap_no_progress"
+REASON_ARCHIVE_GAP_PARTIAL_NO_PROGRESS = "archive_gap_partial_no_progress"
 REASON_CURRENT_DAY_ARCHIVE_NOT_READY = "current_day_archive_not_ready"
 REASON_CURRENT_DAY_GAP_TOO_LARGE = "current_day_gap_too_large"
 REASON_REPAIR_FAILED_COOLDOWN = "repair_failed_cooldown"
+REASON_STALE_WORKER_MISSING = "stale_worker_missing"
 DEFERRED_REPAIR_REASONS = frozenset(
     {
         REASON_ARCHIVE_GAP_NO_PROGRESS,
+        REASON_ARCHIVE_GAP_PARTIAL_NO_PROGRESS,
         REASON_CURRENT_DAY_ARCHIVE_NOT_READY,
         REASON_REPAIR_FAILED_COOLDOWN,
     }
@@ -183,12 +191,13 @@ class RangeBackfillSupervisor:
                     coverage,
                     archive_max_target_end_ms=archive_max_target_end_ms,
                 )
+                worker_running = self.running
                 deferred_reason = self._persisted_retry_reason()
                 if reason != REASON_AVAILABLE and deferred_reason is not None:
                     reason = deferred_reason
                 elif (
                     reason == REASON_ARCHIVE_GAP_BACKFILLING
-                    and not self.running
+                    and not worker_running
                     and self._in_restart_cooldown()
                 ):
                     reason = REASON_REPAIR_FAILED_COOLDOWN
@@ -366,7 +375,7 @@ class RangeBackfillSupervisor:
                 coverage, "current_closed_bucket_end_ms", None
             ),
             "archive_max_target_end_ms": archive_max_target_end_ms,
-            "heartbeat_ms": now_ms(),
+            "supervisor_heartbeat_ms": now_ms(),
         }
         if reason == REASON_AVAILABLE:
             payload["next_retry_after_ms"] = None
@@ -385,7 +394,19 @@ class RangeBackfillSupervisor:
         status = self.status_store.read()
         if not status or not status.get("running"):
             return False
-        heartbeat = status.get("heartbeat_ms")
+        if process_id_exists(status.get("pid")) is False:
+            self.status_store.patch(
+                running=False,
+                pid=None,
+                phase=REASON_STALE_WORKER_MISSING,
+                range_speed_available=False,
+                range_speed_reason=REASON_STALE_WORKER_MISSING,
+                exit_code=0,
+                last_error="stale worker pid not found",
+                next_retry_after_ms=None,
+            )
+            return False
+        heartbeat = worker_heartbeat_ms(status)
         if heartbeat is None:
             return False
         return now_ms() - int(heartbeat) <= self.config.heartbeat_stale_seconds * 1000

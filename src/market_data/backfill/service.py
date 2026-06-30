@@ -13,7 +13,6 @@ from src.market_data.backfill.scanner import RangeBackfillScanner
 from src.market_data.backfill.status_store import RangeBackfillStatusStore, now_ms
 from src.market_data.derived import RangeBarAggregator, RangeBarBuilder
 from src.market_data.historical_trades.importer import (
-    MIN_VALID_TRADE_TIME_MS,
     filter_okx_trade_chunk_by_time,
     iter_trade_csv_chunks,
     normalize_okx_trade_chunk,
@@ -25,12 +24,14 @@ from src.market_data.historical_trades.okx_archive import (
     okx_raw_symbol_from_canonical,
 )
 from src.market_data.models import RangeCoverageStatus, TimeRange
-from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
+from src.market_data.range_checkpoint import (
+    MIN_VALID_COMPLETED_AGGREGATE_MS,
+    SqliteRangeCheckpointStore,
+)
 from src.market_data.storage import SqliteRangeBarStore, SqliteTradeStore
 from src.market_data.warmup.gap_detector import interval_to_ms
 
 ProgressCallback = Callable[[str, Mapping[str, object]], None]
-MIN_VALID_AGGREGATE_BUCKET_END_MS = MIN_VALID_TRADE_TIME_MS
 
 
 @dataclass(frozen=True)
@@ -146,10 +147,12 @@ class RangeBackfillService:
                 mark_process_finished_on_summary=mark_process_finished_on_summary,
             )
         except Exception as exc:
+            heartbeat = now_ms()
             self.status_store.patch(
                 running=not mark_process_finished_on_summary,
                 phase="failed",
-                heartbeat_ms=now_ms(),
+                worker_heartbeat_ms=heartbeat,
+                heartbeat_ms=heartbeat,
                 last_error=str(exc),
                 finished_at_ms=now_ms() if mark_process_finished_on_summary else None,
             )
@@ -170,6 +173,7 @@ class RangeBackfillService:
                 lock.release()
 
     def _mark_cycle_started(self, *, coverage_before, reset_status: bool) -> None:
+        heartbeat = now_ms()
         payload = {
             "mode": self.request.mode,
             "direction": self.request.direction,
@@ -177,7 +181,8 @@ class RangeBackfillService:
             "running": True,
             "phase": "running_cycle",
             "started_at_ms": now_ms(),
-            "heartbeat_ms": now_ms(),
+            "worker_heartbeat_ms": heartbeat,
+            "heartbeat_ms": heartbeat,
             "symbol": self.request.symbol,
             "exchange": self.request.exchange,
             "range_pct": self.request.range_pct,
@@ -381,8 +386,10 @@ class RangeBackfillService:
                     for bar in builder.on_trade(trade):
                         if target_time.start_time_ms <= bar.end_time_ms <= target_time.end_time_ms:
                             bars.append(bar)
+                heartbeat = now_ms()
                 self.status_store.patch(
-                    heartbeat_ms=now_ms(),
+                    worker_heartbeat_ms=heartbeat,
+                    heartbeat_ms=heartbeat,
                     raw_rows=raw_rows,
                     filtered_rows=filtered_rows,
                     dropped_rows=dropped_rows,
@@ -493,8 +500,9 @@ class RangeBackfillService:
             and aggregate.bucket_end_ms <= target_time.end_time_ms
             and aggregate.bucket_end_ms <= coverage_before.current_closed_bucket_end_ms
             and aggregate.bucket_end_ms <= complete_through_ms
-            and aggregate.bucket_start_ms >= MIN_VALID_AGGREGATE_BUCKET_END_MS
-            and aggregate.bucket_end_ms >= MIN_VALID_AGGREGATE_BUCKET_END_MS
+            and aggregate.bucket_start_ms >= MIN_VALID_COMPLETED_AGGREGATE_MS
+            and aggregate.bucket_end_ms >= MIN_VALID_COMPLETED_AGGREGATE_MS
+            and aggregate.bucket_end_ms > aggregate.bucket_start_ms
         ]
         self._emit("writing_aggregates", rows=len(aggregates))
         completed_at = now_ms()
@@ -717,10 +725,12 @@ class RangeBackfillService:
                 phase = "completed"
             else:
                 phase = "sleeping"
+            heartbeat = now_ms()
             self.status_store.patch(
                 running=False if mark_process_finished else True,
                 phase=phase,
-                heartbeat_ms=now_ms(),
+                worker_heartbeat_ms=heartbeat,
+                heartbeat_ms=heartbeat,
                 complete_after=summary.complete_after,
                 missing_after=summary.missing_after,
                 downloaded_files=summary.downloaded_files,

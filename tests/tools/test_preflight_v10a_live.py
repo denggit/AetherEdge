@@ -497,7 +497,11 @@ def _create_range_state_db(
             ) VALUES ('okx', 'ETH-USDT-PERP', '0.002', ?, ?, 10, 'COMPLETE', ?)
             """,
             [
-                (index * 100, index * 100 + 99, index * 100 + 100)
+                (
+                    1_700_000_000_000 + index * 100,
+                    1_700_000_000_000 + index * 100 + 99,
+                    1_700_000_000_000 + index * 100 + 100,
+                )
                 for index in range(complete_history)
             ],
         )

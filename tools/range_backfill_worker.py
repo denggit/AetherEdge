@@ -22,6 +22,7 @@ from src.market_data.historical_trades.okx_archive import okx_raw_symbol_from_ca
 REASON_AVAILABLE = "available"
 REASON_ARCHIVE_GAP_BACKFILLING = "archive_gap_backfilling"
 REASON_ARCHIVE_GAP_NO_PROGRESS = "archive_gap_no_progress"
+REASON_ARCHIVE_GAP_PARTIAL_NO_PROGRESS = "archive_gap_partial_no_progress"
 REASON_CURRENT_DAY_ARCHIVE_NOT_READY = "current_day_archive_not_ready"
 REASON_REPAIR_FAILED_COOLDOWN = "repair_failed_cooldown"
 _DATE_PATTERN = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
@@ -202,10 +203,20 @@ def main(argv: list[str] | None = None) -> int:
                 range_speed_reason = REASON_AVAILABLE
                 return exit_code
             no_progress_reason = _no_progress_reason(summary)
-            if summary.status == "no_progress" or no_progress_reason == REASON_CURRENT_DAY_ARCHIVE_NOT_READY:
+            partial_without_progress = _partial_without_progress(summary)
+            if (
+                summary.status == "no_progress"
+                or partial_without_progress
+                or no_progress_reason == REASON_CURRENT_DAY_ARCHIVE_NOT_READY
+            ):
                 exit_code = 0
                 exit_phase = "no_progress"
-                range_speed_reason = no_progress_reason or REASON_ARCHIVE_GAP_NO_PROGRESS
+                if no_progress_reason == REASON_CURRENT_DAY_ARCHIVE_NOT_READY:
+                    range_speed_reason = no_progress_reason
+                elif partial_without_progress:
+                    range_speed_reason = REASON_ARCHIVE_GAP_PARTIAL_NO_PROGRESS
+                else:
+                    range_speed_reason = no_progress_reason or REASON_ARCHIVE_GAP_NO_PROGRESS
                 next_retry_after_ms = _next_retry_after_ms(
                     reason=range_speed_reason,
                     failure_cooldown_seconds=int(args.failure_cooldown_seconds),
@@ -254,13 +265,15 @@ def _write_process_status(
     next_retry_after_ms: int | None = None,
     summary=None,
 ) -> None:
+    heartbeat = now_ms()
     payload = {
         "mode": request.mode,
         "direction": request.direction,
         "pid": os.getpid(),
         "running": running,
         "phase": phase,
-        "heartbeat_ms": now_ms(),
+        "worker_heartbeat_ms": heartbeat,
+        "heartbeat_ms": heartbeat,
         "symbol": request.symbol,
         "exchange": request.exchange,
         "range_pct": request.range_pct,
@@ -296,6 +309,15 @@ def _no_progress_reason(summary, *, now_ms_value: int | None = None) -> str | No
     if all(day >= now.date() for day in failed_days):
         return REASON_CURRENT_DAY_ARCHIVE_NOT_READY
     return REASON_ARCHIVE_GAP_NO_PROGRESS if summary.status == "no_progress" else None
+
+
+def _partial_without_progress(summary) -> bool:
+    return (
+        summary.status == "partial"
+        and int(summary.aggregates_written) == 0
+        and int(summary.range_bars_written) == 0
+        and int(summary.missing_after) > 0
+    )
 
 
 def _summary_raw_days(summary) -> tuple[date, ...]:

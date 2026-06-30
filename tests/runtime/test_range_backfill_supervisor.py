@@ -326,3 +326,172 @@ def test_available_coverage_clears_retry_deadline(tmp_path) -> None:
     assert status["range_speed_available"] is True
     assert status["range_speed_reason"] == "available"
     assert status["next_retry_after_ms"] is None
+
+
+def test_missing_worker_pid_is_cleared_and_does_not_block_restart(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    fixed_now_ms = 1782835200000
+    started: list[FakeProcess] = []
+    monkeypatch.setattr(
+        "src.runtime.range_backfill_supervisor.now_ms",
+        lambda: fixed_now_ms,
+    )
+    monkeypatch.setattr(
+        "src.runtime.range_backfill_supervisor.process_id_exists",
+        lambda pid: False,
+    )
+
+    def fake_popen(*args, **kwargs):
+        process = FakeProcess(*args, **kwargs)
+        started.append(process)
+        return process
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    supervisor = RangeBackfillSupervisor(
+        RangeBackfillSupervisorConfig(
+            status_path=tmp_path / "status.json",
+            lock_path=tmp_path / "range.lock",
+            repo_root=Path.cwd(),
+            restart_cooldown_seconds=0,
+        )
+    )
+    supervisor.status_store.patch(
+        running=True,
+        pid=909230,
+        phase="sleeping",
+        worker_heartbeat_ms=fixed_now_ms,
+        range_speed_reason="archive_gap_backfilling",
+    )
+
+    assert supervisor._status_shows_running_worker() is False
+    stale = supervisor.status_store.read()
+    assert stale is not None
+    assert stale["running"] is False
+    assert stale["pid"] is None
+    assert stale["phase"] == "stale_worker_missing"
+    assert stale["range_speed_reason"] == "stale_worker_missing"
+    assert stale["exit_code"] == 0
+    assert stale["last_error"] == "stale worker pid not found"
+
+    assert supervisor.start_if_needed(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        range_pct="0.002",
+        bucket_interval="4h",
+        complete_history=96,
+        min_periods=100,
+        max_target_end_ms=1782777599999,
+    )
+    assert started
+
+
+def test_existing_worker_pid_with_fresh_worker_heartbeat_blocks_restart(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    fixed_now_ms = 1782835200000
+    monkeypatch.setattr(
+        "src.runtime.range_backfill_supervisor.now_ms",
+        lambda: fixed_now_ms,
+    )
+    monkeypatch.setattr(
+        "src.runtime.range_backfill_supervisor.process_id_exists",
+        lambda pid: True,
+    )
+    monkeypatch.setattr(
+        "subprocess.Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("second worker must not start")
+        ),
+    )
+    supervisor = RangeBackfillSupervisor(
+        RangeBackfillSupervisorConfig(
+            status_path=tmp_path / "status.json",
+            lock_path=tmp_path / "range.lock",
+            repo_root=Path.cwd(),
+        )
+    )
+    supervisor.status_store.patch(
+        running=True,
+        pid=4321,
+        worker_heartbeat_ms=fixed_now_ms,
+    )
+
+    assert supervisor._status_shows_running_worker() is True
+    assert not supervisor.start_if_needed(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        range_pct="0.002",
+        bucket_interval="4h",
+        complete_history=96,
+        min_periods=100,
+    )
+
+
+def test_existing_worker_supports_legacy_heartbeat_field(tmp_path, monkeypatch) -> None:
+    fixed_now_ms = 1782835200000
+    monkeypatch.setattr(
+        "src.runtime.range_backfill_supervisor.now_ms",
+        lambda: fixed_now_ms,
+    )
+    monkeypatch.setattr(
+        "src.runtime.range_backfill_supervisor.process_id_exists",
+        lambda pid: True,
+    )
+    supervisor = RangeBackfillSupervisor(
+        RangeBackfillSupervisorConfig(
+            status_path=tmp_path / "status.json",
+            lock_path=tmp_path / "range.lock",
+        )
+    )
+    supervisor.status_store.patch(
+        running=True,
+        pid=4321,
+        heartbeat_ms=fixed_now_ms,
+    )
+
+    assert supervisor._status_shows_running_worker() is True
+
+
+def test_coverage_status_only_updates_supervisor_heartbeat(tmp_path, monkeypatch) -> None:
+    fixed_now_ms = 1782835200000
+    monkeypatch.setattr(
+        "src.runtime.range_backfill_supervisor.now_ms",
+        lambda: fixed_now_ms,
+    )
+    supervisor = RangeBackfillSupervisor(
+        RangeBackfillSupervisorConfig(
+            status_path=tmp_path / "status.json",
+            lock_path=tmp_path / "range.lock",
+        )
+    )
+    supervisor.status_store.patch(
+        running=True,
+        pid=909230,
+        worker_heartbeat_ms=111,
+        heartbeat_ms=222,
+    )
+    coverage = type(
+        "Coverage",
+        (),
+        {
+            "required_window_complete_count": 96,
+            "required_window_missing_count": 4,
+            "required_buckets": 100,
+            "current_closed_bucket_end_ms": 1782863999999,
+        },
+    )()
+
+    supervisor._write_coverage_status(
+        coverage,
+        reason="archive_gap_backfilling",
+        archive_max_target_end_ms=1782777599999,
+    )
+
+    status = supervisor.status_store.read()
+    assert status is not None
+    assert status["supervisor_heartbeat_ms"] == fixed_now_ms
+    assert status["worker_heartbeat_ms"] == 111
+    assert status["heartbeat_ms"] == 222

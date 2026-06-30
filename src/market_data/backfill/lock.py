@@ -5,7 +5,12 @@ import os
 from pathlib import Path
 from typing import Any
 
-from src.market_data.backfill.status_store import RangeBackfillStatusStore, now_ms
+from src.market_data.backfill.status_store import (
+    RangeBackfillStatusStore,
+    now_ms,
+    process_id_exists,
+    worker_heartbeat_ms,
+)
 
 
 class RangeBackfillLock:
@@ -60,7 +65,9 @@ class RangeBackfillLock:
         if self.status_path is not None:
             status = RangeBackfillStatusStore(self.status_path).read()
             if status is not None:
-                heartbeat = status.get("heartbeat_ms")
+                if status.get("running") and process_id_exists(status.get("pid")) is False:
+                    return True
+                heartbeat = worker_heartbeat_ms(status)
                 running = bool(status.get("running"))
                 if heartbeat is not None:
                     return (not running) or (now_ms() - int(heartbeat) > self.stale_after_ms)

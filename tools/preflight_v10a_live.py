@@ -27,6 +27,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.platform.config import load_env_config
 from src.platform.exchanges.factory import create_exchange_client
 from src.platform.exchanges.models import ExchangeConfig, MarginMode, PositionMode
+from src.market_data.range_checkpoint import MIN_VALID_COMPLETED_AGGREGATE_MS
 from src.strategy import load_strategy
 from src.utils.sqlite_backup import backup_sqlite_database
 from strategies.eth_lf_portfolio_v10a import Strategy
@@ -903,6 +904,9 @@ def _check_range_state(
                            SUM(CASE WHEN coverage_status = 'COMPLETE' THEN 1 ELSE 0 END)
                     FROM completed_range_aggregates
                     WHERE exchange = ? AND symbol = ? AND range_pct = ?
+                      AND bucket_start_ms >= ?
+                      AND bucket_end_ms >= ?
+                      AND bucket_end_ms > bucket_start_ms
                     """,
                     (
                         _normalized(env.get("AETHER_DATA_EXCHANGE")) or "okx",
@@ -910,6 +914,8 @@ def _check_range_state(
                         _normalized_decimal_text(
                             env.get("AETHER_RANGE_PCT", "0.002")
                         ),
+                        MIN_VALID_COMPLETED_AGGREGATE_MS,
+                        MIN_VALID_COMPLETED_AGGREGATE_MS,
                     ),
                 ).fetchone()
                 total_count = int(row[0] or 0)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sqlite3
 
 from src.market_data.backfill.status_store import RangeBackfillStatusStore, now_ms
@@ -66,7 +67,12 @@ def test_prebuild_exits_when_live_worker_lock_exists(tmp_path) -> None:
     status_path = tmp_path / "status.json"
     lock_path.write_text("running", encoding="utf-8")
     RangeBackfillStatusStore(status_path).write(
-        {"running": True, "heartbeat_ms": now_ms(), "phase": "sleeping"}
+        {
+            "running": True,
+            "pid": os.getpid(),
+            "worker_heartbeat_ms": now_ms(),
+            "phase": "sleeping",
+        }
     )
 
     result = tool.main(
@@ -225,6 +231,7 @@ def test_clean_suspicious_deletes_bad_bucket_rows(tmp_path, capsys) -> None:
             str(tmp_path / "data" / "state" / "backups"),
             "--no-download",
             "--clean-suspicious",
+            "--check-only",
         ]
     )
 

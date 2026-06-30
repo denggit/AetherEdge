@@ -7,7 +7,11 @@ from typing import Any
 
 from src.market_data.backfill.coverage import current_closed_bucket_end_ms
 from src.market_data.backfill.scanner import RangeBackfillScanner
-from src.market_data.backfill.status_store import RangeBackfillStatusStore
+from src.market_data.backfill.status_store import (
+    RangeBackfillStatusStore,
+    worker_heartbeat_ms,
+    worker_status_is_running,
+)
 from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
 from src.market_data.warmup.gap_detector import interval_to_ms
 from src.utils.log import get_logger
@@ -184,6 +188,8 @@ class RangeSpeedHistoryRefresher:
             return
         self._last_warning_ms = now
         backfill = self.status_store.read() or {}
+        backfill_running = worker_status_is_running(backfill)
+        backfill_pid = backfill.get("pid") if backfill_running else None
         logger.warning(
             "V10A range-speed history still insufficient; live runtime continues | "
             "symbol=%s exchange=%s range_pct=%s interval=%s complete_history=%s "
@@ -204,11 +210,11 @@ class RangeSpeedHistoryRefresher:
             status.latest_complete_bucket_end_ms,
             status.current_closed_bucket_end_ms,
             self.backfill_enabled,
-            bool(backfill.get("running")),
-            backfill.get("pid"),
+            backfill_running,
+            backfill_pid,
             backfill.get("mode"),
             backfill.get("direction"),
-            backfill.get("heartbeat_ms"),
+            worker_heartbeat_ms(backfill),
             backfill.get("last_completed_bucket_end_ms"),
             backfill.get("last_error"),
             int(self.refresh_seconds),

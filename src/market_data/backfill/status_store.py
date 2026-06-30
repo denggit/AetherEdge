@@ -11,6 +11,80 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def worker_heartbeat_ms(status: Mapping[str, Any]) -> int | None:
+    value = status.get("worker_heartbeat_ms")
+    if value is None:
+        value = status.get("heartbeat_ms")
+    try:
+        return None if value is None else int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def process_id_exists(pid: object) -> bool | None:
+    try:
+        value = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if value <= 0:
+        return False
+    if value == os.getpid():
+        return True
+    if os.name == "posix":
+        try:
+            os.kill(value, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [
+                ctypes.c_uint32,
+                ctypes.c_int,
+                ctypes.c_uint32,
+            ]
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+            kernel32.CloseHandle.restype = ctypes.c_int
+            handle = kernel32.OpenProcess(0x1000, False, value)
+            if handle:
+                kernel32.CloseHandle(handle)
+                return True
+            error = ctypes.get_last_error()
+            if error == 5:
+                return True
+            if error == 87:
+                return False
+        except (AttributeError, OSError):
+            return None
+    return None
+
+
+def worker_status_is_running(
+    status: Mapping[str, Any],
+    *,
+    stale_after_seconds: int = 180,
+    now_ms_value: int | None = None,
+) -> bool:
+    if not status.get("running"):
+        return False
+    process_exists = process_id_exists(status.get("pid"))
+    if process_exists is False:
+        return False
+    heartbeat = worker_heartbeat_ms(status)
+    if heartbeat is None:
+        return False
+    current = now_ms() if now_ms_value is None else int(now_ms_value)
+    return current - heartbeat <= max(0, int(stale_after_seconds)) * 1000
+
+
 class RangeBackfillStatusStore:
     def __init__(self, path: str | Path = "data/state/range_backfill_status.json") -> None:
         self.path = Path(path)

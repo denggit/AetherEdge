@@ -35,3 +35,26 @@ def test_lock_force_can_replace_fresh_running_lock(tmp_path) -> None:
     lock = RangeBackfillLock(lock_path, status_path=status_path, stale_after_seconds=180)
 
     assert lock.acquire(mode="prebuild", force=True)
+
+
+def test_lock_treats_missing_worker_pid_as_stale(tmp_path, monkeypatch) -> None:
+    lock_path = tmp_path / "range.lock"
+    status_path = tmp_path / "status.json"
+    RangeBackfillStatusStore(status_path).write(
+        {
+            "running": True,
+            "pid": 909230,
+            "worker_heartbeat_ms": 9999999999999,
+        }
+    )
+    lock_path.write_text("stale", encoding="utf-8")
+    monkeypatch.setattr(
+        "src.market_data.backfill.lock.process_id_exists",
+        lambda pid: False,
+    )
+
+    lock = RangeBackfillLock(lock_path, status_path=status_path)
+
+    assert lock.acquire(mode="live")
+    lock.release()
+    assert not lock_path.exists()

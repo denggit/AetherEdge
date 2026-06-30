@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from src.market_data.models import RangeBarAggregate, RangeCoverageStatus
 from src.market_data.range_checkpoint import (
+    MIN_VALID_COMPLETED_AGGREGATE_MS,
     RangeBuilderCheckpoint,
     RangeCheckpointWriter,
     SqliteRangeCheckpointStore,
@@ -144,10 +145,10 @@ def test_bounded_writer_submit_does_not_wait_for_database_and_keeps_latest() -> 
 def test_completed_history_reads_only_complete_in_time_order_and_excludes_current(tmp_path) -> None:
     store = SqliteRangeCheckpointStore(tmp_path / "range.sqlite3")
     for bucket_start, count, coverage in (
-        (30_000, 3, "COMPLETE"),
-        (10_000, 1, "COMPLETE"),
-        (20_000, 99, "RECOVERED_DEGRADED_MINOR"),
-        (40_000, 4, "COMPLETE"),
+        (MIN_VALID_COMPLETED_AGGREGATE_MS + 30_000, 3, "COMPLETE"),
+        (MIN_VALID_COMPLETED_AGGREGATE_MS + 10_000, 1, "COMPLETE"),
+        (MIN_VALID_COMPLETED_AGGREGATE_MS + 20_000, 99, "RECOVERED_DEGRADED_MINOR"),
+        (MIN_VALID_COMPLETED_AGGREGATE_MS + 40_000, 4, "COMPLETE"),
     ):
         store.save_completed_aggregate(
             exchange="okx",
@@ -160,9 +161,30 @@ def test_completed_history_reads_only_complete_in_time_order_and_excludes_curren
         exchange="okx",
         symbol="ETH-USDT-PERP",
         range_pct="0.002",
-        before_bucket_end_ms=49_999,
+        before_bucket_end_ms=MIN_VALID_COMPLETED_AGGREGATE_MS + 49_999,
         limit=1080,
     )
 
-    assert [row.bucket_start_ms for row in rows] == [10_000, 30_000]
+    assert [row.bucket_start_ms for row in rows] == [
+        MIN_VALID_COMPLETED_AGGREGATE_MS + 10_000,
+        MIN_VALID_COMPLETED_AGGREGATE_MS + 30_000,
+    ]
     assert [row.rf_bar_count for row in rows] == [1, 3]
+
+
+def test_completed_aggregate_rejects_suspicious_timestamp(tmp_path) -> None:
+    store = SqliteRangeCheckpointStore(tmp_path / "range.sqlite3")
+
+    saved = store.save_completed_aggregate(
+        exchange="okx",
+        aggregate=_aggregate(bucket_start_ms=0, count=1),
+        coverage_status=RangeCoverageStatus.COMPLETE.value,
+        completed_at_ms=1,
+    )
+
+    assert saved is False
+    assert store.history_counts(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+    ) == (0, 0)

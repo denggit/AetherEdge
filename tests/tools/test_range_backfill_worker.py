@@ -309,3 +309,93 @@ def test_partial_cycle_with_only_current_day_missing_also_exits(
 
     assert worker.main(["--mode", "live", "--no-once", *_paths(tmp_path)]) == 0
     assert calls == 1
+
+
+def test_partial_cycle_without_writes_exits_to_cooldown(tmp_path, monkeypatch) -> None:
+    calls = 0
+
+    class FakeService:
+        def __init__(self, request) -> None:
+            pass
+
+        def run_once(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            return RangeBackfillSummary(
+                symbol="ETH-USDT-PERP",
+                exchange="okx",
+                range_pct="0.002",
+                bucket_interval="4h",
+                target_buckets=100,
+                complete_before=96,
+                complete_after=96,
+                missing_before=4,
+                missing_after=4,
+                aggregates_written=0,
+                range_bars_written=0,
+                status="partial",
+            )
+
+    monkeypatch.setattr(worker, "RangeBackfillService", FakeService)
+    monkeypatch.setattr(
+        worker.time,
+        "sleep",
+        lambda value: (_ for _ in ()).throw(AssertionError("must not sleep")),
+    )
+
+    assert worker.main(["--mode", "live", "--no-once", *_paths(tmp_path)]) == 0
+
+    status = RangeBackfillStatusStore(tmp_path / "status.json").read()
+    assert calls == 1
+    assert status is not None
+    assert status["running"] is False
+    assert status["phase"] == "no_progress"
+    assert status["range_speed_reason"] == "archive_gap_partial_no_progress"
+    assert status["next_retry_after_ms"] > status["finished_at_ms"]
+    assert status["worker_heartbeat_ms"] == status["heartbeat_ms"]
+    assert not (tmp_path / "range.lock").exists()
+
+
+def test_partial_cycle_with_progress_continues(tmp_path, monkeypatch) -> None:
+    calls = 0
+
+    class FakeService:
+        def __init__(self, request) -> None:
+            pass
+
+        def run_once(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return RangeBackfillSummary(
+                    symbol="ETH-USDT-PERP",
+                    exchange="okx",
+                    range_pct="0.002",
+                    bucket_interval="4h",
+                    target_buckets=100,
+                    complete_before=96,
+                    complete_after=97,
+                    missing_before=4,
+                    missing_after=3,
+                    aggregates_written=1,
+                    status="partial",
+                )
+            return RangeBackfillSummary(
+                symbol="ETH-USDT-PERP",
+                exchange="okx",
+                range_pct="0.002",
+                bucket_interval="4h",
+                target_buckets=100,
+                complete_before=97,
+                complete_after=100,
+                missing_before=3,
+                missing_after=0,
+                aggregates_written=3,
+                status="ok",
+            )
+
+    monkeypatch.setattr(worker, "RangeBackfillService", FakeService)
+    monkeypatch.setattr(worker.time, "sleep", lambda value: None)
+
+    assert worker.main(["--mode", "live", "--no-once", *_paths(tmp_path)]) == 0
+    assert calls == 2

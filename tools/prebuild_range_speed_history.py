@@ -18,9 +18,10 @@ from src.market_data.backfill.models import RangeBackfillRequest, RangeBackfillS
 from src.market_data.backfill.coverage import iter_utc_dates, previous_utc_day_start_ms
 from src.market_data.backfill.service import RangeBackfillService
 from src.market_data.historical_trades.okx_archive import okx_raw_symbol_from_canonical
+from src.market_data.range_checkpoint import MIN_VALID_COMPLETED_AGGREGATE_MS
 from src.utils.sqlite_backup import backup_sqlite_database
 
-SUSPICIOUS_BUCKET_CUTOFF_MS = 1_700_000_000_000
+SUSPICIOUS_BUCKET_CUTOFF_MS = MIN_VALID_COMPLETED_AGGREGATE_MS
 SQLITE_BACKUP_KEEP = 5
 
 
@@ -104,6 +105,7 @@ def main(argv: list[str] | None = None) -> int:
     request = request_from_args(args)
     progress = ProgressPrinter()
     service = RangeBackfillService(request, progress_callback=progress)
+    _handle_suspicious_aggregates(args, request)
     if args.check_only:
         coverage = service.check_coverage(direction="oldest-to-recent")
         print("Range speed coverage", flush=True)
@@ -134,31 +136,6 @@ def main(argv: list[str] | None = None) -> int:
         f"max_target_end_ms={request.max_target_end_ms}",
         flush=True,
     )
-    suspicious = suspicious_aggregate_count(request)
-    if args.clean_suspicious:
-        if suspicious > 0:
-            backup_sqlite_database(
-                request.checkpoint_db_path,
-                backup_dir=Path(args.backup_dir),
-                keep=SQLITE_BACKUP_KEEP,
-                before_backup=lambda path: print(
-                    f"SQLite backup path | source={request.checkpoint_db_path} backup={path}",
-                    flush=True,
-                ),
-            )
-        deleted = clean_suspicious_aggregates(request)
-        print(
-            "Suspicious aggregates cleaned | "
-            f"deleted={deleted} cutoff_ms={SUSPICIOUS_BUCKET_CUTOFF_MS}",
-            flush=True,
-        )
-    elif suspicious > 0:
-        print(
-            "Suspicious aggregates warning | "
-            f"count={suspicious} cutoff_ms={SUSPICIOUS_BUCKET_CUTOFF_MS} "
-            "run with --clean-suspicious to delete them",
-            flush=True,
-        )
 
     final_summary: RangeBackfillSummary | None = None
     max_cycles = max(1, int(args.max_cycles))
@@ -363,6 +340,37 @@ def print_final_summary(summary: RangeBackfillSummary) -> None:
     )
 
 
+def _handle_suspicious_aggregates(
+    args: argparse.Namespace,
+    request: RangeBackfillRequest,
+) -> None:
+    suspicious = suspicious_aggregate_count(request)
+    if args.clean_suspicious:
+        if suspicious > 0:
+            backup_sqlite_database(
+                request.checkpoint_db_path,
+                backup_dir=Path(args.backup_dir),
+                keep=SQLITE_BACKUP_KEEP,
+                before_backup=lambda path: print(
+                    f"SQLite backup path | source={request.checkpoint_db_path} backup={path}",
+                    flush=True,
+                ),
+            )
+        deleted = clean_suspicious_aggregates(request)
+        print(
+            "Suspicious aggregates cleaned | "
+            f"deleted={deleted} cutoff_ms={SUSPICIOUS_BUCKET_CUTOFF_MS}",
+            flush=True,
+        )
+    elif suspicious > 0:
+        print(
+            "Suspicious aggregates warning | "
+            f"count={suspicious} cutoff_ms={SUSPICIOUS_BUCKET_CUTOFF_MS} "
+            "run with --clean-suspicious to delete them",
+            flush=True,
+        )
+
+
 def suspicious_aggregate_count(request: RangeBackfillRequest) -> int:
     if not request.checkpoint_db_path.exists():
         return 0
@@ -375,12 +383,17 @@ def suspicious_aggregate_count(request: RangeBackfillRequest) -> int:
                 WHERE exchange = ?
                   AND symbol = ?
                   AND range_pct = ?
-                  AND bucket_end_ms < ?
+                  AND (
+                      bucket_start_ms < ?
+                      OR bucket_end_ms < ?
+                      OR bucket_end_ms <= bucket_start_ms
+                  )
                 """,
                 (
                     str(request.exchange).lower(),
                     request.symbol,
                     _decimal_text(request.range_pct),
+                    SUSPICIOUS_BUCKET_CUTOFF_MS,
                     SUSPICIOUS_BUCKET_CUTOFF_MS,
                 ),
             ).fetchone()
@@ -399,12 +412,17 @@ def clean_suspicious_aggregates(request: RangeBackfillRequest) -> int:
             WHERE exchange = ?
               AND symbol = ?
               AND range_pct = ?
-              AND bucket_end_ms < ?
+              AND (
+                  bucket_start_ms < ?
+                  OR bucket_end_ms < ?
+                  OR bucket_end_ms <= bucket_start_ms
+              )
             """,
             (
                 str(request.exchange).lower(),
                 request.symbol,
                 _decimal_text(request.range_pct),
+                SUSPICIOUS_BUCKET_CUTOFF_MS,
                 SUSPICIOUS_BUCKET_CUTOFF_MS,
             ),
         )

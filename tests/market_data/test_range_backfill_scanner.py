@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+import sqlite3
 
 from src.market_data.backfill.scanner import RangeBackfillScanner
 from src.market_data.models import RangeBarAggregate, RangeCoverageStatus
@@ -187,3 +188,41 @@ def test_scanner_caps_target_end_to_historical_complete_day(tmp_path) -> None:
 
     assert coverage.current_closed_bucket_end_ms == capped_end
     assert coverage.available is True
+
+
+def test_scanner_and_counts_ignore_suspicious_aggregate_rows(tmp_path) -> None:
+    checkpoint_path = tmp_path / "checkpoint.sqlite3"
+    store = SqliteRangeCheckpointStore(checkpoint_path)
+    with sqlite3.connect(checkpoint_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO completed_range_aggregates (
+                exchange, symbol, range_pct, bucket_start_ms, bucket_end_ms,
+                rf_bar_count, coverage_status, missing_gap_ms, completed_at_ms
+            ) VALUES ('okx', 'ETH-USDT-PERP', '0.002', 0, 14399999, 1, 'COMPLETE', 0, 1)
+            """
+        )
+
+    coverage = RangeBackfillScanner(store).scan(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+        bucket_interval="4h",
+        required_buckets=1,
+        lookback_buckets=1,
+        now_ms=1782835200000,
+    )
+
+    assert coverage.complete_history == 0
+    assert coverage.latest_complete_bucket_end_ms is None
+    assert store.load_complete_history(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+        before_bucket_end_ms=1782835200000,
+    ) == []
+    assert store.history_counts(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+    ) == (0, 0)
