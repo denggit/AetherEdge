@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 import time
 from typing import Callable, Mapping
@@ -231,7 +231,9 @@ class RangeBackfillService:
             started=started,
             coverage_before=coverage_before,
         )
-        if first.missing_raw_days and len(target_gaps) > 1:
+        if self._live_archive_is_not_ready(first):
+            results.append(first)
+        elif first.missing_raw_days and len(target_gaps) > 1:
             for gap in target_gaps:
                 result = self._run_build_window(
                     gaps=(gap,),
@@ -526,6 +528,31 @@ class RangeBackfillService:
         downloaded = 0
         missing_days: list[str] = []
         failed_downloads: list[str] = []
+        current_utc_day = self._current_utc_date()
+        unavailable_archive_days = tuple(
+            day
+            for day in days
+            if day >= current_utc_day
+            and not self.archive.local_path(raw_symbol=raw_symbol, day=day).exists()
+        )
+        if unavailable_archive_days:
+            for day in unavailable_archive_days:
+                day_iso = day.isoformat()
+                failed_url = okx_daily_trade_url(raw_symbol=raw_symbol, day=day)
+                self._raw_day_failures[(raw_symbol, day_iso)] = failed_url
+                missing_days.append(day_iso)
+                failed_downloads.append(failed_url)
+                self._emit(
+                    "raw_day_missing",
+                    day=day_iso,
+                    url=failed_url,
+                    reason="current_or_future_archive_not_ready",
+                )
+            return _BuildWindowResult(
+                missing_raw_days=tuple(missing_days),
+                failed_downloads=tuple(failed_downloads),
+                skipped_buckets_due_missing_raw=skipped_buckets,
+            )
         for day in days:
             day_iso = day.isoformat()
             cache_key = (raw_symbol, day_iso)
@@ -571,6 +598,22 @@ class RangeBackfillService:
                 skipped_buckets_due_missing_raw=skipped_buckets,
             )
         return _BuildWindowResult(downloaded_files=downloaded)
+
+    def _live_archive_is_not_ready(self, result: _BuildWindowResult) -> bool:
+        if str(self.request.mode).strip().lower() != "live" or not result.missing_raw_days:
+            return False
+        current_utc_day = self._current_utc_date()
+        parsed_days: list[date] = []
+        for value in result.missing_raw_days:
+            try:
+                parsed_days.append(date.fromisoformat(value))
+            except ValueError:
+                return False
+        return bool(parsed_days) and all(day >= current_utc_day for day in parsed_days)
+
+    def _current_utc_date(self) -> date:
+        value = self._now_ms_value if self._now_ms_value is not None else now_ms()
+        return datetime.fromtimestamp(int(value) / 1000, tz=UTC).date()
 
     def _writable_time_range(
         self,

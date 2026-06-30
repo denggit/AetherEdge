@@ -62,6 +62,9 @@ class LiveRuntimeConfig:
     range_backfill_sleep_seconds: float = 30.0
     range_backfill_heartbeat_stale_seconds: int = 180
     range_backfill_restart_cooldown_seconds: int = 300
+    range_repair_failure_cooldown_seconds: int = 3600
+    range_repair_archive_not_ready_cooldown_seconds: int = 21600
+    range_repair_daily_retry_after_utc_hour: int = 1
     range_backfill_monitor_seconds: float = 60.0
     range_backfill_status_path: str = "data/state/range_backfill_status.json"
     range_backfill_lock_path: str = "data/state/range_backfill.lock"
@@ -173,6 +176,9 @@ def live_runtime_config_from_app(
         range_backfill_sleep_seconds=float(env.get("AETHER_RANGE_BACKFILL_SLEEP_SECONDS", defaults.get("range_backfill_sleep_seconds", 30))),
         range_backfill_heartbeat_stale_seconds=int(env.get("AETHER_RANGE_BACKFILL_HEARTBEAT_STALE_SECONDS", defaults.get("range_backfill_heartbeat_stale_seconds", 180))),
         range_backfill_restart_cooldown_seconds=int(env.get("AETHER_RANGE_BACKFILL_RESTART_COOLDOWN_SECONDS", defaults.get("range_backfill_restart_cooldown_seconds", 300))),
+        range_repair_failure_cooldown_seconds=int(env.get("AETHER_RANGE_REPAIR_FAILURE_COOLDOWN_SECONDS", defaults.get("range_repair_failure_cooldown_seconds", 3600))),
+        range_repair_archive_not_ready_cooldown_seconds=int(env.get("AETHER_RANGE_REPAIR_ARCHIVE_NOT_READY_COOLDOWN_SECONDS", defaults.get("range_repair_archive_not_ready_cooldown_seconds", 21600))),
+        range_repair_daily_retry_after_utc_hour=int(env.get("AETHER_RANGE_REPAIR_DAILY_RETRY_AFTER_UTC_HOUR", defaults.get("range_repair_daily_retry_after_utc_hour", 1))),
         range_backfill_monitor_seconds=float(env.get("AETHER_RANGE_BACKFILL_MONITOR_SECONDS", defaults.get("range_backfill_monitor_seconds", 60))),
         range_backfill_status_path=str(env.get("AETHER_RANGE_BACKFILL_STATUS_PATH", defaults.get("range_backfill_status_path", "data/state/range_backfill_status.json"))),
         range_backfill_lock_path=str(env.get("AETHER_RANGE_BACKFILL_LOCK_PATH", defaults.get("range_backfill_lock_path", "data/state/range_backfill.lock"))),

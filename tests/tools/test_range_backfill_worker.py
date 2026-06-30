@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from src.market_data.backfill.models import RangeBackfillSummary
@@ -33,6 +35,14 @@ def test_worker_accepts_max_target_end_ms() -> None:
     request = worker.request_from_args(args)
 
     assert request.max_target_end_ms == 1782777599999
+
+
+def test_worker_retry_defaults_are_conservative() -> None:
+    args = worker.build_parser().parse_args([])
+
+    assert args.failure_cooldown_seconds == 3600
+    assert args.archive_not_ready_cooldown_seconds == 21600
+    assert args.daily_retry_after_utc_hour == 1
 
 
 def test_worker_low_priority_skips_os_nice_on_windows(monkeypatch) -> None:
@@ -176,3 +186,126 @@ def test_live_worker_status_running_during_cycle_sleep(tmp_path, monkeypatch) ->
 
     assert captured[0]["running"] is True
     assert captured[0]["phase"] == "sleeping"
+
+
+def test_live_worker_no_progress_exits_once_and_releases_lock(tmp_path, monkeypatch) -> None:
+    calls = 0
+
+    class FakeService:
+        def __init__(self, request) -> None:
+            pass
+
+        def run_once(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            return RangeBackfillSummary(
+                symbol="ETH-USDT-PERP",
+                exchange="okx",
+                range_pct="0.002",
+                bucket_interval="4h",
+                target_buckets=100,
+                complete_before=96,
+                complete_after=96,
+                missing_before=4,
+                missing_after=4,
+                status="no_progress",
+                missing_raw_days=("2026-06-29",),
+                failed_downloads=("https://example.test/2026-06-29.zip",),
+            )
+
+    monkeypatch.setattr(worker, "RangeBackfillService", FakeService)
+    monkeypatch.setattr(
+        worker.time,
+        "sleep",
+        lambda value: (_ for _ in ()).throw(AssertionError("must not sleep")),
+    )
+
+    assert worker.main(["--mode", "live", "--no-once", *_paths(tmp_path)]) == 0
+
+    status = RangeBackfillStatusStore(tmp_path / "status.json").read()
+    assert calls == 1
+    assert status is not None
+    assert status["running"] is False
+    assert status["phase"] == "no_progress"
+    assert status["exit_code"] == 0
+    assert status["range_speed_reason"] == "archive_gap_no_progress"
+    assert status["next_retry_after_ms"] > status["finished_at_ms"]
+    assert status["missing_raw_days"] == ["2026-06-29"]
+    assert not (tmp_path / "range.lock").exists()
+
+
+def test_live_worker_current_day_archive_missing_defers_until_next_utc_day(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    today = datetime.now(UTC).date().isoformat()
+
+    class FakeService:
+        def __init__(self, request) -> None:
+            pass
+
+        def run_once(self, **kwargs):
+            return RangeBackfillSummary(
+                symbol="ETH-USDT-PERP",
+                exchange="okx",
+                range_pct="0.002",
+                bucket_interval="4h",
+                target_buckets=100,
+                complete_before=96,
+                complete_after=96,
+                missing_before=4,
+                missing_after=4,
+                status="no_progress",
+                missing_raw_days=(today,),
+                failed_downloads=(f"https://example.test/{today}.zip",),
+            )
+
+    monkeypatch.setattr(worker, "RangeBackfillService", FakeService)
+
+    assert worker.main(["--mode", "live", "--no-once", *_paths(tmp_path)]) == 0
+
+    status = RangeBackfillStatusStore(tmp_path / "status.json").read()
+    assert status is not None
+    assert status["range_speed_reason"] == "current_day_archive_not_ready"
+    retry_at = datetime.fromtimestamp(status["next_retry_after_ms"] / 1000, tz=UTC)
+    assert retry_at.date() > datetime.now(UTC).date()
+
+
+def test_partial_cycle_with_only_current_day_missing_also_exits(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    today = datetime.now(UTC).date().isoformat()
+    calls = 0
+
+    class FakeService:
+        def __init__(self, request) -> None:
+            pass
+
+        def run_once(self, **kwargs):
+            nonlocal calls
+            calls += 1
+            return RangeBackfillSummary(
+                symbol="ETH-USDT-PERP",
+                exchange="okx",
+                range_pct="0.002",
+                bucket_interval="4h",
+                target_buckets=100,
+                complete_before=95,
+                complete_after=96,
+                missing_before=5,
+                missing_after=4,
+                aggregates_written=1,
+                status="partial",
+                missing_raw_days=(today,),
+            )
+
+    monkeypatch.setattr(worker, "RangeBackfillService", FakeService)
+    monkeypatch.setattr(
+        worker.time,
+        "sleep",
+        lambda value: (_ for _ in ()).throw(AssertionError("must not sleep")),
+    )
+
+    assert worker.main(["--mode", "live", "--no-once", *_paths(tmp_path)]) == 0
+    assert calls == 1

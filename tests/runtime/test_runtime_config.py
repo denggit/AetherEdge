@@ -41,6 +41,22 @@ def test_live_runtime_config_wraps_existing_app_config(tmp_path):
     assert cfg.background_queue_maxsize == 7
 
 
+def test_live_runtime_config_loads_range_repair_cooldowns(tmp_path):
+    cfg = live_runtime_config_from_app(
+        _app_config(),
+        defaults_path=tmp_path / "missing.json",
+        environ={
+            "AETHER_RANGE_REPAIR_FAILURE_COOLDOWN_SECONDS": "1234",
+            "AETHER_RANGE_REPAIR_ARCHIVE_NOT_READY_COOLDOWN_SECONDS": "5678",
+            "AETHER_RANGE_REPAIR_DAILY_RETRY_AFTER_UTC_HOUR": "2",
+        },
+    )
+
+    assert cfg.range_repair_failure_cooldown_seconds == 1234
+    assert cfg.range_repair_archive_not_ready_cooldown_seconds == 5678
+    assert cfg.range_repair_daily_retry_after_utc_hour == 2
+
+
 def test_live_runtime_config_injected_environ_ignores_project_master_follower_env(tmp_path, monkeypatch):
     def fake_load_env_config(env_file=None, *, environ=None):
         values = {"AETHER_FOLLOWER_EXCHANGES": "binance"}

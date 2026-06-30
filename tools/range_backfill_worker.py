@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+from datetime import UTC, date, datetime, timedelta
 import os
 from pathlib import Path
 import platform
+import re
 import sys
 import time
 
@@ -16,6 +18,13 @@ from src.market_data.backfill.lock import RangeBackfillLock
 from src.market_data.backfill.service import RangeBackfillService
 from src.market_data.backfill.status_store import RangeBackfillStatusStore, now_ms
 from src.market_data.historical_trades.okx_archive import okx_raw_symbol_from_canonical
+
+REASON_AVAILABLE = "available"
+REASON_ARCHIVE_GAP_BACKFILLING = "archive_gap_backfilling"
+REASON_ARCHIVE_GAP_NO_PROGRESS = "archive_gap_no_progress"
+REASON_CURRENT_DAY_ARCHIVE_NOT_READY = "current_day_archive_not_ready"
+REASON_REPAIR_FAILED_COOLDOWN = "repair_failed_cooldown"
+_DATE_PATTERN = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,6 +58,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-seconds-per-cycle", type=float, default=None)
     parser.add_argument("--max-trades-per-cycle", type=int, default=None)
     parser.add_argument("--max-target-end-ms", type=int, default=None)
+    parser.add_argument(
+        "--failure-cooldown-seconds",
+        type=int,
+        default=int(_env("AETHER_RANGE_REPAIR_FAILURE_COOLDOWN_SECONDS", "3600")),
+    )
+    parser.add_argument(
+        "--archive-not-ready-cooldown-seconds",
+        type=int,
+        default=int(_env("AETHER_RANGE_REPAIR_ARCHIVE_NOT_READY_COOLDOWN_SECONDS", "21600")),
+    )
+    parser.add_argument(
+        "--daily-retry-after-utc-hour",
+        type=int,
+        default=int(_env("AETHER_RANGE_REPAIR_DAILY_RETRY_AFTER_UTC_HOUR", "1")),
+    )
     return parser
 
 
@@ -124,17 +148,22 @@ def main(argv: list[str] | None = None) -> int:
             "Range speed coverage | "
             f"complete_history={coverage.complete_history} "
             f"min_periods={coverage.required_buckets} "
-            f"missing={coverage.missing_periods} available={coverage.available}"
+            f"missing={coverage.missing_periods} available={coverage.available}",
+            flush=True,
         )
         return 0
 
     status_store = RangeBackfillStatusStore(request.status_path)
     lock = RangeBackfillLock(request.lock_path, status_path=request.status_path)
     if not lock.acquire(mode=request.mode, force=request.force):
-        print(f"Range backfill lock busy | path={request.lock_path}")
+        print(f"Range backfill lock busy | path={request.lock_path}", flush=True)
         return 1
 
     exit_code = 1
+    exit_phase = "failed"
+    range_speed_reason: str | None = None
+    next_retry_after_ms: int | None = None
+    final_summary = None
     try:
         _write_process_status(
             status_store,
@@ -142,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
             phase="starting",
             running=True,
             exit_code=None,
+            range_speed_reason=REASON_ARCHIVE_GAP_BACKFILLING,
         )
         while True:
             summary = service.run_once(
@@ -152,28 +182,57 @@ def main(argv: list[str] | None = None) -> int:
                 "Range backfill cycle completed | "
                 f"status={summary.status} complete_after={summary.complete_after} "
                 f"missing_after={summary.missing_after} aggregates_written={summary.aggregates_written} "
-                f"last_error={summary.last_error}"
+                f"last_error={summary.last_error}",
+                flush=True,
             )
+            final_summary = summary
             if summary.status == "error":
                 exit_code = 1
+                exit_phase = "failed"
+                range_speed_reason = REASON_REPAIR_FAILED_COOLDOWN
+                next_retry_after_ms = now_ms() + max(0, int(args.failure_cooldown_seconds)) * 1000
                 return exit_code
             if summary.status == "dry_run":
                 exit_code = 0
+                exit_phase = "completed"
                 return exit_code
             if summary.missing_after <= 0:
                 exit_code = 0
+                exit_phase = "completed"
+                range_speed_reason = REASON_AVAILABLE
+                return exit_code
+            no_progress_reason = _no_progress_reason(summary)
+            if summary.status == "no_progress" or no_progress_reason == REASON_CURRENT_DAY_ARCHIVE_NOT_READY:
+                exit_code = 0
+                exit_phase = "no_progress"
+                range_speed_reason = no_progress_reason or REASON_ARCHIVE_GAP_NO_PROGRESS
+                next_retry_after_ms = _next_retry_after_ms(
+                    reason=range_speed_reason,
+                    failure_cooldown_seconds=int(args.failure_cooldown_seconds),
+                    archive_not_ready_cooldown_seconds=int(args.archive_not_ready_cooldown_seconds),
+                    daily_retry_after_utc_hour=int(args.daily_retry_after_utc_hour),
+                )
+                print(
+                    "Range backfill worker exiting without progress | "
+                    f"reason={range_speed_reason} next_retry_after_ms={next_retry_after_ms}",
+                    flush=True,
+                )
                 return exit_code
             if once:
                 exit_code = 0 if summary.status in {"ok", "dry_run", "partial", "no_progress"} else 1
+                exit_phase = "completed" if exit_code == 0 else "failed"
                 return exit_code
             time.sleep(max(0.0, float(args.sleep_seconds)))
     finally:
         _write_process_status(
             status_store,
             request=request,
-            phase="completed" if exit_code == 0 else "failed",
+            phase=exit_phase,
             running=False,
             exit_code=exit_code,
+            range_speed_reason=range_speed_reason,
+            next_retry_after_ms=next_retry_after_ms,
+            summary=final_summary,
         )
         lock.release()
 
@@ -191,23 +250,99 @@ def _write_process_status(
     phase: str,
     running: bool,
     exit_code: int | None,
+    range_speed_reason: str | None = None,
+    next_retry_after_ms: int | None = None,
+    summary=None,
 ) -> None:
-    status_store.patch(
-        mode=request.mode,
-        direction=request.direction,
-        pid=os.getpid(),
-        running=running,
-        phase=phase,
-        heartbeat_ms=now_ms(),
-        symbol=request.symbol,
-        exchange=request.exchange,
-        range_pct=request.range_pct,
-        bucket_interval=request.bucket_interval,
-        required_buckets=request.required_buckets,
-        lookback_buckets=request.lookback_buckets,
-        exit_code=exit_code,
-        finished_at_ms=now_ms() if not running else None,
-    )
+    payload = {
+        "mode": request.mode,
+        "direction": request.direction,
+        "pid": os.getpid(),
+        "running": running,
+        "phase": phase,
+        "heartbeat_ms": now_ms(),
+        "symbol": request.symbol,
+        "exchange": request.exchange,
+        "range_pct": request.range_pct,
+        "bucket_interval": request.bucket_interval,
+        "required_buckets": request.required_buckets,
+        "lookback_buckets": request.lookback_buckets,
+        "exit_code": exit_code,
+        "finished_at_ms": now_ms() if not running else None,
+    }
+    if range_speed_reason is not None:
+        payload["range_speed_reason"] = range_speed_reason
+        payload["range_speed_available"] = range_speed_reason == REASON_AVAILABLE
+    if next_retry_after_ms is not None:
+        payload["next_retry_after_ms"] = int(next_retry_after_ms)
+    elif running or range_speed_reason == REASON_AVAILABLE:
+        payload["next_retry_after_ms"] = None
+    if summary is not None:
+        payload.update(
+            complete_after=int(summary.complete_after),
+            missing_after=int(summary.missing_after),
+            missing_raw_days=list(summary.missing_raw_days),
+            failed_downloads=list(summary.failed_downloads),
+            last_error=summary.last_error,
+        )
+    status_store.patch(**payload)
+
+
+def _no_progress_reason(summary, *, now_ms_value: int | None = None) -> str | None:
+    failed_days = _summary_raw_days(summary)
+    if not failed_days:
+        return REASON_ARCHIVE_GAP_NO_PROGRESS if summary.status == "no_progress" else None
+    now = _utc_datetime(now_ms_value)
+    if all(day >= now.date() for day in failed_days):
+        return REASON_CURRENT_DAY_ARCHIVE_NOT_READY
+    return REASON_ARCHIVE_GAP_NO_PROGRESS if summary.status == "no_progress" else None
+
+
+def _summary_raw_days(summary) -> tuple[date, ...]:
+    values = [str(value) for value in summary.missing_raw_days]
+    values.extend(str(value) for value in summary.failed_downloads)
+    days: list[date] = []
+    for value in values:
+        for match in _DATE_PATTERN.findall(value):
+            try:
+                parsed = date.fromisoformat(match)
+            except ValueError:
+                continue
+            if parsed not in days:
+                days.append(parsed)
+    return tuple(days)
+
+
+def _next_retry_after_ms(
+    *,
+    reason: str,
+    failure_cooldown_seconds: int,
+    archive_not_ready_cooldown_seconds: int,
+    daily_retry_after_utc_hour: int,
+    now_ms_value: int | None = None,
+) -> int:
+    now = _utc_datetime(now_ms_value)
+    if reason == REASON_CURRENT_DAY_ARCHIVE_NOT_READY:
+        retry_hour = min(23, max(0, int(daily_retry_after_utc_hour)))
+        next_day = (now + timedelta(days=1)).date()
+        daily_retry = datetime(
+            next_day.year,
+            next_day.month,
+            next_day.day,
+            retry_hour,
+            tzinfo=UTC,
+        )
+        cooldown_retry = now + timedelta(seconds=max(0, int(archive_not_ready_cooldown_seconds)))
+        retry_at = max(daily_retry, cooldown_retry)
+    else:
+        retry_at = now + timedelta(seconds=max(0, int(failure_cooldown_seconds)))
+    return int(retry_at.timestamp() * 1000)
+
+
+def _utc_datetime(now_ms_value: int | None = None) -> datetime:
+    if now_ms_value is None:
+        return datetime.now(UTC)
+    return datetime.fromtimestamp(int(now_ms_value) / 1000, tz=UTC)
 
 
 def _env(name: str, default: str) -> str:

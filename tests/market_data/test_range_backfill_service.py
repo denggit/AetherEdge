@@ -290,3 +290,49 @@ def test_no_raw_available_is_no_progress_not_error(tmp_path) -> None:
     assert summary.aggregates_written == 0
     assert summary.failed_downloads
     assert summary.hint == "raw OKX trades zip missing; run downloader or remove --no-download"
+
+
+def test_live_current_day_archive_missing_exits_before_download_or_csv_read(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    request = RangeBackfillRequest(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        raw_symbol="ETH-USDT-SWAP",
+        range_pct="0.01",
+        required_buckets=1,
+        lookback_buckets=1,
+        max_buckets_per_cycle=1,
+        market_db_path=tmp_path / "market.sqlite3",
+        checkpoint_db_path=tmp_path / "checkpoint.sqlite3",
+        raw_root=tmp_path / "raw",
+        status_path=tmp_path / "status.json",
+        lock_path=tmp_path / "range.lock",
+        allow_download=True,
+        mode="live",
+    )
+    service = RangeBackfillService(request)
+    monkeypatch.setattr(
+        "src.market_data.backfill.service.OkxHistoricalTradeArchive.ensure_daily_file",
+        lambda self, **kwargs: (_ for _ in ()).throw(
+            AssertionError("current-day archive must not be downloaded")
+        ),
+    )
+    monkeypatch.setattr(
+        "src.market_data.backfill.service.iter_trade_csv_chunks",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("CSV reader must not run before every raw day is ready")
+        ),
+    )
+
+    summary = service.run_once(now_ms_value=1782835200000)
+
+    assert summary.status == "no_progress"
+    assert summary.raw_rows == 0
+    assert summary.trades_loaded == 0
+    assert summary.aggregates_written == 0
+    assert summary.missing_raw_days == ("2026-06-30",)
+    assert summary.failed_downloads[0].endswith(
+        "/20260630/ETH-USDT-SWAP-trades-2026-06-30.zip"
+    )

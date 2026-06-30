@@ -17,8 +17,17 @@ logger = get_logger(__name__)
 REASON_AVAILABLE = "available"
 REASON_INSUFFICIENT_HISTORY = "insufficient_history"
 REASON_ARCHIVE_GAP_BACKFILLING = "archive_gap_backfilling"
+REASON_ARCHIVE_GAP_NO_PROGRESS = "archive_gap_no_progress"
+REASON_CURRENT_DAY_ARCHIVE_NOT_READY = "current_day_archive_not_ready"
 REASON_CURRENT_DAY_GAP_TOO_LARGE = "current_day_gap_too_large"
 REASON_REPAIR_FAILED_COOLDOWN = "repair_failed_cooldown"
+DEFERRED_REPAIR_REASONS = frozenset(
+    {
+        REASON_ARCHIVE_GAP_NO_PROGRESS,
+        REASON_CURRENT_DAY_ARCHIVE_NOT_READY,
+        REASON_REPAIR_FAILED_COOLDOWN,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -31,6 +40,9 @@ class RangeBackfillSupervisorConfig:
     sleep_seconds: float = 30.0
     heartbeat_stale_seconds: int = 180
     restart_cooldown_seconds: int = 300
+    failure_cooldown_seconds: int = 3600
+    archive_not_ready_cooldown_seconds: int = 21600
+    daily_retry_after_utc_hour: int = 1
     monitor_seconds: float = 60.0
     status_path: Path = Path("data/state/range_backfill_status.json")
     lock_path: Path = Path("data/state/range_backfill.lock")
@@ -101,6 +113,8 @@ class RangeBackfillSupervisor:
             return False
         if self._status_shows_running_worker():
             return False
+        if self._persisted_retry_is_deferred():
+            return False
         if self._in_restart_cooldown():
             return False
         try:
@@ -122,12 +136,27 @@ class RangeBackfillSupervisor:
                 shell=False,
             )
             self._last_start_ms = now_ms()
+            self.status_store.patch(
+                range_speed_available=False,
+                range_speed_reason=REASON_ARCHIVE_GAP_BACKFILLING,
+                next_retry_after_ms=None,
+            )
             logger.warning(
                 "Range backfill worker started | pid=%s mode=live direction=recent-to-oldest",
                 self.process.pid,
             )
             return True
         except Exception as exc:
+            retry_after_ms = now_ms() + max(0, int(self.config.failure_cooldown_seconds)) * 1000
+            self.status_store.patch(
+                running=False,
+                phase="failed",
+                range_speed_available=False,
+                range_speed_reason=REASON_REPAIR_FAILED_COOLDOWN,
+                next_retry_after_ms=retry_after_ms,
+                last_error=str(exc),
+                exit_code=1,
+            )
             logger.warning("Range backfill worker failed to start | error=%s", exc)
             return False
 
@@ -154,7 +183,10 @@ class RangeBackfillSupervisor:
                     coverage,
                     archive_max_target_end_ms=archive_max_target_end_ms,
                 )
-                if (
+                deferred_reason = self._persisted_retry_reason()
+                if reason != REASON_AVAILABLE and deferred_reason is not None:
+                    reason = deferred_reason
+                elif (
                     reason == REASON_ARCHIVE_GAP_BACKFILLING
                     and not self.running
                     and self._in_restart_cooldown()
@@ -295,6 +327,12 @@ class RangeBackfillSupervisor:
             str(self.config.max_seconds_per_cycle),
             "--max-trades-per-cycle",
             str(self.config.max_trades_per_cycle),
+            "--failure-cooldown-seconds",
+            str(self.config.failure_cooldown_seconds),
+            "--archive-not-ready-cooldown-seconds",
+            str(self.config.archive_not_ready_cooldown_seconds),
+            "--daily-retry-after-utc-hour",
+            str(self.config.daily_retry_after_utc_hour),
         ]
         if max_target_end_ms is not None:
             command.extend(["--max-target-end-ms", str(int(max_target_end_ms))])
@@ -315,17 +353,24 @@ class RangeBackfillSupervisor:
         return REASON_CURRENT_DAY_GAP_TOO_LARGE
 
     def _write_coverage_status(self, coverage, *, reason: str, archive_max_target_end_ms: int) -> None:
-        self.status_store.patch(
-            range_speed_available=reason == REASON_AVAILABLE,
-            range_speed_reason=reason,
-            complete_after=int(getattr(coverage, "required_window_complete_count", 0)),
-            missing_after=int(getattr(coverage, "required_window_missing_count", 0)),
-            required_buckets=int(getattr(coverage, "required_buckets", self.config.required_buckets)),
-            lookback_buckets=int(self.config.lookback_buckets),
-            last_scanned_bucket_end_ms=getattr(coverage, "current_closed_bucket_end_ms", None),
-            archive_max_target_end_ms=archive_max_target_end_ms,
-            heartbeat_ms=now_ms(),
-        )
+        payload = {
+            "range_speed_available": reason == REASON_AVAILABLE,
+            "range_speed_reason": reason,
+            "complete_after": int(getattr(coverage, "required_window_complete_count", 0)),
+            "missing_after": int(getattr(coverage, "required_window_missing_count", 0)),
+            "required_buckets": int(
+                getattr(coverage, "required_buckets", self.config.required_buckets)
+            ),
+            "lookback_buckets": int(self.config.lookback_buckets),
+            "last_scanned_bucket_end_ms": getattr(
+                coverage, "current_closed_bucket_end_ms", None
+            ),
+            "archive_max_target_end_ms": archive_max_target_end_ms,
+            "heartbeat_ms": now_ms(),
+        }
+        if reason == REASON_AVAILABLE:
+            payload["next_retry_after_ms"] = None
+        self.status_store.patch(**payload)
 
     def _local_process_running(self) -> bool:
         if self.process is None:
@@ -347,6 +392,25 @@ class RangeBackfillSupervisor:
 
     def _in_restart_cooldown(self) -> bool:
         return self._last_start_ms > 0 and now_ms() - self._last_start_ms < self.config.restart_cooldown_seconds * 1000
+
+    def _persisted_retry_is_deferred(self) -> bool:
+        return self._persisted_retry_reason() is not None
+
+    def _persisted_retry_reason(self) -> str | None:
+        status = self.status_store.read()
+        if not status or status.get("running"):
+            return None
+        reason = str(status.get("range_speed_reason") or "")
+        if reason not in DEFERRED_REPAIR_REASONS:
+            return None
+        retry_after_ms = status.get("next_retry_after_ms")
+        if retry_after_ms is None:
+            return None
+        try:
+            deferred = int(retry_after_ms) > now_ms()
+        except (TypeError, ValueError):
+            return None
+        return reason if deferred else None
 
     def _close_stdout(self) -> None:
         handle = self._stdout_handle
