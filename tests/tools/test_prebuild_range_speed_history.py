@@ -11,6 +11,10 @@ def test_prebuild_defaults_do_not_require_db_args(monkeypatch) -> None:
 
     assert request.symbol == "ETH-USDT-PERP"
     assert str(request.market_db_path).endswith("aether_market_data.sqlite3")
+    assert request.save_raw_trades is True
+    assert request.chunk_sleep_seconds == 0.0
+    assert request.max_seconds_per_cycle == 0.0
+    assert request.max_trades_per_cycle == 0
 
 
 def test_prebuild_buckets_100_takes_effect() -> None:

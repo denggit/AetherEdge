@@ -22,7 +22,7 @@ class RangeBackfillService:
         self.request = request
         self.checkpoint_store = SqliteRangeCheckpointStore(request.checkpoint_db_path)
         self.range_bar_store = SqliteRangeBarStore(request.market_db_path)
-        self.trade_store = SqliteTradeStore(request.market_db_path)
+        self.trade_store = SqliteTradeStore(request.market_db_path) if request.save_raw_trades else None
         self.status_store = RangeBackfillStatusStore(request.status_path)
         self.archive = OkxHistoricalTradeArchive(request.raw_root)
         self._now_ms_value: int | None = None
@@ -44,7 +44,7 @@ class RangeBackfillService:
         self._now_ms_value = now_ms_value
         started = time.monotonic()
         coverage_before = self.check_coverage(now_ms_value=now_ms_value)
-        if coverage_before.available or self.request.dry_run:
+        if self._coverage_satisfied_for_mode(coverage_before) or self.request.dry_run:
             return self._finish_summary(
                 started=started,
                 before=coverage_before,
@@ -67,8 +67,8 @@ class RangeBackfillService:
                 range_pct=self.request.range_pct,
                 bucket_interval=self.request.bucket_interval,
                 target_buckets=self.request.required_buckets,
-                complete_before=coverage_before.complete_history,
-                complete_after=coverage_before.complete_history,
+                complete_before=coverage_before.required_window_complete_count,
+                complete_after=coverage_before.required_window_complete_count,
                 missing_before=coverage_before.missing_periods,
                 missing_after=coverage_before.missing_periods,
                 elapsed_seconds=time.monotonic() - started,
@@ -90,8 +90,12 @@ class RangeBackfillService:
                     "bucket_interval": self.request.bucket_interval,
                     "required_buckets": self.request.required_buckets,
                     "lookback_buckets": self.request.lookback_buckets,
-                    "complete_before": coverage_before.complete_history,
+                    "complete_before": coverage_before.required_window_complete_count,
                     "missing_before": coverage_before.missing_periods,
+                    "save_raw_trades": self.request.save_raw_trades,
+                    "chunk_sleep_seconds": self.request.chunk_sleep_seconds,
+                    "max_seconds_per_cycle": self.request.max_seconds_per_cycle,
+                    "max_trades_per_cycle": self.request.max_trades_per_cycle,
                     "last_error": None,
                 }
             )
@@ -113,7 +117,7 @@ class RangeBackfillService:
             lock.release()
 
     def _run_locked(self, *, started: float, coverage_before) -> RangeBackfillSummary:
-        target_gaps = self._select_target_gaps(tuple(coverage_before.missing_buckets))
+        target_gaps = self._select_target_gaps(self._target_gaps(coverage_before))
         if not target_gaps:
             return self._finish_summary(
                 started=started,
@@ -146,6 +150,8 @@ class RangeBackfillService:
         target_time = TimeRange(min(gap.bucket_start_ms for gap in target_gaps), latest_end)
         bars = []
         trades_loaded = 0
+        processed_through_ms: int | None = None
+        resource_limited = False
         for day in iter_utc_dates(anchor_start, latest_end):
             file_path = self.archive.local_path(raw_symbol=raw_symbol, day=day)
             for chunk in iter_trade_csv_chunks(file_path, chunksize=self.request.chunksize):
@@ -156,13 +162,31 @@ class RangeBackfillService:
                     exchange=self.request.exchange,
                 )
                 if trades:
-                    self.trade_store.save(trades)
+                    if self.trade_store is not None:
+                        self.trade_store.save(trades)
                     trades_loaded += len(trades)
+                    processed_through_ms = trades[-1].trade_time_ms or trades[-1].event_time_ms or processed_through_ms
                 for trade in trades:
                     for bar in builder.on_trade(trade):
                         if target_time.start_time_ms <= bar.end_time_ms <= target_time.end_time_ms:
                             bars.append(bar)
                 self.status_store.patch(heartbeat_ms=now_ms(), trades_loaded=trades_loaded)
+                if self.request.chunk_sleep_seconds > 0:
+                    time.sleep(float(self.request.chunk_sleep_seconds))
+                if (
+                    self.request.max_trades_per_cycle > 0
+                    and trades_loaded >= self.request.max_trades_per_cycle
+                ):
+                    resource_limited = True
+                    break
+                if (
+                    self.request.max_seconds_per_cycle > 0
+                    and time.monotonic() - started >= self.request.max_seconds_per_cycle
+                ):
+                    resource_limited = True
+                    break
+            if resource_limited:
+                break
 
         bars.sort(key=lambda item: (item.end_time_ms, item.bar_id))
         written_bars = self.range_bar_store.replace_range(
@@ -173,11 +197,13 @@ class RangeBackfillService:
         )
         bucket_ms = interval_to_ms(self.request.bucket_interval)
         target_ends = {gap.bucket_end_ms for gap in target_gaps}
+        complete_through_ms = latest_end if not resource_limited else (processed_through_ms or -1)
         aggregates = [
             aggregate
             for aggregate in RangeBarAggregator().aggregate(bars, bucket_ms=bucket_ms)
             if aggregate.bucket_end_ms in target_ends
             and aggregate.bucket_end_ms <= coverage_before.current_closed_bucket_end_ms
+            and aggregate.bucket_end_ms <= complete_through_ms
         ]
         completed_at = now_ms()
         for aggregate in aggregates:
@@ -195,8 +221,18 @@ class RangeBackfillService:
             trades_loaded=trades_loaded,
             range_bars_written=written_bars,
             aggregates_written=len(aggregates),
-            status="ok",
+            status="partial" if resource_limited else "ok",
         )
+
+    def _coverage_satisfied_for_mode(self, coverage) -> bool:
+        if str(self.request.mode).strip().lower() == "prebuild":
+            return coverage.available and not coverage.lookback_missing_buckets
+        return coverage.available
+
+    def _target_gaps(self, coverage) -> tuple[BucketGap, ...]:
+        if str(self.request.mode).strip().lower() == "live":
+            return tuple(coverage.required_window_missing_buckets)
+        return tuple(coverage.lookback_missing_buckets)
 
     def _select_target_gaps(self, gaps: tuple[BucketGap, ...]) -> tuple[BucketGap, ...]:
         selected = list(gaps[: max(1, int(self.request.max_buckets_per_cycle))])
@@ -232,8 +268,8 @@ class RangeBackfillService:
             range_pct=self.request.range_pct,
             bucket_interval=self.request.bucket_interval,
             target_buckets=self.request.required_buckets,
-            complete_before=before.complete_history,
-            complete_after=after.complete_history,
+            complete_before=before.required_window_complete_count,
+            complete_after=after.required_window_complete_count,
             missing_before=before.missing_periods,
             missing_after=after.missing_periods,
             downloaded_files=downloaded_files,
@@ -257,7 +293,7 @@ class RangeBackfillService:
                 last_completed_bucket_end_ms=after.latest_complete_bucket_end_ms,
                 last_scanned_bucket_end_ms=after.current_closed_bucket_end_ms,
                 last_error=last_error,
-                exit_code=0 if status in {"ok", "dry_run"} else 1,
+                exit_code=0 if status in {"ok", "dry_run", "partial"} else 1,
                 finished_at_ms=now_ms(),
             )
         return summary

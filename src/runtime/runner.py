@@ -3265,16 +3265,12 @@ class LiveRuntimeRunner:
         try:
             if self.runtime_config.range_backfill_enabled:
                 supervisor = self._get_range_backfill_supervisor()
-                supervisor.start_if_needed(
+                supervisor.start_monitor(
+                    stop_event=self._stop_event,
                     symbol=self.app_config.symbol,
                     exchange=self.app_config.data_exchange.value,
                     range_pct=str(self._range_pct),
                     bucket_interval=self._closed_bar_interval,
-                    complete_history=self._range_speed_complete_history,
-                    min_periods=max(
-                        self._range_speed_min_periods,
-                        self.runtime_config.range_backfill_required_buckets,
-                    ),
                 )
         except Exception as exc:
             logger.warning("Range backfill supervisor initialization failed | error=%s", exc)
@@ -3299,6 +3295,7 @@ class LiveRuntimeRunner:
                     sleep_seconds=self.runtime_config.range_backfill_sleep_seconds,
                     heartbeat_stale_seconds=self.runtime_config.range_backfill_heartbeat_stale_seconds,
                     restart_cooldown_seconds=self.runtime_config.range_backfill_restart_cooldown_seconds,
+                    monitor_seconds=self.runtime_config.range_backfill_monitor_seconds,
                     status_path=Path(self.runtime_config.range_backfill_status_path),
                     lock_path=Path(self.runtime_config.range_backfill_lock_path),
                     low_priority=self.runtime_config.range_backfill_low_priority,
@@ -3306,6 +3303,10 @@ class LiveRuntimeRunner:
                     raw_root=Path(self.runtime_config.range_backfill_raw_root),
                     market_db_path=Path(self.runtime_config.market_data_db_path),
                     checkpoint_db_path=Path(self.runtime_config.range_checkpoint_db_path),
+                    save_raw_trades=self.runtime_config.range_backfill_save_raw_trades,
+                    chunk_sleep_seconds=self.runtime_config.range_backfill_chunk_sleep_seconds,
+                    max_seconds_per_cycle=self.runtime_config.range_backfill_max_seconds_per_cycle,
+                    max_trades_per_cycle=self.runtime_config.range_backfill_max_trades_per_cycle,
                     repo_root=repo_root,
                 )
             )
@@ -3337,6 +3338,10 @@ class LiveRuntimeRunner:
                     await result
         supervisor = self._range_backfill_supervisor
         if supervisor is not None:
+            stop_async = getattr(supervisor, "stop_async", None)
+            if callable(stop_async):
+                await stop_async()
+                return
             stop = getattr(supervisor, "stop", None)
             if callable(stop):
                 await asyncio.to_thread(stop)

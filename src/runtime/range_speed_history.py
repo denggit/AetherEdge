@@ -6,8 +6,10 @@ import time
 from typing import Any
 
 from src.market_data.backfill.coverage import current_closed_bucket_end_ms
+from src.market_data.backfill.scanner import RangeBackfillScanner
 from src.market_data.backfill.status_store import RangeBackfillStatusStore
 from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
+from src.market_data.warmup.gap_detector import interval_to_ms
 from src.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -55,7 +57,8 @@ class RangeSpeedHistoryRefresher:
         self.backfill_enabled = bool(backfill_enabled)
         self.status_store = RangeBackfillStatusStore(status_path)
         self._task: asyncio.Task | None = None
-        self._last_marker: tuple[int | None, int | None] | None = None
+        self._last_marker: tuple[int, int | None, int | None, int | None] | None = None
+        self._last_coverage_marker: tuple[int, int] | None = None
         self._last_warning_ms = 0
         self._was_available: bool | None = None
         self.last_status: RangeSpeedHistoryStatus | None = None
@@ -88,6 +91,18 @@ class RangeSpeedHistoryRefresher:
         now_ms = int(time.time() * 1000)
         closed_end = current_closed_bucket_end_ms(now_ms, self.bucket_interval)
         rolling = self._rolling_window_bars()
+        min_periods = self._min_periods()
+        coverage = await asyncio.to_thread(
+            RangeBackfillScanner(self.store).scan,
+            exchange=self.exchange,
+            symbol=self.symbol,
+            range_pct=self.range_pct,
+            bucket_interval=self.bucket_interval,
+            required_buckets=min_periods,
+            lookback_buckets=rolling,
+            now_ms=now_ms,
+            direction="oldest-to-recent",
+        )
         rows = await asyncio.to_thread(
             self.store.load_complete_history,
             exchange=self.exchange,
@@ -97,11 +112,20 @@ class RangeSpeedHistoryRefresher:
             limit=rolling,
         )
         latest_end = rows[-1].bucket_end_ms if rows else None
-        latest_completed_at = rows[-1].completed_at_ms if rows else None
-        marker = (latest_end, latest_completed_at)
+        completed_at_values = [row.completed_at_ms for row in rows]
+        marker = (
+            len(rows),
+            rows[0].bucket_end_ms if rows else None,
+            latest_end,
+            max(completed_at_values) if completed_at_values else None,
+        )
+        coverage_marker = (
+            coverage.current_closed_bucket_end_ms,
+            coverage.required_window_missing_count,
+        )
         refreshed = False
-        if marker != self._last_marker:
-            values = [row.rf_bar_count for row in rows]
+        if marker != self._last_marker or coverage_marker != self._last_coverage_marker:
+            values = self._history_values_for_strategy(rows, coverage=coverage, min_periods=min_periods)
             replace = getattr(self.strategy, "replace_range_speed_history", None)
             if callable(replace):
                 replace(values)
@@ -109,8 +133,8 @@ class RangeSpeedHistoryRefresher:
             else:
                 logger.warning("Strategy has no replace_range_speed_history(); range speed refresh skipped")
             self._last_marker = marker
+            self._last_coverage_marker = coverage_marker
         complete = self._complete_history_count(default=len(rows))
-        min_periods = self._min_periods()
         status = RangeSpeedHistoryStatus(
             symbol=self.symbol,
             exchange=self.exchange,
@@ -118,9 +142,9 @@ class RangeSpeedHistoryRefresher:
             bucket_interval=self.bucket_interval,
             complete_history=complete,
             min_periods=min_periods,
-            missing_periods=max(0, min_periods - complete),
+            missing_periods=coverage.required_window_missing_count,
             rolling_window_bars=rolling,
-            available=complete >= min_periods,
+            available=coverage.available,
             latest_complete_bucket_end_ms=latest_end,
             current_closed_bucket_end_ms=closed_end,
             refreshed=refreshed,
@@ -128,6 +152,20 @@ class RangeSpeedHistoryRefresher:
         self.last_status = status
         self._log_status_if_needed(status)
         return status
+
+    def _history_values_for_strategy(self, rows, *, coverage, min_periods: int) -> list[int]:
+        if coverage.available:
+            return [row.rf_bar_count for row in rows]
+        bucket_ms = interval_to_ms(self.bucket_interval)
+        required_oldest_end = (
+            coverage.current_closed_bucket_end_ms
+            - (max(1, int(min_periods)) - 1) * bucket_ms
+        )
+        return [
+            row.rf_bar_count
+            for row in rows
+            if row.bucket_end_ms >= required_oldest_end
+        ]
 
     def _log_status_if_needed(self, status: RangeSpeedHistoryStatus) -> None:
         if status.available:

@@ -25,9 +25,11 @@ class Strategy:
 
     def __init__(self) -> None:
         self.values: list[int] = []
+        self.calls = 0
         self.range_speed_tracker = type("Tracker", (), {"complete_history_count": 0})()
 
     def replace_range_speed_history(self, values) -> int:
+        self.calls += 1
         self.values = list(values)
         self.range_speed_tracker.complete_history_count = len(self.values)
         return len(self.values)
@@ -100,3 +102,43 @@ async def test_refresher_recovery_available_without_restart(tmp_path) -> None:
 
     assert status.available is False
     assert strategy.values == []
+
+
+@pytest.mark.asyncio
+async def test_refresher_detects_older_bucket_backfill_when_latest_marker_unchanged(tmp_path) -> None:
+    store = SqliteRangeCheckpointStore(tmp_path / "checkpoint.sqlite3")
+    bucket_ms = 4 * 60 * 60_000
+    closed_end = current_closed_bucket_end_ms(int(time.time() * 1000), "4h")
+    for offset, count in ((0, 12), (1, 11)):
+        end = closed_end - offset * bucket_ms
+        store.save_completed_aggregate(
+            exchange="okx",
+            aggregate=_aggregate(end - bucket_ms + 1, end, count),
+            coverage_status=RangeCoverageStatus.COMPLETE.value,
+            completed_at_ms=end,
+        )
+    strategy = Strategy()
+    refresher = RangeSpeedHistoryRefresher(
+        strategy=strategy,
+        store=store,
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        range_pct="0.002",
+        bucket_interval="4h",
+        status_path=str(tmp_path / "status.json"),
+    )
+
+    first = await refresher.refresh_once()
+    old_end = closed_end - 2 * bucket_ms
+    store.save_completed_aggregate(
+        exchange="okx",
+        aggregate=_aggregate(old_end - bucket_ms + 1, old_end, 10),
+        coverage_status=RangeCoverageStatus.COMPLETE.value,
+        completed_at_ms=closed_end + 999,
+    )
+    second = await refresher.refresh_once()
+
+    assert first.available is False
+    assert second.available is True
+    assert strategy.values == [10, 11, 12]
+    assert strategy.calls == 2

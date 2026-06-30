@@ -21,14 +21,19 @@ class RangeSpeedCoverage:
     missing_buckets: tuple[BucketGap, ...]
     current_closed_bucket_end_ms: int
     latest_complete_bucket_end_ms: int | None
+    required_window_complete_count: int
+    required_window_missing_count: int
+    required_window_missing_buckets: tuple[BucketGap, ...]
+    lookback_missing_buckets: tuple[BucketGap, ...]
+    has_latest_closed_bucket: bool
 
     @property
     def missing_periods(self) -> int:
-        return max(0, self.required_buckets - self.complete_history)
+        return self.required_window_missing_count
 
     @property
     def available(self) -> bool:
-        return self.complete_history >= self.required_buckets
+        return self.required_window_missing_count == 0
 
 
 @dataclass(frozen=True)
@@ -55,6 +60,10 @@ class RangeBackfillRequest:
     force: bool = False
     sleep_seconds: float = 0.0
     contract_value: str = "1"
+    save_raw_trades: bool = True
+    chunk_sleep_seconds: float = 0.0
+    max_seconds_per_cycle: float = 0.0
+    max_trades_per_cycle: int = 0
 
 
 @dataclass(frozen=True)

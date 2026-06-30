@@ -36,28 +36,46 @@ class RangeBackfillScanner:
         )
         complete_ends = {row.bucket_end_ms for row in rows}
         latest_complete = max(complete_ends) if complete_ends else None
-        count_window = max(int(lookback_buckets), int(required_buckets), 1)
-        ends = [closed_end - offset * bucket_ms for offset in range(count_window)]
-        gaps = [
+        required_count = max(int(required_buckets), 1)
+        count_window = max(int(lookback_buckets), required_count, 1)
+        required_ends = [closed_end - offset * bucket_ms for offset in range(required_count)]
+        lookback_ends = [closed_end - offset * bucket_ms for offset in range(count_window)]
+        required_gaps = [
             BucketGap(
                 bucket_start_ms=bucket_start_from_end(end, bucket_interval),
                 bucket_end_ms=end,
             )
-            for end in ends
+            for end in required_ends
             if end not in complete_ends
         ]
+        lookback_gaps = [
+            BucketGap(
+                bucket_start_ms=bucket_start_from_end(end, bucket_interval),
+                bucket_end_ms=end,
+            )
+            for end in lookback_ends
+            if end not in complete_ends
+        ]
+        required_complete_count = required_count - len(required_gaps)
         if direction in {"oldest-to-recent", "oldest_to_recent"}:
-            gaps.sort(key=lambda item: item.bucket_end_ms)
+            required_gaps.sort(key=lambda item: item.bucket_end_ms)
+            lookback_gaps.sort(key=lambda item: item.bucket_end_ms)
         else:
-            gaps.sort(key=lambda item: item.bucket_end_ms, reverse=True)
+            required_gaps.sort(key=lambda item: item.bucket_end_ms, reverse=True)
+            lookback_gaps.sort(key=lambda item: item.bucket_end_ms, reverse=True)
         return RangeSpeedCoverage(
             symbol=symbol,
             exchange=str(exchange).lower(),
             range_pct=str(range_pct),
             bucket_interval=bucket_interval,
-            complete_history=len(complete_ends),
-            required_buckets=int(required_buckets),
-            missing_buckets=tuple(gaps),
+            complete_history=required_complete_count,
+            required_buckets=required_count,
+            missing_buckets=tuple(required_gaps),
             current_closed_bucket_end_ms=closed_end,
             latest_complete_bucket_end_ms=latest_complete,
+            required_window_complete_count=required_complete_count,
+            required_window_missing_count=len(required_gaps),
+            required_window_missing_buckets=tuple(required_gaps),
+            lookback_missing_buckets=tuple(lookback_gaps),
+            has_latest_closed_bucket=closed_end in complete_ends,
         )

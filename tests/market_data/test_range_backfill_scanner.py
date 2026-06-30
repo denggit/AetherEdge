@@ -70,3 +70,92 @@ def test_scanner_supports_oldest_direction(tmp_path) -> None:
     )
 
     assert coverage.missing_buckets[0].bucket_end_ms < coverage.missing_buckets[1].bucket_end_ms
+
+
+def test_older_complete_buckets_do_not_mask_recent_required_gap(tmp_path) -> None:
+    store = SqliteRangeCheckpointStore(tmp_path / "checkpoint.sqlite3")
+    bucket_ms = 4 * 60 * 60_000
+    now_ms = 1782835200000
+    closed_end = now_ms - 1
+    for offset in (0, 1, 3):
+        end = closed_end - offset * bucket_ms
+        store.save_completed_aggregate(
+            exchange="okx",
+            aggregate=_aggregate(end - bucket_ms + 1, end, 10 + offset),
+            coverage_status=RangeCoverageStatus.COMPLETE.value,
+            completed_at_ms=end,
+        )
+
+    coverage = RangeBackfillScanner(store).scan(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+        bucket_interval="4h",
+        required_buckets=3,
+        lookback_buckets=4,
+        now_ms=now_ms,
+        direction="recent-to-oldest",
+    )
+
+    assert coverage.complete_history == 2
+    assert coverage.required_window_complete_count == 2
+    assert coverage.required_window_missing_count == 1
+    assert coverage.required_window_missing_buckets[0].bucket_end_ms == closed_end - 2 * bucket_ms
+    assert coverage.available is False
+
+
+def test_recent_required_window_all_complete_is_available(tmp_path) -> None:
+    store = SqliteRangeCheckpointStore(tmp_path / "checkpoint.sqlite3")
+    bucket_ms = 4 * 60 * 60_000
+    now_ms = 1782835200000
+    closed_end = now_ms - 1
+    for offset in (0, 1, 2):
+        end = closed_end - offset * bucket_ms
+        store.save_completed_aggregate(
+            exchange="okx",
+            aggregate=_aggregate(end - bucket_ms + 1, end, 10 + offset),
+            coverage_status=RangeCoverageStatus.COMPLETE.value,
+            completed_at_ms=end,
+        )
+
+    coverage = RangeBackfillScanner(store).scan(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+        bucket_interval="4h",
+        required_buckets=3,
+        lookback_buckets=5,
+        now_ms=now_ms,
+    )
+
+    assert coverage.available is True
+    assert coverage.has_latest_closed_bucket is True
+
+
+def test_latest_closed_bucket_missing_is_unavailable(tmp_path) -> None:
+    store = SqliteRangeCheckpointStore(tmp_path / "checkpoint.sqlite3")
+    bucket_ms = 4 * 60 * 60_000
+    now_ms = 1782835200000
+    closed_end = now_ms - 1
+    for offset in (1, 2, 3):
+        end = closed_end - offset * bucket_ms
+        store.save_completed_aggregate(
+            exchange="okx",
+            aggregate=_aggregate(end - bucket_ms + 1, end, 10 + offset),
+            coverage_status=RangeCoverageStatus.COMPLETE.value,
+            completed_at_ms=end,
+        )
+
+    coverage = RangeBackfillScanner(store).scan(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+        bucket_interval="4h",
+        required_buckets=3,
+        lookback_buckets=4,
+        now_ms=now_ms,
+        direction="recent-to-oldest",
+    )
+
+    assert coverage.has_latest_closed_bucket is False
+    assert coverage.available is False

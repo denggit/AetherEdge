@@ -34,6 +34,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-download", action="store_true")
     parser.add_argument("--sleep-seconds", type=float, default=0.0)
+    parser.add_argument("--save-raw-trades", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--chunk-sleep-seconds", type=float, default=0.0)
+    parser.add_argument("--max-seconds-per-cycle", type=float, default=0.0)
+    parser.add_argument("--max-trades-per-cycle", type=int, default=0)
     return parser
 
 
@@ -62,6 +66,10 @@ def request_from_args(args: argparse.Namespace) -> RangeBackfillRequest:
         dry_run=bool(args.dry_run),
         force=bool(args.force),
         sleep_seconds=float(args.sleep_seconds),
+        save_raw_trades=bool(args.save_raw_trades),
+        chunk_sleep_seconds=float(args.chunk_sleep_seconds),
+        max_seconds_per_cycle=float(args.max_seconds_per_cycle),
+        max_trades_per_cycle=int(args.max_trades_per_cycle),
     )
 
 

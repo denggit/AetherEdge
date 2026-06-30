@@ -39,10 +39,15 @@
   "range_backfill_sleep_seconds": 30,
   "range_backfill_heartbeat_stale_seconds": 180,
   "range_backfill_restart_cooldown_seconds": 300,
+  "range_backfill_monitor_seconds": 60,
   "range_backfill_status_path": "data/state/range_backfill_status.json",
   "range_backfill_lock_path": "data/state/range_backfill.lock",
   "range_backfill_low_priority": true,
   "range_backfill_chunksize": 50000,
   "range_backfill_raw_root": "data/okx/raw/trades",
+  "range_backfill_save_raw_trades": false,
+  "range_backfill_chunk_sleep_seconds": 0.05,
+  "range_backfill_max_seconds_per_cycle": 120,
+  "range_backfill_max_trades_per_cycle": 2000000,
   "market_data_db_path": "data/market_data/aether_market_data.sqlite3"
 }

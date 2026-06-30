@@ -41,11 +41,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--no-download", action="store_true")
     parser.add_argument("--low-priority", action=argparse.BooleanOptionalAction, default=_bool(_env("AETHER_RANGE_BACKFILL_LOW_PRIORITY", "true")))
-    parser.add_argument("--once", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--once", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--save-raw-trades", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--chunk-sleep-seconds", type=float, default=None)
+    parser.add_argument("--max-seconds-per-cycle", type=float, default=None)
+    parser.add_argument("--max-trades-per-cycle", type=int, default=None)
     return parser
 
 
 def request_from_args(args: argparse.Namespace) -> RangeBackfillRequest:
+    mode = str(args.mode).strip().lower()
+    save_raw_trades = args.save_raw_trades
+    if save_raw_trades is None:
+        save_raw_trades = mode != "live"
     return RangeBackfillRequest(
         symbol=args.symbol,
         exchange=args.exchange,
@@ -68,6 +76,27 @@ def request_from_args(args: argparse.Namespace) -> RangeBackfillRequest:
         dry_run=bool(args.dry_run),
         force=bool(args.force),
         sleep_seconds=float(args.sleep_seconds),
+        save_raw_trades=bool(save_raw_trades),
+        chunk_sleep_seconds=_mode_float_default(
+            args.chunk_sleep_seconds,
+            mode=mode,
+            live_default=float(_env("AETHER_RANGE_BACKFILL_CHUNK_SLEEP_SECONDS", "0.05")),
+            prebuild_default=0.0,
+        ),
+        max_seconds_per_cycle=_mode_float_default(
+            args.max_seconds_per_cycle,
+            mode=mode,
+            live_default=float(_env("AETHER_RANGE_BACKFILL_MAX_SECONDS_PER_CYCLE", "120")),
+            prebuild_default=0.0,
+        ),
+        max_trades_per_cycle=int(
+            _mode_float_default(
+                args.max_trades_per_cycle,
+                mode=mode,
+                live_default=float(_env("AETHER_RANGE_BACKFILL_MAX_TRADES_PER_CYCLE", "2000000")),
+                prebuild_default=0.0,
+            )
+        ),
     )
 
 
@@ -81,6 +110,7 @@ def maybe_lower_priority(enabled: bool) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    once = resolve_once(args)
     maybe_lower_priority(bool(args.low_priority))
     request = request_from_args(args)
     service = RangeBackfillService(request)
@@ -102,11 +132,21 @@ def main(argv: list[str] | None = None) -> int:
             f"missing_after={summary.missing_after} aggregates_written={summary.aggregates_written} "
             f"last_error={summary.last_error}"
         )
-        if summary.status not in {"ok", "dry_run"}:
+        if summary.status == "error":
             return 1
-        if summary.missing_after <= 0 or args.once:
+        if summary.status == "dry_run":
             return 0
+        if summary.missing_after <= 0:
+            return 0
+        if once:
+            return 0 if summary.status in {"ok", "dry_run", "partial"} else 1
         time.sleep(max(0.0, float(args.sleep_seconds)))
+
+
+def resolve_once(args: argparse.Namespace) -> bool:
+    if args.once is not None:
+        return bool(args.once)
+    return str(args.mode).strip().lower() != "live"
 
 
 def _env(name: str, default: str) -> str:
@@ -115,6 +155,12 @@ def _env(name: str, default: str) -> str:
 
 def _bool(value: str) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _mode_float_default(value, *, mode: str, live_default: float, prebuild_default: float) -> float:
+    if value is not None:
+        return float(value)
+    return float(live_default if mode == "live" else prebuild_default)
 
 
 if __name__ == "__main__":

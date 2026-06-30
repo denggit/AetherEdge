@@ -45,3 +45,50 @@ def test_warning_log_is_rate_limited(tmp_path, caplog) -> None:
     messages = [record.message for record in caplog.records if "range-speed history still insufficient" in record.message]
     assert len(messages) == 1
     assert "backfill_process_running" in messages[0]
+
+
+def test_warning_stops_when_history_available(tmp_path, caplog) -> None:
+    refresher = RangeSpeedHistoryRefresher(
+        strategy=DummyStrategy(),
+        store=object(),
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        range_pct="0.002",
+        bucket_interval="4h",
+        warning_seconds=600,
+        status_path=str(tmp_path / "status.json"),
+    )
+    insufficient = RangeSpeedHistoryStatus(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        range_pct="0.002",
+        bucket_interval="4h",
+        complete_history=1,
+        min_periods=3,
+        missing_periods=2,
+        rolling_window_bars=100,
+        available=False,
+        latest_complete_bucket_end_ms=None,
+        current_closed_bucket_end_ms=123,
+    )
+    available = RangeSpeedHistoryStatus(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        range_pct="0.002",
+        bucket_interval="4h",
+        complete_history=3,
+        min_periods=3,
+        missing_periods=0,
+        rolling_window_bars=100,
+        available=True,
+        latest_complete_bucket_end_ms=123,
+        current_closed_bucket_end_ms=123,
+        refreshed=True,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        refresher._log_status_if_needed(insufficient)
+        refresher._log_status_if_needed(available)
+
+    warnings = [record.message for record in caplog.records if "still insufficient" in record.message]
+    assert len(warnings) == 1

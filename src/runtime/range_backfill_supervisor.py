@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 import subprocess
 import sys
-import time
 
+from src.market_data.backfill.scanner import RangeBackfillScanner
 from src.market_data.backfill.status_store import RangeBackfillStatusStore, now_ms
+from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
 from src.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -22,6 +24,7 @@ class RangeBackfillSupervisorConfig:
     sleep_seconds: float = 30.0
     heartbeat_stale_seconds: int = 180
     restart_cooldown_seconds: int = 300
+    monitor_seconds: float = 60.0
     status_path: Path = Path("data/state/range_backfill_status.json")
     lock_path: Path = Path("data/state/range_backfill.lock")
     low_priority: bool = True
@@ -29,6 +32,10 @@ class RangeBackfillSupervisorConfig:
     raw_root: Path = Path("data/okx/raw/trades")
     market_db_path: Path = Path("data/market_data/aether_market_data.sqlite3")
     checkpoint_db_path: Path = Path("data/state/range_builder_checkpoint.sqlite3")
+    save_raw_trades: bool = False
+    chunk_sleep_seconds: float = 0.05
+    max_seconds_per_cycle: float = 120.0
+    max_trades_per_cycle: int = 2_000_000
     repo_root: Path = Path(".")
 
 
@@ -39,6 +46,36 @@ class RangeBackfillSupervisor:
         self.process: subprocess.Popen | None = None
         self._last_start_ms = 0
         self._stdout_handle = None
+        self._monitor_task: asyncio.Task | None = None
+
+    def start_monitor(
+        self,
+        *,
+        stop_event: asyncio.Event,
+        symbol: str,
+        exchange: str,
+        range_pct: str,
+        bucket_interval: str,
+    ) -> None:
+        if self._monitor_task is not None and not self._monitor_task.done():
+            return
+        self._monitor_task = asyncio.create_task(
+            self._monitor_loop(
+                stop_event=stop_event,
+                symbol=symbol,
+                exchange=exchange,
+                range_pct=range_pct,
+                bucket_interval=bucket_interval,
+            )
+        )
+
+    async def stop_async(self, *, timeout_seconds: float = 2.0) -> None:
+        task = self._monitor_task
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            self._monitor_task = None
+        await asyncio.to_thread(self.stop, timeout_seconds=timeout_seconds)
 
     def start_if_needed(
         self,
@@ -84,6 +121,66 @@ class RangeBackfillSupervisor:
         except Exception as exc:
             logger.warning("Range backfill worker failed to start | error=%s", exc)
             return False
+
+    async def _monitor_loop(
+        self,
+        *,
+        stop_event: asyncio.Event,
+        symbol: str,
+        exchange: str,
+        range_pct: str,
+        bucket_interval: str,
+    ) -> None:
+        while not stop_event.is_set():
+            try:
+                coverage = await asyncio.to_thread(
+                    self._scan_coverage,
+                    symbol=symbol,
+                    exchange=exchange,
+                    range_pct=range_pct,
+                    bucket_interval=bucket_interval,
+                )
+                if not coverage.available:
+                    self.start_if_needed(
+                        symbol=symbol,
+                        exchange=exchange,
+                        range_pct=range_pct,
+                        bucket_interval=bucket_interval,
+                        complete_history=coverage.required_window_complete_count,
+                        min_periods=coverage.required_buckets,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Range backfill supervisor monitor failed | error=%s", exc)
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(),
+                    timeout=max(1.0, float(self.config.monitor_seconds)),
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    def _scan_coverage(
+        self,
+        *,
+        symbol: str,
+        exchange: str,
+        range_pct: str,
+        bucket_interval: str,
+    ):
+        scanner = RangeBackfillScanner(
+            SqliteRangeCheckpointStore(self.config.checkpoint_db_path)
+        )
+        return scanner.scan(
+            exchange=exchange,
+            symbol=symbol,
+            range_pct=range_pct,
+            bucket_interval=bucket_interval,
+            required_buckets=self.config.required_buckets,
+            lookback_buckets=self.config.lookback_buckets,
+            direction="recent-to-oldest",
+        )
 
     def stop(self, *, timeout_seconds: float = 2.0) -> None:
         process = self.process
@@ -156,6 +253,14 @@ class RangeBackfillSupervisor:
             "--raw-root",
             str(self.config.raw_root),
             "--low-priority" if self.config.low_priority else "--no-low-priority",
+            "--no-once",
+            "--save-raw-trades" if self.config.save_raw_trades else "--no-save-raw-trades",
+            "--chunk-sleep-seconds",
+            str(self.config.chunk_sleep_seconds),
+            "--max-seconds-per-cycle",
+            str(self.config.max_seconds_per_cycle),
+            "--max-trades-per-cycle",
+            str(self.config.max_trades_per_cycle),
         ]
 
     def _local_process_running(self) -> bool:
@@ -163,6 +268,8 @@ class RangeBackfillSupervisor:
             return False
         if self.process.poll() is None:
             return True
+        self.process = None
+        self._close_stdout()
         return False
 
     def _status_shows_running_worker(self) -> bool:
