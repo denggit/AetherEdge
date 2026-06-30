@@ -12,7 +12,6 @@ def test_exchange_rest_endpoints_stay_inside_exchange_adapters():
     allowed_parts = {
         ("src", "platform", "exchanges", "okx", "client.py"),
         ("src", "platform", "exchanges", "okx", "historical_data.py"),
-        ("src", "platform", "exchanges", "okx", "rest_tail_trades.py"),
         ("src", "platform", "exchanges", "binance", "client.py"),
     }
     forbidden_tokens = ["/api/v5", "/fapi/"]
