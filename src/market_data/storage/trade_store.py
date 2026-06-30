@@ -15,14 +15,8 @@ from src.platform.exchanges.models import ExchangeName
 class SqliteTradeStore:
     """SQLite repository for normalized trades used by internal warmup."""
 
-    def __init__(
-        self,
-        path: str | Path = "data/market_data/aether_market_data.sqlite3",
-        *,
-        busy_timeout_ms: int = 5_000,
-    ) -> None:
+    def __init__(self, path: str | Path = "data/market_data/aether_market_data.sqlite3") -> None:
         self.path = Path(path)
-        self.busy_timeout_ms = max(0, int(busy_timeout_ms))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
@@ -135,11 +129,10 @@ class SqliteTradeStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_coverage_lookup ON trade_coverage(symbol, source, start_time_ms, end_time_ms)")
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=max(self.busy_timeout_ms / 1000, 0.0))
+        conn = sqlite3.connect(self.path)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA temp_store=MEMORY")
-        conn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
         return conn
 
 

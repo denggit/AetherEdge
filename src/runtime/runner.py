@@ -5,7 +5,6 @@ import os
 import time
 from dataclasses import dataclass
 from decimal import Decimal
-from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from src.app import AppConfig, AppContext
@@ -20,7 +19,6 @@ from src.market_data.range_checkpoint import (
     SqliteRangeCheckpointStore,
     aggregate_snapshot,
 )
-from src.market_data.realtime_trade_recorder import RealtimeTradeRecorder, RealtimeTradeRecorderConfig
 from src.market_data.storage import SqliteKlineStore, SqliteRangeBarStore
 from src.market_data.warmup.gap_detector import interval_to_ms
 from src.market_data.warmup.service import KlineWarmupService
@@ -59,7 +57,6 @@ from src.runtime.startup_catchup import (
 from src.runtime.orders import LiveOrderIntentFactory
 from src.runtime.recovery.service import RecoveryExchangeContext, RuntimeRecoveryService
 from src.runtime.recovery.models import RecoveryReport
-from src.runtime.range_backfill_supervisor import RangeBackfillSupervisor
 from src.runtime.tasks import ClosedBarScheduler, ProducerHealthMonitor, ProducerSupervisor
 from src.runtime.tasks.scheduler import closed_bar_open_time_ms
 from src.signals import TradeSignal
@@ -234,10 +231,6 @@ class LiveRuntimeRunner:
         self._startup_catchup_evaluated = False
         self._range_speed_warmup_excluded_previous = False
         self._startup_catchup_range_observed = False
-        self._realtime_trade_recorder = self.services.get("realtime_trade_recorder")
-        self._range_backfill_supervisor = self.services.get("range_backfill_supervisor")
-        self._range_backfill_worker_pid: int | None = None
-        self._last_range_speed_warning_ms = 0
 
     async def run(self, *, max_market_events: int | None = None) -> LiveRuntimeStats:
         logger.info(
@@ -274,8 +267,6 @@ class LiveRuntimeRunner:
         finally:
             await self._stop_sync_tasks()
             await self._stop_producers()
-            await self._stop_realtime_trade_recorder()
-            self._stop_range_backfill_supervisor_if_configured()
             await self._stop_range_checkpoint_writer()
             await self.context.alerts.stop()
 
@@ -661,8 +652,6 @@ class LiveRuntimeRunner:
 
     async def _startup(self) -> None:
         logger.info("Live runtime startup phase started")
-        self._start_realtime_trade_recorder()
-        self._start_range_backfill_supervisor()
         self._initialize_rangebar_trust_window()
         self._set_health(RuntimePhase.WARMING_UP, healthy=True)
         await self._bootstrap_account_config_if_enabled()
@@ -852,20 +841,12 @@ class LiveRuntimeRunner:
             self.context.strategy.config.entry_filters.range_speed_min_periods
         )
         log = logger.info if loaded >= min_periods else logger.warning
-        if loaded >= min_periods or self._should_log_range_speed_warning(now_ms):
-            supervisor = self._range_backfill_supervisor
-            status = supervisor.read_status() if supervisor is not None and hasattr(supervisor, "read_status") else None
-            plan = status.get("plan", {}) if isinstance(status, dict) else {}
-            log(
-                "V10A range-speed history warmup | complete_history=%s min_periods=%s available=%s continuous_complete_buckets_from_latest=%s nearest_missing_bucket=%s backfill_worker_pid=%s backfill_worker_status_json=%s",
-                loaded,
-                min_periods,
-                loaded >= min_periods,
-                plan.get("continuous_complete_buckets_from_latest") if isinstance(plan, dict) else None,
-                plan.get("nearest_missing_bucket_start_ms") if isinstance(plan, dict) else None,
-                self._range_backfill_worker_pid,
-                getattr(supervisor, "status_json", None),
-            )
+        log(
+            "V10A range-speed history warmup | complete_history=%s min_periods=%s available=%s",
+            loaded,
+            min_periods,
+            loaded >= min_periods,
+        )
 
     async def _finish_range_speed_warmup_after_catchup(self) -> None:
         if (
@@ -2331,7 +2312,6 @@ class LiveRuntimeRunner:
                 break
 
     async def _process_trade(self, trade: MarketTrade) -> None:
-        self._record_realtime_trade(trade)
         if not self.requirements.range_bars.enabled:
             return
         builder = self._get_range_bar_builder()
@@ -2368,40 +2348,6 @@ class LiveRuntimeRunner:
                 self.stats.range_bars_closed += 1
                 await self.process_market_feature(range_bar_closed_feature(bar, exchange=trade.exchange))
         self._submit_range_checkpoint_if_due(trade)
-
-    def _record_realtime_trade(self, trade: MarketTrade) -> None:
-        recorder = self._realtime_trade_recorder
-        if recorder is None:
-            return
-        submit = getattr(recorder, "submit", None)
-        if not callable(submit):
-            return
-        try:
-            ok = bool(submit(trade))
-        except Exception as exc:  # noqa: BLE001 - recorder failure must not block trade path
-            ok = False
-            logger.error("Realtime trade recorder submit failed | error=%s", exc)
-        if ok:
-            return
-        trade_time_ms = _event_time_ms(trade) or int(time.time() * 1000)
-        bucket_start = (trade_time_ms // self._closed_bar_interval_ms) * self._closed_bar_interval_ms
-        self._range_context_degraded_buckets[bucket_start] = "realtime_trade_recorder_queue_full"
-        logger.error(
-            "Realtime trade recorder queue full; bucket marked degraded | symbol=%s bucket_start_ms=%s",
-            trade.symbol,
-            bucket_start,
-        )
-        self.context.alerts.emit(
-            AppAlert(
-                subject="AetherEdge realtime trade recorder queue full",
-                content=f"symbol={trade.symbol} bucket_start_ms={bucket_start}",
-                severity="error",
-            )
-        )
-        try:
-            asyncio.create_task(asyncio.to_thread(self._mark_range_bucket_dirty, trade.exchange.value, trade.symbol, bucket_start))
-        except RuntimeError:
-            pass
 
     def _submit_range_checkpoint_if_due(self, trade: MarketTrade) -> bool:
         now_ms = int(time.time() * 1000)
@@ -3280,127 +3226,6 @@ class LiveRuntimeRunner:
                 on_error=on_error,
             )
         return self._range_checkpoint_writer
-
-    def _start_realtime_trade_recorder(self) -> None:
-        if not self.runtime_config.realtime_trade_recording_enabled:
-            return
-        if self._realtime_trade_recorder is None:
-            def on_error(exc: BaseException) -> None:
-                logger.warning("Realtime trade recorder write failed | error=%s", exc)
-
-            self._realtime_trade_recorder = RealtimeTradeRecorder(
-                RealtimeTradeRecorderConfig(
-                    db_path=self.runtime_config.realtime_trade_db_path,
-                    batch_size=self.runtime_config.realtime_trade_writer_batch_size,
-                    flush_interval_ms=self.runtime_config.realtime_trade_writer_flush_interval_ms,
-                    queue_maxsize=self.runtime_config.realtime_trade_writer_queue_maxsize,
-                    busy_timeout_ms=100,
-                ),
-                on_error=on_error,
-            )
-        start = getattr(self._realtime_trade_recorder, "start", None)
-        if callable(start):
-            start()
-
-    async def _stop_realtime_trade_recorder(self) -> None:
-        recorder = self._realtime_trade_recorder
-        if recorder is None:
-            return
-        stop = getattr(recorder, "stop", None)
-        if callable(stop):
-            await asyncio.to_thread(stop, flush=True)
-
-    def _start_range_backfill_supervisor(self) -> None:
-        if self.runtime_config.mode is not RuntimeMode.LIVE_RUNTIME:
-            return
-        if not (self.runtime_config.range_backfill_enabled and self.runtime_config.range_backfill_autostart):
-            return
-        if self._range_backfill_supervisor is None:
-            self._range_backfill_supervisor = RangeBackfillSupervisor(project_root=Path.cwd())
-        try:
-            raw_symbol = self.context.data.market_profile.raw_symbol(self.app_config.data_exchange)
-        except Exception:
-            raw_symbol = self.app_config.symbol
-        args = [
-            "--symbol",
-            self.app_config.symbol,
-            "--raw-symbol",
-            raw_symbol,
-            "--exchange",
-            self.app_config.data_exchange.value,
-            "--range-pct",
-            str(self._range_pct),
-            "--bucket-interval",
-            self._range_aggregate_interval,
-            "--required-buckets",
-            str(self.runtime_config.range_backfill_required_buckets),
-            "--lookback-buckets",
-            str(self.runtime_config.range_backfill_lookback_buckets),
-            "--market-db",
-            self.runtime_config.realtime_trade_db_path,
-            "--checkpoint-db",
-            self.runtime_config.range_checkpoint_db_path,
-            "--warning-interval-seconds",
-            str(self.runtime_config.range_backfill_warning_interval_seconds),
-        ]
-        try:
-            pid = self._range_backfill_supervisor.start(args=args)
-            self._range_backfill_worker_pid = pid
-            logger.info("Range backfill worker supervisor started | pid=%s", pid)
-        except Exception as exc:  # noqa: BLE001 - live must continue without worker
-            logger.warning("Range backfill worker autostart failed | error=%s", exc)
-
-    def _stop_range_backfill_supervisor_if_configured(self) -> None:
-        supervisor = self._range_backfill_supervisor
-        if supervisor is None:
-            return
-        stop = getattr(supervisor, "stop_if_configured", None)
-        if callable(stop):
-            stop()
-
-    def _mark_range_bucket_dirty(self, exchange: str, symbol: str, bucket_start_ms: int) -> None:
-        import sqlite3
-
-        bucket_end_ms = bucket_start_ms + self._closed_bar_interval_ms - 1
-        with sqlite3.connect(self.runtime_config.range_checkpoint_db_path, timeout=0.1) as conn:
-            conn.execute("PRAGMA busy_timeout=100")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS range_backfill_dirty_buckets (
-                    exchange TEXT NOT NULL,
-                    symbol TEXT NOT NULL,
-                    range_pct TEXT NOT NULL,
-                    bucket_start_ms INTEGER NOT NULL,
-                    bucket_end_ms INTEGER NOT NULL,
-                    reason TEXT NOT NULL,
-                    updated_at_ms INTEGER NOT NULL,
-                    PRIMARY KEY(exchange, symbol, range_pct, bucket_start_ms)
-                )
-                """
-            )
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO range_backfill_dirty_buckets (
-                    exchange, symbol, range_pct, bucket_start_ms, bucket_end_ms, reason, updated_at_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(exchange).lower(),
-                    symbol,
-                    str(self._range_pct),
-                    bucket_start_ms,
-                    bucket_end_ms,
-                    "realtime_trade_recorder_queue_full",
-                    int(time.time() * 1000),
-                ),
-            )
-
-    def _should_log_range_speed_warning(self, now_ms: int) -> bool:
-        interval_ms = max(1, self.runtime_config.range_backfill_warning_interval_seconds) * 1000
-        if now_ms - self._last_range_speed_warning_ms < interval_ms:
-            return False
-        self._last_range_speed_warning_ms = now_ms
-        return True
 
     async def _stop_range_checkpoint_writer(self) -> None:
         writer = self._range_checkpoint_writer

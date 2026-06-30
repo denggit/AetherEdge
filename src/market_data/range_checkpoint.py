@@ -72,14 +72,8 @@ class CompletedRangeAggregate:
 class SqliteRangeCheckpointStore:
     """Latest builder checkpoint and completed aggregate history in SQLite."""
 
-    def __init__(
-        self,
-        path: str | Path = DEFAULT_RANGE_CHECKPOINT_DB,
-        *,
-        busy_timeout_ms: int = 5_000,
-    ) -> None:
+    def __init__(self, path: str | Path = DEFAULT_RANGE_CHECKPOINT_DB) -> None:
         self.path = Path(path)
-        self.busy_timeout_ms = max(0, int(busy_timeout_ms))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
@@ -381,10 +375,10 @@ class SqliteRangeCheckpointStore:
             )
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=max(self.busy_timeout_ms / 1000, 0.0))
+        conn = sqlite3.connect(self.path, timeout=5.0)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
+        conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
 
