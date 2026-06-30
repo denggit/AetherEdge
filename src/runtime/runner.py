@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from pathlib import Path
 import time
 from dataclasses import dataclass
 from decimal import Decimal
@@ -47,6 +48,8 @@ from src.runtime.config import LiveRuntimeConfig, live_runtime_config_from_app
 from src.runtime.features import closed_kline_feature, range_aggregate_feature, range_aggregate_unavailable_feature, range_bar_closed_feature
 from src.runtime.heartbeat import RuntimeHeartbeatService
 from src.runtime.models import RuntimeHealth, RuntimeMode, RuntimePhase
+from src.runtime.range_backfill_supervisor import RangeBackfillSupervisor, RangeBackfillSupervisorConfig
+from src.runtime.range_speed_history import RangeSpeedHistoryRefresher
 from src.runtime.requirements import StrategyRuntimeRequirements, resolve_strategy_runtime_requirements
 from src.runtime.startup_catchup import (
     StartupCatchupConfig,
@@ -231,6 +234,10 @@ class LiveRuntimeRunner:
         self._startup_catchup_evaluated = False
         self._range_speed_warmup_excluded_previous = False
         self._startup_catchup_range_observed = False
+        self._range_speed_complete_history = 0
+        self._range_speed_min_periods = 0
+        self._range_backfill_supervisor = self.services.get("range_backfill_supervisor")
+        self._range_speed_history_refresher = self.services.get("range_speed_history_refresher")
 
     async def run(self, *, max_market_events: int | None = None) -> LiveRuntimeStats:
         logger.info(
@@ -265,6 +272,7 @@ class LiveRuntimeRunner:
             self.context.alerts.emit(AppAlert(subject="AetherEdge live runtime error", content=str(exc), severity="error"))
             raise
         finally:
+            await self._stop_range_speed_background_services()
             await self._stop_sync_tasks()
             await self._stop_producers()
             await self._stop_range_checkpoint_writer()
@@ -276,6 +284,7 @@ class LiveRuntimeRunner:
 
     async def stop(self) -> RuntimeHealth:
         self._stop_event.set()
+        await self._stop_range_speed_background_services()
         await self._stop_producers()
         self._set_health(RuntimePhase.STOPPED, healthy=True)
         return self._health
@@ -656,7 +665,17 @@ class LiveRuntimeRunner:
         self._set_health(RuntimePhase.WARMING_UP, healthy=True)
         await self._bootstrap_account_config_if_enabled()
         await self._run_warmup()
-        await self._warmup_range_speed_history()
+        loaded_range_speed_history = await self._warmup_range_speed_history()
+        if (
+            self._range_speed_min_periods > 0
+            and loaded_range_speed_history < self._range_speed_min_periods
+        ):
+            logger.warning(
+                "V10A range-speed history insufficient; live runtime continues | complete_history=%s min_periods=%s missing=%s",
+                loaded_range_speed_history,
+                self._range_speed_min_periods,
+                self._range_speed_min_periods - loaded_range_speed_history,
+            )
         self._set_health(RuntimePhase.CATCHING_UP, healthy=True, warmup_complete=True)
         snapshots = await self._run_recovery()
         # ── State convergence: reconcile exchange truth against local state ──
@@ -674,6 +693,7 @@ class LiveRuntimeRunner:
         self._heartbeat_service.start(
             runtime_id=f"{self.app_config.strategy}::{self.app_config.symbol}",
         )
+        self._start_range_speed_background_services()
         self._set_health(RuntimePhase.RUNNING, healthy=True, warmup_complete=True, caught_up=True)
         logger.info("Live runtime startup phase completed")
 
@@ -799,14 +819,14 @@ class LiveRuntimeRunner:
             recovery.missing_gap_ms,
         )
 
-    async def _warmup_range_speed_history(self) -> None:
+    async def _warmup_range_speed_history(self) -> int:
         if not self.requirements.range_bars.enabled:
-            return
+            return 0
         warmup = getattr(
             self.context.strategy, "warmup_range_speed_history", None
         )
         if not callable(warmup):
-            return
+            return 0
         now_ms = int(time.time() * 1000)
         current_bucket = (
             now_ms // self._closed_bar_interval_ms
@@ -842,6 +862,14 @@ class LiveRuntimeRunner:
         min_periods = int(
             self.context.strategy.config.entry_filters.range_speed_min_periods
         )
+        self._range_speed_complete_history = int(
+            getattr(
+                getattr(self.context.strategy, "range_speed_tracker", None),
+                "complete_history_count",
+                loaded,
+            )
+        )
+        self._range_speed_min_periods = min_periods
         log = logger.info if loaded >= min_periods else logger.warning
         log(
             "V10A range-speed history warmup | complete_history=%s min_periods=%s available=%s",
@@ -849,6 +877,7 @@ class LiveRuntimeRunner:
             min_periods,
             loaded >= min_periods,
         )
+        return int(loaded)
 
     async def _finish_range_speed_warmup_after_catchup(self) -> None:
         if (
@@ -875,7 +904,8 @@ class LiveRuntimeRunner:
             limit=1,
         )
         if rows and rows[-1].bucket_end_ms == previous_end:
-            warmup([rows[-1].rf_bar_count])
+            count = warmup([rows[-1].rf_bar_count])
+            self._range_speed_complete_history += int(count)
 
     async def _run_warmup(self) -> None:
         warmup_services = self.services.get("warmup_services") or self.services.get("warmup_service")
@@ -3228,6 +3258,88 @@ class LiveRuntimeRunner:
                 on_error=on_error,
             )
         return self._range_checkpoint_writer
+
+    def _start_range_speed_background_services(self) -> None:
+        if not self.requirements.range_bars.enabled:
+            return
+        try:
+            if self.runtime_config.range_backfill_enabled:
+                supervisor = self._get_range_backfill_supervisor()
+                supervisor.start_if_needed(
+                    symbol=self.app_config.symbol,
+                    exchange=self.app_config.data_exchange.value,
+                    range_pct=str(self._range_pct),
+                    bucket_interval=self._closed_bar_interval,
+                    complete_history=self._range_speed_complete_history,
+                    min_periods=max(
+                        self._range_speed_min_periods,
+                        self.runtime_config.range_backfill_required_buckets,
+                    ),
+                )
+        except Exception as exc:
+            logger.warning("Range backfill supervisor initialization failed | error=%s", exc)
+
+        try:
+            if self.runtime_config.range_speed_refresh_enabled:
+                refresher = self._get_range_speed_history_refresher()
+                refresher.start(self._stop_event)
+        except Exception as exc:
+            logger.warning("Range speed history refresher initialization failed | error=%s", exc)
+
+    def _get_range_backfill_supervisor(self) -> RangeBackfillSupervisor:
+        if self._range_backfill_supervisor is None:
+            repo_root = Path(__file__).resolve().parents[2]
+            self._range_backfill_supervisor = RangeBackfillSupervisor(
+                RangeBackfillSupervisorConfig(
+                    enabled=self.runtime_config.range_backfill_enabled,
+                    required_buckets=self.runtime_config.range_backfill_required_buckets,
+                    lookback_buckets=self.runtime_config.range_backfill_lookback_buckets,
+                    max_buckets_per_cycle=self.runtime_config.range_backfill_max_buckets_per_cycle,
+                    max_days_per_cycle=self.runtime_config.range_backfill_max_days_per_cycle,
+                    sleep_seconds=self.runtime_config.range_backfill_sleep_seconds,
+                    heartbeat_stale_seconds=self.runtime_config.range_backfill_heartbeat_stale_seconds,
+                    restart_cooldown_seconds=self.runtime_config.range_backfill_restart_cooldown_seconds,
+                    status_path=Path(self.runtime_config.range_backfill_status_path),
+                    lock_path=Path(self.runtime_config.range_backfill_lock_path),
+                    low_priority=self.runtime_config.range_backfill_low_priority,
+                    chunksize=self.runtime_config.range_backfill_chunksize,
+                    raw_root=Path(self.runtime_config.range_backfill_raw_root),
+                    market_db_path=Path(self.runtime_config.market_data_db_path),
+                    checkpoint_db_path=Path(self.runtime_config.range_checkpoint_db_path),
+                    repo_root=repo_root,
+                )
+            )
+        return self._range_backfill_supervisor
+
+    def _get_range_speed_history_refresher(self) -> RangeSpeedHistoryRefresher:
+        if self._range_speed_history_refresher is None:
+            self._range_speed_history_refresher = RangeSpeedHistoryRefresher(
+                strategy=self.context.strategy,
+                store=self._get_range_checkpoint_store(),
+                symbol=self.app_config.symbol,
+                exchange=self.app_config.data_exchange.value,
+                range_pct=str(self._range_pct),
+                bucket_interval=self._closed_bar_interval,
+                refresh_seconds=self.runtime_config.range_speed_refresh_seconds,
+                warning_seconds=self.runtime_config.range_speed_status_warning_seconds,
+                backfill_enabled=self.runtime_config.range_backfill_enabled,
+                status_path=self.runtime_config.range_backfill_status_path,
+            )
+        return self._range_speed_history_refresher
+
+    async def _stop_range_speed_background_services(self) -> None:
+        refresher = self._range_speed_history_refresher
+        if refresher is not None:
+            stop = getattr(refresher, "stop", None)
+            if callable(stop):
+                result = stop()
+                if asyncio.iscoroutine(result):
+                    await result
+        supervisor = self._range_backfill_supervisor
+        if supervisor is not None:
+            stop = getattr(supervisor, "stop", None)
+            if callable(stop):
+                await asyncio.to_thread(stop)
 
     async def _stop_range_checkpoint_writer(self) -> None:
         writer = self._range_checkpoint_writer

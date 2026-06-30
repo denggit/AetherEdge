@@ -1,0 +1,263 @@
+from __future__ import annotations
+
+from decimal import Decimal
+import time
+
+from src.market_data.backfill.coverage import iter_utc_dates, previous_utc_day_start_ms
+from src.market_data.backfill.lock import RangeBackfillLock
+from src.market_data.backfill.models import BucketGap, RangeBackfillRequest, RangeBackfillSummary
+from src.market_data.backfill.scanner import RangeBackfillScanner
+from src.market_data.backfill.status_store import RangeBackfillStatusStore, now_ms
+from src.market_data.derived import RangeBarAggregator, RangeBarBuilder
+from src.market_data.historical_trades.importer import iter_trade_csv_chunks, normalize_okx_trade_chunk
+from src.market_data.historical_trades.okx_archive import OkxHistoricalTradeArchive, okx_raw_symbol_from_canonical
+from src.market_data.models import RangeCoverageStatus, TimeRange
+from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
+from src.market_data.storage import SqliteRangeBarStore, SqliteTradeStore
+from src.market_data.warmup.gap_detector import interval_to_ms
+
+
+class RangeBackfillService:
+    def __init__(self, request: RangeBackfillRequest) -> None:
+        self.request = request
+        self.checkpoint_store = SqliteRangeCheckpointStore(request.checkpoint_db_path)
+        self.range_bar_store = SqliteRangeBarStore(request.market_db_path)
+        self.trade_store = SqliteTradeStore(request.market_db_path)
+        self.status_store = RangeBackfillStatusStore(request.status_path)
+        self.archive = OkxHistoricalTradeArchive(request.raw_root)
+        self._now_ms_value: int | None = None
+
+    def check_coverage(self, *, now_ms_value: int | None = None, direction: str | None = None):
+        scanner = RangeBackfillScanner(self.checkpoint_store)
+        return scanner.scan(
+            exchange=self.request.exchange,
+            symbol=self.request.symbol,
+            range_pct=self.request.range_pct,
+            bucket_interval=self.request.bucket_interval,
+            required_buckets=self.request.required_buckets,
+            lookback_buckets=self.request.lookback_buckets,
+            now_ms=now_ms_value,
+            direction=direction or self.request.direction,
+        )
+
+    def run_once(self, *, now_ms_value: int | None = None) -> RangeBackfillSummary:
+        self._now_ms_value = now_ms_value
+        started = time.monotonic()
+        coverage_before = self.check_coverage(now_ms_value=now_ms_value)
+        if coverage_before.available or self.request.dry_run:
+            return self._finish_summary(
+                started=started,
+                before=coverage_before,
+                downloaded_files=0,
+                trades_loaded=0,
+                range_bars_written=0,
+                aggregates_written=0,
+                status="ok" if coverage_before.available else "dry_run",
+                update_status=False,
+            )
+
+        lock = RangeBackfillLock(
+            self.request.lock_path,
+            status_path=self.request.status_path,
+        )
+        if not lock.acquire(mode=self.request.mode, force=self.request.force):
+            return RangeBackfillSummary(
+                symbol=self.request.symbol,
+                exchange=self.request.exchange,
+                range_pct=self.request.range_pct,
+                bucket_interval=self.request.bucket_interval,
+                target_buckets=self.request.required_buckets,
+                complete_before=coverage_before.complete_history,
+                complete_after=coverage_before.complete_history,
+                missing_before=coverage_before.missing_periods,
+                missing_after=coverage_before.missing_periods,
+                elapsed_seconds=time.monotonic() - started,
+                status="lock_busy",
+                last_error=f"range backfill lock is held: {self.request.lock_path}",
+            )
+        try:
+            self.status_store.write(
+                {
+                    "mode": self.request.mode,
+                    "direction": self.request.direction,
+                    "pid": __import__("os").getpid(),
+                    "running": True,
+                    "started_at_ms": now_ms(),
+                    "heartbeat_ms": now_ms(),
+                    "symbol": self.request.symbol,
+                    "exchange": self.request.exchange,
+                    "range_pct": self.request.range_pct,
+                    "bucket_interval": self.request.bucket_interval,
+                    "required_buckets": self.request.required_buckets,
+                    "lookback_buckets": self.request.lookback_buckets,
+                    "complete_before": coverage_before.complete_history,
+                    "missing_before": coverage_before.missing_periods,
+                    "last_error": None,
+                }
+            )
+            return self._run_locked(started=started, coverage_before=coverage_before)
+        except Exception as exc:
+            self.status_store.patch(running=False, heartbeat_ms=now_ms(), last_error=str(exc), finished_at_ms=now_ms())
+            return self._finish_summary(
+                started=started,
+                before=coverage_before,
+                downloaded_files=0,
+                trades_loaded=0,
+                range_bars_written=0,
+                aggregates_written=0,
+                status="error",
+                last_error=str(exc),
+                update_status=True,
+            )
+        finally:
+            lock.release()
+
+    def _run_locked(self, *, started: float, coverage_before) -> RangeBackfillSummary:
+        target_gaps = self._select_target_gaps(tuple(coverage_before.missing_buckets))
+        if not target_gaps:
+            return self._finish_summary(
+                started=started,
+                before=coverage_before,
+                downloaded_files=0,
+                trades_loaded=0,
+                range_bars_written=0,
+                aggregates_written=0,
+                status="ok",
+                update_status=True,
+            )
+        earliest_start = min(gap.bucket_start_ms for gap in target_gaps)
+        latest_end = max(gap.bucket_end_ms for gap in target_gaps)
+        anchor_start = previous_utc_day_start_ms(earliest_start)
+        raw_symbol = self.request.raw_symbol or okx_raw_symbol_from_canonical(self.request.symbol)
+        downloaded = 0
+        for day in iter_utc_dates(anchor_start, latest_end):
+            file = self.archive.ensure_daily_file(
+                symbol=self.request.symbol,
+                raw_symbol=raw_symbol,
+                day=day,
+                allow_download=self.request.allow_download,
+            )
+            downloaded += int(file.downloaded)
+
+        builder = RangeBarBuilder(
+            range_pct=Decimal(str(self.request.range_pct)),
+            contract_value=Decimal(str(self.request.contract_value)),
+        )
+        target_time = TimeRange(min(gap.bucket_start_ms for gap in target_gaps), latest_end)
+        bars = []
+        trades_loaded = 0
+        for day in iter_utc_dates(anchor_start, latest_end):
+            file_path = self.archive.local_path(raw_symbol=raw_symbol, day=day)
+            for chunk in iter_trade_csv_chunks(file_path, chunksize=self.request.chunksize):
+                trades = normalize_okx_trade_chunk(
+                    chunk,
+                    symbol=self.request.symbol,
+                    raw_symbol=raw_symbol,
+                    exchange=self.request.exchange,
+                )
+                if trades:
+                    self.trade_store.save(trades)
+                    trades_loaded += len(trades)
+                for trade in trades:
+                    for bar in builder.on_trade(trade):
+                        if target_time.start_time_ms <= bar.end_time_ms <= target_time.end_time_ms:
+                            bars.append(bar)
+                self.status_store.patch(heartbeat_ms=now_ms(), trades_loaded=trades_loaded)
+
+        bars.sort(key=lambda item: (item.end_time_ms, item.bar_id))
+        written_bars = self.range_bar_store.replace_range(
+            symbol=self.request.symbol,
+            range_pct=self.request.range_pct,
+            time_range=target_time,
+            rows=bars,
+        )
+        bucket_ms = interval_to_ms(self.request.bucket_interval)
+        target_ends = {gap.bucket_end_ms for gap in target_gaps}
+        aggregates = [
+            aggregate
+            for aggregate in RangeBarAggregator().aggregate(bars, bucket_ms=bucket_ms)
+            if aggregate.bucket_end_ms in target_ends
+            and aggregate.bucket_end_ms <= coverage_before.current_closed_bucket_end_ms
+        ]
+        completed_at = now_ms()
+        for aggregate in aggregates:
+            self.checkpoint_store.save_completed_aggregate(
+                exchange=self.request.exchange,
+                aggregate=aggregate,
+                coverage_status=RangeCoverageStatus.COMPLETE.value,
+                missing_gap_ms=0,
+                completed_at_ms=completed_at,
+            )
+        return self._finish_summary(
+            started=started,
+            before=coverage_before,
+            downloaded_files=downloaded,
+            trades_loaded=trades_loaded,
+            range_bars_written=written_bars,
+            aggregates_written=len(aggregates),
+            status="ok",
+        )
+
+    def _select_target_gaps(self, gaps: tuple[BucketGap, ...]) -> tuple[BucketGap, ...]:
+        selected = list(gaps[: max(1, int(self.request.max_buckets_per_cycle))])
+        if self.request.max_days_per_cycle <= 0:
+            return tuple(sorted(selected, key=lambda item: item.bucket_end_ms))
+        allowed_days: set[int] = set()
+        limited: list[BucketGap] = []
+        for gap in selected:
+            day_start = gap.bucket_start_ms - (gap.bucket_start_ms % 86_400_000)
+            if day_start not in allowed_days and len(allowed_days) >= self.request.max_days_per_cycle:
+                continue
+            allowed_days.add(day_start)
+            limited.append(gap)
+        return tuple(sorted(limited, key=lambda item: item.bucket_end_ms))
+
+    def _finish_summary(
+        self,
+        *,
+        started: float,
+        before,
+        downloaded_files: int,
+        trades_loaded: int,
+        range_bars_written: int,
+        aggregates_written: int,
+        status: str,
+        last_error: str | None = None,
+        update_status: bool = True,
+    ) -> RangeBackfillSummary:
+        after = self.check_coverage(now_ms_value=self._now_ms_value, direction=self.request.direction)
+        summary = RangeBackfillSummary(
+            symbol=self.request.symbol,
+            exchange=self.request.exchange,
+            range_pct=self.request.range_pct,
+            bucket_interval=self.request.bucket_interval,
+            target_buckets=self.request.required_buckets,
+            complete_before=before.complete_history,
+            complete_after=after.complete_history,
+            missing_before=before.missing_periods,
+            missing_after=after.missing_periods,
+            downloaded_files=downloaded_files,
+            trades_loaded=trades_loaded,
+            range_bars_written=range_bars_written,
+            aggregates_written=aggregates_written,
+            elapsed_seconds=time.monotonic() - started,
+            status=status,
+            last_error=last_error,
+        )
+        if update_status:
+            self.status_store.patch(
+                running=False,
+                heartbeat_ms=now_ms(),
+                complete_after=summary.complete_after,
+                missing_after=summary.missing_after,
+                downloaded_files=summary.downloaded_files,
+                trades_loaded=summary.trades_loaded,
+                range_bars_written=summary.range_bars_written,
+                aggregates_written=summary.aggregates_written,
+                last_completed_bucket_end_ms=after.latest_complete_bucket_end_ms,
+                last_scanned_bucket_end_ms=after.current_closed_bucket_end_ms,
+                last_error=last_error,
+                exit_code=0 if status in {"ok", "dry_run"} else 1,
+                finished_at_ms=now_ms(),
+            )
+        return summary

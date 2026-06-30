@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass
+from typing import Sequence
 
 
 @dataclass(frozen=True)
@@ -95,6 +96,15 @@ class PastOnlyRangeSpeedTracker:
         for value in rf_bar_counts:
             self._history.append(float(value))
         return len(rf_bar_counts)
+
+    def replace_history(self, rf_bar_counts: Sequence[int]) -> int:
+        """Replace the complete-history window without appending duplicates."""
+
+        self._history.clear()
+        values = tuple(rf_bar_counts)[-self.window_bars :]
+        for value in values:
+            self._history.append(float(value))
+        return self.complete_history_count
 
     @property
     def history(self) -> tuple[float | None, ...]:

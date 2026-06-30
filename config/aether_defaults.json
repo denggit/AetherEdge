@@ -27,5 +27,22 @@
   "range_checkpoint_max_age_for_recovered_minor_ms": 60000,
   "range_checkpoint_max_age_for_restore_ms": 300000,
   "degraded_fast_margin": 1.05,
-  "producer_stale_timeout_ms": 60000
+  "producer_stale_timeout_ms": 60000,
+  "range_speed_refresh_enabled": true,
+  "range_speed_refresh_seconds": 60,
+  "range_speed_status_warning_seconds": 600,
+  "range_backfill_enabled": true,
+  "range_backfill_required_buckets": 100,
+  "range_backfill_lookback_buckets": 160,
+  "range_backfill_max_buckets_per_cycle": 6,
+  "range_backfill_max_days_per_cycle": 1,
+  "range_backfill_sleep_seconds": 30,
+  "range_backfill_heartbeat_stale_seconds": 180,
+  "range_backfill_restart_cooldown_seconds": 300,
+  "range_backfill_status_path": "data/state/range_backfill_status.json",
+  "range_backfill_lock_path": "data/state/range_backfill.lock",
+  "range_backfill_low_priority": true,
+  "range_backfill_chunksize": 50000,
+  "range_backfill_raw_root": "data/okx/raw/trades",
+  "market_data_db_path": "data/market_data/aether_market_data.sqlite3"
 }

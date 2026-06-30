@@ -212,6 +212,37 @@ class Strategy:
             )
         return count
 
+    def replace_range_speed_history(self, rf_bar_counts: Sequence[int]) -> int:
+        """Refresh range-speed history after background backfill."""
+
+        count = self.range_speed_tracker.replace_history(
+            tuple(int(value) for value in rf_bar_counts)
+        )
+        self.range_speed_history_warmup_count = count
+        if count >= self.config.entry_filters.range_speed_min_periods:
+            logger.info(
+                "V10B short-speed block available after range history refresh | complete_history=%s min_periods=%s",
+                count,
+                self.config.entry_filters.range_speed_min_periods,
+            )
+        else:
+            logger.warning(
+                "V10B short-speed block still unavailable after range history refresh | complete_history=%s min_periods=%s",
+                count,
+                self.config.entry_filters.range_speed_min_periods,
+            )
+        return count
+
+    def range_speed_history_status(self) -> Mapping[str, int | bool]:
+        count = self.range_speed_tracker.complete_history_count
+        min_periods = self.config.entry_filters.range_speed_min_periods
+        return {
+            "complete_history": count,
+            "min_periods": min_periods,
+            "rolling_window_bars": self.config.entry_filters.range_speed_rolling_window_bars,
+            "available": count >= min_periods,
+        }
+
     def runtime_requirements(self) -> Mapping[str, Any]:
         return dict(self.config.runtime_requirements)
 
