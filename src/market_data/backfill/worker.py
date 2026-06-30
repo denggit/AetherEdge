@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import TextIO
 
 from src.market_data.backfill.scanner import BackfillScanner
-from src.market_data.backfill.scheduler import TailCooldownTracker
 from src.market_data.backfill.service import BackfillService
 from src.market_data.warmup.gap_detector import interval_to_ms
 from src.platform.exchanges.okx.rest_tail_trades import OkxRestTailTradesFetcher
@@ -35,19 +34,12 @@ class RangeBackfillWorker:
     chunksize: int = 300_000
     max_rest_tail_gap_minutes: int = 240
     max_rest_tail_buckets: int = 12
-    tail_cooldown_seconds: int = 600
     warning_interval_seconds: float = 600.0
     json_status: str | Path = "data/reports/range_backfill/status.json"
     pid_file: str | Path = "data/run/range_backfill_worker.pid"
     lock_file: str | Path = "data/run/range_backfill_worker.lock"
 
     def run_once(self) -> dict[str, object]:
-        now_ms = int(time.time() * 1000)
-
-        # Restore tail cooldown from previous status so tail failures
-        # persist across cycles (daemon) and invocations (once mode).
-        tracker = self._load_cooldown_tracker()
-
         scanner = BackfillScanner(checkpoint_db=self.checkpoint_db, market_db=self.market_db)
         service = BackfillService(
             market_db=self.market_db,
@@ -57,7 +49,6 @@ class RangeBackfillWorker:
             download_sleep_seconds=self.download_sleep_seconds,
             max_rest_tail_gap_minutes=self.max_rest_tail_gap_minutes,
             max_rest_tail_buckets=self.max_rest_tail_buckets,
-            tail_cooldown_seconds=self.tail_cooldown_seconds,
             rest_tail_fetcher=OkxRestTailTradesFetcher(symbol=self.symbol),
         )
         plan = scanner.scan(
@@ -68,22 +59,11 @@ class RangeBackfillWorker:
             bucket_ms=interval_to_ms(self.bucket_interval),
             required_buckets=self.required_buckets,
             lookback_buckets=self.lookback_buckets,
-            current_time_ms=now_ms,
+            current_time_ms=int(time.time() * 1000),
         )
-        result = service.process_plan(
-            plan,
-            max_buckets=self.max_buckets_per_cycle,
-            tail_cooldown=tracker.cooldown_buckets,
-        )
-
-        # Update cooldown: every tail bucket that failed this cycle enters
-        # cooldown so the next cycle prioritises historical candidates.
-        for bucket_start in result.tail_fetch_failed_buckets:
-            tracker.add(bucket_start, now_ms)
-        tracker.clean_expired(now_ms)
-
-        status: dict[str, object] = {
-            "updated_at_ms": now_ms,
+        result = service.process_plan(plan, max_buckets=self.max_buckets_per_cycle)
+        status = {
+            "updated_at_ms": int(time.time() * 1000),
             "mode": "once",
             "pid": os.getpid(),
             "plan": plan.to_dict(),
@@ -93,31 +73,9 @@ class RangeBackfillWorker:
             "continuous_complete_buckets_from_latest": plan.continuous_complete_buckets_from_latest,
             "tail_fetch_failed_buckets": list(result.tail_fetch_failed_buckets),
             "archive_errors_count": len(result.archive_errors),
-            "candidate_bucket_count": result.candidate_bucket_count,
-            "eligible_historical_bucket_count": result.eligible_historical_bucket_count,
-            "eligible_tail_bucket_count": result.eligible_tail_bucket_count,
-            "tail_cooldown_buckets": list(result.tail_cooldown_buckets),
-            "tail_deferred_buckets": list(result.tail_deferred_buckets),
-            "selected_buckets": list(result.selected_buckets),
-            "tail_cooldown": tracker.to_dict(),
         }
         self.write_status(status)
         return status
-
-    def _load_cooldown_tracker(self) -> TailCooldownTracker:
-        """Restore TailCooldownTracker from the previous status JSON, if any."""
-        path = Path(self.json_status)
-        if not path.exists():
-            return TailCooldownTracker(cooldown_seconds=self.tail_cooldown_seconds)
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return TailCooldownTracker(cooldown_seconds=self.tail_cooldown_seconds)
-        if not isinstance(data, dict):
-            return TailCooldownTracker(cooldown_seconds=self.tail_cooldown_seconds)
-        tracker = TailCooldownTracker.from_status(data)
-        tracker.cooldown_seconds = self.tail_cooldown_seconds
-        return tracker
 
     def run_daemon(self, *, stop_after_cycles: int | None = None) -> int:
         last_warning = 0.0

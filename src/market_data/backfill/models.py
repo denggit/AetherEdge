@@ -66,13 +66,6 @@ class BackfillResult:
     tail_errors: list[str] = field(default_factory=list)
     locked: bool = False
     errors: list[str] = field(default_factory=list)
-    # Candidate selection diagnostics (added for tail-cooldown / fallthrough).
-    candidate_bucket_count: int = 0
-    eligible_historical_bucket_count: int = 0
-    eligible_tail_bucket_count: int = 0
-    tail_cooldown_buckets: list[int] = field(default_factory=list)
-    tail_deferred_buckets: list[int] = field(default_factory=list)
-    selected_buckets: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -92,10 +85,4 @@ class BackfillResult:
             "tail_errors": list(self.tail_errors),
             "locked": self.locked,
             "errors": list(self.errors),
-            "candidate_bucket_count": self.candidate_bucket_count,
-            "eligible_historical_bucket_count": self.eligible_historical_bucket_count,
-            "eligible_tail_bucket_count": self.eligible_tail_bucket_count,
-            "tail_cooldown_buckets": list(self.tail_cooldown_buckets),
-            "tail_deferred_buckets": list(self.tail_deferred_buckets),
-            "selected_buckets": list(self.selected_buckets),
         }
