@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sqlite3
 import tempfile
 import time
@@ -20,6 +21,7 @@ from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
 from src.market_data.storage import SqliteTradeStore
 from src.market_data.warmup.current_rangebar import CurrentRangeBarWarmupResult
 from src.platform import Balance, ExchangeName, LeverageInfo, Order, OrderSide, OrderStatus, Position, PositionMode, PositionSide
+from src.platform.config import ProjectEnvConfig
 from src.platform.data.models import MarketKline, MarketTicker, MarketTrade, TradeSide
 from src.platform.markets import get_market_profile
 from src.platform.snapshot import PlatformSnapshot
@@ -77,6 +79,15 @@ def _app_config(*, dry_run: bool = False, data_streams=()) -> AppConfig:
         alert_queue_maxsize=20,
         dry_run=dry_run,
         enable_email_alerts=False,
+    )
+
+
+def _test_project_env_config() -> ProjectEnvConfig:
+    return ProjectEnvConfig(
+        values=dict(os.environ),
+        source_files=(),
+        env_file=Path(".env"),
+        example_file=None,
     )
 
 
@@ -367,6 +378,7 @@ def _runner(strategy, *, data=None, services=None, dry_run=False, data_streams=(
     )
     runtime_config = LiveRuntimeConfig(app=cfg, mode=RuntimeMode.LIVE_RUNTIME, closed_bar_buffer_ms=60_000)
     resolved_services = dict(services or {})
+    resolved_services.setdefault("project_env_config", _test_project_env_config())
     if data_streams or "range_bar_builder" in resolved_services or "range_bar_store" in resolved_services:
         resolved_services.setdefault("runtime_requirements", _feature_requirements())
     return LiveRuntimeRunner(app_config=cfg, app_context=context, runtime_config=runtime_config, services=resolved_services)
