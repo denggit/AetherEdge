@@ -9,6 +9,7 @@ data/
 *.db
 *.sqlite
 *.sqlite3
+/.env
 /.agents/
 /.tmp/
 /.tmp_pytest/
