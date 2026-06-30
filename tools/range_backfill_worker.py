@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-download", action="store_true")
     parser.add_argument("--low-priority", action=argparse.BooleanOptionalAction, default=_bool(_env("AETHER_RANGE_BACKFILL_LOW_PRIORITY", "true")))
     parser.add_argument("--once", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--save-raw-trades", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--save-raw-trades", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--chunk-sleep-seconds", type=float, default=None)
     parser.add_argument("--max-seconds-per-cycle", type=float, default=None)
     parser.add_argument("--max-trades-per-cycle", type=int, default=None)
@@ -79,9 +79,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def request_from_args(args: argparse.Namespace) -> RangeBackfillRequest:
     mode = str(args.mode).strip().lower()
-    save_raw_trades = args.save_raw_trades
-    if save_raw_trades is None:
-        save_raw_trades = mode != "live"
     return RangeBackfillRequest(
         symbol=args.symbol,
         exchange=args.exchange,
@@ -104,7 +101,7 @@ def request_from_args(args: argparse.Namespace) -> RangeBackfillRequest:
         dry_run=bool(args.dry_run),
         force=bool(args.force),
         sleep_seconds=float(args.sleep_seconds),
-        save_raw_trades=bool(save_raw_trades),
+        save_raw_trades=bool(args.save_raw_trades),
         chunk_sleep_seconds=_mode_float_default(
             args.chunk_sleep_seconds,
             mode=mode,

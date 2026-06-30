@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import logging
 import sqlite3
 from decimal import Decimal
 from pathlib import Path
@@ -11,17 +12,29 @@ from src.market_data.models import TimeRange
 from src.platform.data.models import MarketDataSource, MarketTrade, TradeSide
 from src.platform.exchanges.models import ExchangeName
 
+logger = logging.getLogger(__name__)
+
 
 class SqliteTradeStore:
     """SQLite repository for normalized trades used by internal warmup."""
 
-    def __init__(self, path: str | Path = "data/market_data/aether_market_data.sqlite3") -> None:
+    def __init__(
+        self,
+        path: str | Path = "data/market_data/aether_market_data.sqlite3",
+        *,
+        save_raw_trades: bool = False,
+    ) -> None:
         self.path = Path(path)
+        self.save_raw_trades = bool(save_raw_trades)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
+        if self.save_raw_trades:
+            logger.warning(
+                "Raw trades persistence enabled; market DB may grow quickly"
+            )
 
     def save(self, rows: Sequence[MarketTrade]) -> int:
-        if not rows:
+        if not self.save_raw_trades or not rows:
             return 0
         with self._connect() as conn:
             conn.executemany(
@@ -36,6 +49,11 @@ class SqliteTradeStore:
                 [_trade_params(row) for row in rows],
             )
         return len(rows)
+
+    def save_trades(self, rows: Sequence[MarketTrade]) -> int:
+        """Persist raw trades only when explicitly enabled at construction."""
+
+        return self.save(rows)
 
     def load(self, *, symbol: str, time_range: TimeRange) -> list[MarketTrade]:
         with self._connect() as conn:
@@ -66,6 +84,8 @@ class SqliteTradeStore:
         return int(row[0])
 
     def mark_coverage(self, *, symbol: str, time_range: TimeRange, source: str = "historical") -> None:
+        if not self.save_raw_trades:
+            return
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
             conn.execute(

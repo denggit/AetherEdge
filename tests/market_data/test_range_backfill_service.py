@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import sqlite3
 import zipfile
 
 from src.market_data.backfill.coverage import current_closed_bucket_end_ms
 from src.market_data.backfill.models import RangeBackfillRequest
 from src.market_data.backfill.service import RangeBackfillService
 from src.market_data.historical_trades.okx_archive import okx_raw_symbol_from_canonical
+from src.market_data.storage import SqliteTradeStore
 
 
 def _write_zip(root, raw_symbol: str, day: str, rows: str) -> None:
@@ -30,6 +32,8 @@ def test_service_builds_forward_and_marks_only_closed_complete(tmp_path) -> None
         f"{target_start + 1},100,1,buy,a\n"
         f"{target_start + 2},101.5,1,buy,b\n",
     )
+    market_db = tmp_path / "market.sqlite3"
+    SqliteTradeStore(market_db)
     request = RangeBackfillRequest(
         symbol=symbol,
         exchange="okx",
@@ -38,7 +42,7 @@ def test_service_builds_forward_and_marks_only_closed_complete(tmp_path) -> None
         required_buckets=1,
         lookback_buckets=1,
         max_buckets_per_cycle=1,
-        market_db_path=tmp_path / "market.sqlite3",
+        market_db_path=market_db,
         checkpoint_db_path=tmp_path / "checkpoint.sqlite3",
         raw_root=raw_root,
         status_path=tmp_path / "status.json",
@@ -46,14 +50,70 @@ def test_service_builds_forward_and_marks_only_closed_complete(tmp_path) -> None
         allow_download=False,
     )
 
-    summary = RangeBackfillService(request).run_once(now_ms_value=now_ms)
+    service = RangeBackfillService(request)
+    summary = service.run_once(now_ms_value=now_ms)
 
+    assert request.save_raw_trades is False
+    assert service.trade_store is None
     assert summary.status == "ok"
     assert summary.aggregates_written == 1
     assert summary.complete_after == 1
     assert summary.raw_rows == 2
     assert summary.filtered_rows == 2
     assert summary.dropped_rows == 0
+    with sqlite3.connect(market_db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM trade_coverage").fetchone()[0] == 0
+
+
+def test_service_explicitly_enabled_raw_trade_persistence_still_works(
+    tmp_path,
+    caplog,
+) -> None:
+    symbol = "ETH-USDT-PERP"
+    raw = okx_raw_symbol_from_canonical(symbol)
+    raw_root = tmp_path / "raw"
+    market_db = tmp_path / "market.sqlite3"
+    now_ms = 1782835200000
+    closed_end = current_closed_bucket_end_ms(now_ms, "4h")
+    target_start = closed_end - 4 * 60 * 60_000 + 1
+    _write_zip(raw_root, raw, "2026-06-29", "")
+    _write_zip(
+        raw_root,
+        raw,
+        "2026-06-30",
+        f"{target_start + 1},100,1,buy,a\n"
+        f"{target_start + 2},101.5,1,buy,b\n",
+    )
+    request = RangeBackfillRequest(
+        symbol=symbol,
+        exchange="okx",
+        raw_symbol=raw,
+        range_pct="0.01",
+        required_buckets=1,
+        lookback_buckets=1,
+        max_buckets_per_cycle=1,
+        market_db_path=market_db,
+        checkpoint_db_path=tmp_path / "checkpoint.sqlite3",
+        raw_root=raw_root,
+        status_path=tmp_path / "status.json",
+        lock_path=tmp_path / "range.lock",
+        allow_download=False,
+        save_raw_trades=True,
+    )
+
+    service = RangeBackfillService(request)
+    summary = service.run_once(now_ms_value=now_ms)
+
+    assert service.trade_store is not None
+    assert summary.aggregates_written == 1
+    with sqlite3.connect(market_db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 2
+        assert conn.execute("SELECT COUNT(*) FROM trade_coverage").fetchone()[0] == 0
+    assert (
+        "Raw trades persistence enabled; market DB may grow quickly"
+        in caplog.text
+    )
 
 
 def test_service_filters_raw_rows_before_normalize_and_reports_progress(tmp_path) -> None:

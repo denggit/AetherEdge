@@ -38,7 +38,10 @@ class FakeHistoricalTradeFeed:
 
 @pytest.mark.asyncio
 async def test_trade_warmup_service_fetches_missing_coverage_and_marks_it(tmp_path):
-    store = SqliteTradeStore(tmp_path / "market.sqlite3")
+    store = SqliteTradeStore(
+        tmp_path / "market.sqlite3",
+        save_raw_trades=True,
+    )
     feed = FakeHistoricalTradeFeed([_trade(1000), _trade(2000), _trade(3000)])
     service = TradeWarmupService(data_feed=feed, repository=store, coverage_repository=store, batch_limit=2)
 
@@ -58,7 +61,10 @@ async def test_trade_warmup_service_fetches_missing_coverage_and_marks_it(tmp_pa
 
 @pytest.mark.asyncio
 async def test_trade_warmup_service_rejects_non_trade_dataset(tmp_path):
-    store = SqliteTradeStore(tmp_path / "market.sqlite3")
+    store = SqliteTradeStore(
+        tmp_path / "market.sqlite3",
+        save_raw_trades=True,
+    )
     service = TradeWarmupService(data_feed=FakeHistoricalTradeFeed([]), repository=store, coverage_repository=store)
 
     with pytest.raises(ValueError):

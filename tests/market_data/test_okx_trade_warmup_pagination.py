@@ -32,7 +32,10 @@ class LateFullBatchFeed:
 
 @pytest.mark.asyncio
 async def test_okx_reverse_history_trades_does_not_mark_unfetched_early_gap_covered(tmp_path):
-    store = SqliteTradeStore(tmp_path / "market.sqlite3")
+    store = SqliteTradeStore(
+        tmp_path / "market.sqlite3",
+        save_raw_trades=True,
+    )
     service = TradeWarmupService(data_feed=LateFullBatchFeed(), repository=store, coverage_repository=store, batch_limit=2)
 
     request = WarmupRequest(symbol="ETH-USDT-PERP", dataset=MarketDataSet.TRADES, time_range=TimeRange(1000, 6000))

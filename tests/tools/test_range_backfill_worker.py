@@ -22,6 +22,26 @@ def test_worker_cli_defaults_parse() -> None:
     assert request.max_trades_per_cycle == 300_000
 
 
+def test_worker_all_modes_default_to_no_raw_trade_persistence() -> None:
+    live_request = worker.request_from_args(
+        worker.build_parser().parse_args(["--mode", "live"])
+    )
+    prebuild_request = worker.request_from_args(
+        worker.build_parser().parse_args(["--mode", "prebuild"])
+    )
+
+    assert live_request.save_raw_trades is False
+    assert prebuild_request.save_raw_trades is False
+
+
+def test_worker_raw_trade_persistence_requires_explicit_flag() -> None:
+    request = worker.request_from_args(
+        worker.build_parser().parse_args(["--save-raw-trades"])
+    )
+
+    assert request.save_raw_trades is True
+
+
 def test_live_worker_default_once_false_and_prebuild_once_true() -> None:
     live_args = worker.build_parser().parse_args(["--mode", "live"])
     prebuild_args = worker.build_parser().parse_args(["--mode", "prebuild"])

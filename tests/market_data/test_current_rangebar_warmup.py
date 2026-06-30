@@ -40,7 +40,10 @@ def _trade(price: str, time_ms: int, *, side: TradeSide = TradeSide.BUY) -> Mark
 async def test_current_rangebar_warmup_downloads_persists_and_reuses_coverage(tmp_path) -> None:
     trades = [_trade("100", 1_000), _trade("100.2", 2_000, side=TradeSide.SELL)]
     feed = FakeHistoricalTradeFeed(trades)
-    trade_store = SqliteTradeStore(tmp_path / "market.sqlite3")
+    trade_store = SqliteTradeStore(
+        tmp_path / "market.sqlite3",
+        save_raw_trades=True,
+    )
     range_store = SqliteRangeBarStore(tmp_path / "market.sqlite3")
     service = CurrentRangeBarWarmupService(
         trade_repository=trade_store,

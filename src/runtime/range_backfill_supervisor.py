@@ -329,7 +329,7 @@ class RangeBackfillSupervisor:
             str(self.config.raw_root),
             "--low-priority" if self.config.low_priority else "--no-low-priority",
             "--no-once",
-            "--save-raw-trades" if self.config.save_raw_trades else "--no-save-raw-trades",
+            "--no-save-raw-trades",
             "--chunk-sleep-seconds",
             str(self.config.chunk_sleep_seconds),
             "--max-seconds-per-cycle",

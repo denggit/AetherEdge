@@ -63,6 +63,26 @@ def test_supervisor_starts_when_history_insufficient(tmp_path, monkeypatch) -> N
     assert "--daily-retry-after-utc-hour" in command
 
 
+def test_supervisor_never_enables_raw_trade_persistence(tmp_path) -> None:
+    supervisor = RangeBackfillSupervisor(
+        RangeBackfillSupervisorConfig(
+            status_path=tmp_path / "status.json",
+            lock_path=tmp_path / "range.lock",
+            save_raw_trades=True,
+        )
+    )
+
+    command = supervisor._build_command(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        range_pct="0.002",
+        bucket_interval="4h",
+    )
+
+    assert "--no-save-raw-trades" in command
+    assert "--save-raw-trades" not in command
+
+
 def test_supervisor_does_not_start_when_history_available(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not start")))
     supervisor = RangeBackfillSupervisor(

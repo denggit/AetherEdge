@@ -60,7 +60,14 @@ class RangeBackfillService:
         self.progress_callback = progress_callback
         self.checkpoint_store = SqliteRangeCheckpointStore(request.checkpoint_db_path)
         self.range_bar_store = SqliteRangeBarStore(request.market_db_path)
-        self.trade_store = SqliteTradeStore(request.market_db_path) if request.save_raw_trades else None
+        self.trade_store = (
+            SqliteTradeStore(
+                request.market_db_path,
+                save_raw_trades=True,
+            )
+            if request.save_raw_trades
+            else None
+        )
         self.status_store = RangeBackfillStatusStore(request.status_path)
         self.archive = OkxHistoricalTradeArchive(request.raw_root)
         self._now_ms_value: int | None = None
@@ -379,7 +386,7 @@ class RangeBackfillService:
                 dropped_rows += filtered.raw_rows - len(trades)
                 if trades:
                     if self.trade_store is not None:
-                        self.trade_store.save(trades)
+                        self.trade_store.save_trades(trades)
                     trades_loaded += len(trades)
                     processed_through_ms = trades[-1].trade_time_ms or trades[-1].event_time_ms or processed_through_ms
                 for trade in trades:

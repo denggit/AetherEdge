@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+import sqlite3
 
 from src.market_data.models import TimeRange
 from src.market_data.storage import SqliteTradeStore
@@ -25,7 +26,10 @@ def _trade(trade_id: str | None, time_ms: int, *, side: TradeSide = TradeSide.BU
 
 
 def test_sqlite_trade_store_saves_loads_and_upserts_by_trade_id(tmp_path):
-    store = SqliteTradeStore(tmp_path / "market.sqlite3")
+    store = SqliteTradeStore(
+        tmp_path / "market.sqlite3",
+        save_raw_trades=True,
+    )
     assert store.save([_trade("1", 1000), _trade("2", 2000, side=TradeSide.SELL)]) == 2
     assert store.save([_trade("1", 1000)]) == 1
 
@@ -38,10 +42,30 @@ def test_sqlite_trade_store_saves_loads_and_upserts_by_trade_id(tmp_path):
 
 
 def test_sqlite_trade_store_supports_trades_without_exchange_trade_id(tmp_path):
-    store = SqliteTradeStore(tmp_path / "market.sqlite3")
+    store = SqliteTradeStore(
+        tmp_path / "market.sqlite3",
+        save_raw_trades=True,
+    )
     store.save([_trade(None, 3000)])
 
     rows = store.load(symbol="ETH-USDT-PERP", time_range=TimeRange(3000, 3000))
 
     assert len(rows) == 1
     assert rows[0].trade_id is None
+
+
+def test_sqlite_trade_store_defaults_to_write_protected(tmp_path):
+    db_path = tmp_path / "market.sqlite3"
+    store = SqliteTradeStore(db_path)
+
+    assert store.save([_trade("1", 1000)]) == 0
+    assert store.save_trades([_trade("2", 2000)]) == 0
+    store.mark_coverage(
+        symbol="ETH-USDT-PERP",
+        time_range=TimeRange(1000, 2000),
+        source="historical_current_bucket",
+    )
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM trade_coverage").fetchone()[0] == 0

@@ -57,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-download", action="store_true")
     parser.add_argument("--sleep-seconds", type=float, default=0.0)
-    parser.add_argument("--save-raw-trades", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--save-raw-trades", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--chunk-sleep-seconds", type=float, default=0.0)
     parser.add_argument("--max-seconds-per-cycle", type=float, default=0.0)
     parser.add_argument("--max-trades-per-cycle", type=int, default=0)

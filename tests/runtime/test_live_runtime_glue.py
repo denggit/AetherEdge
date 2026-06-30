@@ -649,7 +649,10 @@ async def test_poll_closed_bar_logs_4h_decision_summary_when_range_unavailable(c
 async def test_closed_bar_poll_does_not_backfill_historical_trades_when_trade_warmup_removed(tmp_path):
     strategy = FeatureStrategy()
     data = FakeData()
-    trade_store = SqliteTradeStore(tmp_path / "market.sqlite3")
+    trade_store = SqliteTradeStore(
+        tmp_path / "market.sqlite3",
+        save_raw_trades=True,
+    )
     range_store = MemoryRangeBarStore()
 
     class GapFillFeed:

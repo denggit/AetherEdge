@@ -60,7 +60,7 @@ class RangeBackfillRequest:
     force: bool = False
     sleep_seconds: float = 0.0
     contract_value: str = "1"
-    save_raw_trades: bool = True
+    save_raw_trades: bool = False
     chunk_sleep_seconds: float = 0.0
     max_seconds_per_cycle: float = 0.0
     max_trades_per_cycle: int = 0
