@@ -31,6 +31,7 @@ from src.order_management.safety import RecoveryExitOrderValidator
 from src.platform import create_account_client, create_execution_client
 from src.platform.account.events import AccountEvent
 from src.platform.account.ports import AccountClient
+from src.platform.config import ProjectEnvConfig, get_project_env_config
 from src.platform.data.models import MarketEvent, MarketEventType, MarketKline, MarketOrderBook, MarketTicker, MarketTrade
 from src.platform.exchanges.models import ExchangeConfig, ExchangeName, Order, OrderStatus, Position, PositionMode, PositionSide
 from src.platform.execution.ports import ExecutionClient
@@ -153,6 +154,7 @@ class LiveRuntimeRunner:
         self.runtime_config = runtime_config or live_runtime_config_from_app(app_config)
         self.context = app_context
         self.services = dict(services or {})
+        self._project_env: ProjectEnvConfig = self.services.get("project_env_config") or get_project_env_config()
         self.requirements: StrategyRuntimeRequirements = self.services.get("runtime_requirements") or resolve_strategy_runtime_requirements(app_context.strategy, fallback_data_streams=app_config.data_streams)
         self.stats = LiveRuntimeStats()
         self._market_queue: asyncio.Queue[MarketEvent] = asyncio.Queue(maxsize=app_config.market_queue_maxsize)
@@ -208,14 +210,12 @@ class LiveRuntimeRunner:
         self._last_snapshots: tuple[PlatformSnapshot, ...] = ()
         self._last_account_snapshot_log_state: dict[tuple[str, str], tuple[Decimal, Decimal]] = {}
         self._last_account_snapshot_log_ms: dict[tuple[str, str], int] = {}
-        self._account_snapshot_log_keepalive_seconds = _account_snapshot_log_keepalive_seconds_from_env()
+        self._account_snapshot_log_keepalive_seconds = _account_snapshot_log_keepalive_seconds_from_env(self._project_env)
         self._last_market_queue_full_log_ms = 0
         self._last_market_queue_full_alert_ms = 0
         self._last_market_queue_backlog_log_ms = 0
-        self._market_queue_backlog_warn_threshold = int(
-            os.getenv("AETHER_MARKET_QUEUE_BACKLOG_WARN_THRESHOLD", "500")
-        )
-        self._market_queue_drain_batch_size = int(os.getenv("AETHER_MARKET_QUEUE_DRAIN_BATCH_SIZE", "1000"))
+        self._market_queue_backlog_warn_threshold = self._project_env.get_int("AETHER_MARKET_QUEUE_BACKLOG_WARN_THRESHOLD", 500)
+        self._market_queue_drain_batch_size = self._project_env.get_int("AETHER_MARKET_QUEUE_DRAIN_BATCH_SIZE", 1000)
         self._last_trade_health_update_ms = 0
         self._range_context_degraded_buckets: dict[int, str] = {}
         self._executed_range_aggregate_buckets: set[tuple[str, str, int]] = set()
@@ -681,11 +681,13 @@ class LiveRuntimeRunner:
         if self.runtime_config.mode is not RuntimeMode.LIVE_RUNTIME:
             return
 
-        live_trading = _env_bool(os.getenv("AETHER_LIVE_TRADING", "false"))
+        project_env = self._project_env
+        live_trading = project_env.get_bool("AETHER_LIVE_TRADING", False)
         require_leverage = live_trading and not self.app_config.dry_run
         env = load_account_config_env(
             exchanges=self.app_config.exchanges,
             symbol=self.app_config.symbol,
+            environ=project_env.values,
             require_leverage=require_leverage,
         )
         if env.missing_leverage:
@@ -699,7 +701,7 @@ class LiveRuntimeRunner:
             return
 
         apply_writes = (not self.app_config.dry_run) and (
-            live_trading or _all_exchange_sandbox(self.app_config.exchanges)
+            live_trading or _all_exchange_sandbox(self.app_config.exchanges, project_env)
         )
         results = await bootstrap_account_config(
             targets=env.targets,
@@ -2683,8 +2685,8 @@ class LiveRuntimeRunner:
                 continue
 
             # ── Retry loop: exchange state may be briefly stale ──
-            attempts = _stop_post_check_attempts_from_env()
-            delay = _stop_post_check_delay_from_env()
+            attempts = _stop_post_check_attempts_from_env(self._project_env)
+            delay = _stop_post_check_delay_from_env(self._project_env)
 
             for attempt in range(1, attempts + 1):
                 try:
@@ -2975,7 +2977,7 @@ class LiveRuntimeRunner:
 
     def _get_order_journal(self):
         if self._order_journal is None:
-            path = os.getenv("AETHER_ORDER_JOURNAL_DB", "data/state/aether_order_journal.sqlite3")
+            path = self._project_env.get("AETHER_ORDER_JOURNAL_DB", "data/state/aether_order_journal.sqlite3")
             self._order_journal = SqliteOrderJournalStore(path)
         return self._order_journal
 
@@ -3177,7 +3179,7 @@ class LiveRuntimeRunner:
 
     def _get_position_plan_store(self):
         if self._position_plan_store is None:
-            path = os.getenv("AETHER_POSITION_PLAN_DB", "data/state/aether_position_plan.sqlite3")
+            path = self._project_env.get("AETHER_POSITION_PLAN_DB", "data/state/aether_position_plan.sqlite3")
             self._position_plan_store = SqlitePositionPlanStore(path)
         return self._position_plan_store
 
@@ -3292,9 +3294,9 @@ def _is_trade_at_or_before(event: MarketEvent, close_time_ms: int) -> bool:
     return event_ms is not None and event_ms <= close_time_ms
 
 
-def _stop_post_check_attempts_from_env() -> int:
+def _stop_post_check_attempts_from_env(project_env: ProjectEnvConfig) -> int:
     """Parse ``AETHER_STOP_POST_CHECK_ATTEMPTS`` safely, clamping to >= 1."""
-    raw = os.getenv("AETHER_STOP_POST_CHECK_ATTEMPTS", "").strip()
+    raw = project_env.get("AETHER_STOP_POST_CHECK_ATTEMPTS", "").strip()
     if not raw:
         return 3
     try:
@@ -3303,15 +3305,15 @@ def _stop_post_check_attempts_from_env() -> int:
         logger.warning(
             "Invalid stop post-check env value; using default | env=%s raw=%r default=3",
             "AETHER_STOP_POST_CHECK_ATTEMPTS",
-            os.getenv("AETHER_STOP_POST_CHECK_ATTEMPTS", ""),
+            project_env.get("AETHER_STOP_POST_CHECK_ATTEMPTS", ""),
         )
         return 3
     return max(1, value)
 
 
-def _account_snapshot_log_keepalive_seconds_from_env() -> float:
+def _account_snapshot_log_keepalive_seconds_from_env(project_env: ProjectEnvConfig) -> float:
     """Parse account snapshot INFO keepalive seconds, where zero disables it."""
-    raw = os.getenv("AETHER_ACCOUNT_SNAPSHOT_LOG_KEEPALIVE_SECONDS", "").strip()
+    raw = project_env.get("AETHER_ACCOUNT_SNAPSHOT_LOG_KEEPALIVE_SECONDS", "").strip()
     if not raw:
         return 3600
     try:
@@ -3320,15 +3322,15 @@ def _account_snapshot_log_keepalive_seconds_from_env() -> float:
         logger.warning(
             "Invalid account snapshot log keepalive env value; using default | env=%s raw=%r default=3600",
             "AETHER_ACCOUNT_SNAPSHOT_LOG_KEEPALIVE_SECONDS",
-            os.getenv("AETHER_ACCOUNT_SNAPSHOT_LOG_KEEPALIVE_SECONDS", ""),
+            project_env.get("AETHER_ACCOUNT_SNAPSHOT_LOG_KEEPALIVE_SECONDS", ""),
         )
         return 3600
     return max(0.0, value)
 
 
-def _stop_post_check_delay_from_env() -> float:
+def _stop_post_check_delay_from_env(project_env: ProjectEnvConfig) -> float:
     """Parse ``AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS`` safely, clamping to >= 0.0."""
-    raw = os.getenv("AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS", "").strip()
+    raw = project_env.get("AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS", "").strip()
     if not raw:
         return 0.5
     try:
@@ -3337,21 +3339,17 @@ def _stop_post_check_delay_from_env() -> float:
         logger.warning(
             "Invalid stop post-check env value; using default | env=%s raw=%r default=0.5",
             "AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS",
-            os.getenv("AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS", ""),
+            project_env.get("AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS", ""),
         )
         return 0.5
     return max(0.0, value)
 
 
-def _env_bool(value: str) -> bool:
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _all_exchange_sandbox(exchanges: Sequence[ExchangeName]) -> bool:
+def _all_exchange_sandbox(exchanges: Sequence[ExchangeName], project_env: ProjectEnvConfig) -> bool:
     if not exchanges:
         return False
     return all(
-        _env_bool(os.getenv(f"{exchange.value.upper()}_SANDBOX", os.getenv("SANDBOX", "false")))
+        project_env.get_bool(f"{exchange.value.upper()}_SANDBOX", project_env.get_bool("SANDBOX", False))
         for exchange in exchanges
     )
 

@@ -87,9 +87,14 @@ class ExchangeConfig:
         exchange: ExchangeName | str,
         env: Mapping[str, str] | None = None,
     ) -> "ExchangeConfig":
-        from src.platform.config import load_env_config
+        from src.platform.config import get_project_env_config, has_project_env_config, load_env_config
 
-        values = load_env_config(environ=env) if env is not None else load_env_config()
+        if env is not None:
+            values = {str(key): str(value) for key, value in env.items()}
+        elif has_project_env_config():
+            values = dict(get_project_env_config().values)
+        else:
+            values = load_env_config()
         exchange_name = exchange if isinstance(exchange, ExchangeName) else ExchangeName(str(exchange).strip().lower())
         base = cls(
             sandbox=_bool_env(values.get(f"{exchange_name.value.upper()}_SANDBOX", values.get("SANDBOX", "false"))),

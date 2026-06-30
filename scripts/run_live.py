@@ -17,6 +17,22 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.platform.config import ProjectEnvConfig, load_project_env_config, set_project_env_config
+
+
+def bootstrap_live_process_config(project_root: Path = PROJECT_ROOT) -> ProjectEnvConfig:
+    config = load_project_env_config(
+        env_file=project_root / ".env",
+        example_file=project_root / ".env.example",
+        include_process_env=False,
+    )
+    set_project_env_config(config)
+    globals()["PROJECT_ENV_CONFIG"] = config
+    return config
+
+
+PROJECT_ENV_CONFIG = bootstrap_live_process_config()
+
 from src.app import AppConfig, AppRunner, build_app_context
 from src.runtime import LiveRuntimeRunner, RuntimeMode, live_runtime_config_from_app, runtime_mode_from_env
 from src.runtime.runner import LiveRuntimeError, _is_fatal_startup_error
@@ -27,12 +43,34 @@ logger = get_logger(__name__)
 FATAL_STARTUP_EXIT_CODE = 78
 
 
+def _log_live_process_config_loaded(config: ProjectEnvConfig) -> None:
+    logger.info(
+        "Live process env config loaded | example_file=%s env_file=%s key_count=%s "
+        "runtime_mode=%s strategy=%s exchanges=%s follower_exchanges=%s data_exchange=%s "
+        "live_trading=%s dry_run=%s margin_mode=%s okx_leverage=%s binance_leverage=%s",
+        config.example_file,
+        config.env_file,
+        len(config.values),
+        config.get("AETHER_RUNTIME_MODE"),
+        config.get("AETHER_STRATEGY"),
+        config.get("AETHER_EXCHANGES"),
+        config.get("AETHER_FOLLOWER_EXCHANGES"),
+        config.get("AETHER_DATA_EXCHANGE"),
+        config.get("AETHER_LIVE_TRADING"),
+        config.get("AETHER_DRY_RUN"),
+        config.get("MARGIN_MODE"),
+        config.get("OKX_LEVERAGE"),
+        config.get("BINANCE_LEVERAGE"),
+    )
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description="Run AetherEdge live runner.")
     parser.add_argument("--max-events", type=int, default=None, help="Stop after N market events; useful for smoke runs.")
     parser.add_argument("--defaults", default="config/aether_defaults.json", help="Path to stable defaults JSON.")
     args = parser.parse_args()
 
+    _log_live_process_config_loaded(PROJECT_ENV_CONFIG)
     config = AppConfig.from_env(defaults_path=args.defaults)
     context = build_app_context(config)
     runtime_mode = runtime_mode_from_env(defaults_path=args.defaults)

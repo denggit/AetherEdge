@@ -8,7 +8,7 @@ from typing import Any, Mapping
 
 from src.app import AppConfig
 from src.order_management import MasterFollowerPolicyConfig
-from src.platform.config import load_env_config
+from src.platform.config import get_project_env_config, load_env_config
 from src.runtime.models import RuntimeMode
 from src.runtime.startup_catchup import StartupCatchupConfig
 
@@ -150,15 +150,13 @@ def live_runtime_config_from_app(
 
 
 def _load_runtime_env(*, env_file: str | Path | None, environ: Mapping[str, str] | None) -> dict[str, str]:
-    values = dict(load_env_config(env_file, environ=environ))
+    if environ is None and env_file is None:
+        return dict(get_project_env_config().values)
     if environ is not None and env_file is None:
         # Synthetic environ mappings used by tests should be hermetic: do not
-        # inherit the developer's project .env just because load_env_config can
-        # read it by default. Production calls pass environ=None and still load
-        # the real project environment.
-        allowed = {str(key) for key in environ.keys()}
-        values = {key: value for key, value in values.items() if key in allowed}
-    return values
+        # inherit the developer's project config.
+        return {str(key): str(value) for key, value in environ.items()}
+    return dict(load_env_config(env_file, environ=environ))
 
 
 def _load_defaults(path: str | Path) -> dict[str, Any]:
@@ -178,14 +176,7 @@ def _master_follower_env(
     env_file: str | Path | None,
     environ: Mapping[str, str] | None,
 ) -> dict[str, str]:
-    """Keep injected runtime-config tests from inheriting project role config.
-
-    ``load_env_config`` intentionally reads the project ``.env`` and overlays
-    the provided mapping. That is correct for production. For callers passing a
-    synthetic ``environ`` without an explicit ``env_file`` (mostly tests), the
-    app config object is already authoritative for exchanges, so stale project
-    master/follower variables should not leak into the derived runtime config.
-    """
+    """Keep injected runtime-config tests from inheriting project role config."""
 
     values = dict(env)
     if environ is None or env_file is not None:

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from src.platform.config import load_env_config
+from src.platform.config import get_project_env_config, load_env_config
 from src.platform.exchanges.models import ExchangeName
 
 
@@ -32,7 +32,7 @@ class AppConfig:
         environ: Mapping[str, str] | None = None,
     ) -> "AppConfig":
         defaults = _load_defaults(defaults_path)
-        env = load_env_config(env_file, environ=environ)
+        env = _load_app_env(env_file=env_file, environ=environ)
 
         symbol = env.get("AETHER_MARKET", str(defaults.get("symbol", "ETH-USDT-PERP")))
         exchanges = _exchange_tuple(env.get("AETHER_EXCHANGES"), defaults.get("exchanges", ["okx"]))
@@ -59,6 +59,14 @@ def _load_defaults(path: str | Path) -> dict[str, Any]:
     if not defaults_path.exists():
         return {}
     return json.loads(defaults_path.read_text(encoding="utf-8"))
+
+
+def _load_app_env(*, env_file: str | Path | None, environ: Mapping[str, str] | None) -> dict[str, str]:
+    if environ is None and env_file is None:
+        return dict(get_project_env_config().values)
+    if environ is not None and env_file is None:
+        return {str(key): str(value) for key, value in environ.items()}
+    return dict(load_env_config(env_file, environ=environ))
 
 
 def _exchange_tuple(raw: str | None, default: Any) -> tuple[ExchangeName, ...]:

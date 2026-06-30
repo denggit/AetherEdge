@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -16,6 +17,7 @@ from src.platform.exchanges.models import (
     PositionMode,
     PositionSide,
 )
+from src.platform.config import ProjectEnvConfig
 from src.platform.markets import get_market_profile
 from src.runtime.config import LiveRuntimeConfig
 from src.runtime.account_config import (
@@ -359,35 +361,102 @@ async def test_set_leverage_raises_still_fails() -> None:
 
 
 @pytest.mark.asyncio
-async def test_live_runtime_startup_hook_applies_account_config_from_env(monkeypatch) -> None:
-    monkeypatch.setenv("AETHER_LIVE_TRADING", "true")
-    monkeypatch.setenv("OKX_SANDBOX", "false")
-    monkeypatch.setenv("MARGIN_MODE", "isolated")
-    monkeypatch.setenv("OKX_LEVERAGE", "15")
-    account = FakeAccount(ExchangeName.OKX, leverage=Decimal("3"), margin_mode=MarginMode.CROSS)
-    execution = FakeExecution(ExchangeName.OKX)
-    app = AppConfig(
-        symbol="ETH-USDT-PERP",
-        exchanges=(ExchangeName.OKX,),
-        data_exchange=ExchangeName.OKX,
-        strategy="strategies.fake:Strategy",
-        data_streams=("trades",),
-        state_db_path="unused.sqlite3",
-        market_queue_maxsize=100,
-        signal_queue_maxsize=100,
-        alert_queue_maxsize=100,
+async def test_live_runtime_startup_hook_applies_account_config_from_project_env(monkeypatch) -> None:
+    monkeypatch.delenv("AETHER_LIVE_TRADING", raising=False)
+    account = FakeAccount(ExchangeName.BINANCE, leverage=Decimal("3"), margin_mode=MarginMode.CROSS)
+    execution = FakeExecution(ExchangeName.BINANCE)
+    runner = _runner_for_account_bootstrap(
+        exchange=ExchangeName.BINANCE,
         dry_run=False,
-        enable_email_alerts=False,
+        account=account,
+        execution=execution,
+        project_env=_project_config(
+            {
+                "AETHER_LIVE_TRADING": "true",
+                "AETHER_DRY_RUN": "false",
+                "BINANCE_SANDBOX": "false",
+                "BINANCE_LEVERAGE": "15",
+                "MARGIN_MODE": "isolated",
+            }
+        ),
     )
-    runner = LiveRuntimeRunner(
-        app_config=app,
-        app_context=AppContext(data=object(), execution=object(), state_store=object(), strategy=object(), planner=object(), alerts=object()),
-        runtime_config=LiveRuntimeConfig(app=app, mode=RuntimeMode.LIVE_RUNTIME),
-        services={
-            "account_clients": [account],
-            "execution_clients": [execution],
-            "runtime_requirements": StrategyRuntimeRequirements.from_mapping({}),
-        },
+
+    await runner._bootstrap_account_config_if_enabled()
+
+    assert account.set_margin_mode_calls == [MarginMode.ISOLATED]
+    assert account.set_leverage_calls == [(Decimal("15"), MarginMode.ISOLATED)]
+
+
+@pytest.mark.asyncio
+async def test_live_runtime_startup_hook_read_only_when_live_trading_false() -> None:
+    account = FakeAccount(ExchangeName.BINANCE, leverage=Decimal("3"), margin_mode=MarginMode.CROSS)
+    execution = FakeExecution(ExchangeName.BINANCE)
+    runner = _runner_for_account_bootstrap(
+        exchange=ExchangeName.BINANCE,
+        dry_run=False,
+        account=account,
+        execution=execution,
+        project_env=_project_config(
+            {
+                "AETHER_LIVE_TRADING": "false",
+                "AETHER_DRY_RUN": "false",
+                "BINANCE_SANDBOX": "false",
+                "BINANCE_LEVERAGE": "15",
+                "MARGIN_MODE": "isolated",
+            }
+        ),
+    )
+
+    await runner._bootstrap_account_config_if_enabled()
+
+    assert account.set_margin_mode_calls == []
+    assert account.set_leverage_calls == []
+
+
+@pytest.mark.asyncio
+async def test_live_runtime_startup_hook_dry_run_does_not_apply() -> None:
+    account = FakeAccount(ExchangeName.BINANCE, leverage=Decimal("3"), margin_mode=MarginMode.CROSS)
+    execution = FakeExecution(ExchangeName.BINANCE)
+    runner = _runner_for_account_bootstrap(
+        exchange=ExchangeName.BINANCE,
+        dry_run=True,
+        account=account,
+        execution=execution,
+        project_env=_project_config(
+            {
+                "AETHER_LIVE_TRADING": "true",
+                "AETHER_DRY_RUN": "true",
+                "BINANCE_SANDBOX": "false",
+                "BINANCE_LEVERAGE": "15",
+                "MARGIN_MODE": "isolated",
+            }
+        ),
+    )
+
+    await runner._bootstrap_account_config_if_enabled()
+
+    assert account.set_margin_mode_calls == []
+    assert account.set_leverage_calls == []
+
+
+@pytest.mark.asyncio
+async def test_live_runtime_startup_hook_applies_when_all_exchanges_are_sandbox() -> None:
+    account = FakeAccount(ExchangeName.BINANCE, leverage=Decimal("3"), margin_mode=MarginMode.CROSS)
+    execution = FakeExecution(ExchangeName.BINANCE)
+    runner = _runner_for_account_bootstrap(
+        exchange=ExchangeName.BINANCE,
+        dry_run=False,
+        account=account,
+        execution=execution,
+        project_env=_project_config(
+            {
+                "AETHER_LIVE_TRADING": "false",
+                "AETHER_DRY_RUN": "false",
+                "BINANCE_SANDBOX": "true",
+                "BINANCE_LEVERAGE": "15",
+                "MARGIN_MODE": "isolated",
+            }
+        ),
     )
 
     await runner._bootstrap_account_config_if_enabled()
@@ -477,6 +546,44 @@ class FakeExecution:
 
 def _target(exchange: ExchangeName) -> AccountConfigTarget:
     return AccountConfigTarget(exchange=exchange, symbol="ETH-USDT-PERP", margin_mode=MarginMode.ISOLATED, leverage=Decimal("15"))
+
+
+def _project_config(values: dict[str, str]) -> ProjectEnvConfig:
+    return ProjectEnvConfig(values=values, source_files=(), env_file=Path(".env"), example_file=None)
+
+
+def _runner_for_account_bootstrap(
+    *,
+    exchange: ExchangeName,
+    dry_run: bool,
+    account: FakeAccount,
+    execution: FakeExecution,
+    project_env: ProjectEnvConfig,
+) -> LiveRuntimeRunner:
+    app = AppConfig(
+        symbol="ETH-USDT-PERP",
+        exchanges=(exchange,),
+        data_exchange=exchange,
+        strategy="strategies.fake:Strategy",
+        data_streams=("trades",),
+        state_db_path="unused.sqlite3",
+        market_queue_maxsize=100,
+        signal_queue_maxsize=100,
+        alert_queue_maxsize=100,
+        dry_run=dry_run,
+        enable_email_alerts=False,
+    )
+    return LiveRuntimeRunner(
+        app_config=app,
+        app_context=AppContext(data=object(), execution=object(), state_store=object(), strategy=object(), planner=object(), alerts=object()),
+        runtime_config=LiveRuntimeConfig(app=app, mode=RuntimeMode.LIVE_RUNTIME),
+        services={
+            "account_clients": [account],
+            "execution_clients": [execution],
+            "runtime_requirements": StrategyRuntimeRequirements.from_mapping({}),
+            "project_env_config": project_env,
+        },
+    )
 
 
 def _position(exchange: ExchangeName) -> Position:

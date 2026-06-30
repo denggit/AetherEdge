@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from src.platform.account.ports import AccountClient
-from src.platform.config import load_env_config
+from src.platform.config import get_project_env_config, load_env_config
 from src.platform.exchanges.models import ExchangeName, LeverageInfo, MarginMode, Order, Position
 from src.platform.execution.ports import ExecutionClient
 from src.utils.log import get_logger
@@ -362,11 +362,11 @@ def _parse_leverage(value: str, *, key: str) -> Decimal:
 
 
 def _load_env(*, env_file: str | Path | None, environ: Mapping[str, str] | None) -> dict[str, str]:
-    values = dict(load_env_config(env_file, environ=environ))
+    if environ is None and env_file is None:
+        return dict(get_project_env_config().values)
     if environ is not None and env_file is None:
-        allowed = {str(key) for key in environ.keys()}
-        values = {key: value for key, value in values.items() if key in allowed}
-    return values
+        return {str(key): str(value) for key, value in environ.items()}
+    return dict(load_env_config(env_file, environ=environ))
 
 
 def _error_result(target: AccountConfigTarget, message: str) -> AccountConfigBootstrapResult:
