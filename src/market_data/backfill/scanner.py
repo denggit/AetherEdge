@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import time
 
-from src.market_data.backfill.coverage import bucket_start_from_end, current_closed_bucket_end_ms
+from src.market_data.backfill.coverage import (
+    bucket_start_from_end,
+    capped_closed_bucket_end_ms,
+    current_closed_bucket_end_ms,
+)
 from src.market_data.backfill.models import BucketGap, RangeSpeedCoverage
 from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
 from src.market_data.warmup.gap_detector import interval_to_ms
@@ -22,11 +26,17 @@ class RangeBackfillScanner:
         required_buckets: int,
         lookback_buckets: int,
         now_ms: int | None = None,
+        max_target_end_ms: int | None = None,
         direction: str = "oldest-to-recent",
     ) -> RangeSpeedCoverage:
         now = int(time.time() * 1000) if now_ms is None else int(now_ms)
         bucket_ms = interval_to_ms(bucket_interval)
         closed_end = current_closed_bucket_end_ms(now, bucket_interval)
+        if max_target_end_ms is not None:
+            closed_end = min(
+                closed_end,
+                capped_closed_bucket_end_ms(int(max_target_end_ms), bucket_interval),
+            )
         rows = self.store.load_complete_history(
             exchange=exchange,
             symbol=symbol,

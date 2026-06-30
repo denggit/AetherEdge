@@ -159,3 +159,31 @@ def test_latest_closed_bucket_missing_is_unavailable(tmp_path) -> None:
 
     assert coverage.has_latest_closed_bucket is False
     assert coverage.available is False
+
+
+def test_scanner_caps_target_end_to_historical_complete_day(tmp_path) -> None:
+    store = SqliteRangeCheckpointStore(tmp_path / "checkpoint.sqlite3")
+    bucket_ms = 4 * 60 * 60_000
+    now_ms = 1782864000000
+    max_target_end_ms = 1782777599999
+    capped_end = max_target_end_ms
+    store.save_completed_aggregate(
+        exchange="okx",
+        aggregate=_aggregate(capped_end - bucket_ms + 1, capped_end, 10),
+        coverage_status=RangeCoverageStatus.COMPLETE.value,
+        completed_at_ms=capped_end,
+    )
+
+    coverage = RangeBackfillScanner(store).scan(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+        bucket_interval="4h",
+        required_buckets=1,
+        lookback_buckets=1,
+        now_ms=now_ms,
+        max_target_end_ms=max_target_end_ms,
+    )
+
+    assert coverage.current_closed_bucket_end_ms == capped_end
+    assert coverage.available is True

@@ -66,6 +66,7 @@ class RangeBackfillRequest:
     max_trades_per_cycle: int = 0
     max_chunks_per_cycle: int = 0
     progress_seconds: float = 30.0
+    max_target_end_ms: int | None = None
 
 
 @dataclass(frozen=True)

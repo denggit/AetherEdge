@@ -11,6 +11,12 @@ def current_closed_bucket_end_ms(now_ms: int, bucket_interval: str) -> int:
     return max(0, current_start - 1)
 
 
+def capped_closed_bucket_end_ms(max_target_end_ms: int, bucket_interval: str) -> int:
+    bucket_ms = interval_to_ms(bucket_interval)
+    next_start = ((int(max_target_end_ms) + 1) // bucket_ms) * bucket_ms
+    return max(0, next_start - 1)
+
+
 def bucket_start_from_end(bucket_end_ms: int, bucket_interval: str) -> int:
     return int(bucket_end_ms) - interval_to_ms(bucket_interval) + 1
 

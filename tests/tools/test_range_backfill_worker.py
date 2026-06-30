@@ -28,6 +28,13 @@ def test_live_worker_default_once_false_and_prebuild_once_true() -> None:
     assert worker.resolve_once(prebuild_args) is True
 
 
+def test_worker_accepts_max_target_end_ms() -> None:
+    args = worker.build_parser().parse_args(["--max-target-end-ms", "1782777599999"])
+    request = worker.request_from_args(args)
+
+    assert request.max_target_end_ms == 1782777599999
+
+
 def test_worker_low_priority_skips_os_nice_on_windows(monkeypatch) -> None:
     called = False
 

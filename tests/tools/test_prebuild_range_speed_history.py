@@ -40,6 +40,27 @@ def test_prebuild_batch_args_control_cycle_size() -> None:
     assert request.max_days_per_cycle == 3
 
 
+def test_prebuild_end_before_date_sets_max_target_end() -> None:
+    args = tool.build_parser().parse_args(["--end-before-date", "2026-06-30"])
+    request = tool.request_from_args(args)
+
+    assert request.max_target_end_ms == 1782777599999
+
+
+def test_prebuild_max_target_end_ms_is_most_conservative_cap() -> None:
+    args = tool.build_parser().parse_args(
+        [
+            "--end-before-date",
+            "2026-06-30",
+            "--max-target-end-ms",
+            "1782691199999",
+        ]
+    )
+    request = tool.request_from_args(args)
+
+    assert request.max_target_end_ms == 1782691199999
+
+
 def test_prebuild_exits_when_live_worker_lock_exists(tmp_path) -> None:
     lock_path = tmp_path / "range.lock"
     status_path = tmp_path / "status.json"
@@ -96,6 +117,33 @@ def test_prebuild_no_download_missing_raw_prints_clear_summary(tmp_path, capsys)
     assert "missing_raw_days:" in output
     assert "failed_downloads:" in output
     assert "hint: raw OKX trades zip missing; run downloader or remove --no-download" in output
+
+
+def test_profile_one_bucket_respects_historical_complete_boundary(tmp_path, capsys) -> None:
+    result = tool.main(
+        [
+            "--profile-one-bucket",
+            "--end-before-date",
+            "2026-06-30",
+            "--market-db",
+            str(tmp_path / "market.sqlite3"),
+            "--checkpoint-db",
+            str(tmp_path / "checkpoint.sqlite3"),
+            "--raw-root",
+            str(tmp_path / "raw"),
+            "--status-path",
+            str(tmp_path / "status.json"),
+            "--lock-path",
+            str(tmp_path / "range.lock"),
+            "--no-download",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert result == 0
+    assert "2026-06-30.zip" not in output
+    assert "2026-06-30']" not in output
+    assert "max_target_end_ms=1782777599999" in output
 
 
 def test_check_only_check_raw_prints_raw_diagnostics(tmp_path, capsys) -> None:

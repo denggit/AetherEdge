@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from src.market_data.backfill.models import BucketGap
 from src.runtime.range_backfill_supervisor import RangeBackfillSupervisor, RangeBackfillSupervisorConfig
 
 
@@ -115,6 +116,10 @@ async def test_supervisor_monitor_starts_worker_when_coverage_insufficient(tmp_p
         )
     )
     monkeypatch.setattr(
+        "src.runtime.range_backfill_supervisor._archive_complete_max_target_end_ms",
+        lambda: 1782777599999,
+    )
+    monkeypatch.setattr(
         supervisor,
         "_scan_coverage",
         lambda **kwargs: type(
@@ -124,6 +129,9 @@ async def test_supervisor_monitor_starts_worker_when_coverage_insufficient(tmp_p
                 "available": False,
                 "required_window_complete_count": 1,
                 "required_buckets": 3,
+                "required_window_missing_count": 1,
+                "required_window_missing_buckets": (BucketGap(1782763200000, 1782777599999),),
+                "current_closed_bucket_end_ms": 1782863999999,
             },
         )(),
     )
@@ -141,3 +149,56 @@ async def test_supervisor_monitor_starts_worker_when_coverage_insufficient(tmp_p
     await supervisor.stop_async()
 
     assert started
+    assert "--max-target-end-ms" in started[0].args[0]
+    assert "1782777599999" in started[0].args[0]
+
+
+@pytest.mark.asyncio
+async def test_supervisor_current_day_gap_only_writes_status_without_starting(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not start")))
+    monkeypatch.setattr(
+        "src.runtime.range_backfill_supervisor._archive_complete_max_target_end_ms",
+        lambda: 1782777599999,
+    )
+    supervisor = RangeBackfillSupervisor(
+        RangeBackfillSupervisorConfig(
+            status_path=tmp_path / "status.json",
+            lock_path=tmp_path / "range.lock",
+            repo_root=Path.cwd(),
+            monitor_seconds=1,
+            restart_cooldown_seconds=0,
+        )
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_scan_coverage",
+        lambda **kwargs: type(
+            "Coverage",
+            (),
+            {
+                "available": False,
+                "required_window_complete_count": 99,
+                "required_buckets": 100,
+                "required_window_missing_count": 1,
+                "required_window_missing_buckets": (BucketGap(1782849600000, 1782863999999),),
+                "current_closed_bucket_end_ms": 1782863999999,
+            },
+        )(),
+    )
+    stop_event = asyncio.Event()
+
+    supervisor.start_monitor(
+        stop_event=stop_event,
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        range_pct="0.002",
+        bucket_interval="4h",
+    )
+    await asyncio.sleep(0.05)
+    stop_event.set()
+    await supervisor.stop_async()
+
+    status = supervisor.status_store.read()
+    assert status is not None
+    assert status["range_speed_available"] is False
+    assert status["range_speed_reason"] == "current_day_gap_too_large"

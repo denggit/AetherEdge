@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 import subprocess
 import sys
@@ -12,6 +13,12 @@ from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
 from src.utils.log import get_logger
 
 logger = get_logger(__name__)
+
+REASON_AVAILABLE = "available"
+REASON_INSUFFICIENT_HISTORY = "insufficient_history"
+REASON_ARCHIVE_GAP_BACKFILLING = "archive_gap_backfilling"
+REASON_CURRENT_DAY_GAP_TOO_LARGE = "current_day_gap_too_large"
+REASON_REPAIR_FAILED_COOLDOWN = "repair_failed_cooldown"
 
 
 @dataclass(frozen=True)
@@ -86,6 +93,7 @@ class RangeBackfillSupervisor:
         bucket_interval: str,
         complete_history: int,
         min_periods: int,
+        max_target_end_ms: int | None = None,
     ) -> bool:
         if not self.config.enabled or int(complete_history) >= int(min_periods):
             return False
@@ -101,6 +109,7 @@ class RangeBackfillSupervisor:
                 exchange=exchange,
                 range_pct=range_pct,
                 bucket_interval=bucket_interval,
+                max_target_end_ms=max_target_end_ms,
             )
             log_path = self.config.repo_root / "logs" / "range_backfill_worker.out"
             log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -140,7 +149,23 @@ class RangeBackfillSupervisor:
                     range_pct=range_pct,
                     bucket_interval=bucket_interval,
                 )
-                if not coverage.available:
+                archive_max_target_end_ms = _archive_complete_max_target_end_ms()
+                reason = self._coverage_reason(
+                    coverage,
+                    archive_max_target_end_ms=archive_max_target_end_ms,
+                )
+                if (
+                    reason == REASON_ARCHIVE_GAP_BACKFILLING
+                    and not self.running
+                    and self._in_restart_cooldown()
+                ):
+                    reason = REASON_REPAIR_FAILED_COOLDOWN
+                self._write_coverage_status(
+                    coverage,
+                    reason=reason,
+                    archive_max_target_end_ms=archive_max_target_end_ms,
+                )
+                if reason == REASON_ARCHIVE_GAP_BACKFILLING:
                     self.start_if_needed(
                         symbol=symbol,
                         exchange=exchange,
@@ -148,6 +173,7 @@ class RangeBackfillSupervisor:
                         bucket_interval=bucket_interval,
                         complete_history=coverage.required_window_complete_count,
                         min_periods=coverage.required_buckets,
+                        max_target_end_ms=archive_max_target_end_ms,
                     )
             except asyncio.CancelledError:
                 raise
@@ -213,8 +239,16 @@ class RangeBackfillSupervisor:
             return None if raw is None else int(raw)
         return None
 
-    def _build_command(self, *, symbol: str, exchange: str, range_pct: str, bucket_interval: str) -> list[str]:
-        return [
+    def _build_command(
+        self,
+        *,
+        symbol: str,
+        exchange: str,
+        range_pct: str,
+        bucket_interval: str,
+        max_target_end_ms: int | None = None,
+    ) -> list[str]:
+        command = [
             sys.executable,
             "-u",
             "tools/range_backfill_worker.py",
@@ -262,6 +296,36 @@ class RangeBackfillSupervisor:
             "--max-trades-per-cycle",
             str(self.config.max_trades_per_cycle),
         ]
+        if max_target_end_ms is not None:
+            command.extend(["--max-target-end-ms", str(int(max_target_end_ms))])
+        return command
+
+    def _coverage_reason(self, coverage, *, archive_max_target_end_ms: int) -> str:
+        if bool(getattr(coverage, "available", False)):
+            return REASON_AVAILABLE
+        gaps = tuple(
+            getattr(coverage, "required_window_missing_buckets", ())
+            or getattr(coverage, "missing_buckets", ())
+            or ()
+        )
+        if not gaps:
+            return REASON_INSUFFICIENT_HISTORY
+        if any(gap.bucket_end_ms <= archive_max_target_end_ms for gap in gaps):
+            return REASON_ARCHIVE_GAP_BACKFILLING
+        return REASON_CURRENT_DAY_GAP_TOO_LARGE
+
+    def _write_coverage_status(self, coverage, *, reason: str, archive_max_target_end_ms: int) -> None:
+        self.status_store.patch(
+            range_speed_available=reason == REASON_AVAILABLE,
+            range_speed_reason=reason,
+            complete_after=int(getattr(coverage, "required_window_complete_count", 0)),
+            missing_after=int(getattr(coverage, "required_window_missing_count", 0)),
+            required_buckets=int(getattr(coverage, "required_buckets", self.config.required_buckets)),
+            lookback_buckets=int(self.config.lookback_buckets),
+            last_scanned_bucket_end_ms=getattr(coverage, "current_closed_bucket_end_ms", None),
+            archive_max_target_end_ms=archive_max_target_end_ms,
+            heartbeat_ms=now_ms(),
+        )
 
     def _local_process_running(self) -> bool:
         if self.process is None:
@@ -292,3 +356,9 @@ class RangeBackfillSupervisor:
                 handle.close()
             except Exception:
                 pass
+
+
+def _archive_complete_max_target_end_ms(now_ms_value: int | None = None) -> int:
+    now = datetime.now(UTC) if now_ms_value is None else datetime.fromtimestamp(int(now_ms_value) / 1000, tz=UTC)
+    today_start = datetime(now.year, now.month, now.day, tzinfo=UTC)
+    return int(today_start.timestamp() * 1000) - 1

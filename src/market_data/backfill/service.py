@@ -80,6 +80,7 @@ class RangeBackfillService:
             required_buckets=self.request.required_buckets,
             lookback_buckets=self.request.lookback_buckets,
             now_ms=now_ms_value,
+            max_target_end_ms=self.request.max_target_end_ms,
             direction=direction or self.request.direction,
         )
 

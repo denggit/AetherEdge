@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import date
+from datetime import UTC, date, datetime, time as datetime_time, timedelta
 from decimal import Decimal
 import os
 from pathlib import Path
@@ -40,6 +40,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile-one-bucket", action="store_true")
     parser.add_argument("--max-chunks", type=int, default=0)
     parser.add_argument("--clean-suspicious", action="store_true")
+    parser.add_argument("--complete-before-days", type=int, default=1)
+    parser.add_argument("--end-before-date", default=None)
+    parser.add_argument("--max-target-end-ms", type=int, default=None)
     parser.add_argument("--market-db", default=_env("AETHER_MARKET_DATA_DB", "data/market_data/aether_market_data.sqlite3"))
     parser.add_argument("--checkpoint-db", default=_env("AETHER_RANGE_CHECKPOINT_DB", "data/state/range_builder_checkpoint.sqlite3"))
     parser.add_argument("--raw-root", default=_env("AETHER_RANGE_BACKFILL_RAW_ROOT", "data/okx/raw/trades"))
@@ -92,6 +95,7 @@ def request_from_args(args: argparse.Namespace) -> RangeBackfillRequest:
         max_trades_per_cycle=int(args.max_trades_per_cycle),
         max_chunks_per_cycle=max(0, int(args.max_chunks)),
         progress_seconds=max(0.0, float(args.progress_seconds)),
+        max_target_end_ms=resolve_max_target_end_ms(args),
     )
 
 
@@ -126,7 +130,8 @@ def main(argv: list[str] | None = None) -> int:
         "Range speed prebuild started | "
         f"symbol={request.symbol} exchange={request.exchange} range_pct={request.range_pct} "
         f"target_buckets={request.required_buckets} batch_buckets={request.max_buckets_per_cycle} "
-        f"batch_days={request.max_days_per_cycle} max_cycles={args.max_cycles}",
+        f"batch_days={request.max_days_per_cycle} max_cycles={args.max_cycles} "
+        f"max_target_end_ms={request.max_target_end_ms}",
         flush=True,
     )
     suspicious = suspicious_aggregate_count(request)
@@ -428,12 +433,31 @@ def raw_coverage_report(service: RangeBackfillService, *, coverage, raw_symbol: 
     }
 
 
+def resolve_max_target_end_ms(args: argparse.Namespace) -> int | None:
+    candidates: list[int] = []
+    if args.max_target_end_ms is not None:
+        candidates.append(int(args.max_target_end_ms))
+    if args.end_before_date:
+        end_before = date.fromisoformat(str(args.end_before_date))
+        candidates.append(_utc_day_start_ms(end_before) - 1)
+    complete_before_days = int(args.complete_before_days)
+    if complete_before_days >= 0:
+        today = datetime.now(UTC).date()
+        last_complete_day = today - timedelta(days=complete_before_days)
+        candidates.append(_utc_day_start_ms(last_complete_day + timedelta(days=1)) - 1)
+    return min(candidates) if candidates else None
+
+
 def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
 def _decimal_text(value: Decimal | str) -> str:
     return format(Decimal(str(value)).normalize(), "f")
+
+
+def _utc_day_start_ms(day: date) -> int:
+    return int(datetime.combine(day, datetime_time.min, tzinfo=UTC).timestamp() * 1000)
 
 
 if __name__ == "__main__":

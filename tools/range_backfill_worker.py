@@ -48,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunk-sleep-seconds", type=float, default=None)
     parser.add_argument("--max-seconds-per-cycle", type=float, default=None)
     parser.add_argument("--max-trades-per-cycle", type=int, default=None)
+    parser.add_argument("--max-target-end-ms", type=int, default=None)
     return parser
 
 
@@ -99,6 +100,7 @@ def request_from_args(args: argparse.Namespace) -> RangeBackfillRequest:
                 prebuild_default=0.0,
             )
         ),
+        max_target_end_ms=args.max_target_end_ms,
     )
 
 
