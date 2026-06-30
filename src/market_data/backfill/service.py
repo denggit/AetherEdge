@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal
 import time
 
@@ -10,11 +12,28 @@ from src.market_data.backfill.scanner import RangeBackfillScanner
 from src.market_data.backfill.status_store import RangeBackfillStatusStore, now_ms
 from src.market_data.derived import RangeBarAggregator, RangeBarBuilder
 from src.market_data.historical_trades.importer import iter_trade_csv_chunks, normalize_okx_trade_chunk
-from src.market_data.historical_trades.okx_archive import OkxHistoricalTradeArchive, okx_raw_symbol_from_canonical
+from src.market_data.historical_trades.okx_archive import (
+    OkxHistoricalTradeArchive,
+    OkxHistoricalTradeDownloadError,
+    okx_daily_trade_url,
+    okx_raw_symbol_from_canonical,
+)
 from src.market_data.models import RangeCoverageStatus, TimeRange
 from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
 from src.market_data.storage import SqliteRangeBarStore, SqliteTradeStore
 from src.market_data.warmup.gap_detector import interval_to_ms
+
+
+@dataclass(frozen=True)
+class _BuildWindowResult:
+    downloaded_files: int = 0
+    trades_loaded: int = 0
+    range_bars_written: int = 0
+    aggregates_written: int = 0
+    resource_limited: bool = False
+    missing_raw_days: tuple[str, ...] = ()
+    failed_downloads: tuple[str, ...] = ()
+    skipped_buckets_due_missing_raw: int = 0
 
 
 class RangeBackfillService:
@@ -26,6 +45,7 @@ class RangeBackfillService:
         self.status_store = RangeBackfillStatusStore(request.status_path)
         self.archive = OkxHistoricalTradeArchive(request.raw_root)
         self._now_ms_value: int | None = None
+        self._raw_day_failures: dict[tuple[str, str], str] = {}
 
     def check_coverage(self, *, now_ms_value: int | None = None, direction: str | None = None):
         scanner = RangeBackfillScanner(self.checkpoint_store)
@@ -48,6 +68,7 @@ class RangeBackfillService:
         mark_process_finished_on_summary: bool = True,
     ) -> RangeBackfillSummary:
         self._now_ms_value = now_ms_value
+        self._raw_day_failures = {}
         started = time.monotonic()
         coverage_before = self.check_coverage(now_ms_value=now_ms_value)
         if self._coverage_satisfied_for_mode(coverage_before) or self.request.dry_run:
@@ -167,23 +188,94 @@ class RangeBackfillService:
             )
         earliest_start = min(gap.bucket_start_ms for gap in target_gaps)
         latest_end = max(gap.bucket_end_ms for gap in target_gaps)
-        anchor_start = previous_utc_day_start_ms(earliest_start)
         raw_symbol = self.request.raw_symbol or okx_raw_symbol_from_canonical(self.request.symbol)
-        downloaded = 0
-        for day in iter_utc_dates(anchor_start, latest_end):
-            file = self.archive.ensure_daily_file(
-                symbol=self.request.symbol,
-                raw_symbol=raw_symbol,
-                day=day,
-                allow_download=self.request.allow_download,
-            )
-            downloaded += int(file.downloaded)
+        attempts = [target_gaps]
+        results: list[_BuildWindowResult] = []
+        first = self._run_build_window(
+            gaps=target_gaps,
+            raw_symbol=raw_symbol,
+            started=started,
+            coverage_before=coverage_before,
+        )
+        if first.missing_raw_days and len(target_gaps) > 1:
+            for gap in target_gaps:
+                result = self._run_build_window(
+                    gaps=(gap,),
+                    raw_symbol=raw_symbol,
+                    started=started,
+                    coverage_before=coverage_before,
+                )
+                results.append(result)
+                if result.resource_limited:
+                    break
+        else:
+            results.append(first)
 
+        downloaded = sum(result.downloaded_files for result in results)
+        trades_loaded = sum(result.trades_loaded for result in results)
+        written_bars = sum(result.range_bars_written for result in results)
+        aggregates_written = sum(result.aggregates_written for result in results)
+        missing_raw_days = tuple(
+            dict.fromkeys(day for result in results for day in result.missing_raw_days)
+        )
+        failed_downloads = tuple(
+            dict.fromkeys(url for result in results for url in result.failed_downloads)
+        )
+        skipped_buckets = sum(result.skipped_buckets_due_missing_raw for result in results)
+        resource_limited = any(result.resource_limited for result in results)
+        if missing_raw_days and aggregates_written == 0 and written_bars == 0:
+            status = "no_progress"
+        elif missing_raw_days or resource_limited:
+            status = "partial"
+        else:
+            status = "ok"
+        hint = (
+            "raw OKX trades zip missing; run downloader or remove --no-download"
+            if missing_raw_days and not self.request.allow_download
+            else None
+        )
+        last_error = failed_downloads[-1] if failed_downloads else None
+        return self._finish_summary(
+            started=started,
+            before=coverage_before,
+            downloaded_files=downloaded,
+            trades_loaded=trades_loaded,
+            range_bars_written=written_bars,
+            aggregates_written=aggregates_written,
+            status=status,
+            last_error=last_error,
+            missing_raw_days=missing_raw_days,
+            failed_downloads=failed_downloads,
+            skipped_buckets_due_missing_raw=skipped_buckets,
+            hint=hint,
+            mark_process_finished=mark_process_finished_on_summary,
+        )
+
+    def _run_build_window(
+        self,
+        *,
+        gaps: tuple[BucketGap, ...],
+        raw_symbol: str,
+        started: float,
+        coverage_before,
+    ) -> _BuildWindowResult:
+        earliest_start = min(gap.bucket_start_ms for gap in gaps)
+        latest_end = max(gap.bucket_end_ms for gap in gaps)
+        anchor_start = previous_utc_day_start_ms(earliest_start)
+        raw_result = self._ensure_raw_days(
+            raw_symbol=raw_symbol,
+            days=tuple(iter_utc_dates(anchor_start, latest_end)),
+            skipped_buckets=len(gaps),
+        )
+        if raw_result.missing_raw_days:
+            return raw_result
+
+        downloaded = raw_result.downloaded_files
         builder = RangeBarBuilder(
             range_pct=Decimal(str(self.request.range_pct)),
             contract_value=Decimal(str(self.request.contract_value)),
         )
-        target_time = TimeRange(min(gap.bucket_start_ms for gap in target_gaps), latest_end)
+        target_time = TimeRange(min(gap.bucket_start_ms for gap in gaps), latest_end)
         bars = []
         trades_loaded = 0
         processed_through_ms: int | None = None
@@ -226,7 +318,7 @@ class RangeBackfillService:
 
         bars.sort(key=lambda item: (item.end_time_ms, item.bar_id))
         bucket_ms = interval_to_ms(self.request.bucket_interval)
-        target_ends = {gap.bucket_end_ms for gap in target_gaps}
+        target_ends = {gap.bucket_end_ms for gap in gaps}
         complete_through_ms = latest_end if not resource_limited else (processed_through_ms or -1)
         writable_time_range = self._writable_time_range(
             target_time=target_time,
@@ -268,16 +360,59 @@ class RangeBackfillService:
                 missing_gap_ms=0,
                 completed_at_ms=completed_at,
             )
-        return self._finish_summary(
-            started=started,
-            before=coverage_before,
+        return _BuildWindowResult(
             downloaded_files=downloaded,
             trades_loaded=trades_loaded,
             range_bars_written=written_bars,
             aggregates_written=len(aggregates),
-            status="partial" if resource_limited else "ok",
-            mark_process_finished=mark_process_finished_on_summary,
+            resource_limited=resource_limited,
         )
+
+    def _ensure_raw_days(
+        self,
+        *,
+        raw_symbol: str,
+        days: tuple[date, ...],
+        skipped_buckets: int,
+    ) -> _BuildWindowResult:
+        downloaded = 0
+        missing_days: list[str] = []
+        failed_downloads: list[str] = []
+        for day in days:
+            day_iso = day.isoformat()
+            cache_key = (raw_symbol, day_iso)
+            cached_failure = self._raw_day_failures.get(cache_key)
+            if cached_failure is not None:
+                missing_days.append(day_iso)
+                failed_downloads.append(cached_failure)
+                break
+            try:
+                file = self.archive.ensure_daily_file(
+                    symbol=self.request.symbol,
+                    raw_symbol=raw_symbol,
+                    day=day,
+                    allow_download=self.request.allow_download,
+                )
+                downloaded += int(file.downloaded)
+            except FileNotFoundError:
+                failed_url = okx_daily_trade_url(raw_symbol=raw_symbol, day=day)
+                self._raw_day_failures[cache_key] = failed_url
+                missing_days.append(day_iso)
+                failed_downloads.append(failed_url)
+                break
+            except OkxHistoricalTradeDownloadError as exc:
+                self._raw_day_failures[cache_key] = exc.url
+                missing_days.append(day_iso)
+                failed_downloads.append(exc.url)
+                break
+        if missing_days:
+            return _BuildWindowResult(
+                downloaded_files=downloaded,
+                missing_raw_days=tuple(missing_days),
+                failed_downloads=tuple(failed_downloads),
+                skipped_buckets_due_missing_raw=skipped_buckets,
+            )
+        return _BuildWindowResult(downloaded_files=downloaded)
 
     def _writable_time_range(
         self,
@@ -330,6 +465,10 @@ class RangeBackfillService:
         last_error: str | None = None,
         update_status: bool = True,
         mark_process_finished: bool = True,
+        missing_raw_days: tuple[str, ...] = (),
+        failed_downloads: tuple[str, ...] = (),
+        skipped_buckets_due_missing_raw: int = 0,
+        hint: str | None = None,
     ) -> RangeBackfillSummary:
         after = self.check_coverage(now_ms_value=self._now_ms_value, direction=self.request.direction)
         summary = RangeBackfillSummary(
@@ -349,13 +488,17 @@ class RangeBackfillService:
             elapsed_seconds=time.monotonic() - started,
             status=status,
             last_error=last_error,
+            missing_raw_days=missing_raw_days,
+            failed_downloads=failed_downloads,
+            skipped_buckets_due_missing_raw=skipped_buckets_due_missing_raw,
+            hint=hint,
         )
         if update_status:
             if status == "error":
                 phase = "failed"
             elif status == "partial":
                 phase = "partial"
-            elif mark_process_finished and status in {"ok", "dry_run"}:
+            elif mark_process_finished and status in {"ok", "dry_run", "no_progress"}:
                 phase = "completed"
             else:
                 phase = "sleeping"
@@ -372,7 +515,11 @@ class RangeBackfillService:
                 last_completed_bucket_end_ms=after.latest_complete_bucket_end_ms,
                 last_scanned_bucket_end_ms=after.current_closed_bucket_end_ms,
                 last_error=last_error,
-                exit_code=0 if status in {"ok", "dry_run", "partial"} else 1,
+                missing_raw_days=list(missing_raw_days),
+                failed_downloads=list(failed_downloads),
+                skipped_buckets_due_missing_raw=skipped_buckets_due_missing_raw,
+                hint=hint,
+                exit_code=0 if status in {"ok", "dry_run", "partial", "no_progress"} else 1,
                 finished_at_ms=now_ms() if mark_process_finished else None,
             )
         return summary

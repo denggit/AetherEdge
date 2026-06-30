@@ -53,3 +53,57 @@ def test_prebuild_exits_when_live_worker_lock_exists(tmp_path) -> None:
     )
 
     assert result == 1
+
+
+def test_prebuild_no_download_missing_raw_prints_clear_summary(tmp_path, capsys) -> None:
+    result = tool.main(
+        [
+            "--buckets",
+            "1",
+            "--market-db",
+            str(tmp_path / "market.sqlite3"),
+            "--checkpoint-db",
+            str(tmp_path / "checkpoint.sqlite3"),
+            "--raw-root",
+            str(tmp_path / "raw"),
+            "--status-path",
+            str(tmp_path / "status.json"),
+            "--lock-path",
+            str(tmp_path / "range.lock"),
+            "--no-download",
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert result == 0
+    assert "status: no_progress" in output
+    assert "missing_raw_days:" in output
+    assert "failed_downloads:" in output
+    assert "hint: raw OKX trades zip missing; run downloader or remove --no-download" in output
+
+
+def test_check_only_check_raw_prints_raw_diagnostics(tmp_path, capsys) -> None:
+    result = tool.main(
+        [
+            "--check-only",
+            "--check-raw",
+            "--buckets",
+            "1",
+            "--market-db",
+            str(tmp_path / "market.sqlite3"),
+            "--checkpoint-db",
+            str(tmp_path / "checkpoint.sqlite3"),
+            "--raw-root",
+            str(tmp_path / "raw"),
+            "--status-path",
+            str(tmp_path / "status.json"),
+            "--lock-path",
+            str(tmp_path / "range.lock"),
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert result == 0
+    assert "raw_required_days=" in output
+    assert "raw_missing_days=" in output
+    assert "first_missing_raw_day=" in output

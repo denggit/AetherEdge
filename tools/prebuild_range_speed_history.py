@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date
 import os
 from pathlib import Path
 import sys
@@ -10,6 +11,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.market_data.backfill.models import RangeBackfillRequest, RangeBackfillSummary
+from src.market_data.backfill.coverage import iter_utc_dates, previous_utc_day_start_ms
 from src.market_data.backfill.service import RangeBackfillService
 from src.market_data.historical_trades.okx_archive import okx_raw_symbol_from_canonical
 
@@ -31,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chunksize", type=int, default=int(_env("AETHER_RANGE_BACKFILL_CHUNKSIZE", "50000")))
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--check-only", action="store_true")
+    parser.add_argument("--check-raw", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-download", action="store_true")
     parser.add_argument("--sleep-seconds", type=float, default=0.0)
@@ -89,10 +92,17 @@ def main(argv: list[str] | None = None) -> int:
             f"min_periods={coverage.required_buckets} "
             f"missing={coverage.missing_periods} available={coverage.available}"
         )
+        if args.check_raw:
+            raw = raw_coverage_report(service, coverage=coverage, raw_symbol=request.raw_symbol or okx_raw_symbol_from_canonical(request.symbol))
+            print(f"raw_required_days={raw['required']}")
+            print(f"raw_available_days={raw['available']}")
+            print(f"raw_missing_days={raw['missing']}")
+            if raw["missing_days"]:
+                print(f"first_missing_raw_day={raw['missing_days'][0]}")
         return 0
     summary = service.run_once()
     print_summary(summary)
-    return 0 if summary.status in {"ok", "dry_run"} else 1
+    return 0 if summary.status in {"ok", "dry_run", "partial", "no_progress"} else 1
 
 
 def print_summary(summary: RangeBackfillSummary) -> None:
@@ -110,10 +120,37 @@ def print_summary(summary: RangeBackfillSummary) -> None:
     print(f"trades_loaded: {summary.trades_loaded}")
     print(f"range_bars_written: {summary.range_bars_written}")
     print(f"aggregates_written: {summary.aggregates_written}")
+    print(f"missing_raw_days: {list(summary.missing_raw_days)}")
+    print(f"failed_downloads: {list(summary.failed_downloads)}")
+    print(f"skipped_buckets_due_missing_raw: {summary.skipped_buckets_due_missing_raw}")
     print(f"elapsed_seconds: {summary.elapsed_seconds:.3f}")
     print(f"status: {summary.status}")
     if summary.last_error:
         print(f"last_error: {summary.last_error}")
+    if summary.hint:
+        print(f"hint: {summary.hint}")
+
+
+def raw_coverage_report(service: RangeBackfillService, *, coverage, raw_symbol: str) -> dict[str, object]:
+    days = []
+    for gap in coverage.lookback_missing_buckets:
+        anchor = previous_utc_day_start_ms(gap.bucket_start_ms)
+        days.extend(day.isoformat() for day in iter_utc_dates(anchor, gap.bucket_end_ms))
+    unique_days = tuple(dict.fromkeys(days))
+    missing = [
+        day
+        for day in unique_days
+        if not service.archive.local_path(
+            raw_symbol=raw_symbol,
+            day=date.fromisoformat(day),
+        ).exists()
+    ]
+    return {
+        "required": len(unique_days),
+        "available": len(unique_days) - len(missing),
+        "missing": len(missing),
+        "missing_days": missing[:10],
+    }
 
 
 def _env(name: str, default: str) -> str:

@@ -4,15 +4,46 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 import time
-from urllib.error import URLError
-from urllib.request import urlopen
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+import zipfile
 
 from src.market_data.historical_trades.models import HistoricalTradeFile
+from src.utils.log import get_logger
+
+logger = get_logger(__name__)
 
 OKX_DAILY_TRADES_URL_TEMPLATE = (
     "https://www.okx.com/cdn/okex/traderecords/trades/daily/"
     "{yyyymmdd}/{symbol}-trades-{date}.zip"
 )
+
+OKX_HISTORICAL_TRADES_HEADERS = {
+    "User-Agent": "AetherEdge/okx-historical-trades",
+    "Accept": "application/zip,application/octet-stream,*/*",
+}
+
+
+class OkxHistoricalTradeDownloadError(IOError):
+    def __init__(
+        self,
+        *,
+        url: str,
+        day: date,
+        status: int | None = None,
+        reason: str | None = None,
+    ) -> None:
+        self.url = url
+        self.day = day
+        self.status = status
+        self.reason = reason
+        details = []
+        if status is not None:
+            details.append(f"status={status}")
+        if reason:
+            details.append(f"reason={reason}")
+        suffix = " " + " ".join(details) if details else ""
+        super().__init__(f"failed to download OKX historical trades: {url}{suffix}")
 
 
 def okx_raw_symbol_from_canonical(symbol: str) -> str:
@@ -64,16 +95,28 @@ class OkxHistoricalTradeArchive:
 
         path.parent.mkdir(parents=True, exist_ok=True)
         url = okx_daily_trade_url(raw_symbol=raw_symbol, day=day)
+        part = path.with_suffix(path.suffix + ".part")
         last_error: BaseException | None = None
         for attempt in range(max(1, int(self.retries))):
             try:
-                with urlopen(url, timeout=max(0.1, float(self.timeout_seconds))) as response:
+                request = Request(url, headers=OKX_HISTORICAL_TRADES_HEADERS)
+                with urlopen(request, timeout=max(0.1, float(self.timeout_seconds))) as response:
                     payload = response.read()
                 if not payload:
-                    raise IOError(f"empty OKX historical trade archive: {url}")
-                tmp = path.with_suffix(path.suffix + ".tmp")
-                tmp.write_bytes(payload)
-                tmp.replace(path)
+                    raise OkxHistoricalTradeDownloadError(
+                        url=url,
+                        day=day,
+                        reason="empty response",
+                    )
+                part.write_bytes(payload)
+                if part.stat().st_size <= 0:
+                    raise OkxHistoricalTradeDownloadError(
+                        url=url,
+                        day=day,
+                        reason="empty file",
+                    )
+                _validate_zip(part, url=url, day=day)
+                part.replace(path)
                 return HistoricalTradeFile(
                     exchange="okx",
                     symbol=symbol,
@@ -82,8 +125,55 @@ class OkxHistoricalTradeArchive:
                     path=path,
                     downloaded=True,
                 )
-            except (OSError, URLError) as exc:
+            except HTTPError as exc:
+                _delete_if_exists(part)
+                last_error = OkxHistoricalTradeDownloadError(
+                    url=url,
+                    day=day,
+                    status=exc.code,
+                    reason=str(exc.reason),
+                )
+            except (OSError, URLError, zipfile.BadZipFile, OkxHistoricalTradeDownloadError) as exc:
+                _delete_if_exists(part)
                 last_error = exc
-                if attempt + 1 < max(1, int(self.retries)):
-                    time.sleep(max(0.0, float(self.retry_sleep_seconds)))
-        raise IOError(f"failed to download OKX historical trades: {url}") from last_error
+            if attempt + 1 < max(1, int(self.retries)):
+                logger.warning(
+                    "OKX historical trades download retry | url=%s attempt=%s retries=%s error=%s",
+                    url,
+                    attempt + 1,
+                    max(1, int(self.retries)),
+                    last_error,
+                )
+                time.sleep(max(0.0, float(self.retry_sleep_seconds)))
+        if isinstance(last_error, OkxHistoricalTradeDownloadError):
+            raise last_error
+        raise OkxHistoricalTradeDownloadError(
+            url=url,
+            day=day,
+            reason=str(last_error) if last_error is not None else "unknown",
+        ) from last_error
+
+
+def _validate_zip(path: Path, *, url: str, day: date) -> None:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            bad_member = archive.testzip()
+    except zipfile.BadZipFile as exc:
+        raise OkxHistoricalTradeDownloadError(
+            url=url,
+            day=day,
+            reason=f"bad zip: {exc}",
+        ) from exc
+    if bad_member is not None:
+        raise OkxHistoricalTradeDownloadError(
+            url=url,
+            day=day,
+            reason=f"bad zip member: {bad_member}",
+        )
+
+
+def _delete_if_exists(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass

@@ -84,3 +84,7 @@ class RangeBackfillSummary:
     elapsed_seconds: float = 0.0
     status: str = "ok"
     last_error: str | None = None
+    missing_raw_days: tuple[str, ...] = ()
+    failed_downloads: tuple[str, ...] = ()
+    skipped_buckets_due_missing_raw: int = 0
+    hint: str | None = None

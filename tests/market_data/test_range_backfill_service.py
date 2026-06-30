@@ -167,3 +167,71 @@ def test_resource_limited_before_target_start_does_not_replace_range(tmp_path) -
     assert summary.status == "partial"
     assert summary.aggregates_written == 0
     assert called is False
+
+
+def test_missing_anchor_day_skips_old_window_but_later_window_can_succeed(tmp_path) -> None:
+    symbol = "ETH-USDT-PERP"
+    raw = okx_raw_symbol_from_canonical(symbol)
+    raw_root = tmp_path / "raw"
+    now_ms = 1782835200000
+    closed_end = current_closed_bucket_end_ms(now_ms, "4h")
+    bucket_ms = 4 * 60 * 60_000
+    latest_start = closed_end - bucket_ms + 1
+    _write_zip(raw_root, raw, "2026-06-29", "")
+    _write_zip(
+        raw_root,
+        raw,
+        "2026-06-30",
+        f"{latest_start + 1},100,1,buy,a\n"
+        f"{latest_start + 2},101.5,1,buy,b\n",
+    )
+    request = RangeBackfillRequest(
+        symbol=symbol,
+        exchange="okx",
+        raw_symbol=raw,
+        range_pct="0.01",
+        required_buckets=1,
+        lookback_buckets=8,
+        max_buckets_per_cycle=8,
+        max_days_per_cycle=10_000,
+        market_db_path=tmp_path / "market.sqlite3",
+        checkpoint_db_path=tmp_path / "checkpoint.sqlite3",
+        raw_root=raw_root,
+        status_path=tmp_path / "status.json",
+        lock_path=tmp_path / "range.lock",
+        allow_download=False,
+        mode="prebuild",
+    )
+
+    summary = RangeBackfillService(request).run_once(now_ms_value=now_ms)
+
+    assert summary.status == "partial"
+    assert summary.aggregates_written > 0
+    assert "2026-06-28" in summary.missing_raw_days
+    assert summary.skipped_buckets_due_missing_raw > 0
+
+
+def test_no_raw_available_is_no_progress_not_error(tmp_path) -> None:
+    request = RangeBackfillRequest(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        raw_symbol="ETH-USDT-SWAP",
+        range_pct="0.01",
+        required_buckets=1,
+        lookback_buckets=2,
+        max_buckets_per_cycle=2,
+        market_db_path=tmp_path / "market.sqlite3",
+        checkpoint_db_path=tmp_path / "checkpoint.sqlite3",
+        raw_root=tmp_path / "raw",
+        status_path=tmp_path / "status.json",
+        lock_path=tmp_path / "range.lock",
+        allow_download=False,
+        mode="prebuild",
+    )
+
+    summary = RangeBackfillService(request).run_once(now_ms_value=1782835200000)
+
+    assert summary.status == "no_progress"
+    assert summary.aggregates_written == 0
+    assert summary.failed_downloads
+    assert summary.hint == "raw OKX trades zip missing; run downloader or remove --no-download"

@@ -162,7 +162,7 @@ def main(argv: list[str] | None = None) -> int:
                 exit_code = 0
                 return exit_code
             if once:
-                exit_code = 0 if summary.status in {"ok", "dry_run", "partial"} else 1
+                exit_code = 0 if summary.status in {"ok", "dry_run", "partial", "no_progress"} else 1
                 return exit_code
             time.sleep(max(0.0, float(args.sleep_seconds)))
     finally:
