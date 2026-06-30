@@ -41,17 +41,6 @@ class ArchiveMetadata:
     status: str
 
 
-class OkxArchiveUnavailableError(RuntimeError):
-    """Controlled unavailable daily archive response, usually a 404."""
-
-    def __init__(self, *, raw_symbol: str, day: date, url: str, status: str, message: str) -> None:
-        self.raw_symbol = raw_symbol
-        self.day = day
-        self.url = url
-        self.status = status
-        super().__init__(message)
-
-
 def build_daily_trades_url(raw_symbol: str, day: date) -> str:
     day_text = day.isoformat()
     return OKX_DAILY_TRADES_URL_TEMPLATE.format(
@@ -134,22 +123,6 @@ class OkxHistoricalArchive:
                     raise RuntimeError("downloaded daily trades zip is empty")
                 part_path.replace(destination)
                 return _metadata(path=destination, url=url, day=day, status="downloaded")
-            except urllib.error.HTTPError as exc:
-                last_error = repr(exc)
-                try:
-                    part_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                if int(exc.code) == 404:
-                    raise OkxArchiveUnavailableError(
-                        raw_symbol=raw_symbol,
-                        day=day,
-                        url=url,
-                        status="not_yet_published",
-                        message=f"OKX daily trades archive unavailable: raw_symbol={raw_symbol} day={day.isoformat()} status=404",
-                    ) from exc
-                if attempt < self.max_retries and self.sleep_seconds > 0:
-                    time.sleep(min(self.sleep_seconds * (2 ** (attempt - 1)), 30.0))
             except Exception as exc:  # noqa: BLE001 - download retries need broad capture
                 last_error = repr(exc)
                 try:

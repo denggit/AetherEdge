@@ -2,14 +2,11 @@ from __future__ import annotations
 
 import ast
 import io
-import urllib.error
 import zipfile
 from datetime import UTC, date, datetime
 from pathlib import Path
 
-import pytest
-
-from src.platform.exchanges.okx.historical_archive import OkxArchiveUnavailableError, OkxHistoricalArchive, build_daily_trades_url
+from src.platform.exchanges.okx.historical_archive import OkxHistoricalArchive, build_daily_trades_url
 
 
 def test_build_daily_trades_url() -> None:
@@ -81,23 +78,6 @@ def test_missing_completed_day_downloads_with_part_atomic_replace(tmp_path: Path
     assert meta is not None
     assert Path(meta.path).read_bytes() == b"zip-bytes"
     assert not Path(str(meta.path) + ".part").exists()
-
-
-def test_completed_day_404_is_typed_unavailable(tmp_path: Path) -> None:
-    def fake_urlopen(*_args, **_kwargs):
-        raise urllib.error.HTTPError("url", 404, "not found", {}, None)
-
-    archive = OkxHistoricalArchive(urlopen=fake_urlopen, sleep_seconds=0)
-
-    with pytest.raises(OkxArchiveUnavailableError) as caught:
-        archive.ensure_daily_trades_zip(
-            raw_root=tmp_path,
-            raw_symbol="ETH-USDT-SWAP",
-            day=date(2026, 6, 29),
-            now=datetime(2026, 6, 30, tzinfo=UTC),
-        )
-
-    assert caught.value.status == "not_yet_published"
 
 
 def test_platform_archive_does_not_import_business_domains() -> None:

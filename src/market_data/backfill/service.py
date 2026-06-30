@@ -15,7 +15,7 @@ from src.market_data.models import RangeBar, RangeBarAggregate, RangeCoverageSta
 from src.market_data.range_checkpoint import RangeBuilderCheckpoint, SqliteRangeCheckpointStore
 from src.market_data.storage import SqliteRangeBarStore, SqliteTradeStore
 from src.platform.data.models import MarketTrade
-from src.platform.exchanges.okx.historical_archive import OkxArchiveUnavailableError, OkxHistoricalArchive, daily_trades_zip_path
+from src.platform.exchanges.okx.historical_archive import OkxHistoricalArchive, daily_trades_zip_path
 from src.platform.markets import get_market_profile
 
 
@@ -70,13 +70,9 @@ class BackfillService:
                 result.errors.append(str(exc))
                 return result
             raise
-        except Exception as exc:  # noqa: BLE001 - worker daemon must keep running
-            result.errors.append(f"{type(exc).__name__}: {exc}")
-            return result
         return result
 
     def _ensure_raw_trades(self, *, plan: BackfillPlan, targets: Sequence[int], result: BackfillResult, now: datetime) -> None:
-        target_count = len(set(targets))
         for start in sorted(set(targets)):
             end = start + plan.bucket_ms - 1
             day = datetime.fromtimestamp(start / 1000, tz=UTC).date()
@@ -84,87 +80,33 @@ class BackfillService:
             if day < current_day:
                 before = daily_trades_zip_path(self.raw_root, plan.raw_symbol, day)
                 existed_before = before.exists()
-                try:
-                    meta = self.archive.ensure_daily_trades_zip(  # type: ignore[union-attr]
-                        raw_root=self.raw_root,
-                        raw_symbol=plan.raw_symbol,
-                        day=day,
-                        now=now,
-                    )
-                except OkxArchiveUnavailableError as exc:
-                    _append_unique(result.skipped_buckets, start)
-                    result.archive_errors.append(str(exc))
-                    result.errors.append(str(exc))
-                    continue
-                except Exception as exc:  # noqa: BLE001 - archive/network/parser errors retry next cycle
-                    _append_unique(result.skipped_buckets, start)
-                    message = f"archive bucket_start_ms={start}: {type(exc).__name__}: {exc}"
-                    result.archive_errors.append(message)
-                    result.errors.append(message)
-                    continue
+                meta = self.archive.ensure_daily_trades_zip(  # type: ignore[union-attr]
+                    raw_root=self.raw_root,
+                    raw_symbol=plan.raw_symbol,
+                    day=day,
+                    now=now,
+                )
                 if meta is None:
-                    _append_unique(result.skipped_buckets, start)
+                    result.skipped_buckets.append(start)
                     continue
-                if not existed_before and getattr(meta, "status", "downloaded") == "downloaded":
+                if not existed_before:
                     result.downloaded_days += 1
                     if self.download_sleep_seconds > 0:
                         time.sleep(self.download_sleep_seconds)
-                try:
-                    result.imported_trades += self._import_zip(path=Path(meta.path), plan=plan, bucket_start_ms=start, bucket_end_ms=end)
-                except Exception as exc:  # noqa: BLE001 - bad zip/csv must not kill daemon
-                    _append_unique(result.skipped_buckets, start)
-                    message = f"archive import bucket_start_ms={start}: {type(exc).__name__}: {exc}"
-                    result.archive_errors.append(message)
-                    result.errors.append(message)
+                result.imported_trades += self._import_zip(path=Path(meta.path), plan=plan, bucket_start_ms=start, bucket_end_ms=end)
                 continue
 
-            validation = self._validate_bucket_trade_coverage(plan.symbol, start, end, result)
-            if validation.complete:
-                continue
-            if end > plan.latest_closed_bucket_end_ms:
-                _append_unique(result.skipped_buckets, start)
-                continue
-            gap_minutes = max(0, (end - start + 1) // 60_000)
-            if self.rest_tail_fetcher is None:
-                _append_unique(result.skipped_buckets, start)
-                message = f"tail fetch unavailable bucket_start_ms={start} reason={validation.reason}"
-                result.tail_errors.append(message)
-                result.errors.append(message)
-                continue
-            if gap_minutes > self.max_rest_tail_gap_minutes or target_count > self.max_rest_tail_buckets:
-                _append_unique(result.skipped_buckets, start)
-                message = (
-                    "tail fetch skipped bucket_start_ms="
-                    f"{start} gap_minutes={gap_minutes} max_gap_minutes={self.max_rest_tail_gap_minutes} "
-                    f"target_count={target_count} max_buckets={self.max_rest_tail_buckets}"
-                )
-                result.tail_errors.append(message)
-                result.errors.append(message)
-                continue
-            _append_unique(result.tail_fetch_requested_buckets, start)
-            try:
-                rows = list(self.rest_tail_fetcher(plan.raw_symbol, start, end))
-                saved = self.trade_store.save(rows)
-                result.imported_trades += saved
-                result.tail_fetch_trades_saved += saved
-            except sqlite3.OperationalError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - tail/network errors retry next cycle
-                _append_unique(result.skipped_buckets, start)
-                _append_unique(result.tail_fetch_failed_buckets, start)
-                message = f"tail fetch bucket_start_ms={start}: {type(exc).__name__}: {exc}"
-                result.tail_errors.append(message)
-                result.errors.append(message)
-                continue
-            validation = self._validate_bucket_trade_coverage(plan.symbol, start, end, result)
-            if validation.complete:
-                _append_unique(result.tail_fetch_succeeded_buckets, start)
-            else:
-                _append_unique(result.skipped_buckets, start)
-                _append_unique(result.tail_fetch_failed_buckets, start)
-                message = f"tail fetch incomplete bucket_start_ms={start} reason={validation.reason}"
-                result.tail_errors.append(message)
-                result.errors.append(message)
+            if not self._bucket_has_trade_coverage(plan.symbol, start, end):
+                gap_minutes = max(0, (end - start + 1) // 60_000)
+                if (
+                    self.rest_tail_fetcher is not None
+                    and gap_minutes <= self.max_rest_tail_gap_minutes
+                    and len(targets) <= self.max_rest_tail_buckets
+                ):
+                    rows = list(self.rest_tail_fetcher(plan.raw_symbol, start, end))
+                    result.imported_trades += self.trade_store.save(rows)
+                else:
+                    result.skipped_buckets.append(start)
 
     def _import_zip(self, *, path: Path, plan: BackfillPlan, bucket_start_ms: int, bucket_end_ms: int) -> int:
         saved = 0
@@ -206,26 +148,26 @@ class BackfillService:
         aggregates = self.aggregator.aggregate(persisted, bucket_ms=plan.bucket_ms)
         by_bucket = {aggregate.bucket_start_ms: aggregate for aggregate in aggregates}
         for bucket_start in sorted(target_set):
-            if (
-                bucket_start in set(plan.complete_bucket_starts)
-                and bucket_start not in set(plan.dirty_bucket_starts)
-                and bucket_start not in set(plan.incomplete_coverage_bucket_starts)
-            ):
-                continue
             bucket_end = bucket_start + plan.bucket_ms - 1
-            validation = self._validate_bucket_trade_coverage(plan.symbol, bucket_start, bucket_end, result)
+            validation = validate_trade_coverage(
+                trade_store=self.trade_store,
+                symbol=plan.symbol,
+                bucket_start_ms=bucket_start,
+                bucket_end_ms=bucket_end,
+                edge_tolerance_ms=self.edge_tolerance_ms,
+                coverage_max_gap_ms=self.coverage_max_gap_ms,
+            )
             if not validation.complete:
-                _append_unique(result.skipped_buckets, bucket_start)
+                result.skipped_buckets.append(bucket_start)
                 continue
             aggregate = by_bucket.get(bucket_start)
             if aggregate is None:
-                _append_unique(result.skipped_buckets, bucket_start)
+                result.skipped_buckets.append(bucket_start)
                 continue
             self.trade_store.mark_coverage(
                 symbol=plan.symbol,
                 time_range=TimeRange(bucket_start, bucket_end),
                 source="historical",
-                coverage_status=RangeCoverageStatus.COMPLETE.value,
             )
             self._upsert_completed_aggregate(
                 exchange=plan.exchange,
@@ -283,20 +225,11 @@ class BackfillService:
             completed_at_ms=completed_at_ms,
         )
 
-    def _validate_bucket_trade_coverage(self, symbol: str, start: int, end: int, result: BackfillResult):
-        validation = validate_trade_coverage(
-            trade_store=self.trade_store,
-            symbol=symbol,
-            bucket_start_ms=start,
-            bucket_end_ms=end,
-            edge_tolerance_ms=self.edge_tolerance_ms,
-            coverage_max_gap_ms=self.coverage_max_gap_ms,
+    def _bucket_has_trade_coverage(self, symbol: str, start: int, end: int) -> bool:
+        return any(
+            item.start_time_ms <= start and item.end_time_ms >= end
+            for item in self.trade_store.coverage_ranges(symbol=symbol, time_range=TimeRange(start, end))
         )
-        if validation.complete:
-            _append_unique(result.coverage_validated_buckets, start)
-        else:
-            _append_unique(result.coverage_failed_buckets, start)
-        return validation
 
 
 def _recent_unique(values: Sequence[int]) -> list[int]:
@@ -307,11 +240,6 @@ def _recent_unique(values: Sequence[int]) -> list[int]:
             seen.add(value)
             out.append(value)
     return out
-
-
-def _append_unique(values: list[int], value: int) -> None:
-    if value not in values:
-        values.append(value)
 
 
 def _utc_day_start_ms(ts_ms: int) -> int:
