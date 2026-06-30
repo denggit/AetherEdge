@@ -107,9 +107,63 @@ def test_resource_limits_stop_cycle_before_marking_complete(tmp_path, monkeypatc
         max_trades_per_cycle=1,
     )
 
-    summary = RangeBackfillService(request).run_once(now_ms_value=now_ms)
+    calls: list[tuple[int, int, int]] = []
+    service = RangeBackfillService(request)
+
+    def fake_replace_range(*, symbol, range_pct, time_range, rows):
+        calls.append((time_range.start_time_ms, time_range.end_time_ms, len(rows)))
+        return len(rows)
+
+    service.range_bar_store.replace_range = fake_replace_range
+
+    summary = service.run_once(now_ms_value=now_ms)
 
     assert summary.status == "partial"
     assert summary.aggregates_written == 0
     assert summary.complete_after == 0
     assert sleeps == [0.05]
+    assert calls == [(target_start, target_start + 1, 0)]
+
+
+def test_resource_limited_before_target_start_does_not_replace_range(tmp_path) -> None:
+    symbol = "ETH-USDT-PERP"
+    raw = okx_raw_symbol_from_canonical(symbol)
+    raw_root = tmp_path / "raw"
+    now_ms = 1782835200000
+    closed_end = current_closed_bucket_end_ms(now_ms, "4h")
+    target_start = closed_end - 4 * 60 * 60_000 + 1
+    _write_zip(raw_root, raw, "2026-06-29", "")
+    _write_zip(raw_root, raw, "2026-06-30", f"{target_start - 100},100,1,buy,a\n")
+    request = RangeBackfillRequest(
+        symbol=symbol,
+        exchange="okx",
+        raw_symbol=raw,
+        range_pct="0.01",
+        required_buckets=1,
+        lookback_buckets=1,
+        max_buckets_per_cycle=1,
+        market_db_path=tmp_path / "market.sqlite3",
+        checkpoint_db_path=tmp_path / "checkpoint.sqlite3",
+        raw_root=raw_root,
+        status_path=tmp_path / "status.json",
+        lock_path=tmp_path / "range.lock",
+        allow_download=False,
+        save_raw_trades=False,
+        chunksize=1,
+        max_trades_per_cycle=1,
+    )
+    service = RangeBackfillService(request)
+    called = False
+
+    def fake_replace_range(*, symbol, range_pct, time_range, rows):
+        nonlocal called
+        called = True
+        return 0
+
+    service.range_bar_store.replace_range = fake_replace_range
+
+    summary = service.run_once(now_ms_value=now_ms)
+
+    assert summary.status == "partial"
+    assert summary.aggregates_written == 0
+    assert called is False

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from src.market_data.backfill.status_store import RangeBackfillStatusStore, now_ms
 from tools import prebuild_range_speed_history as tool
 
 
@@ -23,3 +24,32 @@ def test_prebuild_buckets_100_takes_effect() -> None:
 
     assert request.required_buckets == 100
     assert request.max_buckets_per_cycle == 100
+
+
+def test_prebuild_exits_when_live_worker_lock_exists(tmp_path) -> None:
+    lock_path = tmp_path / "range.lock"
+    status_path = tmp_path / "status.json"
+    lock_path.write_text("running", encoding="utf-8")
+    RangeBackfillStatusStore(status_path).write(
+        {"running": True, "heartbeat_ms": now_ms(), "phase": "sleeping"}
+    )
+
+    result = tool.main(
+        [
+            "--buckets",
+            "1",
+            "--market-db",
+            str(tmp_path / "market.sqlite3"),
+            "--checkpoint-db",
+            str(tmp_path / "checkpoint.sqlite3"),
+            "--raw-root",
+            str(tmp_path / "raw"),
+            "--status-path",
+            str(status_path),
+            "--lock-path",
+            str(lock_path),
+            "--no-download",
+        ]
+    )
+
+    assert result == 1

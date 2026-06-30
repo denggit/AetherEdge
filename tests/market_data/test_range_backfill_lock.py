@@ -24,3 +24,14 @@ def test_lock_force_can_replace_stale_status(tmp_path) -> None:
     lock = RangeBackfillLock(lock_path, status_path=status_path, stale_after_seconds=1)
 
     assert lock.acquire(mode="test", force=True)
+
+
+def test_lock_force_can_replace_fresh_running_lock(tmp_path) -> None:
+    lock_path = tmp_path / "range.lock"
+    status_path = tmp_path / "status.json"
+    RangeBackfillStatusStore(status_path).write({"running": True, "heartbeat_ms": 9999999999999})
+    lock_path.write_text("running", encoding="utf-8")
+
+    lock = RangeBackfillLock(lock_path, status_path=status_path, stale_after_seconds=180)
+
+    assert lock.acquire(mode="prebuild", force=True)

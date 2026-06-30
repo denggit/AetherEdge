@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
 from src.market_data.backfill.models import RangeBackfillSummary
+from src.market_data.backfill.status_store import RangeBackfillStatusStore
 from tools import range_backfill_worker as worker
 
 
@@ -48,14 +51,31 @@ def test_worker_check_only_does_not_request_writes(monkeypatch) -> None:
     assert args.check_only is True
 
 
-def test_worker_loops_until_missing_after_zero(monkeypatch) -> None:
+def _paths(tmp_path) -> list[str]:
+    return [
+        "--status-path",
+        str(tmp_path / "status.json"),
+        "--lock-path",
+        str(tmp_path / "range.lock"),
+        "--market-db",
+        str(tmp_path / "market.sqlite3"),
+        "--checkpoint-db",
+        str(tmp_path / "checkpoint.sqlite3"),
+        "--raw-root",
+        str(tmp_path / "raw"),
+    ]
+
+
+def test_worker_loops_until_missing_after_zero(tmp_path, monkeypatch) -> None:
     calls = 0
 
     class FakeService:
         def __init__(self, request) -> None:
             pass
 
-        def run_once(self):
+        def run_once(self, **kwargs):
+            assert kwargs["acquire_lock"] is False
+            assert kwargs["mark_process_finished_on_summary"] is False
             nonlocal calls
             calls += 1
             missing = 1 if calls == 1 else 0
@@ -75,16 +95,16 @@ def test_worker_loops_until_missing_after_zero(monkeypatch) -> None:
     monkeypatch.setattr(worker, "RangeBackfillService", FakeService)
     monkeypatch.setattr(worker.time, "sleep", lambda value: None)
 
-    assert worker.main(["--mode", "live", "--sleep-seconds", "0"]) == 0
+    assert worker.main(["--mode", "live", "--sleep-seconds", "0", *_paths(tmp_path)]) == 0
     assert calls == 2
 
 
-def test_worker_exits_zero_when_cycle_reaches_required_coverage(monkeypatch) -> None:
+def test_worker_exits_zero_when_cycle_reaches_required_coverage(tmp_path, monkeypatch) -> None:
     class FakeService:
         def __init__(self, request) -> None:
             pass
 
-        def run_once(self):
+        def run_once(self, **kwargs):
             return RangeBackfillSummary(
                 symbol="ETH-USDT-PERP",
                 exchange="okx",
@@ -100,4 +120,52 @@ def test_worker_exits_zero_when_cycle_reaches_required_coverage(monkeypatch) -> 
 
     monkeypatch.setattr(worker, "RangeBackfillService", FakeService)
 
-    assert worker.main(["--mode", "live"]) == 0
+    assert worker.main(["--mode", "live", *_paths(tmp_path)]) == 0
+    status = RangeBackfillStatusStore(tmp_path / "status.json").read()
+    assert status is not None
+    assert status["running"] is False
+    assert status["phase"] == "completed"
+    assert status["exit_code"] == 0
+
+
+def test_live_worker_status_running_during_cycle_sleep(tmp_path, monkeypatch) -> None:
+    captured: list[dict] = []
+
+    class FakeService:
+        def __init__(self, request) -> None:
+            self.request = request
+
+        def run_once(self, **kwargs):
+            RangeBackfillStatusStore(self.request.status_path).patch(
+                running=True,
+                phase="sleeping",
+                heartbeat_ms=1,
+                missing_after=1,
+            )
+            return RangeBackfillSummary(
+                symbol="ETH-USDT-PERP",
+                exchange="okx",
+                range_pct="0.002",
+                bucket_interval="4h",
+                target_buckets=3,
+                complete_before=1,
+                complete_after=2,
+                missing_before=2,
+                missing_after=1,
+                status="ok",
+            )
+
+    def fake_sleep(value: float) -> None:
+        status = RangeBackfillStatusStore(tmp_path / "status.json").read()
+        assert status is not None
+        captured.append(status)
+        raise RuntimeError("stop after observing sleep status")
+
+    monkeypatch.setattr(worker, "RangeBackfillService", FakeService)
+    monkeypatch.setattr(worker.time, "sleep", fake_sleep)
+
+    with pytest.raises(RuntimeError):
+        worker.main(["--mode", "live", "--sleep-seconds", "30", *_paths(tmp_path)])
+
+    assert captured[0]["running"] is True
+    assert captured[0]["phase"] == "sleeping"

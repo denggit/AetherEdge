@@ -12,7 +12,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.market_data.backfill.models import RangeBackfillRequest
+from src.market_data.backfill.lock import RangeBackfillLock
 from src.market_data.backfill.service import RangeBackfillService
+from src.market_data.backfill.status_store import RangeBackfillStatusStore, now_ms
 from src.market_data.historical_trades.okx_archive import okx_raw_symbol_from_canonical
 
 
@@ -124,29 +126,86 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    while True:
-        summary = service.run_once()
-        print(
-            "Range backfill cycle completed | "
-            f"status={summary.status} complete_after={summary.complete_after} "
-            f"missing_after={summary.missing_after} aggregates_written={summary.aggregates_written} "
-            f"last_error={summary.last_error}"
+    status_store = RangeBackfillStatusStore(request.status_path)
+    lock = RangeBackfillLock(request.lock_path, status_path=request.status_path)
+    if not lock.acquire(mode=request.mode, force=request.force):
+        print(f"Range backfill lock busy | path={request.lock_path}")
+        return 1
+
+    exit_code = 1
+    try:
+        _write_process_status(
+            status_store,
+            request=request,
+            phase="starting",
+            running=True,
+            exit_code=None,
         )
-        if summary.status == "error":
-            return 1
-        if summary.status == "dry_run":
-            return 0
-        if summary.missing_after <= 0:
-            return 0
-        if once:
-            return 0 if summary.status in {"ok", "dry_run", "partial"} else 1
-        time.sleep(max(0.0, float(args.sleep_seconds)))
+        while True:
+            summary = service.run_once(
+                acquire_lock=False,
+                mark_process_finished_on_summary=False,
+            )
+            print(
+                "Range backfill cycle completed | "
+                f"status={summary.status} complete_after={summary.complete_after} "
+                f"missing_after={summary.missing_after} aggregates_written={summary.aggregates_written} "
+                f"last_error={summary.last_error}"
+            )
+            if summary.status == "error":
+                exit_code = 1
+                return exit_code
+            if summary.status == "dry_run":
+                exit_code = 0
+                return exit_code
+            if summary.missing_after <= 0:
+                exit_code = 0
+                return exit_code
+            if once:
+                exit_code = 0 if summary.status in {"ok", "dry_run", "partial"} else 1
+                return exit_code
+            time.sleep(max(0.0, float(args.sleep_seconds)))
+    finally:
+        _write_process_status(
+            status_store,
+            request=request,
+            phase="completed" if exit_code == 0 else "failed",
+            running=False,
+            exit_code=exit_code,
+        )
+        lock.release()
 
 
 def resolve_once(args: argparse.Namespace) -> bool:
     if args.once is not None:
         return bool(args.once)
     return str(args.mode).strip().lower() != "live"
+
+
+def _write_process_status(
+    status_store: RangeBackfillStatusStore,
+    *,
+    request: RangeBackfillRequest,
+    phase: str,
+    running: bool,
+    exit_code: int | None,
+) -> None:
+    status_store.patch(
+        mode=request.mode,
+        direction=request.direction,
+        pid=os.getpid(),
+        running=running,
+        phase=phase,
+        heartbeat_ms=now_ms(),
+        symbol=request.symbol,
+        exchange=request.exchange,
+        range_pct=request.range_pct,
+        bucket_interval=request.bucket_interval,
+        required_buckets=request.required_buckets,
+        lookback_buckets=request.lookback_buckets,
+        exit_code=exit_code,
+        finished_at_ms=now_ms() if not running else None,
+    )
 
 
 def _env(name: str, default: str) -> str:

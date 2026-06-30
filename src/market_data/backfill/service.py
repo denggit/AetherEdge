@@ -40,7 +40,13 @@ class RangeBackfillService:
             direction=direction or self.request.direction,
         )
 
-    def run_once(self, *, now_ms_value: int | None = None) -> RangeBackfillSummary:
+    def run_once(
+        self,
+        *,
+        now_ms_value: int | None = None,
+        acquire_lock: bool = True,
+        mark_process_finished_on_summary: bool = True,
+    ) -> RangeBackfillSummary:
         self._now_ms_value = now_ms_value
         started = time.monotonic()
         coverage_before = self.check_coverage(now_ms_value=now_ms_value)
@@ -56,52 +62,45 @@ class RangeBackfillService:
                 update_status=False,
             )
 
-        lock = RangeBackfillLock(
-            self.request.lock_path,
-            status_path=self.request.status_path,
-        )
-        if not lock.acquire(mode=self.request.mode, force=self.request.force):
-            return RangeBackfillSummary(
-                symbol=self.request.symbol,
-                exchange=self.request.exchange,
-                range_pct=self.request.range_pct,
-                bucket_interval=self.request.bucket_interval,
-                target_buckets=self.request.required_buckets,
-                complete_before=coverage_before.required_window_complete_count,
-                complete_after=coverage_before.required_window_complete_count,
-                missing_before=coverage_before.missing_periods,
-                missing_after=coverage_before.missing_periods,
-                elapsed_seconds=time.monotonic() - started,
-                status="lock_busy",
-                last_error=f"range backfill lock is held: {self.request.lock_path}",
+        lock: RangeBackfillLock | None = None
+        if acquire_lock:
+            lock = RangeBackfillLock(
+                self.request.lock_path,
+                status_path=self.request.status_path,
             )
+            if not lock.acquire(mode=self.request.mode, force=self.request.force):
+                return RangeBackfillSummary(
+                    symbol=self.request.symbol,
+                    exchange=self.request.exchange,
+                    range_pct=self.request.range_pct,
+                    bucket_interval=self.request.bucket_interval,
+                    target_buckets=self.request.required_buckets,
+                    complete_before=coverage_before.required_window_complete_count,
+                    complete_after=coverage_before.required_window_complete_count,
+                    missing_before=coverage_before.missing_periods,
+                    missing_after=coverage_before.missing_periods,
+                    elapsed_seconds=time.monotonic() - started,
+                    status="lock_busy",
+                    last_error=f"range backfill lock is held: {self.request.lock_path}",
+                )
         try:
-            self.status_store.write(
-                {
-                    "mode": self.request.mode,
-                    "direction": self.request.direction,
-                    "pid": __import__("os").getpid(),
-                    "running": True,
-                    "started_at_ms": now_ms(),
-                    "heartbeat_ms": now_ms(),
-                    "symbol": self.request.symbol,
-                    "exchange": self.request.exchange,
-                    "range_pct": self.request.range_pct,
-                    "bucket_interval": self.request.bucket_interval,
-                    "required_buckets": self.request.required_buckets,
-                    "lookback_buckets": self.request.lookback_buckets,
-                    "complete_before": coverage_before.required_window_complete_count,
-                    "missing_before": coverage_before.missing_periods,
-                    "save_raw_trades": self.request.save_raw_trades,
-                    "chunk_sleep_seconds": self.request.chunk_sleep_seconds,
-                    "max_seconds_per_cycle": self.request.max_seconds_per_cycle,
-                    "max_trades_per_cycle": self.request.max_trades_per_cycle,
-                    "last_error": None,
-                }
+            self._mark_cycle_started(
+                coverage_before=coverage_before,
+                reset_status=acquire_lock,
             )
-            return self._run_locked(started=started, coverage_before=coverage_before)
+            return self._run_locked(
+                started=started,
+                coverage_before=coverage_before,
+                mark_process_finished_on_summary=mark_process_finished_on_summary,
+            )
         except Exception as exc:
-            self.status_store.patch(running=False, heartbeat_ms=now_ms(), last_error=str(exc), finished_at_ms=now_ms())
+            self.status_store.patch(
+                running=not mark_process_finished_on_summary,
+                phase="failed",
+                heartbeat_ms=now_ms(),
+                last_error=str(exc),
+                finished_at_ms=now_ms() if mark_process_finished_on_summary else None,
+            )
             return self._finish_summary(
                 started=started,
                 before=coverage_before,
@@ -112,11 +111,47 @@ class RangeBackfillService:
                 status="error",
                 last_error=str(exc),
                 update_status=True,
+                mark_process_finished=mark_process_finished_on_summary,
             )
         finally:
-            lock.release()
+            if lock is not None:
+                lock.release()
 
-    def _run_locked(self, *, started: float, coverage_before) -> RangeBackfillSummary:
+    def _mark_cycle_started(self, *, coverage_before, reset_status: bool) -> None:
+        payload = {
+            "mode": self.request.mode,
+            "direction": self.request.direction,
+            "pid": __import__("os").getpid(),
+            "running": True,
+            "phase": "running_cycle",
+            "started_at_ms": now_ms(),
+            "heartbeat_ms": now_ms(),
+            "symbol": self.request.symbol,
+            "exchange": self.request.exchange,
+            "range_pct": self.request.range_pct,
+            "bucket_interval": self.request.bucket_interval,
+            "required_buckets": self.request.required_buckets,
+            "lookback_buckets": self.request.lookback_buckets,
+            "complete_before": coverage_before.required_window_complete_count,
+            "missing_before": coverage_before.missing_periods,
+            "save_raw_trades": self.request.save_raw_trades,
+            "chunk_sleep_seconds": self.request.chunk_sleep_seconds,
+            "max_seconds_per_cycle": self.request.max_seconds_per_cycle,
+            "max_trades_per_cycle": self.request.max_trades_per_cycle,
+            "last_error": None,
+        }
+        if reset_status:
+            self.status_store.write(payload)
+        else:
+            self.status_store.patch(**payload)
+
+    def _run_locked(
+        self,
+        *,
+        started: float,
+        coverage_before,
+        mark_process_finished_on_summary: bool,
+    ) -> RangeBackfillSummary:
         target_gaps = self._select_target_gaps(self._target_gaps(coverage_before))
         if not target_gaps:
             return self._finish_summary(
@@ -128,6 +163,7 @@ class RangeBackfillService:
                 aggregates_written=0,
                 status="ok",
                 update_status=True,
+                mark_process_finished=mark_process_finished_on_summary,
             )
         earliest_start = min(gap.bucket_start_ms for gap in target_gaps)
         latest_end = max(gap.bucket_end_ms for gap in target_gaps)
@@ -189,15 +225,33 @@ class RangeBackfillService:
                 break
 
         bars.sort(key=lambda item: (item.end_time_ms, item.bar_id))
-        written_bars = self.range_bar_store.replace_range(
-            symbol=self.request.symbol,
-            range_pct=self.request.range_pct,
-            time_range=target_time,
-            rows=bars,
-        )
         bucket_ms = interval_to_ms(self.request.bucket_interval)
         target_ends = {gap.bucket_end_ms for gap in target_gaps}
         complete_through_ms = latest_end if not resource_limited else (processed_through_ms or -1)
+        writable_time_range = self._writable_time_range(
+            target_time=target_time,
+            resource_limited=resource_limited,
+            complete_through_ms=complete_through_ms,
+        )
+        writable_bars = (
+            []
+            if writable_time_range is None
+            else [
+                bar
+                for bar in bars
+                if writable_time_range.start_time_ms
+                <= bar.end_time_ms
+                <= writable_time_range.end_time_ms
+            ]
+        )
+        written_bars = 0
+        if writable_time_range is not None:
+            written_bars = self.range_bar_store.replace_range(
+                symbol=self.request.symbol,
+                range_pct=self.request.range_pct,
+                time_range=writable_time_range,
+                rows=writable_bars,
+            )
         aggregates = [
             aggregate
             for aggregate in RangeBarAggregator().aggregate(bars, bucket_ms=bucket_ms)
@@ -222,7 +276,22 @@ class RangeBackfillService:
             range_bars_written=written_bars,
             aggregates_written=len(aggregates),
             status="partial" if resource_limited else "ok",
+            mark_process_finished=mark_process_finished_on_summary,
         )
+
+    def _writable_time_range(
+        self,
+        *,
+        target_time: TimeRange,
+        resource_limited: bool,
+        complete_through_ms: int,
+    ) -> TimeRange | None:
+        if not resource_limited:
+            return target_time
+        covered_end_ms = min(target_time.end_time_ms, int(complete_through_ms))
+        if covered_end_ms < target_time.start_time_ms:
+            return None
+        return TimeRange(target_time.start_time_ms, covered_end_ms)
 
     def _coverage_satisfied_for_mode(self, coverage) -> bool:
         if str(self.request.mode).strip().lower() == "prebuild":
@@ -260,6 +329,7 @@ class RangeBackfillService:
         status: str,
         last_error: str | None = None,
         update_status: bool = True,
+        mark_process_finished: bool = True,
     ) -> RangeBackfillSummary:
         after = self.check_coverage(now_ms_value=self._now_ms_value, direction=self.request.direction)
         summary = RangeBackfillSummary(
@@ -281,8 +351,17 @@ class RangeBackfillService:
             last_error=last_error,
         )
         if update_status:
+            if status == "error":
+                phase = "failed"
+            elif status == "partial":
+                phase = "partial"
+            elif mark_process_finished and status in {"ok", "dry_run"}:
+                phase = "completed"
+            else:
+                phase = "sleeping"
             self.status_store.patch(
-                running=False,
+                running=False if mark_process_finished else True,
+                phase=phase,
                 heartbeat_ms=now_ms(),
                 complete_after=summary.complete_after,
                 missing_after=summary.missing_after,
@@ -294,6 +373,6 @@ class RangeBackfillService:
                 last_scanned_bucket_end_ms=after.current_closed_bucket_end_ms,
                 last_error=last_error,
                 exit_code=0 if status in {"ok", "dry_run", "partial"} else 1,
-                finished_at_ms=now_ms(),
+                finished_at_ms=now_ms() if mark_process_finished else None,
             )
         return summary
