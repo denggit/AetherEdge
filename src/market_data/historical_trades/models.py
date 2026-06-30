@@ -19,8 +19,6 @@ class HistoricalTradeImportSummary:
     raw_files_found: list[str] = field(default_factory=list)
     raw_files_downloaded: list[str] = field(default_factory=list)
     raw_files_missing: list[str] = field(default_factory=list)
-    raw_files_not_yet_published: list[str] = field(default_factory=list)
-    raw_files_skipped_incomplete_day: list[str] = field(default_factory=list)
     raw_manifest_path: str = ""
     would_download_buckets: int = 0
     would_download_trade_count: int = 0

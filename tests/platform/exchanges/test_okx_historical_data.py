@@ -4,11 +4,8 @@ import io
 import sqlite3
 import zipfile
 from datetime import date
-from decimal import Decimal
 from pathlib import Path
 
-from src.platform.data.models import TradeSide
-from src.platform.exchanges.models import ExchangeName
 from src.platform.exchanges.okx import historical_data
 from src.platform.exchanges.okx.historical_data import OkxHistoricalTradesArchiveClient
 
@@ -27,20 +24,6 @@ def _zip_bytes() -> bytes:
                 "1,100,2,buy,1704067200000",
                 "2,101,3,sell,1704067201",
                 "3,102,4,buy,2024-01-01T00:00:02Z",
-            ]) + "\n",
-        )
-    return buf.getvalue()
-
-
-def _real_okx_header_zip_bytes() -> bytes:
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(
-            "ETH-USDT-SWAP-trades-2026-06-28.csv",
-            "\n".join([
-                "instrument_name,trade_id,side,price,size,created_time",
-                "ETH-USDT-SWAP,4033860455,sell,1604.96,2.08,1782576000012",
-                "ETH-USDT-SWAP,4033860456,buy,1604.97,1.5,1782576000032",
             ]) + "\n",
         )
     return buf.getvalue()
@@ -69,47 +52,6 @@ def test_iter_daily_trades_zip_supports_common_columns_and_timestamps(tmp_path: 
     assert trades[0].trade_id == "1"
     assert trades[1].trade_time_ms == 1704067201000
     assert trades[2].trade_time_ms == 1704067202000
-
-
-def test_iter_daily_trades_zip_supports_okx_cdn_created_time_header(tmp_path: Path) -> None:
-    path = tmp_path / "real-header.zip"
-    path.write_bytes(_real_okx_header_zip_bytes())
-    client = OkxHistoricalTradesArchiveClient()
-
-    batches = list(client.iter_daily_trades_zip(path, raw_symbol=RAW_SYMBOL, symbol=SYMBOL, chunksize=1))
-    trades = [trade for batch in batches for trade in batch]
-
-    assert len(trades) == 2
-    assert trades[0].exchange == ExchangeName.OKX
-    assert trades[0].symbol == SYMBOL
-    assert trades[0].raw_symbol == RAW_SYMBOL
-    assert trades[0].trade_id == "4033860455"
-    assert trades[0].side == TradeSide.SELL
-    assert trades[0].price == Decimal("1604.96")
-    assert trades[0].quantity == Decimal("2.08")
-    assert trades[0].event_time_ms == 1782576000012
-    assert trades[0].trade_time_ms == 1782576000012
-    assert trades[1].side == TradeSide.BUY
-
-
-def test_iter_daily_trades_zip_error_includes_member_columns_aliases_and_rows(tmp_path: Path) -> None:
-    path = tmp_path / "bad.zip"
-    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("bad.csv", "foo,price\n1,2\n3,4\n")
-    client = OkxHistoricalTradesArchiveClient()
-
-    try:
-        list(client.iter_daily_trades_zip(path, raw_symbol=RAW_SYMBOL, symbol=SYMBOL))
-    except ValueError as exc:
-        message = str(exc)
-    else:
-        raise AssertionError("expected missing column error")
-
-    assert "member='bad.csv'" in message
-    assert "detected_columns=['foo', 'price']" in message
-    assert "required_aliases=" in message
-    assert "created_time" in message
-    assert "first_3_rows=" in message
 
 
 def test_download_daily_trades_zip_uses_part_and_atomic_replace(tmp_path: Path, monkeypatch) -> None:

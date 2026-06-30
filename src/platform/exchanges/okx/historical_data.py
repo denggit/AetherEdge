@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import csv
 import json
 import time
 import urllib.error
@@ -25,18 +24,6 @@ OKX_DAILY_TRADES_URL_TEMPLATE = (
 OKX_HISTORY_TRADES_PATH = "/api/v5/market/history-trades"
 OKX_RETRYABLE_HTTP_CODES = {429, 500, 502, 503, 504}
 OKX_TOO_MANY_REQUESTS_CODE = "50011"
-RAW_TRADE_COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
-    "timestamp": ("created_time", "createdTime", "ts", "timestamp", "time", "datetime"),
-    "raw_symbol": ("instrument_name", "instId", "inst_id", "symbol", "raw_symbol"),
-    "trade_id": ("trade_id", "tradeId", "id"),
-    "price": ("price", "px"),
-    "size": ("size", "sz", "qty", "quantity"),
-    "side": ("side",),
-}
-HEADERLESS_RAW_TRADE_COLUMNS_BY_COUNT: dict[int, list[str]] = {
-    5: ["trade_id", "price", "size", "side", "timestamp"],
-    6: ["raw_symbol", "trade_id", "side", "price", "size", "timestamp"],
-}
 
 
 @dataclass(frozen=True)
@@ -180,25 +167,12 @@ class OkxHistoricalTradesArchiveClient:
 
         with zipfile.ZipFile(path) as zf:
             member = _first_zip_member(zf)
-            has_header = _zip_member_has_header(zf, member)
             with zf.open(member) as fh:
-                read_kwargs: dict[str, object] = {}
-                if not has_header:
-                    column_count = _zip_member_column_count(zf, member)
-                    read_kwargs = {
-                        "header": None,
-                        "names": HEADERLESS_RAW_TRADE_COLUMNS_BY_COUNT.get(column_count),
-                    }
-                for chunk in pd.read_csv(
-                    fh,
-                    chunksize=max(1, int(chunksize)),
-                    **read_kwargs,
-                ):
+                for chunk in pd.read_csv(fh, chunksize=max(1, int(chunksize))):
                     yield _raw_chunk_to_trades(
                         chunk,
                         symbol=symbol,
                         raw_symbol=raw_symbol,
-                        member=member,
                     )
 
     def fetch_history_trades_page(
@@ -334,16 +308,15 @@ class OkxHistoricalTradesArchiveClient:
         return min(self._sleep_seconds * (2 ** max(0, attempt - 1)), 30.0)
 
 
-def _raw_chunk_to_trades(chunk, *, symbol: str, raw_symbol: str, member: str = "<unknown>") -> list[MarketTrade]:
+def _raw_chunk_to_trades(chunk, *, symbol: str, raw_symbol: str) -> list[MarketTrade]:
     columns = _raw_column_map(chunk.columns)
-    raw_symbol_col = _find_raw_col(columns, RAW_TRADE_COLUMN_ALIASES["raw_symbol"])
-    trade_col = _find_raw_col(columns, RAW_TRADE_COLUMN_ALIASES["trade_id"])
-    price_col = _find_raw_col(columns, RAW_TRADE_COLUMN_ALIASES["price"])
-    size_col = _find_raw_col(columns, RAW_TRADE_COLUMN_ALIASES["size"])
-    side_col = _find_raw_col(columns, RAW_TRADE_COLUMN_ALIASES["side"])
-    ts_col = _find_raw_col(columns, RAW_TRADE_COLUMN_ALIASES["timestamp"])
+    trade_col = _find_raw_col(columns, ("tradeid", "trade_id", "id"))
+    price_col = _find_raw_col(columns, ("px", "price"))
+    size_col = _find_raw_col(columns, ("sz", "size", "qty", "quantity"))
+    side_col = _find_raw_col(columns, ("side",))
+    ts_col = _find_raw_col(columns, ("ts", "timestamp", "time", "datetime"))
     if price_col is None or size_col is None or ts_col is None:
-        raise ValueError(_raw_columns_error_message(chunk, member=member))
+        raise ValueError("raw trades CSV missing required price/size/timestamp columns")
 
     trades: list[MarketTrade] = []
     for index, row in chunk.iterrows():
@@ -368,16 +341,11 @@ def _raw_chunk_to_trades(chunk, *, symbol: str, raw_symbol: str, member: str = "
                 trade_id = str(raw_trade_id).strip()
         if trade_id is None:
             trade_id = f"{raw_symbol}:{ts_ms}:{index}"
-        trade_raw_symbol = raw_symbol
-        if raw_symbol_col is not None:
-            row_raw_symbol = row[raw_symbol_col]
-            if row_raw_symbol is not None and str(row_raw_symbol).strip().lower() != "nan":
-                trade_raw_symbol = str(row_raw_symbol).strip()
         trades.append(
             MarketTrade(
                 exchange=ExchangeName.OKX,
                 symbol=symbol,
-                raw_symbol=trade_raw_symbol,
+                raw_symbol=raw_symbol,
                 source=MarketDataSource.REST,
                 price=price,
                 quantity=quantity,
@@ -398,29 +366,6 @@ def _first_zip_member(zf: zipfile.ZipFile) -> str:
     raise ValueError("raw zip has no file members")
 
 
-def _zip_member_has_header(zf: zipfile.ZipFile, member: str) -> bool:
-    first_row = _zip_member_first_row(zf, member)
-    normalized = {_normalize_raw_col(value) for value in first_row}
-    known_columns = {
-        _normalize_raw_col(alias)
-        for aliases in RAW_TRADE_COLUMN_ALIASES.values()
-        for alias in aliases
-    }
-    return bool(normalized & known_columns)
-
-
-def _zip_member_column_count(zf: zipfile.ZipFile, member: str) -> int:
-    return len(_zip_member_first_row(zf, member))
-
-
-def _zip_member_first_row(zf: zipfile.ZipFile, member: str) -> list[str]:
-    with zf.open(member) as fh:
-        first_line = fh.readline().decode("utf-8-sig", errors="replace")
-    if not first_line:
-        return []
-    return next(csv.reader([first_line]))
-
-
 def _raw_column_map(columns) -> dict[str, str]:
     return {_normalize_raw_col(str(col)): str(col) for col in columns}
 
@@ -435,22 +380,6 @@ def _find_raw_col(columns: dict[str, str], candidates: Sequence[str]) -> str | N
         if found is not None:
             return found
     return None
-
-
-def _raw_columns_error_message(chunk, *, member: str) -> str:
-    required_aliases = {
-        "price": list(RAW_TRADE_COLUMN_ALIASES["price"]),
-        "size": list(RAW_TRADE_COLUMN_ALIASES["size"]),
-        "timestamp": list(RAW_TRADE_COLUMN_ALIASES["timestamp"]),
-    }
-    return (
-        "raw trades CSV missing required price/size/timestamp columns "
-        f"member={member!r} "
-        f"detected_columns={list(map(str, chunk.columns))!r} "
-        f"required_aliases={required_aliases!r} "
-        f"all_aliases={ {key: list(value) for key, value in RAW_TRADE_COLUMN_ALIASES.items()}!r} "
-        f"first_3_rows={chunk.head(3).to_dict(orient='records')!r}"
-    )
 
 
 def _parse_raw_timestamp(value: object) -> int | None:
