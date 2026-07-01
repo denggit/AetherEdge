@@ -75,6 +75,8 @@ async def test_micro_repair_fetches_forward_pages_and_deduplicates_boundary() ->
     assert result.rest_pages == 3
     assert result.rest_raw_trades == 5
     assert result.rest_deduped_trades == 3
+    assert result.fetch_mode == "time_range_fallback"
+    assert result.fallback_reason == "missing_trade_ids"
 
 
 class _StalledProvider:
@@ -135,6 +137,101 @@ async def test_micro_repair_passes_total_page_budget_to_platform_adapter() -> No
     assert len(result.trades) == 250
 
 
+class _AnchoredProvider:
+    def __init__(self) -> None:
+        self.last_historical_trade_pages = 13
+        self.anchor_call = None
+        self.time_calls = 0
+
+    async def fetch_trades_between_ids(self, **kwargs):
+        self.anchor_call = kwargs
+        return [
+            _trade(1002, "1020"),
+            _trade(1001, "1001"),
+            _trade(1002, "1020"),
+            _trade(1087, "1087"),
+        ]
+
+    async def fetch_trades(self, **kwargs):
+        self.time_calls += 1
+        raise AssertionError("time-range fallback must not be used")
+
+
+@pytest.mark.asyncio
+async def test_micro_repair_prefers_trade_id_anchor_and_deduplicates() -> None:
+    provider = _AnchoredProvider()
+    result = await RangeMicroRepairService(
+        provider,
+        page_limit=100,
+        max_pages=20,
+        max_seconds=1,
+    ).fetch(
+        symbol="ETH-USDT-PERP",
+        start_time_ms=1001,
+        end_time_ms=1087,
+        newer_trade_id="2000",
+        older_trade_id="1000",
+    )
+
+    assert provider.time_calls == 0
+    assert provider.anchor_call == {
+        "symbol": "ETH-USDT-PERP",
+        "newer_trade_id": "2000",
+        "older_trade_id": "1000",
+        "start_time_ms": 1001,
+        "end_time_ms": 1087,
+        "limit": 100,
+        "max_pages": 20,
+        "oldest_first": True,
+    }
+    assert [row.trade_id for row in result.trades] == [
+        "1001",
+        "1020",
+        "1087",
+    ]
+    assert result.rest_pages == 13
+    assert result.rest_raw_trades == 4
+    assert result.rest_deduped_trades == 3
+    assert result.fetch_mode == "trade_id_anchor"
+    assert result.fallback_reason is None
+
+
+@pytest.mark.asyncio
+async def test_micro_repair_falls_back_when_checkpoint_trade_id_is_missing() -> None:
+    class _Provider:
+        def __init__(self) -> None:
+            self.anchor_calls = 0
+            self.time_call = None
+
+        async def fetch_trades_between_ids(self, **kwargs):
+            self.anchor_calls += 1
+            raise AssertionError("anchor fetch must not be called")
+
+        async def fetch_trades(self, **kwargs):
+            self.time_call = kwargs
+            return [_trade(1001, "1")]
+
+    provider = _Provider()
+    result = await RangeMicroRepairService(
+        provider,
+        page_limit=100,
+        max_pages=5,
+        max_seconds=1,
+    ).fetch(
+        symbol="ETH-USDT-PERP",
+        start_time_ms=1001,
+        end_time_ms=1087,
+        newer_trade_id="2000",
+        older_trade_id=None,
+    )
+
+    assert provider.anchor_calls == 0
+    assert provider.time_call["start_time_ms"] == 1001
+    assert provider.time_call["end_time_ms"] == 1087
+    assert result.fetch_mode == "time_range_fallback"
+    assert result.fallback_reason == "missing_trade_ids"
+
+
 @pytest.mark.asyncio
 async def test_rebuild_service_uses_independent_checkpoint_builder_and_marks_complete(
     tmp_path,
@@ -145,20 +242,20 @@ async def test_rebuild_service_uses_independent_checkpoint_builder_and_marks_com
     checkpoint_ts = bucket_start + 1_000
     first_live_ts = bucket_start + 1_088
     builder = RangeBarBuilder(range_pct="0.001", contract_value="1")
-    builder.on_trade(_trade(checkpoint_ts, "cp"))
+    builder.on_trade(_trade(checkpoint_ts, "4048125172"))
     job = RangeMicroRepairJob(
         exchange="okx",
         symbol="ETH-USDT-PERP",
         range_pct="0.001",
         bucket_start_ms=bucket_start,
         bucket_end_ms=bucket_end,
-        checkpoint_last_trade_id="cp",
+        checkpoint_last_trade_id="4048125172",
         checkpoint_last_trade_ts_ms=checkpoint_ts,
         builder_state=builder.snapshot_state(),
         coverage_status=RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value,
         missing_gap_ms=87_580,
         first_live_trade_ts_ms=first_live_ts,
-        first_live_trade_id="j1",
+        first_live_trade_id="4048126437",
         repair_gap_start_ms=checkpoint_ts + 1,
         repair_gap_end_ms=first_live_ts - 1,
         journal_start_ms=first_live_ts,
@@ -169,15 +266,21 @@ async def test_rebuild_service_uses_independent_checkpoint_builder_and_marks_com
     )
     class _Provider:
         def __init__(self) -> None:
-            self.call = None
+            self.anchor_call = None
+            self.time_calls = 0
+            self.last_historical_trade_pages = 13
+
+        async def fetch_trades_between_ids(self, **kwargs):
+            self.anchor_call = kwargs
+            return [
+                _trade(checkpoint_ts + 1, "4048125173", price="100.2"),
+                _trade(checkpoint_ts + 20, "4048125200", price="100.4"),
+                _trade(first_live_ts - 1, "4048126436", price="100.6"),
+            ]
 
         async def fetch_trades(self, **kwargs):
-            self.call = kwargs
-            return [
-                _trade(checkpoint_ts + 1, "r1", price="100.2"),
-                _trade(checkpoint_ts + 20, "r2", price="100.4"),
-                _trade(first_live_ts - 1, "r3", price="100.6"),
-            ]
+            self.time_calls += 1
+            raise AssertionError("time-range fallback must not be used")
 
     provider = _Provider()
     replayed = []
@@ -216,14 +319,14 @@ async def test_rebuild_service_uses_independent_checkpoint_builder_and_marks_com
         checkpoint_store=checkpoint_store,
         contract_value="1",
         page_limit=100,
-        max_pages=5,
+        max_pages=20,
         max_seconds=1,
     ).rebuild(
         job,
         journal_trades=[
             _trade(
                 first_live_ts,
-                "j1",
+                "4048126437",
                 price="100.8",
                 source=MarketDataSource.WEBSOCKET,
             ),
@@ -255,9 +358,12 @@ async def test_rebuild_service_uses_independent_checkpoint_builder_and_marks_com
         range_pct="0.001",
         bucket_end_ms=bucket_end,
     )
-    assert provider.call["start_time_ms"] == checkpoint_ts + 1
-    assert provider.call["end_time_ms"] == first_live_ts - 1
-    assert provider.call["end_time_ms"] != bucket_end
+    assert provider.time_calls == 0
+    assert provider.anchor_call["newer_trade_id"] == "4048126437"
+    assert provider.anchor_call["older_trade_id"] == "4048125172"
+    assert provider.anchor_call["start_time_ms"] == checkpoint_ts + 1
+    assert provider.anchor_call["end_time_ms"] == first_live_ts - 1
+    assert provider.anchor_call["end_time_ms"] != bucket_end
     assert replayed == [
         checkpoint_ts + 1,
         checkpoint_ts + 20,
@@ -270,6 +376,7 @@ async def test_rebuild_service_uses_independent_checkpoint_builder_and_marks_com
     assert result.repair_gap_ms == 87
     assert result.replayed_rest_trades == 3
     assert result.replayed_journal_trades == 4
+    assert result.fetch_mode == "trade_id_anchor"
     assert result.range_bars_written > 0
     assert repaired is not None
     assert repaired.coverage_status == "COMPLETE"

@@ -293,6 +293,8 @@ def main(argv: list[str] | None = None) -> int:
             f"repair_gap_start_ms={result.repair_gap_start_ms} "
             f"repair_gap_end_ms={result.repair_gap_end_ms} "
             f"repair_gap_ms={result.repair_gap_ms} "
+            f"fetch_mode={result.fetch_mode} "
+            f"fallback_reason={result.fallback_reason} "
             f"rest_pages={result.rest_pages} "
             f"rest_raw_trades={result.rest_raw_trades} "
             f"rest_deduped_trades={result.rest_deduped_trades} "
@@ -675,6 +677,8 @@ def _write_status(
         "rest_pages": 0,
         "rest_raw_trades": 0,
         "rest_deduped_trades": 0,
+        "fetch_mode": None,
+        "fallback_reason": None,
         "replayed_rest_trades": 0,
         "replayed_journal_trades": 0,
         "range_bars_written": 0,
@@ -737,6 +741,8 @@ def _write_status(
             rest_pages=result.rest_pages,
             rest_raw_trades=result.rest_raw_trades,
             rest_deduped_trades=result.rest_deduped_trades,
+            fetch_mode=result.fetch_mode,
+            fallback_reason=result.fallback_reason,
             replayed_rest_trades=result.replayed_rest_trades,
             replayed_journal_trades=result.replayed_journal_trades,
             range_bars_written=result.range_bars_written,

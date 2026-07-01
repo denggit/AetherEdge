@@ -34,6 +34,8 @@ class RangeMicroRepairFetchResult:
     rest_pages: int
     rest_raw_trades: int
     rest_deduped_trades: int
+    fetch_mode: str
+    fallback_reason: str | None
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,8 @@ class RangeMicroRepairRebuildResult:
     replayed_journal_trades: int
     range_bars_written: int
     aggregate_written: bool
+    fetch_mode: str
+    fallback_reason: str | None
 
 
 class RangeMicroRepairService:
@@ -81,10 +85,166 @@ class RangeMicroRepairService:
         symbol: str,
         start_time_ms: int,
         end_time_ms: int,
+        newer_trade_id: str | None = None,
+        older_trade_id: str | None = None,
     ) -> RangeMicroRepairFetchResult:
+        fetch_mode, fallback_reason = self.select_fetch_mode(
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+            newer_trade_id=newer_trade_id,
+            older_trade_id=older_trade_id,
+        )
         if end_time_ms < start_time_ms:
-            return RangeMicroRepairFetchResult((), 0, 0, 0)
+            return RangeMicroRepairFetchResult(
+                trades=(),
+                rest_pages=0,
+                rest_raw_trades=0,
+                rest_deduped_trades=0,
+                fetch_mode=fetch_mode,
+                fallback_reason=fallback_reason,
+            )
+        if fetch_mode == "trade_id_anchor":
+            return await self._fetch_between_ids(
+                symbol=symbol,
+                start_time_ms=start_time_ms,
+                end_time_ms=end_time_ms,
+                newer_trade_id=str(newer_trade_id),
+                older_trade_id=str(older_trade_id),
+            )
+        return await self._fetch_time_range(
+            symbol=symbol,
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+            fallback_reason=fallback_reason,
+        )
 
+    def select_fetch_mode(
+        self,
+        *,
+        start_time_ms: int,
+        end_time_ms: int,
+        newer_trade_id: str | None,
+        older_trade_id: str | None,
+    ) -> tuple[str, str | None]:
+        if end_time_ms < start_time_ms:
+            return "not_required", None
+        if not older_trade_id or not newer_trade_id:
+            return "time_range_fallback", "missing_trade_ids"
+        anchored_fetch = getattr(
+            self.provider,
+            "fetch_trades_between_ids",
+            None,
+        )
+        if not callable(anchored_fetch):
+            return (
+                "time_range_fallback",
+                "provider_missing_fetch_trades_between_ids",
+            )
+        return "trade_id_anchor", None
+
+    async def _fetch_between_ids(
+        self,
+        *,
+        symbol: str,
+        start_time_ms: int,
+        end_time_ms: int,
+        newer_trade_id: str,
+        older_trade_id: str,
+    ) -> RangeMicroRepairFetchResult:
+        try:
+            newer_id = int(newer_trade_id)
+            older_id = int(older_trade_id)
+        except ValueError as exc:
+            raise RangeMicroRepairError(
+                "trade-id anchored repair requires numeric trade IDs"
+            ) from exc
+        if older_id >= newer_id:
+            raise RangeMicroRepairError(
+                "checkpoint trade ID must be older than first live trade ID"
+            )
+
+        anchored_fetch = getattr(
+            self.provider,
+            "fetch_trades_between_ids",
+        )
+        try:
+            page = await asyncio.wait_for(
+                anchored_fetch(
+                    symbol=symbol,
+                    newer_trade_id=newer_trade_id,
+                    older_trade_id=older_trade_id,
+                    start_time_ms=int(start_time_ms),
+                    end_time_ms=int(end_time_ms),
+                    limit=self.page_limit,
+                    max_pages=self.max_pages,
+                    oldest_first=True,
+                ),
+                timeout=self.max_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            raise RangeMicroRepairError(
+                f"REST micro repair timed out after {self.max_seconds:.3f}s"
+            ) from exc
+
+        raw_rows = tuple(page)
+        by_identity: dict[tuple[object, ...], MarketTrade] = {}
+        for trade in raw_rows:
+            trade_id = str(trade.trade_id or "")
+            try:
+                numeric_trade_id = int(trade_id)
+            except ValueError as exc:
+                raise RangeMicroRepairError(
+                    "trade-id anchored provider returned a trade without a numeric ID"
+                ) from exc
+            if not older_id < numeric_trade_id < newer_id:
+                raise RangeMicroRepairError(
+                    "trade-id anchored provider returned a trade outside anchor bounds"
+                )
+            trade_time_ms = _trade_time_ms(trade)
+            if (
+                trade_time_ms is None
+                or trade_time_ms < start_time_ms
+                or trade_time_ms > end_time_ms
+            ):
+                raise RangeMicroRepairError(
+                    "trade-id anchored provider returned a trade outside time bounds"
+                )
+            by_identity.setdefault(trade_identity(trade), trade)
+
+        trades = tuple(sorted(by_identity.values(), key=_trade_sort_key))
+        _assert_strict_replay_order(trades)
+        pages = max(
+            1,
+            int(
+                getattr(
+                    self.provider,
+                    "last_historical_trade_pages",
+                    1,
+                )
+                or 1
+            ),
+        )
+        if pages > self.max_pages:
+            raise RangeMicroRepairError(
+                f"REST pagination limit exceeded: pages={pages} max_pages={self.max_pages}"
+            )
+        return RangeMicroRepairFetchResult(
+            trades=trades,
+            rest_pages=pages,
+            rest_raw_trades=len(raw_rows),
+            rest_deduped_trades=len(trades),
+            fetch_mode="trade_id_anchor",
+            fallback_reason=None,
+        )
+
+    async def _fetch_time_range(
+        self,
+        *,
+        symbol: str,
+        start_time_ms: int,
+        end_time_ms: int,
+        fallback_reason: str | None,
+    ) -> RangeMicroRepairFetchResult:
         started = time.monotonic()
         cursor_start_ms = int(start_time_ms)
         pages = 0
@@ -163,6 +323,8 @@ class RangeMicroRepairService:
                     rest_pages=pages,
                     rest_raw_trades=raw_count,
                     rest_deduped_trades=len(trades),
+                    fetch_mode="time_range_fallback",
+                    fallback_reason=fallback_reason,
                 )
 
             max_time_ms = max(int(_trade_time_ms(trade) or 0) for trade in normalized)
@@ -181,6 +343,8 @@ class RangeMicroRepairService:
             rest_pages=pages,
             rest_raw_trades=raw_count,
             rest_deduped_trades=len(trades),
+            fetch_mode="time_range_fallback",
+            fallback_reason=fallback_reason,
         )
 
 
@@ -238,13 +402,19 @@ class RangeMicroRepairRebuildService:
         )
         journal_start_ms = int(job.first_live_trade_ts_ms)
         journal_end_ms = suffix_end_ms
+        fetch_mode, fallback_reason = self.fetcher.select_fetch_mode(
+            start_time_ms=repair_gap_start_ms,
+            end_time_ms=repair_gap_end_ms,
+            newer_trade_id=job.first_live_trade_id,
+            older_trade_id=job.checkpoint_last_trade_id,
+        )
         logger.info(
             "range_micro_repair_rest_gap_fetch_started | symbol=%s exchange=%s "
             "range_pct=%s bucket_start_ms=%s bucket_end_ms=%s "
             "checkpoint_last_trade_ts_ms=%s checkpoint_last_trade_id=%s "
             "first_live_trade_ts_ms=%s first_live_trade_id=%s "
             "repair_gap_start_ms=%s repair_gap_end_ms=%s repair_gap_ms=%s "
-            "coverage_before=%s",
+            "fetch_mode=%s fallback_reason=%s coverage_before=%s",
             job.symbol,
             job.exchange,
             job.range_pct,
@@ -257,18 +427,23 @@ class RangeMicroRepairRebuildService:
             repair_gap_start_ms,
             repair_gap_end_ms,
             repair_gap_ms,
+            fetch_mode,
+            fallback_reason,
             job.coverage_status,
         )
         fetch = await self.fetcher.fetch(
             symbol=job.symbol,
             start_time_ms=repair_gap_start_ms,
             end_time_ms=repair_gap_end_ms,
+            newer_trade_id=job.first_live_trade_id,
+            older_trade_id=job.checkpoint_last_trade_id,
         )
         logger.info(
             "range_micro_repair_rest_gap_fetch_completed | symbol=%s "
             "exchange=%s bucket_start_ms=%s bucket_end_ms=%s "
             "repair_gap_start_ms=%s repair_gap_end_ms=%s repair_gap_ms=%s "
-            "rest_pages=%s rest_raw_trades=%s rest_deduped_trades=%s",
+            "fetch_mode=%s fallback_reason=%s rest_pages=%s "
+            "rest_raw_trades=%s rest_deduped_trades=%s",
             job.symbol,
             job.exchange,
             job.bucket_start_ms,
@@ -276,6 +451,8 @@ class RangeMicroRepairRebuildService:
             repair_gap_start_ms,
             repair_gap_end_ms,
             repair_gap_ms,
+            fetch.fetch_mode,
+            fetch.fallback_reason,
             fetch.rest_pages,
             fetch.rest_raw_trades,
             fetch.rest_deduped_trades,
@@ -415,6 +592,8 @@ class RangeMicroRepairRebuildService:
             replayed_journal_trades=len(journal_deduped),
             range_bars_written=written,
             aggregate_written=True,
+            fetch_mode=fetch.fetch_mode,
+            fallback_reason=fetch.fallback_reason,
         )
 
 

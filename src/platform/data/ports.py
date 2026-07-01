@@ -49,6 +49,20 @@ class MarketDataFeed(Protocol):
     ) -> list[MarketTrade]:
         ...
 
+    async def fetch_trades_between_ids(
+        self,
+        *,
+        symbol: str | None = None,
+        newer_trade_id: str,
+        older_trade_id: str,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 100,
+        max_pages: int = 20,
+        oldest_first: bool = True,
+    ) -> list[MarketTrade]:
+        ...
+
     def stream_trades(self) -> AsyncIterator[MarketTrade]:
         ...
 

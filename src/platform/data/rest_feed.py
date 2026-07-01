@@ -135,6 +135,54 @@ class RestMarketDataFeed:
         )
         return [market_trade_from_exchange(row) for row in rows]
 
+    async def fetch_trades_between_ids(
+        self,
+        *,
+        symbol: str | None = None,
+        newer_trade_id: str,
+        older_trade_id: str,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 100,
+        max_pages: int = 20,
+        oldest_first: bool = True,
+    ) -> list[MarketTrade]:
+        if symbol is not None and symbol != self._symbol:
+            raise ValueError(
+                f"data feed is bound to {self._symbol}, got {symbol}"
+            )
+        fetch = getattr(
+            self._exchange_client,
+            "fetch_trades_between_ids",
+            None,
+        )
+        if not callable(fetch):
+            raise NotImplementedError(
+                f"Trade-id anchored history is not supported for {self.exchange.value}"
+            )
+        rows = await fetch(
+            self._symbol,
+            newer_trade_id=str(newer_trade_id),
+            older_trade_id=str(older_trade_id),
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+            limit=int(limit),
+            max_pages=int(max_pages),
+            oldest_first=bool(oldest_first),
+        )
+        self.last_historical_trade_pages = max(
+            1,
+            int(
+                getattr(
+                    self._exchange_client,
+                    "last_historical_trade_pages",
+                    1,
+                )
+                or 1
+            ),
+        )
+        return [market_trade_from_exchange(row) for row in rows]
+
     async def stream_trades(self) -> AsyncIterator[MarketTrade]:
         if self._trade_stream is None:
             raise NotImplementedError("No trade stream configured for this feed")

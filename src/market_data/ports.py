@@ -62,6 +62,21 @@ class HistoricalTradeProvider(Protocol):
     ) -> Sequence[MarketTrade]:
         ...
 
+    async def fetch_trades_between_ids(
+        self,
+        *,
+        symbol: str,
+        newer_trade_id: str,
+        older_trade_id: str,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 100,
+        max_pages: int = 20,
+        oldest_first: bool = True,
+    ) -> Sequence[MarketTrade]:
+        """Optional capability used when an exchange exposes ordered trade IDs."""
+        ...
+
 
 class HistoricalTradeFeed(HistoricalTradeProvider, Protocol):
     """Legacy warmup port with explicit ordering control."""

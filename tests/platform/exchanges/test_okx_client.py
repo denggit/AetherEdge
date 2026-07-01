@@ -297,3 +297,158 @@ def test_okx_history_trades_fails_when_page_cap_cannot_prove_start(
                 limit=100,
             )
         )
+
+
+def _okx_trade_row(trade_id: int) -> dict[str, str]:
+    return {
+        "tradeId": str(trade_id),
+        "px": "100",
+        "sz": "1",
+        "side": "buy",
+        "ts": str(1_782_911_250_000 + trade_id),
+    }
+
+
+def test_okx_trade_id_anchored_history_pages_from_newer_anchor() -> None:
+    newer_trade_id = 4_048_126_437
+    older_trade_id = 4_048_125_172
+    pages = []
+    cursor = newer_trade_id
+    for _ in range(13):
+        page = [_okx_trade_row(trade_id) for trade_id in range(cursor - 1, cursor - 101, -1)]
+        pages.append({"code": "0", "data": page})
+        cursor -= 100
+    http = FakeHttpClient(pages)
+    client = create_exchange_client(
+        ExchangeName.OKX,
+        ExchangeConfig(),
+        http_client=http,
+    )
+
+    rows = asyncio.run(
+        client.fetch_trades_between_ids(
+            "ETH-USDT-PERP",
+            newer_trade_id=str(newer_trade_id),
+            older_trade_id=str(older_trade_id),
+            limit=100,
+            max_pages=20,
+            oldest_first=True,
+        )
+    )
+
+    assert len(http.calls) == 13
+    assert http.calls[0]["params"]["after"] == str(newer_trade_id)
+    for call, response in zip(http.calls[1:], pages[:-1], strict=True):
+        assert call["params"]["after"] == response["data"][-1]["tradeId"]
+    returned_ids = [int(row.trade_id) for row in rows]
+    assert returned_ids == sorted(returned_ids)
+    assert returned_ids[0] == older_trade_id + 1
+    assert returned_ids[-1] == newer_trade_id - 1
+    assert older_trade_id not in returned_ids
+    assert newer_trade_id not in returned_ids
+    assert all(
+        older_trade_id < trade_id < newer_trade_id
+        for trade_id in returned_ids
+    )
+    assert client.last_historical_trade_pages == 13
+
+
+def test_okx_trade_id_anchored_history_first_request_requires_after() -> None:
+    class RejectUnanchoredHttpClient(FakeHttpClient):
+        async def request(self, method, url, **kwargs):
+            params = kwargs.get("params") or {}
+            assert params.get("after") == "20"
+            return {
+                "code": "0",
+                "data": [
+                    _okx_trade_row(19),
+                    _okx_trade_row(10),
+                ],
+            }
+
+    client = create_exchange_client(
+        ExchangeName.OKX,
+        ExchangeConfig(),
+        http_client=RejectUnanchoredHttpClient([]),
+    )
+
+    rows = asyncio.run(
+        client.fetch_trades_between_ids(
+            "ETH-USDT-PERP",
+            newer_trade_id="20",
+            older_trade_id="10",
+        )
+    )
+
+    assert [row.trade_id for row in rows] == ["19"]
+
+
+def test_okx_trade_id_anchored_history_fails_before_older_coverage() -> None:
+    http = FakeHttpClient(
+        [
+            {
+                "code": "0",
+                "data": [
+                    _okx_trade_row(199),
+                    _okx_trade_row(198),
+                ],
+            },
+            {
+                "code": "0",
+                "data": [
+                    _okx_trade_row(197),
+                    _okx_trade_row(196),
+                ],
+            },
+        ]
+    )
+    client = create_exchange_client(
+        ExchangeName.OKX,
+        ExchangeConfig(),
+        http_client=http,
+    )
+
+    with pytest.raises(
+        ExchangeApiError,
+        match="before older_trade_id coverage",
+    ):
+        asyncio.run(
+            client.fetch_trades_between_ids(
+                "ETH-USDT-PERP",
+                newer_trade_id="200",
+                older_trade_id="100",
+                limit=100,
+                max_pages=2,
+            )
+        )
+
+
+def test_okx_trade_id_anchored_history_deduplicates_ids() -> None:
+    http = FakeHttpClient(
+        [
+            {
+                "code": "0",
+                "data": [
+                    _okx_trade_row(14),
+                    _okx_trade_row(13),
+                    _okx_trade_row(13),
+                    _okx_trade_row(10),
+                ],
+            }
+        ]
+    )
+    client = create_exchange_client(
+        ExchangeName.OKX,
+        ExchangeConfig(),
+        http_client=http,
+    )
+
+    rows = asyncio.run(
+        client.fetch_trades_between_ids(
+            "ETH-USDT-PERP",
+            newer_trade_id="15",
+            older_trade_id="10",
+        )
+    )
+
+    assert [row.trade_id for row in rows] == ["13", "14"]

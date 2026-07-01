@@ -265,6 +265,180 @@ class OkxExchangeClient:
         trades.sort(key=lambda row: ((row.trade_time_ms or row.event_time_ms or 0), row.trade_id or ""), reverse=not oldest_first)
         return trades[:limit]
 
+    async def fetch_trades_between_ids(
+        self,
+        symbol: str,
+        *,
+        newer_trade_id: str,
+        older_trade_id: str,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 100,
+        max_pages: int = 20,
+        oldest_first: bool = True,
+    ) -> list[Trade]:
+        """Fetch trades strictly between two OKX trade IDs.
+
+        OKX ``history-trades`` interprets ``after`` as "older than this trade
+        ID".  Starting from the first post-recovery live trade therefore
+        bounds micro repair independently of how far the market has advanced.
+        """
+
+        raw_symbol = to_exchange_symbol(self.exchange, symbol)
+        try:
+            newer_id = int(str(newer_trade_id))
+            older_id = int(str(older_trade_id))
+        except (TypeError, ValueError) as exc:
+            raise ExchangeApiError(
+                "OKX history-trades anchors must be numeric trade IDs",
+                payload={
+                    "symbol": symbol,
+                    "newer_trade_id": newer_trade_id,
+                    "older_trade_id": older_trade_id,
+                },
+            ) from exc
+        if older_id >= newer_id:
+            raise ExchangeApiError(
+                "OKX history-trades older anchor must precede newer anchor",
+                payload={
+                    "symbol": symbol,
+                    "newer_trade_id": str(newer_trade_id),
+                    "older_trade_id": str(older_trade_id),
+                },
+            )
+
+        page_limit = min(max(int(limit or 100), 1), 100)
+        configured_max_pages = int(
+            os.getenv("OKX_HISTORY_TRADES_MAX_PAGES", "500")
+        )
+        page_budget = min(
+            configured_max_pages,
+            max(1, int(max_pages)),
+        )
+        page_sleep_every = int(
+            os.getenv("OKX_HISTORY_TRADES_PAGE_SLEEP_EVERY", "20")
+        )
+        page_sleep_seconds = max(
+            0.0,
+            float(
+                os.getenv(
+                    "OKX_HISTORY_TRADES_PAGE_SLEEP_SECONDS",
+                    "1",
+                )
+            ),
+        )
+        cursor = str(newer_trade_id)
+        cursor_id = newer_id
+        rows_by_id: dict[int, dict[str, Any]] = {}
+        coverage_proven = False
+        self.last_historical_trade_pages = 0
+
+        for _ in range(page_budget):
+            payload = await self._request_public(
+                "GET",
+                "/api/v5/market/history-trades",
+                params={
+                    "instId": raw_symbol,
+                    "limit": page_limit,
+                    "after": cursor,
+                },
+            )
+            self.last_historical_trade_pages += 1
+            data = list(payload.get("data", []))
+            if not data:
+                raise ExchangeApiError(
+                    "OKX history-trades returned an empty page before older_trade_id coverage",
+                    payload={
+                        "symbol": symbol,
+                        "newer_trade_id": str(newer_trade_id),
+                        "older_trade_id": str(older_trade_id),
+                        "after": cursor,
+                        "pages": self.last_historical_trade_pages,
+                    },
+                )
+
+            parsed_page: list[tuple[int, dict[str, Any]]] = []
+            for row in data:
+                raw_trade_id = row.get("tradeId")
+                try:
+                    trade_id = int(str(raw_trade_id))
+                except (TypeError, ValueError) as exc:
+                    raise ExchangeApiError(
+                        "OKX history-trades returned a non-numeric trade ID",
+                        payload={"symbol": symbol, "row": row},
+                    ) from exc
+                parsed_page.append((trade_id, row))
+                if trade_id <= older_id:
+                    coverage_proven = True
+                if not older_id < trade_id < newer_id:
+                    continue
+                trade_time_ms = _optional_int(row.get("ts"))
+                if (
+                    start_time_ms is not None
+                    and (
+                        trade_time_ms is None
+                        or trade_time_ms < start_time_ms
+                    )
+                ):
+                    continue
+                if (
+                    end_time_ms is not None
+                    and (
+                        trade_time_ms is None
+                        or trade_time_ms > end_time_ms
+                    )
+                ):
+                    continue
+                rows_by_id.setdefault(trade_id, row)
+
+            if coverage_proven:
+                break
+
+            next_cursor_id = parsed_page[-1][0]
+            if next_cursor_id >= cursor_id:
+                raise ExchangeApiError(
+                    "OKX history-trades trade-id pagination did not advance toward older trades",
+                    payload={
+                        "symbol": symbol,
+                        "after": cursor,
+                        "next_after": str(next_cursor_id),
+                        "pages": self.last_historical_trade_pages,
+                    },
+                )
+            cursor_id = next_cursor_id
+            cursor = str(next_cursor_id)
+            if (
+                page_sleep_every > 0
+                and page_sleep_seconds > 0
+                and self.last_historical_trade_pages % page_sleep_every == 0
+            ):
+                await asyncio.sleep(page_sleep_seconds)
+
+        if not coverage_proven:
+            raise ExchangeApiError(
+                "OKX history-trades pagination limit reached before older_trade_id coverage",
+                payload={
+                    "symbol": symbol,
+                    "newer_trade_id": str(newer_trade_id),
+                    "older_trade_id": str(older_trade_id),
+                    "max_pages": page_budget,
+                    "pages": self.last_historical_trade_pages,
+                },
+            )
+
+        trades = [
+            _map_okx_trade(row, symbol=symbol, raw_symbol=raw_symbol)
+            for row in rows_by_id.values()
+        ]
+        trades.sort(
+            key=lambda row: (
+                row.trade_time_ms or row.event_time_ms or 0,
+                int(str(row.trade_id)),
+            ),
+            reverse=not oldest_first,
+        )
+        return trades
+
     async def fetch_instrument_rule(self, symbol: str) -> InstrumentRule:
         raw_symbol = to_exchange_symbol(self.exchange, symbol)
         payload = await self._request_public(

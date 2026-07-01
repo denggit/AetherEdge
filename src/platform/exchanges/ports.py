@@ -78,6 +78,20 @@ class ExchangeMarketDataClient(ExchangeIdentity, Protocol):
     ) -> list[Trade]:
         ...
 
+    async def fetch_trades_between_ids(
+        self,
+        symbol: str,
+        *,
+        newer_trade_id: str,
+        older_trade_id: str,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 100,
+        max_pages: int = 20,
+        oldest_first: bool = True,
+    ) -> list[Trade]:
+        ...
+
     async def fetch_instrument_rule(self, symbol: str) -> InstrumentRule:
         ...
 
