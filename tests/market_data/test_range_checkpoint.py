@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import threading
 import time
 from decimal import Decimal
@@ -243,3 +244,83 @@ def test_micro_repair_worker_checkpoint_and_status_are_persisted(
     assert failed is not None
     assert failed.status == MICRO_REPAIR_FAILED
     assert failed.last_error == "REST unavailable"
+
+
+def test_micro_repair_job_schema_migrates_existing_database(tmp_path) -> None:
+    path = tmp_path / "range.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE range_micro_repair_jobs (
+                exchange TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                range_pct TEXT NOT NULL,
+                bucket_start_ms INTEGER NOT NULL,
+                bucket_end_ms INTEGER NOT NULL,
+                checkpoint_last_trade_id TEXT,
+                checkpoint_last_trade_ts_ms INTEGER,
+                builder_state_json TEXT NOT NULL,
+                coverage_status TEXT NOT NULL,
+                missing_gap_ms INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                last_error TEXT,
+                PRIMARY KEY (
+                    exchange, symbol, range_pct, bucket_start_ms
+                )
+            )
+            """
+        )
+
+    SqliteRangeCheckpointStore(path)
+
+    with sqlite3.connect(path) as conn:
+        columns = {
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(range_micro_repair_jobs)"
+            )
+        }
+    assert {
+        "first_live_trade_ts_ms",
+        "repair_gap_start_ms",
+        "repair_gap_end_ms",
+        "journal_start_ms",
+        "journal_end_ms",
+        "journal_status",
+    } <= columns
+
+
+def test_invalid_journal_can_revoke_repaired_complete_aggregate(
+    tmp_path,
+) -> None:
+    store = SqliteRangeCheckpointStore(tmp_path / "range.sqlite3")
+    start = MIN_VALID_COMPLETED_AGGREGATE_MS + 100_000
+    aggregate = _aggregate(bucket_start_ms=start, count=3)
+    assert store.save_completed_aggregate(
+        exchange="okx",
+        aggregate=aggregate,
+        coverage_status=RangeCoverageStatus.COMPLETE.value,
+        completed_at_ms=aggregate.bucket_end_ms,
+    )
+
+    assert store.invalidate_completed_aggregate(
+        exchange="okx",
+        symbol=aggregate.symbol,
+        range_pct=str(aggregate.range_pct),
+        bucket_end_ms=aggregate.bucket_end_ms,
+        coverage_status=RangeCoverageStatus.RECOVERED_INCOMPLETE.value,
+        missing_gap_ms=1,
+        completed_at_ms=aggregate.bucket_end_ms + 1,
+    )
+
+    repaired = store.load_completed_aggregate(
+        exchange="okx",
+        symbol=aggregate.symbol,
+        range_pct=str(aggregate.range_pct),
+        bucket_end_ms=aggregate.bucket_end_ms,
+    )
+    assert repaired is not None
+    assert repaired.coverage_status == "RECOVERED_INCOMPLETE"
+    assert repaired.missing_gap_ms == 1

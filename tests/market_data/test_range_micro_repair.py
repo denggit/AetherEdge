@@ -21,17 +21,23 @@ from src.platform.data.models import (
 from src.platform.exchanges.models import ExchangeName
 
 
-def _trade(ts: int, trade_id: str) -> MarketTrade:
+def _trade(
+    ts: int,
+    trade_id: str,
+    *,
+    price: str = "100",
+    source: MarketDataSource = MarketDataSource.REST,
+) -> MarketTrade:
     return MarketTrade(
         exchange=ExchangeName.OKX,
         symbol="ETH-USDT-PERP",
         raw_symbol="ETH-USDT-SWAP",
-        price=Decimal("100"),
+        price=Decimal(price),
         quantity=Decimal("1"),
         side=TradeSide.BUY,
         trade_id=trade_id,
         trade_time_ms=ts,
-        source=MarketDataSource.REST,
+        source=source,
     )
 
 
@@ -132,10 +138,12 @@ async def test_micro_repair_passes_total_page_budget_to_platform_adapter() -> No
 @pytest.mark.asyncio
 async def test_rebuild_service_uses_independent_checkpoint_builder_and_marks_complete(
     tmp_path,
+    monkeypatch,
 ) -> None:
     bucket_start = 1_780_000_000_000
-    bucket_end = bucket_start + 9_999
-    checkpoint_ts = bucket_start + 100
+    bucket_end = bucket_start + 1_999
+    checkpoint_ts = bucket_start + 1_000
+    first_live_ts = bucket_start + 1_088
     builder = RangeBarBuilder(range_pct="0.001", contract_value="1")
     builder.on_trade(_trade(checkpoint_ts, "cp"))
     job = RangeMicroRepairJob(
@@ -149,25 +157,37 @@ async def test_rebuild_service_uses_independent_checkpoint_builder_and_marks_com
         builder_state=builder.snapshot_state(),
         coverage_status=RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value,
         missing_gap_ms=87_580,
+        first_live_trade_ts_ms=first_live_ts,
+        first_live_trade_id="j1",
+        repair_gap_start_ms=checkpoint_ts + 1,
+        repair_gap_end_ms=first_live_ts - 1,
+        journal_start_ms=first_live_ts,
+        journal_end_ms=bucket_end,
+        journal_status="journal_finalized",
         created_at_ms=bucket_start,
         updated_at_ms=bucket_start,
     )
     class _Provider:
+        def __init__(self) -> None:
+            self.call = None
+
         async def fetch_trades(self, **kwargs):
+            self.call = kwargs
             return [
-                MarketTrade(
-                    exchange=ExchangeName.OKX,
-                    symbol="ETH-USDT-PERP",
-                    raw_symbol="ETH-USDT-SWAP",
-                    price=Decimal("100.2"),
-                    quantity=Decimal("1"),
-                    side=TradeSide.BUY,
-                    trade_id="r1",
-                    trade_time_ms=checkpoint_ts + 1,
-                    source=MarketDataSource.REST,
-                )
+                _trade(checkpoint_ts + 1, "r1", price="100.2"),
+                _trade(checkpoint_ts + 20, "r2", price="100.4"),
+                _trade(first_live_ts - 1, "r3", price="100.6"),
             ]
 
+    provider = _Provider()
+    replayed = []
+    original_on_trade = RangeBarBuilder.on_trade
+
+    def recording_on_trade(self, trade):
+        replayed.append(trade.trade_time_ms)
+        return original_on_trade(self, trade)
+
+    monkeypatch.setattr(RangeBarBuilder, "on_trade", recording_on_trade)
     checkpoint_store = SqliteRangeCheckpointStore(tmp_path / "checkpoint.sqlite3")
     checkpoint_store.save_completed_aggregate(
         exchange="okx",
@@ -191,14 +211,43 @@ async def test_rebuild_service_uses_independent_checkpoint_builder_and_marks_com
         completed_at_ms=bucket_end,
     )
     result = await RangeMicroRepairRebuildService(
-        provider=_Provider(),
+        provider=provider,
         range_bar_store=SqliteRangeBarStore(tmp_path / "market.sqlite3"),
         checkpoint_store=checkpoint_store,
         contract_value="1",
         page_limit=100,
         max_pages=5,
         max_seconds=1,
-    ).rebuild(job, completed_at_ms=bucket_end + 1)
+    ).rebuild(
+        job,
+        journal_trades=[
+            _trade(
+                first_live_ts,
+                "j1",
+                price="100.8",
+                source=MarketDataSource.WEBSOCKET,
+            ),
+            _trade(
+                bucket_start + 1_100,
+                "j2",
+                price="101.0",
+                source=MarketDataSource.WEBSOCKET,
+            ),
+            _trade(
+                bucket_start + 1_200,
+                "j3",
+                price="101.2",
+                source=MarketDataSource.WEBSOCKET,
+            ),
+            _trade(
+                bucket_start + 1_999,
+                "j4",
+                price="101.4",
+                source=MarketDataSource.WEBSOCKET,
+            ),
+        ],
+        completed_at_ms=bucket_end + 1,
+    )
 
     repaired = checkpoint_store.load_completed_aggregate(
         exchange="okx",
@@ -206,7 +255,22 @@ async def test_rebuild_service_uses_independent_checkpoint_builder_and_marks_com
         range_pct="0.001",
         bucket_end_ms=bucket_end,
     )
-    assert result.range_bars_written == 1
+    assert provider.call["start_time_ms"] == checkpoint_ts + 1
+    assert provider.call["end_time_ms"] == first_live_ts - 1
+    assert provider.call["end_time_ms"] != bucket_end
+    assert replayed == [
+        checkpoint_ts + 1,
+        checkpoint_ts + 20,
+        first_live_ts - 1,
+        first_live_ts,
+        bucket_start + 1_100,
+        bucket_start + 1_200,
+        bucket_start + 1_999,
+    ]
+    assert result.repair_gap_ms == 87
+    assert result.replayed_rest_trades == 3
+    assert result.replayed_journal_trades == 4
+    assert result.range_bars_written > 0
     assert repaired is not None
     assert repaired.coverage_status == "COMPLETE"
     assert repaired.missing_gap_ms == 0
@@ -218,3 +282,68 @@ async def test_rebuild_service_uses_independent_checkpoint_builder_and_marks_com
         limit=10,
     )
     assert [row.bucket_end_ms for row in complete_history] == [bucket_end]
+
+
+@pytest.mark.asyncio
+async def test_rebuild_skips_rest_when_first_live_is_next_trade_ms(
+    tmp_path,
+) -> None:
+    bucket_start = 1_780_000_000_000
+    bucket_end = bucket_start + 1_999
+    checkpoint_ts = bucket_start + 1_000
+    first_live_ts = checkpoint_ts + 1
+    builder = RangeBarBuilder(range_pct="0.001", contract_value="1")
+    builder.on_trade(_trade(checkpoint_ts, "cp"))
+    job = RangeMicroRepairJob(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=bucket_start,
+        bucket_end_ms=bucket_end,
+        checkpoint_last_trade_id="cp",
+        checkpoint_last_trade_ts_ms=checkpoint_ts,
+        builder_state=builder.snapshot_state(),
+        coverage_status=RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value,
+        missing_gap_ms=1,
+        first_live_trade_ts_ms=first_live_ts,
+        first_live_trade_id="j1",
+        repair_gap_start_ms=first_live_ts,
+        repair_gap_end_ms=first_live_ts - 1,
+        journal_start_ms=first_live_ts,
+        journal_end_ms=bucket_end,
+        journal_status="journal_finalized",
+    )
+
+    class _NoRestProvider:
+        calls = 0
+
+        async def fetch_trades(self, **kwargs):
+            self.calls += 1
+            raise AssertionError("REST must not be called for an empty gap")
+
+    provider = _NoRestProvider()
+    checkpoint_store = SqliteRangeCheckpointStore(
+        tmp_path / "checkpoint.sqlite3"
+    )
+    result = await RangeMicroRepairRebuildService(
+        provider=provider,
+        range_bar_store=SqliteRangeBarStore(tmp_path / "market.sqlite3"),
+        checkpoint_store=checkpoint_store,
+        contract_value="1",
+    ).rebuild(
+        job,
+        journal_trades=[
+            _trade(
+                first_live_ts,
+                "j1",
+                price="100.2",
+                source=MarketDataSource.WEBSOCKET,
+            )
+        ],
+        completed_at_ms=bucket_end + 1,
+    )
+
+    assert provider.calls == 0
+    assert result.repair_gap_ms == 0
+    assert result.replayed_rest_trades == 0
+    assert result.replayed_journal_trades == 1

@@ -27,6 +27,7 @@ async def test_producer_supervisor_restarts_transient_stream_failure():
     supervisor = ProducerSupervisor()
     calls = 0
     items = []
+    transient_failures = []
 
     def stream_factory():
         nonlocal calls
@@ -44,10 +45,14 @@ async def test_producer_supervisor_restarts_transient_stream_failure():
         on_item=on_item,
         restart_delay_seconds=0,
         max_restarts=1,
+        on_transient_failure=(
+            lambda name, exc: transient_failures.append((name, type(exc)))
+        ),
     )
 
     assert calls == 2
     assert items == ["trade"]
+    assert transient_failures == [("trades", ConnectionClosedError)]
     assert supervisor.monitor.snapshot()[0].status is ProducerStatus.STOPPED
 
 

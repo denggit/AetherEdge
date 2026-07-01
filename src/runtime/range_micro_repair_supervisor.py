@@ -26,6 +26,10 @@ class RangeMicroRepairSupervisorConfig:
     market_db_path: Path = Path(
         "data/market_data/aether_market_data.sqlite3"
     )
+    journal_db_path: Path = Path(
+        "data/state/range_repair_trade_journal.sqlite3"
+    )
+    max_gap_ms: int = 600_000
     page_limit: int = 100
     max_pages: int = 20
     max_seconds: float = 30.0
@@ -34,7 +38,7 @@ class RangeMicroRepairSupervisorConfig:
 
 
 class RangeMicroRepairSupervisor:
-    """Launch a self-contained repair worker without handling trade data."""
+    """Monitor the one startup-recovery current-bucket repair worker."""
 
     def __init__(
         self,
@@ -87,7 +91,7 @@ class RangeMicroRepairSupervisor:
             except asyncio.TimeoutError:
                 pass
 
-    def start_for_recovery(
+    def start_startup_recovery(
         self,
         *,
         exchange: str,
@@ -131,7 +135,8 @@ class RangeMicroRepairSupervisor:
                 **popen_kwargs,
             )
             logger.warning(
-                "Range micro repair worker started | pid=%s symbol=%s "
+                "Startup recovery micro repair worker started | "
+                "pid=%s symbol=%s "
                 "bucket_start_ms=%s bucket_end_ms=%s",
                 self.process.pid,
                 symbol,
@@ -207,6 +212,8 @@ class RangeMicroRepairSupervisor:
             str(self.config.checkpoint_db_path),
             "--market-db",
             str(self.config.market_db_path),
+            "--journal-db",
+            str(self.config.journal_db_path),
             "--status-path",
             str(self.config.status_path),
             "--lock-path",
@@ -217,6 +224,8 @@ class RangeMicroRepairSupervisor:
             str(self.config.max_pages),
             "--max-seconds",
             str(self.config.max_seconds),
+            "--max-gap-ms",
+            str(self.config.max_gap_ms),
             "--missing-bucket-grace-seconds",
             str(self.config.missing_bucket_grace_seconds),
         ]

@@ -45,6 +45,9 @@ class ProducerSupervisor:
         on_item: Callable[[T], Awaitable[None]],
         restart_delay_seconds: float = 1.0,
         max_restarts: int | None = None,
+        on_transient_failure: (
+            Callable[[str, BaseException], Awaitable[None] | None] | None
+        ) = None,
     ) -> None:
         """Run a market-data stream and rebuild it after transient failures.
 
@@ -75,6 +78,10 @@ class ProducerSupervisor:
                     logger.exception("Producer stream restart limit exceeded | name=%s restarts=%s", name, restarts)
                     raise
                 restarts += 1
+                if on_transient_failure is not None:
+                    callback_result = on_transient_failure(name, exc)
+                    if callback_result is not None:
+                        await callback_result
                 delay = _restart_delay(restart_delay_seconds, restarts)
                 self.monitor.heartbeat(name)
                 logger.warning(

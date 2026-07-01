@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import replace
+from decimal import Decimal
 import os
 from pathlib import Path
 import sys
@@ -14,7 +15,16 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.market_data.backfill.lock import RangeBackfillLock
 from src.market_data.backfill.status_store import RangeBackfillStatusStore, now_ms
-from src.market_data.micro_repair import RangeMicroRepairRebuildService
+from src.market_data.micro_repair import (
+    RangeMicroRepairError,
+    RangeMicroRepairRebuildService,
+)
+from src.market_data.models import RangeCoverageStatus
+from src.market_data.range_repair_journal import (
+    RangeRepairJournalState,
+    SqliteRangeRepairJournalStore,
+    journal_status_is_invalid,
+)
 from src.market_data.range_checkpoint import (
     MICRO_REPAIR_FAILED,
     MICRO_REPAIR_QUEUED,
@@ -26,13 +36,20 @@ from src.market_data.range_checkpoint import (
 )
 from src.market_data.storage import SqliteRangeBarStore
 from src.platform.data import create_market_data_feed
+from src.platform.data.models import (
+    MarketDataSource,
+    MarketTrade,
+    TradeSide,
+)
 from src.platform.exchanges.models import ExchangeConfig, ExchangeName
 from src.platform.markets import get_market_profile
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Repair one closed degraded range bucket in a subprocess."
+        description=(
+            "Repair the startup-recovery current range bucket in a subprocess."
+        )
     )
     parser.add_argument("--exchange", required=True)
     parser.add_argument("--symbol", required=True)
@@ -43,11 +60,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--missing-gap-ms", type=int, required=True)
     parser.add_argument("--checkpoint-db", required=True)
     parser.add_argument("--market-db", required=True)
+    parser.add_argument("--journal-db", required=True)
     parser.add_argument("--status-path", required=True)
     parser.add_argument("--lock-path", required=True)
     parser.add_argument("--page-limit", type=int, default=100)
     parser.add_argument("--max-pages", type=int, default=20)
     parser.add_argument("--max-seconds", type=float, default=30.0)
+    parser.add_argument("--max-gap-ms", type=int, default=600_000)
     parser.add_argument("--missing-bucket-grace-seconds", type=int, default=120)
     parser.add_argument("--wait-poll-seconds", type=float, default=5.0)
     return parser
@@ -58,6 +77,7 @@ def main(argv: list[str] | None = None) -> int:
     _lower_process_priority()
     status_store = RangeBackfillStatusStore(args.status_path)
     checkpoint_store = SqliteRangeCheckpointStore(args.checkpoint_db)
+    journal_store = SqliteRangeRepairJournalStore(args.journal_db)
     job = _capture_repair_job(checkpoint_store, args=args)
     if job is None:
         _write_status(
@@ -76,21 +96,40 @@ def main(argv: list[str] | None = None) -> int:
         running=True,
         job=job,
     )
-    print(
-        "range_micro_repair_worker_waiting_for_closed_bucket | "
-        f"symbol={job.symbol} exchange={job.exchange} "
-        f"bucket_start_ms={job.bucket_start_ms} "
-        f"bucket_end_ms={job.bucket_end_ms} "
-        f"checkpoint_last_trade_ts_ms={job.checkpoint_last_trade_ts_ms}",
-        flush=True,
-    )
-    if not _wait_until_bucket_can_be_repaired(
-        checkpoint_store,
-        status_store,
-        args=args,
-        job=job,
-    ):
+    try:
+        ready = _wait_until_bucket_can_be_repaired(
+            checkpoint_store,
+            journal_store,
+            status_store,
+            args=args,
+            job=job,
+        )
+    except Exception as exc:
+        _mark_and_write(
+            checkpoint_store,
+            status_store,
+            job=job,
+            status=MICRO_REPAIR_FAILED,
+            args=args,
+            failure_reason=f"{type(exc).__name__}:{exc}",
+            journal_state=journal_store.load_state(
+                exchange=job.exchange,
+                symbol=job.symbol,
+                range_pct=job.range_pct,
+                bucket_start_ms=job.bucket_start_ms,
+            ),
+        )
+        print(
+            "range_micro_repair_failed | "
+            f"symbol={job.symbol} exchange={job.exchange} "
+            f"bucket_start_ms={job.bucket_start_ms} "
+            f"failure_reason={type(exc).__name__}:{exc}",
+            flush=True,
+        )
+        return 1
+    if ready is None:
         return 0
+    job, journal_state = ready
 
     completed = checkpoint_store.load_completed_aggregate(
         exchange=job.exchange,
@@ -106,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
             status=MICRO_REPAIR_SKIPPED,
             args=args,
             failure_reason="bucket_already_complete",
+            journal_state=journal_state,
         )
         return 0
 
@@ -121,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
             args=args,
             running=False,
             job=job,
+            journal_state=journal_state,
             failure_reason="micro_repair_lock_busy",
         )
         return 0
@@ -139,6 +180,7 @@ def main(argv: list[str] | None = None) -> int:
         args=args,
         running=True,
         job=job,
+        journal_state=journal_state,
     )
     print(
         "range_micro_repair_started | "
@@ -176,7 +218,52 @@ def main(argv: list[str] | None = None) -> int:
             max_pages=args.max_pages,
             max_seconds=args.max_seconds,
         )
-        result = asyncio.run(service.rebuild(job, completed_at_ms=now_ms()))
+        journal_records = journal_store.load_trades(
+            exchange=job.exchange,
+            symbol=job.symbol,
+            range_pct=job.range_pct,
+            bucket_start_ms=job.bucket_start_ms,
+            start_time_ms=int(job.journal_start_ms or 0),
+            end_time_ms=int(job.journal_end_ms or job.bucket_end_ms),
+        )
+        journal_trades = tuple(
+            _market_trade_from_journal(row) for row in journal_records
+        )
+        result = asyncio.run(
+            service.rebuild(
+                job,
+                journal_trades=journal_trades,
+                completed_at_ms=now_ms(),
+            )
+        )
+        post_repair_journal_state = journal_store.load_state(
+            exchange=job.exchange,
+            symbol=job.symbol,
+            range_pct=job.range_pct,
+            bucket_start_ms=job.bucket_start_ms,
+        )
+        if (
+            post_repair_journal_state is None
+            or not post_repair_journal_state.valid_for_repair
+            or post_repair_journal_state.journal_trade_count
+            != journal_state.journal_trade_count
+            or post_repair_journal_state.updated_at_ms
+            != journal_state.updated_at_ms
+        ):
+            checkpoint_store.invalidate_completed_aggregate(
+                exchange=job.exchange,
+                symbol=job.symbol,
+                range_pct=job.range_pct,
+                bucket_end_ms=job.bucket_end_ms,
+                coverage_status=(
+                    RangeCoverageStatus.RECOVERED_INCOMPLETE.value
+                ),
+                missing_gap_ms=1,
+                completed_at_ms=now_ms(),
+            )
+            raise RangeMicroRepairError(
+                "repair journal changed while micro repair was running"
+            )
         checkpoint_store.mark_micro_repair_status(
             exchange=job.exchange,
             symbol=job.symbol,
@@ -192,6 +279,7 @@ def main(argv: list[str] | None = None) -> int:
             running=False,
             job=job,
             result=result,
+            journal_state=journal_state,
         )
         print(
             "range_micro_repair_succeeded | "
@@ -202,11 +290,14 @@ def main(argv: list[str] | None = None) -> int:
             f"checkpoint_last_trade_ts_ms={job.checkpoint_last_trade_ts_ms} "
             f"checkpoint_last_trade_id={job.checkpoint_last_trade_id} "
             f"missing_gap_ms={job.missing_gap_ms} "
-            f"repair_start_ms={result.repair_start_ms} "
-            f"repair_end_ms={result.repair_end_ms} "
+            f"repair_gap_start_ms={result.repair_gap_start_ms} "
+            f"repair_gap_end_ms={result.repair_gap_end_ms} "
+            f"repair_gap_ms={result.repair_gap_ms} "
             f"rest_pages={result.rest_pages} "
             f"rest_raw_trades={result.rest_raw_trades} "
             f"rest_deduped_trades={result.rest_deduped_trades} "
+            f"replayed_rest_trades={result.replayed_rest_trades} "
+            f"replayed_journal_trades={result.replayed_journal_trades} "
             f"range_bars_written={result.range_bars_written} "
             f"coverage_before={job.coverage_status} "
             "coverage_after=COMPLETE failure_reason=None",
@@ -229,6 +320,7 @@ def main(argv: list[str] | None = None) -> int:
             args=args,
             running=False,
             job=job,
+            journal_state=journal_state,
             failure_reason=f"{type(exc).__name__}:{exc}",
         )
         print(
@@ -240,8 +332,8 @@ def main(argv: list[str] | None = None) -> int:
             f"checkpoint_last_trade_ts_ms={job.checkpoint_last_trade_ts_ms} "
             f"checkpoint_last_trade_id={job.checkpoint_last_trade_id} "
             f"missing_gap_ms={job.missing_gap_ms} "
-            f"repair_start_ms={int(job.checkpoint_last_trade_ts_ms or job.bucket_start_ms - 1) + 1} "
-            f"repair_end_ms={job.bucket_end_ms} "
+            f"repair_gap_start_ms={job.repair_gap_start_ms} "
+            f"repair_gap_end_ms={job.repair_gap_end_ms} "
             "coverage_after="
             f"{job.coverage_status} "
             f"failure_reason={type(exc).__name__}:{exc}",
@@ -329,13 +421,18 @@ def _earliest_checkpoint_job(
 
 def _wait_until_bucket_can_be_repaired(
     checkpoint_store: SqliteRangeCheckpointStore,
+    journal_store: SqliteRangeRepairJournalStore,
     status_store: RangeBackfillStatusStore,
     *,
     args,
     job: RangeMicroRepairJob,
-) -> bool:
+) -> tuple[RangeMicroRepairJob, RangeRepairJournalState] | None:
     grace_ms = max(0, int(args.missing_bucket_grace_seconds)) * 1000
     poll_seconds = max(0.1, float(args.wait_poll_seconds))
+    waiting_first_logged = False
+    waiting_close_logged = False
+    waiting_finalized_logged = False
+    finalized_signature = None
     while True:
         completed = checkpoint_store.load_completed_aggregate(
             exchange=job.exchange,
@@ -351,20 +448,155 @@ def _wait_until_bucket_can_be_repaired(
                 status=MICRO_REPAIR_SKIPPED,
                 args=args,
                 failure_reason="bucket_already_complete",
+                journal_state=journal_store.load_state(
+                    exchange=job.exchange,
+                    symbol=job.symbol,
+                    range_pct=job.range_pct,
+                    bucket_start_ms=job.bucket_start_ms,
+                ),
             )
-            return False
+            return None
+        state = journal_store.load_state(
+            exchange=job.exchange,
+            symbol=job.symbol,
+            range_pct=job.range_pct,
+            bucket_start_ms=job.bucket_start_ms,
+        )
+        if state is not None:
+            checkpoint_store.update_micro_repair_journal_status(
+                exchange=job.exchange,
+                symbol=job.symbol,
+                range_pct=job.range_pct,
+                bucket_start_ms=job.bucket_start_ms,
+                journal_status=state.status,
+                updated_at_ms=now_ms(),
+            )
+        if state is not None and journal_status_is_invalid(state.status):
+            raise RangeMicroRepairError(
+                f"repair journal invalid: status={state.status} "
+                f"error={state.last_error}"
+            )
+        if state is None or state.first_live_trade_ts_ms is None:
+            if now_ms() >= job.bucket_end_ms + 1 + grace_ms:
+                raise RangeMicroRepairError(
+                    "first live trade was not recorded before grace deadline"
+                )
+            if not waiting_first_logged:
+                print(
+                    "range_micro_repair_waiting_for_first_live_trade | "
+                    f"symbol={job.symbol} exchange={job.exchange} "
+                    f"bucket_start_ms={job.bucket_start_ms}",
+                    flush=True,
+                )
+                waiting_first_logged = True
+            _write_status(
+                status_store,
+                status=MICRO_REPAIR_QUEUED,
+                args=args,
+                running=True,
+                job=job,
+                journal_state=state,
+                waiting_reason="waiting_for_first_live_trade",
+            )
+            time.sleep(poll_seconds)
+            continue
+        repair_gap_start_ms = int(job.checkpoint_last_trade_ts_ms or 0) + 1
+        repair_gap_end_ms = int(state.first_live_trade_ts_ms) - 1
+        repair_gap_ms = max(
+            0, repair_gap_end_ms - repair_gap_start_ms + 1
+        )
+        if repair_gap_ms > int(args.max_gap_ms):
+            raise RangeMicroRepairError(
+                "real REST repair gap exceeds configured maximum: "
+                f"repair_gap_ms={repair_gap_ms} max_gap_ms={args.max_gap_ms}"
+            )
+        checkpoint_store.update_micro_repair_journal(
+            exchange=job.exchange,
+            symbol=job.symbol,
+            range_pct=job.range_pct,
+            bucket_start_ms=job.bucket_start_ms,
+            first_live_trade_ts_ms=state.first_live_trade_ts_ms,
+            first_live_trade_id=state.first_live_trade_id,
+            repair_gap_start_ms=repair_gap_start_ms,
+            repair_gap_end_ms=repair_gap_end_ms,
+            journal_start_ms=state.first_live_trade_ts_ms,
+            journal_end_ms=job.bucket_end_ms,
+            journal_status=state.status,
+            updated_at_ms=now_ms(),
+        )
+        job = replace(
+            job,
+            first_live_trade_ts_ms=state.first_live_trade_ts_ms,
+            first_live_trade_id=state.first_live_trade_id,
+            repair_gap_start_ms=repair_gap_start_ms,
+            repair_gap_end_ms=repair_gap_end_ms,
+            journal_start_ms=state.first_live_trade_ts_ms,
+            journal_end_ms=job.bucket_end_ms,
+            journal_status=state.status,
+            updated_at_ms=now_ms(),
+        )
         current_ms = now_ms()
-        if current_ms > job.bucket_end_ms and (
-            completed is not None
-            or current_ms >= job.bucket_end_ms + 1 + grace_ms
-        ):
-            return True
+        if current_ms <= job.bucket_end_ms:
+            if not waiting_close_logged:
+                print(
+                    "range_micro_repair_waiting_for_bucket_close | "
+                    f"symbol={job.symbol} exchange={job.exchange} "
+                    f"bucket_start_ms={job.bucket_start_ms} "
+                    f"bucket_end_ms={job.bucket_end_ms}",
+                    flush=True,
+                )
+                waiting_close_logged = True
+            waiting_reason = "waiting_for_bucket_close"
+        elif not state.finalized:
+            if current_ms >= job.bucket_end_ms + 1 + grace_ms:
+                raise RangeMicroRepairError(
+                    "repair journal was not finalized before grace deadline"
+                )
+            if not waiting_finalized_logged:
+                print(
+                    "range_micro_repair_waiting_for_journal_finalized | "
+                    f"symbol={job.symbol} exchange={job.exchange} "
+                    f"bucket_start_ms={job.bucket_start_ms}",
+                    flush=True,
+                )
+                waiting_finalized_logged = True
+            waiting_reason = "waiting_for_journal_finalized"
+        else:
+            if not state.valid_for_repair:
+                raise RangeMicroRepairError(
+                    f"repair journal is not valid: status={state.status} "
+                    f"dropped_trades={state.dropped_trades} "
+                    f"writer_failures={state.writer_failures}"
+                )
+            signature = (
+                state.updated_at_ms,
+                state.journal_trade_count,
+                state.dropped_trades,
+                state.writer_failures,
+                state.status,
+            )
+            if finalized_signature != signature:
+                finalized_signature = signature
+                _write_status(
+                    status_store,
+                    status=MICRO_REPAIR_QUEUED,
+                    args=args,
+                    running=True,
+                    job=job,
+                    journal_state=state,
+                    waiting_reason="waiting_for_journal_stability",
+                )
+                time.sleep(poll_seconds)
+                continue
+            return job, state
         _write_status(
             status_store,
             status=MICRO_REPAIR_QUEUED,
             args=args,
             running=True,
             job=job,
+            journal_state=state,
+            waiting_reason=waiting_reason,
         )
         time.sleep(poll_seconds)
 
@@ -377,6 +609,7 @@ def _mark_and_write(
     status: str,
     args,
     failure_reason: str,
+    journal_state: RangeRepairJournalState | None = None,
 ) -> None:
     checkpoint_store.mark_micro_repair_status(
         exchange=job.exchange,
@@ -393,6 +626,7 @@ def _mark_and_write(
         args=args,
         running=False,
         job=job,
+        journal_state=journal_state,
         failure_reason=failure_reason,
     )
 
@@ -405,6 +639,8 @@ def _write_status(
     running: bool,
     job=None,
     result=None,
+    journal_state: RangeRepairJournalState | None = None,
+    waiting_reason: str | None = None,
     failure_reason: str | None = None,
 ) -> None:
     timestamp = now_ms()
@@ -413,6 +649,7 @@ def _write_status(
         "running": bool(running),
         "repair_status": status,
         "phase": status,
+        "repair_scope": "startup_recovery_current_bucket",
         "exchange": args.exchange,
         "symbol": args.symbol,
         "range_pct": str(args.range_pct),
@@ -420,14 +657,32 @@ def _write_status(
         "worker_heartbeat_ms": timestamp,
         "heartbeat_ms": timestamp,
         "failure_reason": failure_reason,
+        "waiting_reason": waiting_reason,
         "finished_at_ms": None if running else timestamp,
+        "checkpoint_last_trade_ts_ms": None,
+        "checkpoint_last_trade_id": None,
+        "first_live_trade_ts_ms": None,
+        "first_live_trade_id": None,
+        "repair_gap_start_ms": None,
+        "repair_gap_end_ms": None,
+        "repair_gap_ms": None,
+        "journal_start_ms": None,
+        "journal_end_ms": None,
+        "journal_trade_count": 0,
+        "journal_status": None,
+        "journal_dropped_trades": 0,
+        "journal_writer_failures": 0,
+        "rest_pages": 0,
+        "rest_raw_trades": 0,
+        "rest_deduped_trades": 0,
+        "replayed_rest_trades": 0,
+        "replayed_journal_trades": 0,
+        "range_bars_written": 0,
+        "aggregate_written": False,
+        "coverage_before": None,
+        "coverage_after": None,
     }
     if job is not None:
-        repair_start_ms = (
-            int(job.checkpoint_last_trade_ts_ms) + 1
-            if job.checkpoint_last_trade_ts_ms is not None
-            else int(job.bucket_start_ms)
-        )
         payload.update(
             bucket_end_ms=job.bucket_end_ms,
             checkpoint_last_trade_ts_ms=job.checkpoint_last_trade_ts_ms,
@@ -435,26 +690,84 @@ def _write_status(
             coverage_before=job.coverage_status,
             coverage_after=job.coverage_status,
             missing_gap_ms=job.missing_gap_ms,
-            repair_start_ms=repair_start_ms,
-            repair_end_ms=job.bucket_end_ms,
+            first_live_trade_ts_ms=job.first_live_trade_ts_ms,
+            first_live_trade_id=job.first_live_trade_id,
+            repair_gap_start_ms=job.repair_gap_start_ms,
+            repair_gap_end_ms=job.repair_gap_end_ms,
+            repair_gap_ms=(
+                None
+                if job.repair_gap_start_ms is None
+                or job.repair_gap_end_ms is None
+                else max(
+                    0,
+                    job.repair_gap_end_ms
+                    - job.repair_gap_start_ms
+                    + 1,
+                )
+            ),
+            journal_start_ms=job.journal_start_ms,
+            journal_end_ms=job.journal_end_ms,
+            journal_status=job.journal_status,
             rest_pages=0,
             rest_raw_trades=0,
             rest_deduped_trades=0,
             range_bars_written=0,
             aggregates_written=0,
         )
+    if journal_state is not None:
+        payload.update(
+            first_live_trade_ts_ms=journal_state.first_live_trade_ts_ms,
+            first_live_trade_id=journal_state.first_live_trade_id,
+            journal_trade_count=journal_state.journal_trade_count,
+            journal_status=journal_state.status,
+            journal_dropped_trades=journal_state.dropped_trades,
+            journal_writer_failures=journal_state.writer_failures,
+            journal_finalized=journal_state.finalized,
+        )
     if result is not None:
         payload.update(
             repair_start_ms=result.repair_start_ms,
             repair_end_ms=result.repair_end_ms,
+            repair_gap_start_ms=result.repair_gap_start_ms,
+            repair_gap_end_ms=result.repair_gap_end_ms,
+            repair_gap_ms=result.repair_gap_ms,
+            journal_start_ms=result.journal_start_ms,
+            journal_end_ms=result.journal_end_ms,
+            journal_trade_count=result.journal_trade_count,
             rest_pages=result.rest_pages,
             rest_raw_trades=result.rest_raw_trades,
             rest_deduped_trades=result.rest_deduped_trades,
+            replayed_rest_trades=result.replayed_rest_trades,
+            replayed_journal_trades=result.replayed_journal_trades,
             range_bars_written=result.range_bars_written,
+            aggregate_written=bool(result.aggregate_written),
             aggregates_written=int(result.aggregate_written),
             coverage_after="COMPLETE",
         )
     store.write(payload)
+
+
+def _market_trade_from_journal(row) -> MarketTrade:
+    try:
+        side = TradeSide(str(row.side))
+    except ValueError:
+        side = TradeSide.UNKNOWN
+    try:
+        source = MarketDataSource(str(row.source))
+    except ValueError:
+        source = MarketDataSource.WEBSOCKET
+    return MarketTrade(
+        exchange=ExchangeName(str(row.exchange).lower()),
+        symbol=row.symbol,
+        raw_symbol=row.raw_symbol,
+        price=Decimal(str(row.price)),
+        quantity=Decimal(str(row.quantity)),
+        side=side,
+        trade_id=row.trade_id,
+        event_time_ms=row.event_time_ms,
+        trade_time_ms=row.trade_time_ms,
+        source=source,
+    )
 
 
 if __name__ == "__main__":

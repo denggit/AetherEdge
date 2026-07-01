@@ -71,6 +71,12 @@ def test_live_runtime_config_loads_micro_repair_limits(tmp_path):
             "AETHER_RANGE_MICRO_REPAIR_MISSING_BUCKET_GRACE_SECONDS": "12",
             "AETHER_RANGE_MICRO_REPAIR_STATUS_PATH": "state/micro.json",
             "AETHER_RANGE_MICRO_REPAIR_LOCK_PATH": "state/micro.lock",
+            "AETHER_RANGE_REPAIR_JOURNAL_ENABLED": "true",
+            "AETHER_RANGE_REPAIR_JOURNAL_DB": "state/journal.sqlite3",
+            "AETHER_RANGE_REPAIR_JOURNAL_RETENTION_HOURS": "13",
+            "AETHER_RANGE_REPAIR_JOURNAL_WRITER_MAX_PENDING": "14",
+            "AETHER_RANGE_REPAIR_JOURNAL_FLUSH_INTERVAL_MS": "15",
+            "AETHER_RANGE_REPAIR_JOURNAL_BATCH_SIZE": "16",
         },
     )
 
@@ -83,6 +89,12 @@ def test_live_runtime_config_loads_micro_repair_limits(tmp_path):
     assert cfg.range_micro_repair_missing_bucket_grace_seconds == 12
     assert cfg.range_micro_repair_status_path == "state/micro.json"
     assert cfg.range_micro_repair_lock_path == "state/micro.lock"
+    assert cfg.range_repair_journal_enabled is True
+    assert cfg.range_repair_journal_db == "state/journal.sqlite3"
+    assert cfg.range_repair_journal_retention_hours == 13
+    assert cfg.range_repair_journal_writer_max_pending == 14
+    assert cfg.range_repair_journal_flush_interval_ms == 15
+    assert cfg.range_repair_journal_batch_size == 16
 
 
 def test_live_runtime_config_injected_environ_ignores_project_master_follower_env(tmp_path, monkeypatch):

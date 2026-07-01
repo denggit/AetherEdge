@@ -13,8 +13,12 @@ from src.app import (
 from src.market_data.derived import RangeBarAggregator, RangeBarBuilder
 from src.market_data.models import RangeBarAggregate, RangeCoverageStatus
 from src.market_data.range_checkpoint import (
+    MICRO_REPAIR_QUEUED,
     RangeBuilderCheckpoint,
     SqliteRangeCheckpointStore,
+)
+from src.market_data.range_repair_journal import (
+    SqliteRangeRepairJournalStore,
 )
 from src.market_data.storage import SqliteRangeBarStore
 from src.platform.data.models import MarketTrade, TradeSide
@@ -54,7 +58,7 @@ class _MicroSupervisor:
     def __init__(self) -> None:
         self.launches = []
 
-    def start_for_recovery(self, **kwargs) -> bool:
+    def start_startup_recovery(self, **kwargs) -> bool:
         self.launches.append(dict(kwargs))
         return True
 
@@ -124,6 +128,7 @@ async def test_live_main_launches_subprocess_without_touching_trade_flow(
         mode=RuntimeMode.LIVE_RUNTIME,
         range_checkpoint_db_path=str(tmp_path / "checkpoint.sqlite3"),
         market_data_db_path=str(tmp_path / "market.sqlite3"),
+        range_repair_journal_db=str(tmp_path / "journal.sqlite3"),
     )
     requirements = StrategyRuntimeRequirements.from_mapping(
         {
@@ -151,7 +156,24 @@ async def test_live_main_launches_subprocess_without_touching_trade_flow(
     )
 
     runner._initialize_rangebar_trust_window()
+    await runner._process_trade(
+        MarketTrade(
+            exchange=ExchangeName.OKX,
+            symbol=app.symbol,
+            raw_symbol="ETH-USDT-SWAP",
+            price=Decimal("100.2"),
+            quantity=Decimal("1"),
+            side=TradeSide.BUY,
+            trade_id="first-live",
+            trade_time_ms=NOW_MS + 88,
+        )
+    )
+    runner._finalize_range_repair_journal(
+        bucket_start_ms=BUCKET_START,
+        finalized_at_ms=BUCKET_START + H4,
+    )
     runner._get_range_checkpoint_writer().stop(flush=True)
+    runner._get_range_repair_journal_writer().stop(flush=True)
 
     job = checkpoint_store.load_micro_repair_job(
         exchange="okx",
@@ -159,12 +181,28 @@ async def test_live_main_launches_subprocess_without_touching_trade_flow(
         range_pct="0.002",
         bucket_start_ms=BUCKET_START,
     )
-    assert job is None
+    assert job is not None
+    assert job.status == MICRO_REPAIR_QUEUED
     assert len(micro_supervisor.launches) == 1
     assert micro_supervisor.launches[0]["bucket_start_ms"] == BUCKET_START
     assert data.fetch_calls == 0
     assert data.stream_calls == 0
     assert runner._market_queue.empty()
+    journal_state = SqliteRangeRepairJournalStore(
+        tmp_path / "journal.sqlite3"
+    ).load_state(
+        exchange="okx",
+        symbol=app.symbol,
+        range_pct="0.002",
+        bucket_start_ms=BUCKET_START,
+    )
+    assert journal_state is not None
+    assert journal_state.first_live_trade_ts_ms == NOW_MS + 88
+    assert journal_state.first_live_trade_id == "first-live"
+    assert journal_state.finalized
+    assert journal_state.status == "journal_finalized"
+    assert journal_state.checkpoint_last_trade_ts_ms == NOW_MS - 100
+    assert journal_state.first_live_trade_ts_ms - 1 == NOW_MS + 87
 
     checkpoint_store.save_completed_aggregate(
         exchange="okx",
@@ -187,7 +225,11 @@ async def test_live_main_launches_subprocess_without_touching_trade_flow(
         missing_gap_ms=0,
         completed_at_ms=NOW_MS,
     )
+    runner._range_context_degraded_buckets[BUCKET_START] = (
+        "live_trade_collection_started_mid_bucket"
+    )
     runner._refresh_range_micro_repair_coverage(BUCKET_START)
     coverage = runner._range_coverage_for_bucket(BUCKET_START)
     assert coverage.coverage_status == RangeCoverageStatus.COMPLETE.value
     assert coverage.missing_gap_ms == 0
+    assert BUCKET_START not in runner._range_context_degraded_buckets

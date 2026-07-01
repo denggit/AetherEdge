@@ -60,6 +60,14 @@ class LiveRuntimeConfig:
         "data/state/range_micro_repair_status.json"
     )
     range_micro_repair_lock_path: str = "data/state/range_micro_repair.lock"
+    range_repair_journal_enabled: bool = True
+    range_repair_journal_db: str = (
+        "data/state/range_repair_trade_journal.sqlite3"
+    )
+    range_repair_journal_retention_hours: int = 12
+    range_repair_journal_writer_max_pending: int = 20_000
+    range_repair_journal_flush_interval_ms: int = 500
+    range_repair_journal_batch_size: int = 1_000
     degraded_fast_margin: float = 1.05
     producer_stale_timeout_ms: int = 60_000
     range_speed_refresh_enabled: bool = True
@@ -229,6 +237,51 @@ def live_runtime_config_from_app(
                     "range_micro_repair_lock_path",
                     "data/state/range_micro_repair.lock",
                 ),
+            )
+        ),
+        range_repair_journal_enabled=_bool(
+            env.get(
+                "AETHER_RANGE_REPAIR_JOURNAL_ENABLED",
+                defaults.get("range_repair_journal_enabled", True),
+            )
+        ),
+        range_repair_journal_db=str(
+            env.get(
+                "AETHER_RANGE_REPAIR_JOURNAL_DB",
+                defaults.get(
+                    "range_repair_journal_db",
+                    "data/state/range_repair_trade_journal.sqlite3",
+                ),
+            )
+        ),
+        range_repair_journal_retention_hours=int(
+            env.get(
+                "AETHER_RANGE_REPAIR_JOURNAL_RETENTION_HOURS",
+                defaults.get(
+                    "range_repair_journal_retention_hours", 12
+                ),
+            )
+        ),
+        range_repair_journal_writer_max_pending=int(
+            env.get(
+                "AETHER_RANGE_REPAIR_JOURNAL_WRITER_MAX_PENDING",
+                defaults.get(
+                    "range_repair_journal_writer_max_pending", 20_000
+                ),
+            )
+        ),
+        range_repair_journal_flush_interval_ms=int(
+            env.get(
+                "AETHER_RANGE_REPAIR_JOURNAL_FLUSH_INTERVAL_MS",
+                defaults.get(
+                    "range_repair_journal_flush_interval_ms", 500
+                ),
+            )
+        ),
+        range_repair_journal_batch_size=int(
+            env.get(
+                "AETHER_RANGE_REPAIR_JOURNAL_BATCH_SIZE",
+                defaults.get("range_repair_journal_batch_size", 1_000),
             )
         ),
         degraded_fast_margin=float(

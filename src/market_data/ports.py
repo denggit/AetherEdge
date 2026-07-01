@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Protocol, Sequence
 
 from src.market_data.models import DataGap, MarketDataSet, RangeBar, RangeBarAggregate, TimeRange, WarmupRequest, WarmupResult
+# Legacy compatibility: normalized market event models currently live under
+# platform. New journal models remain market_data-native.
 from src.platform.data.models import MarketKline, MarketTrade
 
 

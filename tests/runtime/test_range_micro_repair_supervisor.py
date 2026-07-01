@@ -23,7 +23,7 @@ class _Process:
 
 
 def _start(supervisor: RangeMicroRepairSupervisor) -> bool:
-    return supervisor.start_for_recovery(
+    return supervisor.start_startup_recovery(
         exchange="okx",
         symbol="ETH-USDT-PERP",
         range_pct="0.002",
@@ -49,6 +49,7 @@ def test_supervisor_builds_independent_worker_command(tmp_path, monkeypatch) -> 
             lock_path=tmp_path / "repair.lock",
             checkpoint_db_path=tmp_path / "checkpoint.sqlite3",
             market_db_path=tmp_path / "market.sqlite3",
+            journal_db_path=tmp_path / "journal.sqlite3",
             repo_root=tmp_path,
         )
     )
@@ -60,6 +61,8 @@ def test_supervisor_builds_independent_worker_command(tmp_path, monkeypatch) -> 
     assert "--bucket-start-ms" in command
     assert "1780000000000" in command
     assert "--bucket-end-ms" in command
+    assert "--journal-db" in command
+    assert "--max-gap-ms" in command
     assert "--missing-bucket-grace-seconds" in command
     assert supervisor.status_store.read() is None
 

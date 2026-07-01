@@ -14,7 +14,10 @@ from src.market_data.range_checkpoint import (
     RangeMicroRepairJob,
     SqliteRangeCheckpointStore,
 )
+from src.market_data.range_repair_journal import JOURNAL_FINALIZED
 from src.market_data.storage import SqliteRangeBarStore
+# Legacy compatibility: normalized MarketTrade still lives under platform.
+# Keep this dependency contained until the shared model migration is done.
 from src.platform.data.models import MarketTrade
 from src.utils.log import get_logger
 
@@ -39,9 +42,17 @@ class RangeMicroRepairRebuildResult:
     bucket_end_ms: int
     repair_start_ms: int
     repair_end_ms: int
+    repair_gap_start_ms: int
+    repair_gap_end_ms: int
+    repair_gap_ms: int
+    journal_start_ms: int
+    journal_end_ms: int
+    journal_trade_count: int
     rest_pages: int
     rest_raw_trades: int
     rest_deduped_trades: int
+    replayed_rest_trades: int
+    replayed_journal_trades: int
     range_bars_written: int
     aggregate_written: bool
 
@@ -202,23 +213,37 @@ class RangeMicroRepairRebuildService:
         self,
         job: RangeMicroRepairJob,
         *,
+        journal_trades: Sequence[MarketTrade],
         completed_at_ms: int,
     ) -> RangeMicroRepairRebuildResult:
-        if job.checkpoint_last_trade_ts_ms is not None and job.builder_state:
-            builder = RangeBarBuilder.restore_state(job.builder_state)
-            repair_start_ms = int(job.checkpoint_last_trade_ts_ms) + 1
-        else:
-            builder = RangeBarBuilder(
-                range_pct=Decimal(str(job.range_pct)),
-                contract_value=self.contract_value,
+        if job.checkpoint_last_trade_ts_ms is None or not job.builder_state:
+            raise RangeMicroRepairError(
+                "checkpoint builder_state is required for micro repair"
             )
-            repair_start_ms = int(job.bucket_start_ms)
-        repair_end_ms = int(job.bucket_end_ms)
+        if job.first_live_trade_ts_ms is None:
+            raise RangeMicroRepairError(
+                "first_live_trade_ts_ms is required for micro repair"
+            )
+        if job.journal_required and job.journal_status != JOURNAL_FINALIZED:
+            raise RangeMicroRepairError(
+                f"repair journal is not finalized: {job.journal_status}"
+            )
+        builder = RangeBarBuilder.restore_state(job.builder_state)
+        repair_start_ms = int(job.checkpoint_last_trade_ts_ms) + 1
+        suffix_end_ms = int(job.bucket_end_ms)
+        repair_gap_start_ms = repair_start_ms
+        repair_gap_end_ms = int(job.first_live_trade_ts_ms) - 1
+        repair_gap_ms = max(
+            0, repair_gap_end_ms - repair_gap_start_ms + 1
+        )
+        journal_start_ms = int(job.first_live_trade_ts_ms)
+        journal_end_ms = suffix_end_ms
         logger.info(
-            "range_micro_repair_rest_fetch_started | symbol=%s exchange=%s "
+            "range_micro_repair_rest_gap_fetch_started | symbol=%s exchange=%s "
             "range_pct=%s bucket_start_ms=%s bucket_end_ms=%s "
             "checkpoint_last_trade_ts_ms=%s checkpoint_last_trade_id=%s "
-            "missing_gap_ms=%s repair_start_ms=%s repair_end_ms=%s "
+            "first_live_trade_ts_ms=%s first_live_trade_id=%s "
+            "repair_gap_start_ms=%s repair_gap_end_ms=%s repair_gap_ms=%s "
             "coverage_before=%s",
             job.symbol,
             job.exchange,
@@ -227,50 +252,87 @@ class RangeMicroRepairRebuildService:
             job.bucket_end_ms,
             job.checkpoint_last_trade_ts_ms,
             job.checkpoint_last_trade_id,
-            job.missing_gap_ms,
-            repair_start_ms,
-            repair_end_ms,
+            job.first_live_trade_ts_ms,
+            job.first_live_trade_id,
+            repair_gap_start_ms,
+            repair_gap_end_ms,
+            repair_gap_ms,
             job.coverage_status,
         )
         fetch = await self.fetcher.fetch(
             symbol=job.symbol,
-            start_time_ms=repair_start_ms,
-            end_time_ms=repair_end_ms,
+            start_time_ms=repair_gap_start_ms,
+            end_time_ms=repair_gap_end_ms,
         )
         logger.info(
-            "range_micro_repair_rest_fetch_completed | symbol=%s exchange=%s "
-            "bucket_start_ms=%s bucket_end_ms=%s repair_start_ms=%s "
-            "repair_end_ms=%s rest_pages=%s rest_raw_trades=%s "
-            "rest_deduped_trades=%s",
+            "range_micro_repair_rest_gap_fetch_completed | symbol=%s "
+            "exchange=%s bucket_start_ms=%s bucket_end_ms=%s "
+            "repair_gap_start_ms=%s repair_gap_end_ms=%s repair_gap_ms=%s "
+            "rest_pages=%s rest_raw_trades=%s rest_deduped_trades=%s",
             job.symbol,
             job.exchange,
             job.bucket_start_ms,
             job.bucket_end_ms,
-            repair_start_ms,
-            repair_end_ms,
+            repair_gap_start_ms,
+            repair_gap_end_ms,
+            repair_gap_ms,
             fetch.rest_pages,
             fetch.rest_raw_trades,
             fetch.rest_deduped_trades,
         )
 
+        journal_rows = tuple(journal_trades)
+        journal_deduped = dedupe_and_sort_trades(journal_rows)
+        if len(journal_deduped) != len(journal_rows):
+            raise RangeMicroRepairError(
+                "journal contains duplicate trade identities"
+            )
+        if any(
+            (_trade_time_ms(trade) or -1) < journal_start_ms
+            or (_trade_time_ms(trade) or -1) > journal_end_ms
+            for trade in journal_deduped
+        ):
+            raise RangeMicroRepairError(
+                "journal contains trades outside the required interval"
+            )
+        if not _contains_first_live_trade(job, journal_deduped):
+            raise RangeMicroRepairError(
+                "journal does not contain the recorded first live trade"
+            )
+        logger.info(
+            "range_micro_repair_journal_load_completed | symbol=%s "
+            "exchange=%s bucket_start_ms=%s journal_start_ms=%s "
+            "journal_end_ms=%s journal_trade_count=%s journal_status=%s",
+            job.symbol,
+            job.exchange,
+            job.bucket_start_ms,
+            journal_start_ms,
+            journal_end_ms,
+            len(journal_deduped),
+            job.journal_status,
+        )
+        combined = tuple(fetch.trades) + journal_deduped
+        _assert_strict_replay_order(combined)
         generated = []
         logger.info(
             "range_micro_repair_replay_started | symbol=%s exchange=%s "
-            "bucket_start_ms=%s bucket_end_ms=%s trades=%s",
+            "bucket_start_ms=%s bucket_end_ms=%s replayed_rest_trades=%s "
+            "replayed_journal_trades=%s",
             job.symbol,
             job.exchange,
             job.bucket_start_ms,
             job.bucket_end_ms,
             len(fetch.trades),
+            len(journal_deduped),
         )
-        for trade in fetch.trades:
+        for trade in combined:
             generated.extend(builder.on_trade(trade))
         generated = [
             bar
             for bar in generated
-            if repair_start_ms <= bar.end_time_ms <= repair_end_ms
+            if repair_start_ms <= bar.end_time_ms <= suffix_end_ms
         ]
-        replace_start_ms = min(repair_start_ms, repair_end_ms)
+        replace_start_ms = min(repair_start_ms, suffix_end_ms)
         existing_bars = self.range_bar_store.load(
             symbol=job.symbol,
             range_pct=job.range_pct,
@@ -279,7 +341,7 @@ class RangeMicroRepairRebuildService:
         all_bars = [
             bar
             for bar in existing_bars
-            if not replace_start_ms <= bar.end_time_ms <= repair_end_ms
+            if not replace_start_ms <= bar.end_time_ms <= suffix_end_ms
         ]
         all_bars.extend(generated)
         all_bars.sort(key=lambda row: (row.end_time_ms, row.bar_id))
@@ -302,7 +364,7 @@ class RangeMicroRepairRebuildService:
         written = self.range_bar_store.replace_range_for_repair(
             symbol=job.symbol,
             range_pct=job.range_pct,
-            time_range=TimeRange(replace_start_ms, repair_end_ms),
+            time_range=TimeRange(replace_start_ms, suffix_end_ms),
             rows=generated,
         )
         aggregate_written = self.checkpoint_store.save_completed_aggregate(
@@ -318,14 +380,19 @@ class RangeMicroRepairRebuildService:
             )
         logger.info(
             "range_micro_repair_replay_completed | symbol=%s exchange=%s "
-            "bucket_start_ms=%s bucket_end_ms=%s rest_deduped_trades=%s "
+            "bucket_start_ms=%s bucket_end_ms=%s "
+            "repair_gap_ms=%s rest_deduped_trades=%s "
+            "replayed_rest_trades=%s replayed_journal_trades=%s "
             "range_bars_written=%s aggregates_written=1 "
             "coverage_before=%s coverage_after=%s",
             job.symbol,
             job.exchange,
             job.bucket_start_ms,
             job.bucket_end_ms,
+            repair_gap_ms,
             fetch.rest_deduped_trades,
+            len(fetch.trades),
+            len(journal_deduped),
             written,
             job.coverage_status,
             RangeCoverageStatus.COMPLETE.value,
@@ -334,10 +401,18 @@ class RangeMicroRepairRebuildService:
             bucket_start_ms=job.bucket_start_ms,
             bucket_end_ms=job.bucket_end_ms,
             repair_start_ms=repair_start_ms,
-            repair_end_ms=repair_end_ms,
+            repair_end_ms=suffix_end_ms,
+            repair_gap_start_ms=repair_gap_start_ms,
+            repair_gap_end_ms=repair_gap_end_ms,
+            repair_gap_ms=repair_gap_ms,
+            journal_start_ms=journal_start_ms,
+            journal_end_ms=journal_end_ms,
+            journal_trade_count=len(journal_deduped),
             rest_pages=fetch.rest_pages,
             rest_raw_trades=fetch.rest_raw_trades,
             rest_deduped_trades=fetch.rest_deduped_trades,
+            replayed_rest_trades=len(fetch.trades),
+            replayed_journal_trades=len(journal_deduped),
             range_bars_written=written,
             aggregate_written=True,
         )
@@ -381,3 +456,35 @@ def _accepts_keyword(callable_obj, keyword: str) -> bool:
     except (TypeError, ValueError):
         return False
     return keyword in parameters
+
+
+def _contains_first_live_trade(
+    job: RangeMicroRepairJob,
+    trades: Sequence[MarketTrade],
+) -> bool:
+    expected_ts = int(job.first_live_trade_ts_ms or -1)
+    expected_id = job.first_live_trade_id
+    return any(
+        int(_trade_time_ms(trade) or -1) == expected_ts
+        and (
+            expected_id is None
+            or str(trade.trade_id or "") == str(expected_id)
+        )
+        for trade in trades
+    )
+
+
+def _assert_strict_replay_order(trades: Sequence[MarketTrade]) -> None:
+    identities: set[tuple[object, ...]] = set()
+    previous = None
+    for trade in trades:
+        identity = trade_identity(trade)
+        if identity in identities:
+            raise RangeMicroRepairError(
+                "replay contains duplicate trade identity"
+            )
+        identities.add(identity)
+        key = _trade_sort_key(trade)
+        if previous is not None and key < previous:
+            raise RangeMicroRepairError("replay trades are out of order")
+        previous = key

@@ -68,6 +68,14 @@ class RangeMicroRepairJob:
     builder_state: Mapping[str, Any]
     coverage_status: str
     missing_gap_ms: int
+    first_live_trade_ts_ms: int | None = None
+    first_live_trade_id: str | None = None
+    repair_gap_start_ms: int | None = None
+    repair_gap_end_ms: int | None = None
+    journal_start_ms: int | None = None
+    journal_end_ms: int | None = None
+    journal_required: bool = True
+    journal_status: str | None = None
     status: str = MICRO_REPAIR_QUEUED
     created_at_ms: int = 0
     updated_at_ms: int = 0
@@ -313,6 +321,42 @@ class SqliteRangeCheckpointStore:
             ).fetchone()
         return None if row is None else _completed_from_row(row)
 
+    def invalidate_completed_aggregate(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        range_pct: str,
+        bucket_end_ms: int,
+        coverage_status: str,
+        missing_gap_ms: int,
+        completed_at_ms: int,
+    ) -> bool:
+        status = _coverage_value(coverage_status)
+        if status == RangeCoverageStatus.COMPLETE.value:
+            raise ValueError("invalidated aggregate cannot remain COMPLETE")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE completed_range_aggregates
+                SET coverage_status=?,
+                    missing_gap_ms=MAX(missing_gap_ms, ?),
+                    completed_at_ms=?
+                WHERE exchange=? AND symbol=? AND range_pct=?
+                  AND bucket_end_ms=?
+                """,
+                (
+                    status,
+                    max(1, int(missing_gap_ms)),
+                    int(completed_at_ms),
+                    str(exchange).lower(),
+                    symbol,
+                    _decimal_text(range_pct),
+                    int(bucket_end_ms),
+                ),
+            )
+        return int(cursor.rowcount or 0) > 0
+
     def enqueue_micro_repair(self, job: RangeMicroRepairJob) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -321,8 +365,16 @@ class SqliteRangeCheckpointStore:
                     exchange, symbol, range_pct, bucket_start_ms, bucket_end_ms,
                     checkpoint_last_trade_id, checkpoint_last_trade_ts_ms,
                     builder_state_json, coverage_status, missing_gap_ms,
+                    first_live_trade_ts_ms, first_live_trade_id,
+                    repair_gap_start_ms, repair_gap_end_ms,
+                    journal_start_ms, journal_end_ms, journal_required,
+                    journal_status,
                     status, created_at_ms, updated_at_ms, last_error
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?
+                )
                 ON CONFLICT(exchange, symbol, range_pct, bucket_start_ms)
                 DO UPDATE SET
                     bucket_end_ms=excluded.bucket_end_ms,
@@ -331,6 +383,35 @@ class SqliteRangeCheckpointStore:
                     builder_state_json=excluded.builder_state_json,
                     coverage_status=excluded.coverage_status,
                     missing_gap_ms=excluded.missing_gap_ms,
+                    first_live_trade_ts_ms=COALESCE(
+                        range_micro_repair_jobs.first_live_trade_ts_ms,
+                        excluded.first_live_trade_ts_ms
+                    ),
+                    first_live_trade_id=COALESCE(
+                        range_micro_repair_jobs.first_live_trade_id,
+                        excluded.first_live_trade_id
+                    ),
+                    repair_gap_start_ms=COALESCE(
+                        range_micro_repair_jobs.repair_gap_start_ms,
+                        excluded.repair_gap_start_ms
+                    ),
+                    repair_gap_end_ms=COALESCE(
+                        range_micro_repair_jobs.repair_gap_end_ms,
+                        excluded.repair_gap_end_ms
+                    ),
+                    journal_start_ms=COALESCE(
+                        range_micro_repair_jobs.journal_start_ms,
+                        excluded.journal_start_ms
+                    ),
+                    journal_end_ms=COALESCE(
+                        range_micro_repair_jobs.journal_end_ms,
+                        excluded.journal_end_ms
+                    ),
+                    journal_required=excluded.journal_required,
+                    journal_status=COALESCE(
+                        excluded.journal_status,
+                        range_micro_repair_jobs.journal_status
+                    ),
                     status=CASE
                         WHEN range_micro_repair_jobs.status = ?
                         THEN range_micro_repair_jobs.status
@@ -350,6 +431,14 @@ class SqliteRangeCheckpointStore:
                     _json_dump(job.builder_state),
                     _coverage_value(job.coverage_status),
                     max(0, int(job.missing_gap_ms)),
+                    job.first_live_trade_ts_ms,
+                    job.first_live_trade_id,
+                    job.repair_gap_start_ms,
+                    job.repair_gap_end_ms,
+                    job.journal_start_ms,
+                    job.journal_end_ms,
+                    int(bool(job.journal_required)),
+                    job.journal_status,
                     str(job.status),
                     int(job.created_at_ms),
                     int(job.updated_at_ms),
@@ -372,6 +461,10 @@ class SqliteRangeCheckpointStore:
                 SELECT exchange, symbol, range_pct, bucket_start_ms, bucket_end_ms,
                        checkpoint_last_trade_id, checkpoint_last_trade_ts_ms,
                        builder_state_json, coverage_status, missing_gap_ms,
+                       first_live_trade_ts_ms, first_live_trade_id,
+                       repair_gap_start_ms, repair_gap_end_ms,
+                       journal_start_ms, journal_end_ms, journal_required,
+                       journal_status,
                        status, created_at_ms, updated_at_ms, last_error
                 FROM range_micro_repair_jobs
                 WHERE exchange = ? AND symbol = ? AND range_pct = ?
@@ -385,6 +478,83 @@ class SqliteRangeCheckpointStore:
                 ),
             ).fetchone()
         return None if row is None else _micro_repair_job_from_row(row)
+
+    def update_micro_repair_journal(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        range_pct: str,
+        bucket_start_ms: int,
+        first_live_trade_ts_ms: int,
+        first_live_trade_id: str | None,
+        repair_gap_start_ms: int,
+        repair_gap_end_ms: int,
+        journal_start_ms: int,
+        journal_end_ms: int,
+        journal_status: str,
+        updated_at_ms: int,
+    ) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE range_micro_repair_jobs
+                SET first_live_trade_ts_ms=?,
+                    first_live_trade_id=?,
+                    repair_gap_start_ms=?,
+                    repair_gap_end_ms=?,
+                    journal_start_ms=?,
+                    journal_end_ms=?,
+                    journal_status=?,
+                    updated_at_ms=?
+                WHERE exchange=? AND symbol=? AND range_pct=?
+                  AND bucket_start_ms=?
+                """,
+                (
+                    int(first_live_trade_ts_ms),
+                    first_live_trade_id,
+                    int(repair_gap_start_ms),
+                    int(repair_gap_end_ms),
+                    int(journal_start_ms),
+                    int(journal_end_ms),
+                    journal_status,
+                    int(updated_at_ms),
+                    str(exchange).lower(),
+                    symbol,
+                    _decimal_text(range_pct),
+                    int(bucket_start_ms),
+                ),
+            )
+        return int(cursor.rowcount or 0) > 0
+
+    def update_micro_repair_journal_status(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        range_pct: str,
+        bucket_start_ms: int,
+        journal_status: str,
+        updated_at_ms: int,
+    ) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE range_micro_repair_jobs
+                SET journal_status=?, updated_at_ms=?
+                WHERE exchange=? AND symbol=? AND range_pct=?
+                  AND bucket_start_ms=?
+                """,
+                (
+                    journal_status,
+                    int(updated_at_ms),
+                    str(exchange).lower(),
+                    symbol,
+                    _decimal_text(range_pct),
+                    int(bucket_start_ms),
+                ),
+            )
+        return int(cursor.rowcount or 0) > 0
 
     def mark_micro_repair_status(
         self,
@@ -614,6 +784,14 @@ class SqliteRangeCheckpointStore:
                     builder_state_json TEXT NOT NULL,
                     coverage_status TEXT NOT NULL,
                     missing_gap_ms INTEGER NOT NULL DEFAULT 0,
+                    first_live_trade_ts_ms INTEGER,
+                    first_live_trade_id TEXT,
+                    repair_gap_start_ms INTEGER,
+                    repair_gap_end_ms INTEGER,
+                    journal_start_ms INTEGER,
+                    journal_end_ms INTEGER,
+                    journal_required INTEGER NOT NULL DEFAULT 1,
+                    journal_status TEXT,
                     status TEXT NOT NULL,
                     created_at_ms INTEGER NOT NULL,
                     updated_at_ms INTEGER NOT NULL,
@@ -621,6 +799,54 @@ class SqliteRangeCheckpointStore:
                     PRIMARY KEY (exchange, symbol, range_pct, bucket_start_ms)
                 )
                 """
+            )
+            _ensure_column(
+                conn,
+                "range_micro_repair_jobs",
+                "first_live_trade_ts_ms",
+                "INTEGER",
+            )
+            _ensure_column(
+                conn,
+                "range_micro_repair_jobs",
+                "first_live_trade_id",
+                "TEXT",
+            )
+            _ensure_column(
+                conn,
+                "range_micro_repair_jobs",
+                "repair_gap_start_ms",
+                "INTEGER",
+            )
+            _ensure_column(
+                conn,
+                "range_micro_repair_jobs",
+                "repair_gap_end_ms",
+                "INTEGER",
+            )
+            _ensure_column(
+                conn,
+                "range_micro_repair_jobs",
+                "journal_start_ms",
+                "INTEGER",
+            )
+            _ensure_column(
+                conn,
+                "range_micro_repair_jobs",
+                "journal_end_ms",
+                "INTEGER",
+            )
+            _ensure_column(
+                conn,
+                "range_micro_repair_jobs",
+                "journal_required",
+                "INTEGER NOT NULL DEFAULT 1",
+            )
+            _ensure_column(
+                conn,
+                "range_micro_repair_jobs",
+                "journal_status",
+                "TEXT",
             )
             conn.execute(
                 """
@@ -815,11 +1041,37 @@ def _micro_repair_job_from_row(row: Sequence[object]) -> RangeMicroRepairJob:
         builder_state=json.loads(str(row[7])),
         coverage_status=str(row[8]),
         missing_gap_ms=int(row[9]),
-        status=str(row[10]),
-        created_at_ms=int(row[11]),
-        updated_at_ms=int(row[12]),
-        last_error=None if row[13] is None else str(row[13]),
+        first_live_trade_ts_ms=(
+            None if row[10] is None else int(row[10])
+        ),
+        first_live_trade_id=None if row[11] is None else str(row[11]),
+        repair_gap_start_ms=None if row[12] is None else int(row[12]),
+        repair_gap_end_ms=None if row[13] is None else int(row[13]),
+        journal_start_ms=None if row[14] is None else int(row[14]),
+        journal_end_ms=None if row[15] is None else int(row[15]),
+        journal_required=bool(row[16]),
+        journal_status=None if row[17] is None else str(row[17]),
+        status=str(row[18]),
+        created_at_ms=int(row[19]),
+        updated_at_ms=int(row[20]),
+        last_error=None if row[21] is None else str(row[21]),
     )
+
+
+def _ensure_column(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    definition: str,
+) -> None:
+    columns = {
+        str(row[1])
+        for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    if column not in columns:
+        conn.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        )
 
 
 def _json_dump(value: Mapping[str, Any]) -> str:

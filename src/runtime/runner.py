@@ -14,11 +14,24 @@ from src.market_data.derived import RangeBarAggregator, RangeBarBuilder
 from src.market_data.events import MarketFeatureEvent
 from src.market_data.models import MarketDataSet, RangeBar, RangeBarAggregate, RangeCoverageStatus, TimeRange, WarmupRequest
 from src.market_data.range_checkpoint import (
+    MICRO_REPAIR_FAILED,
+    MICRO_REPAIR_QUEUED,
     RangeBuilderCheckpoint,
     RangeCheckpointRecovery,
     RangeCheckpointWriter,
+    RangeMicroRepairJob,
     SqliteRangeCheckpointStore,
     aggregate_snapshot,
+)
+from src.market_data.range_repair_journal import (
+    JOURNAL_INVALID_DROPPED_TRADE,
+    JOURNAL_INVALID_MARKET_QUEUE_DRAIN_INCOMPLETE,
+    JOURNAL_INVALID_PRODUCER_FAILED,
+    JOURNAL_INVALID_PRODUCER_STALE,
+    JOURNAL_OPEN,
+    RangeRepairJournalWriter,
+    RangeRepairTrade,
+    SqliteRangeRepairJournalStore,
 )
 from src.market_data.storage import SqliteKlineStore, SqliteRangeBarStore
 from src.market_data.warmup.gap_detector import interval_to_ms
@@ -183,6 +196,17 @@ class LiveRuntimeRunner:
         self._range_bar_aggregator = self.services.get("range_bar_aggregator")
         self._range_checkpoint_store = self.services.get("range_checkpoint_store")
         self._range_checkpoint_writer = self.services.get("range_checkpoint_writer")
+        self._range_repair_journal_store = self.services.get(
+            "range_repair_journal_store"
+        )
+        self._range_repair_journal_writer = self.services.get(
+            "range_repair_journal_writer"
+        )
+        self._range_repair_journal_bucket_ms: int | None = None
+        self._range_repair_checkpoint_last_trade_ts_ms: int | None = None
+        self._range_repair_first_live_submitted = False
+        self._range_repair_journal_finalize_submitted = False
+        self._range_repair_journal_append_failure_warned = False
         self._producer_monitor: ProducerHealthMonitor = self.services.get("producer_monitor") or ProducerHealthMonitor()
         self._producer_supervisor: ProducerSupervisor = self.services.get("producer_supervisor") or ProducerSupervisor(
             monitor=self._producer_monitor,
@@ -282,6 +306,7 @@ class LiveRuntimeRunner:
             await self._stop_range_speed_background_services()
             await self._stop_sync_tasks()
             await self._stop_producers()
+            await self._stop_range_repair_journal_writer()
             await self._stop_range_checkpoint_writer()
             await self.context.alerts.stop()
 
@@ -293,6 +318,7 @@ class LiveRuntimeRunner:
         self._stop_event.set()
         await self._stop_range_speed_background_services()
         await self._stop_producers()
+        await self._stop_range_repair_journal_writer()
         self._set_health(RuntimePhase.STOPPED, healthy=True)
         return self._health
 
@@ -465,6 +491,10 @@ class LiveRuntimeRunner:
                 drain_result.hit_event_limit,
                 drain_result.hit_time_limit,
             )
+        self._finalize_range_repair_journal(
+            bucket_start_ms=open_time_ms,
+            finalized_at_ms=now,
+        )
         event = closed_kline_feature(closed_kline)
         self.stats.closed_klines_seen += 1
         await self.process_market_feature(event)
@@ -840,10 +870,9 @@ class LiveRuntimeRunner:
             and checkpoint is not None
             and checkpoint.last_trade_ts_ms is not None
             and recovery.missing_gap_ms > 0
-            and recovery.missing_gap_ms
-            <= self.runtime_config.range_micro_repair_max_gap_ms
             and recovery.coverage_status
             != RangeCoverageStatus.COMPLETE.value
+            and self.runtime_config.range_repair_journal_enabled
         )
         if not repairable:
             if recovery.missing_gap_ms > 0:
@@ -866,23 +895,55 @@ class LiveRuntimeRunner:
                     recovery.missing_gap_ms,
                     recovery.coverage_status,
                     recovery.coverage_status,
-                    "missing_checkpoint_or_gap_exceeds_limit",
+                    "missing_checkpoint_or_repair_journal_disabled",
                 )
             return
-        started = self._get_range_micro_repair_supervisor().start_for_recovery(
+        job = RangeMicroRepairJob(
             exchange=self.app_config.data_exchange.value,
             symbol=self.app_config.symbol,
             range_pct=str(self._range_pct),
             bucket_start_ms=checkpoint.bucket_start_ms,
             bucket_end_ms=checkpoint.bucket_end_ms,
+            checkpoint_last_trade_id=checkpoint.last_trade_id,
+            checkpoint_last_trade_ts_ms=checkpoint.last_trade_ts_ms,
+            builder_state=dict(checkpoint.builder_state),
             coverage_status=recovery.coverage_status,
             missing_gap_ms=recovery.missing_gap_ms,
+            journal_required=True,
+            journal_status=JOURNAL_OPEN,
+            status=MICRO_REPAIR_QUEUED,
+            created_at_ms=int(time.time() * 1000),
+            updated_at_ms=int(time.time() * 1000),
+        )
+        self._get_range_checkpoint_store().enqueue_micro_repair(job)
+        journal_started = self._start_range_repair_journal(checkpoint)
+        if not journal_started:
+            logger.warning(
+                "startup_recovery_micro_repair skipped | symbol=%s "
+                "bucket_start_ms=%s failure_reason=journal_writer_start_failed",
+                checkpoint.symbol,
+                checkpoint.bucket_start_ms,
+            )
+            return
+        started = (
+            self._get_range_micro_repair_supervisor()
+            .start_startup_recovery(
+                exchange=self.app_config.data_exchange.value,
+                symbol=self.app_config.symbol,
+                range_pct=str(self._range_pct),
+                bucket_start_ms=checkpoint.bucket_start_ms,
+                bucket_end_ms=checkpoint.bucket_end_ms,
+                coverage_status=recovery.coverage_status,
+                missing_gap_ms=recovery.missing_gap_ms,
+            )
         )
         logger.warning(
-            "range_micro_repair_subprocess_launch | symbol=%s exchange=%s "
+            "startup_recovery_micro_repair_subprocess_launch | "
+            "symbol=%s exchange=%s "
             "range_pct=%s bucket_start_ms=%s bucket_end_ms=%s "
             "checkpoint_last_trade_ts_ms=%s checkpoint_last_trade_id=%s "
-            "missing_gap_ms=%s repair_start_ms=%s repair_end_ms=%s "
+            "missing_gap_ms=%s repair_gap_start_ms=%s "
+            "repair_gap_end_ms=pending_first_live_trade "
             "coverage_before=%s started=%s",
             self.app_config.symbol,
             self.app_config.data_exchange.value,
@@ -893,7 +954,6 @@ class LiveRuntimeRunner:
             checkpoint.last_trade_id,
             recovery.missing_gap_ms,
             int(checkpoint.last_trade_ts_ms) + 1,
-            checkpoint.bucket_end_ms,
             recovery.coverage_status,
             started,
         )
@@ -2048,6 +2108,9 @@ class LiveRuntimeRunner:
                         name="trades",
                         stream_factory=self.context.data.stream_trades,
                         on_item=self._enqueue_market_event,
+                        on_transient_failure=(
+                            self._on_market_producer_transient_failure
+                        ),
                     )
                 )
             )
@@ -2063,6 +2126,27 @@ class LiveRuntimeRunner:
                 )
             )
         return tasks
+
+    def _on_market_producer_transient_failure(
+        self, name: str, exc: BaseException
+    ) -> None:
+        if name != "trades":
+            return
+        event_ms = int(time.time() * 1000)
+        bucket_start_ms = (
+            event_ms // self._closed_bar_interval_ms
+        ) * self._closed_bar_interval_ms
+        self._mark_range_context_degraded_bucket(
+            bucket_start_ms=bucket_start_ms,
+            reason="producer_failed",
+            event_time_ms=event_ms,
+        )
+        logger.warning(
+            "Range repair journal invalidated by transient trade stream "
+            "failure | bucket_start_ms=%s error=%s",
+            bucket_start_ms,
+            exc,
+        )
 
     def _start_sync_tasks(self) -> list[asyncio.Task]:
         tasks: list[asyncio.Task] = []
@@ -2211,6 +2295,23 @@ class LiveRuntimeRunner:
         self._mark_range_context_degraded_bucket(bucket_start_ms=bucket_start, reason=reason, event_time_ms=event_ms)
 
     def _mark_range_context_degraded_bucket(self, *, bucket_start_ms: int, reason: str, event_time_ms: int | None = None) -> None:
+        journal_status = {
+            "market_queue_dropped_trade": JOURNAL_INVALID_DROPPED_TRADE,
+            "market_queue_drain_incomplete_before_closed_bar": (
+                JOURNAL_INVALID_MARKET_QUEUE_DRAIN_INCOMPLETE
+            ),
+            "producer_stale": JOURNAL_INVALID_PRODUCER_STALE,
+            "producer_failed": JOURNAL_INVALID_PRODUCER_FAILED,
+        }.get(reason)
+        if journal_status is not None:
+            self._invalidate_range_repair_journal(
+                bucket_start_ms=bucket_start_ms,
+                status=journal_status,
+                reason=reason,
+                dropped_trades=(
+                    1 if reason == "market_queue_dropped_trade" else 0
+                ),
+            )
         if bucket_start_ms not in self._range_context_degraded_buckets:
             self._range_context_degraded_buckets[bucket_start_ms] = reason
             logger.warning(
@@ -2459,6 +2560,7 @@ class LiveRuntimeRunner:
                 self.stats.range_bars_closed += 1
                 await self.process_market_feature(range_bar_closed_feature(bar, exchange=trade.exchange))
         self._submit_range_checkpoint_if_due(trade)
+        self._append_range_repair_trade(trade)
 
     def _submit_range_checkpoint_if_due(self, trade: MarketTrade) -> bool:
         now_ms = int(time.time() * 1000)
@@ -3053,6 +3155,22 @@ class LiveRuntimeRunner:
             return
         self.stats.producer_failures += sum(1 for item in unhealthy if item.status.value == "failed")
         self.stats.producer_stale += sum(1 for item in unhealthy if item.status.value == "stale")
+        event_ms = int(time.time() * 1000)
+        bucket_start_ms = (
+            event_ms // self._closed_bar_interval_ms
+        ) * self._closed_bar_interval_ms
+        if any(item.status.value == "failed" for item in unhealthy):
+            self._mark_range_context_degraded_bucket(
+                bucket_start_ms=bucket_start_ms,
+                reason="producer_failed",
+                event_time_ms=event_ms,
+            )
+        elif any(item.status.value == "stale" for item in unhealthy):
+            self._mark_range_context_degraded_bucket(
+                bucket_start_ms=bucket_start_ms,
+                reason="producer_stale",
+                event_time_ms=event_ms,
+            )
         message = "; ".join(f"{item.name}:{item.status.value}:{item.error}" for item in unhealthy)
         logger.error("Runtime producer unhealthy | %s", message)
         raise LiveRuntimeError(f"producer unhealthy: {message}")
@@ -3338,6 +3456,278 @@ class LiveRuntimeRunner:
             )
         return self._range_checkpoint_writer
 
+    def _get_range_repair_journal_store(
+        self,
+    ) -> SqliteRangeRepairJournalStore:
+        if self._range_repair_journal_store is None:
+            self._range_repair_journal_store = (
+                SqliteRangeRepairJournalStore(
+                    self.runtime_config.range_repair_journal_db
+                )
+            )
+        return self._range_repair_journal_store
+
+    def _get_range_repair_journal_writer(
+        self,
+    ) -> RangeRepairJournalWriter:
+        if self._range_repair_journal_writer is None:
+            loop = asyncio.get_running_loop()
+
+            def on_error(exc: BaseException) -> None:
+                logger.warning(
+                    "Range repair journal writer failed | error=%s", exc
+                )
+                loop.call_soon_threadsafe(
+                    self.context.alerts.emit,
+                    AppAlert(
+                        subject="AetherEdge range repair journal failed",
+                        content=str(exc),
+                        severity="warning",
+                    ),
+                )
+
+            def on_invalidated(
+                key: tuple[str, str, str, int],
+                status: str,
+                error: str,
+            ) -> None:
+                exchange, symbol, range_pct, bucket_start_ms = key
+                timestamp = int(time.time() * 1000)
+                store = self._get_range_checkpoint_store()
+                store.invalidate_completed_aggregate(
+                    exchange=exchange,
+                    symbol=symbol,
+                    range_pct=range_pct,
+                    bucket_end_ms=(
+                        bucket_start_ms
+                        + self._closed_bar_interval_ms
+                        - 1
+                    ),
+                    coverage_status=(
+                        RangeCoverageStatus.RECOVERED_INCOMPLETE.value
+                    ),
+                    missing_gap_ms=1,
+                    completed_at_ms=timestamp,
+                )
+                store.mark_micro_repair_status(
+                    exchange=exchange,
+                    symbol=symbol,
+                    range_pct=range_pct,
+                    bucket_start_ms=bucket_start_ms,
+                    status=MICRO_REPAIR_FAILED,
+                    updated_at_ms=timestamp,
+                    last_error=f"{status}:{error}",
+                )
+                logger.warning(
+                    "Range repair journal invalidated; COMPLETE aggregate "
+                    "revoked if present | symbol=%s bucket_start_ms=%s "
+                    "journal_status=%s error=%s",
+                    symbol,
+                    bucket_start_ms,
+                    status,
+                    error,
+                )
+
+            self._range_repair_journal_writer = RangeRepairJournalWriter(
+                self._get_range_repair_journal_store(),
+                max_pending=(
+                    self.runtime_config
+                    .range_repair_journal_writer_max_pending
+                ),
+                flush_interval_ms=(
+                    self.runtime_config
+                    .range_repair_journal_flush_interval_ms
+                ),
+                batch_size=(
+                    self.runtime_config.range_repair_journal_batch_size
+                ),
+                retention_hours=(
+                    self.runtime_config.range_repair_journal_retention_hours
+                ),
+                on_error=on_error,
+                on_invalidated=on_invalidated,
+            )
+        return self._range_repair_journal_writer
+
+    def _start_range_repair_journal(
+        self, checkpoint: RangeBuilderCheckpoint
+    ) -> bool:
+        writer = self._get_range_repair_journal_writer()
+        writer.start()
+        accepted = writer.submit_open(
+            exchange=checkpoint.exchange,
+            symbol=checkpoint.symbol,
+            range_pct=checkpoint.range_pct,
+            bucket_start_ms=checkpoint.bucket_start_ms,
+            bucket_end_ms=checkpoint.bucket_end_ms,
+            checkpoint_last_trade_ts_ms=checkpoint.last_trade_ts_ms,
+            checkpoint_last_trade_id=checkpoint.last_trade_id,
+            updated_at_ms=int(time.time() * 1000),
+        )
+        if not accepted:
+            return False
+        self._range_repair_journal_bucket_ms = checkpoint.bucket_start_ms
+        self._range_repair_checkpoint_last_trade_ts_ms = (
+            checkpoint.last_trade_ts_ms
+        )
+        self._range_repair_first_live_submitted = False
+        self._range_repair_journal_finalize_submitted = False
+        self._range_repair_journal_append_failure_warned = False
+        logger.info(
+            "range_repair_journal_started | symbol=%s exchange=%s "
+            "range_pct=%s bucket_start_ms=%s bucket_end_ms=%s "
+            "checkpoint_last_trade_ts_ms=%s checkpoint_last_trade_id=%s",
+            checkpoint.symbol,
+            checkpoint.exchange,
+            checkpoint.range_pct,
+            checkpoint.bucket_start_ms,
+            checkpoint.bucket_end_ms,
+            checkpoint.last_trade_ts_ms,
+            checkpoint.last_trade_id,
+        )
+        return True
+
+    def _append_range_repair_trade(self, trade: MarketTrade) -> None:
+        bucket_start_ms = self._range_repair_journal_bucket_ms
+        checkpoint_ts = self._range_repair_checkpoint_last_trade_ts_ms
+        writer = self._range_repair_journal_writer
+        trade_time_ms = _event_time_ms(trade)
+        if (
+            writer is None
+            or bucket_start_ms is None
+            or checkpoint_ts is None
+            or trade_time_ms is None
+            or trade.exchange != self.app_config.data_exchange
+            or getattr(trade.source, "value", str(trade.source))
+            != "websocket"
+            or trade_time_ms <= checkpoint_ts
+            or trade_time_ms < bucket_start_ms
+            or trade_time_ms
+            >= bucket_start_ms + self._closed_bar_interval_ms
+        ):
+            return
+        now_ms = int(time.time() * 1000)
+        if self._range_repair_journal_finalize_submitted:
+            self._invalidate_range_repair_journal(
+                bucket_start_ms=bucket_start_ms,
+                status=JOURNAL_INVALID_MARKET_QUEUE_DRAIN_INCOMPLETE,
+                reason="live trade arrived after journal finalize",
+            )
+        if not self._range_repair_first_live_submitted:
+            accepted = writer.submit_first_live(
+                exchange=trade.exchange.value,
+                symbol=trade.symbol,
+                range_pct=str(self._range_pct),
+                bucket_start_ms=bucket_start_ms,
+                trade_time_ms=trade_time_ms,
+                trade_id=trade.trade_id,
+                recorded_at_ms=now_ms,
+            )
+            if accepted:
+                self._range_repair_first_live_submitted = True
+                logger.info(
+                    "range_repair_first_live_trade_recorded | symbol=%s "
+                    "exchange=%s bucket_start_ms=%s "
+                    "first_live_trade_ts_ms=%s first_live_trade_id=%s",
+                    trade.symbol,
+                    trade.exchange.value,
+                    bucket_start_ms,
+                    trade_time_ms,
+                    trade.trade_id,
+                )
+        source = getattr(trade.source, "value", str(trade.source))
+        side = getattr(trade.side, "value", str(trade.side))
+        accepted = writer.submit_trade(
+            RangeRepairTrade(
+                exchange=trade.exchange.value,
+                symbol=trade.symbol,
+                range_pct=str(self._range_pct),
+                bucket_start_ms=bucket_start_ms,
+                trade_time_ms=trade_time_ms,
+                event_time_ms=trade.event_time_ms,
+                trade_id=trade.trade_id,
+                raw_symbol=trade.raw_symbol,
+                side=side,
+                price=str(trade.price),
+                quantity=str(trade.quantity),
+                source=source,
+                created_at_ms=now_ms,
+            )
+        )
+        if (
+            not accepted
+            and not self._range_repair_journal_append_failure_warned
+        ):
+            self._range_repair_journal_append_failure_warned = True
+            logger.warning(
+                "Range repair journal trade dropped | symbol=%s "
+                "exchange=%s bucket_start_ms=%s trade_time_ms=%s",
+                trade.symbol,
+                trade.exchange.value,
+                bucket_start_ms,
+                trade_time_ms,
+            )
+            self.context.alerts.emit(
+                AppAlert(
+                    subject="AetherEdge range repair journal trade dropped",
+                    content=(
+                        f"symbol={trade.symbol}\n"
+                        f"bucket_start_ms={bucket_start_ms}\n"
+                        f"trade_time_ms={trade_time_ms}"
+                    ),
+                    severity="warning",
+                )
+            )
+
+    def _invalidate_range_repair_journal(
+        self,
+        *,
+        bucket_start_ms: int,
+        status: str,
+        reason: str,
+        dropped_trades: int = 0,
+    ) -> None:
+        if (
+            self._range_repair_journal_writer is None
+            or self._range_repair_journal_bucket_ms != bucket_start_ms
+        ):
+            return
+        self._range_repair_journal_writer.submit_invalidation(
+            exchange=self.app_config.data_exchange.value,
+            symbol=self.app_config.symbol,
+            range_pct=str(self._range_pct),
+            bucket_start_ms=bucket_start_ms,
+            status=status,
+            last_error=reason,
+            dropped_trades=dropped_trades,
+        )
+
+    def _finalize_range_repair_journal(
+        self, *, bucket_start_ms: int, finalized_at_ms: int
+    ) -> None:
+        writer = self._range_repair_journal_writer
+        if (
+            writer is None
+            or self._range_repair_journal_bucket_ms != bucket_start_ms
+        ):
+            return
+        writer.submit_finalize(
+            exchange=self.app_config.data_exchange.value,
+            symbol=self.app_config.symbol,
+            range_pct=str(self._range_pct),
+            bucket_start_ms=bucket_start_ms,
+            finalized_at_ms=finalized_at_ms,
+        )
+        self._range_repair_journal_finalize_submitted = True
+        logger.info(
+            "range_repair_journal_finalized | symbol=%s exchange=%s "
+            "bucket_start_ms=%s finalized_at_ms=%s",
+            self.app_config.symbol,
+            self.app_config.data_exchange.value,
+            bucket_start_ms,
+            finalized_at_ms,
+        )
+
     def _start_range_speed_background_services(self) -> None:
         if not self.requirements.range_bars.enabled:
             return
@@ -3428,6 +3818,12 @@ class LiveRuntimeRunner:
                         market_db_path=Path(
                             self.runtime_config.market_data_db_path
                         ),
+                        journal_db_path=Path(
+                            self.runtime_config.range_repair_journal_db
+                        ),
+                        max_gap_ms=(
+                            self.runtime_config.range_micro_repair_max_gap_ms
+                        ),
                         page_limit=(
                             self.runtime_config.range_micro_repair_page_limit
                         ),
@@ -3501,6 +3897,14 @@ class LiveRuntimeRunner:
         if callable(stop):
             await asyncio.to_thread(stop, flush=True)
 
+    async def _stop_range_repair_journal_writer(self) -> None:
+        writer = self._range_repair_journal_writer
+        if writer is None:
+            return
+        stop = getattr(writer, "stop", None)
+        if callable(stop):
+            await asyncio.to_thread(stop, flush=True)
+
     def _range_coverage_for_bucket(
         self, bucket_start_ms: int
     ) -> RangeCheckpointRecovery:
@@ -3552,6 +3956,7 @@ class LiveRuntimeRunner:
             recovered_from_checkpoint=True,
         )
         self._rangebar_trust_start_bucket_ms = bucket_start_ms
+        self._range_context_degraded_buckets.pop(bucket_start_ms, None)
         logger.info(
             "Range micro repair COMPLETE aggregate adopted | symbol=%s "
             "exchange=%s bucket_start_ms=%s bucket_end_ms=%s",
