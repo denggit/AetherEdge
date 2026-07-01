@@ -13,6 +13,11 @@ from src.market_data.models import RangeBarAggregate, RangeCoverageStatus
 
 DEFAULT_RANGE_CHECKPOINT_DB = "data/state/range_builder_checkpoint.sqlite3"
 MIN_VALID_COMPLETED_AGGREGATE_MS = 1_700_000_000_000
+MICRO_REPAIR_QUEUED = "micro_repair_queued"
+MICRO_REPAIR_RUNNING = "micro_repair_running"
+MICRO_REPAIR_SUCCESS = "micro_repair_success"
+MICRO_REPAIR_FAILED = "micro_repair_failed"
+MICRO_REPAIR_SKIPPED = "micro_repair_skipped"
 
 
 @dataclass(frozen=True)
@@ -49,6 +54,33 @@ class RangeCheckpointRecovery:
     checkpoint_age_ms: int | None
     missing_gap_ms: int
     recovered_from_checkpoint: bool
+
+
+@dataclass(frozen=True)
+class RangeMicroRepairJob:
+    exchange: str
+    symbol: str
+    range_pct: str
+    bucket_start_ms: int
+    bucket_end_ms: int
+    checkpoint_last_trade_id: str | None
+    checkpoint_last_trade_ts_ms: int | None
+    builder_state: Mapping[str, Any]
+    coverage_status: str
+    missing_gap_ms: int
+    status: str = MICRO_REPAIR_QUEUED
+    created_at_ms: int = 0
+    updated_at_ms: int = 0
+    last_error: str | None = None
+
+    @property
+    def key(self) -> tuple[str, str, str, int]:
+        return (
+            str(self.exchange).lower(),
+            self.symbol,
+            _decimal_text(self.range_pct),
+            self.bucket_start_ms,
+        )
 
 
 @dataclass(frozen=True)
@@ -253,6 +285,138 @@ class SqliteRangeCheckpointStore:
             )
         return True
 
+    def load_completed_aggregate(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        range_pct: str,
+        bucket_end_ms: int,
+    ) -> CompletedRangeAggregate | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT exchange, symbol, range_pct, bucket_start_ms, bucket_end_ms,
+                       rf_bar_count, imbalance, close_pos, taker_buy_ratio,
+                       micro_return_pct, delta_notional_sum, notional_sum,
+                       coverage_status, missing_gap_ms, completed_at_ms
+                FROM completed_range_aggregates
+                WHERE exchange = ? AND symbol = ? AND range_pct = ?
+                  AND bucket_end_ms = ?
+                """,
+                (
+                    str(exchange).lower(),
+                    symbol,
+                    _decimal_text(range_pct),
+                    int(bucket_end_ms),
+                ),
+            ).fetchone()
+        return None if row is None else _completed_from_row(row)
+
+    def enqueue_micro_repair(self, job: RangeMicroRepairJob) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO range_micro_repair_jobs (
+                    exchange, symbol, range_pct, bucket_start_ms, bucket_end_ms,
+                    checkpoint_last_trade_id, checkpoint_last_trade_ts_ms,
+                    builder_state_json, coverage_status, missing_gap_ms,
+                    status, created_at_ms, updated_at_ms, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(exchange, symbol, range_pct, bucket_start_ms)
+                DO UPDATE SET
+                    bucket_end_ms=excluded.bucket_end_ms,
+                    checkpoint_last_trade_id=excluded.checkpoint_last_trade_id,
+                    checkpoint_last_trade_ts_ms=excluded.checkpoint_last_trade_ts_ms,
+                    builder_state_json=excluded.builder_state_json,
+                    coverage_status=excluded.coverage_status,
+                    missing_gap_ms=excluded.missing_gap_ms,
+                    status=CASE
+                        WHEN range_micro_repair_jobs.status = ?
+                        THEN range_micro_repair_jobs.status
+                        ELSE excluded.status
+                    END,
+                    updated_at_ms=excluded.updated_at_ms,
+                    last_error=excluded.last_error
+                """,
+                (
+                    str(job.exchange).lower(),
+                    job.symbol,
+                    _decimal_text(job.range_pct),
+                    int(job.bucket_start_ms),
+                    int(job.bucket_end_ms),
+                    job.checkpoint_last_trade_id,
+                    job.checkpoint_last_trade_ts_ms,
+                    _json_dump(job.builder_state),
+                    _coverage_value(job.coverage_status),
+                    max(0, int(job.missing_gap_ms)),
+                    str(job.status),
+                    int(job.created_at_ms),
+                    int(job.updated_at_ms),
+                    job.last_error,
+                    MICRO_REPAIR_SUCCESS,
+                ),
+            )
+
+    def load_micro_repair_job(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        range_pct: str,
+        bucket_start_ms: int,
+    ) -> RangeMicroRepairJob | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT exchange, symbol, range_pct, bucket_start_ms, bucket_end_ms,
+                       checkpoint_last_trade_id, checkpoint_last_trade_ts_ms,
+                       builder_state_json, coverage_status, missing_gap_ms,
+                       status, created_at_ms, updated_at_ms, last_error
+                FROM range_micro_repair_jobs
+                WHERE exchange = ? AND symbol = ? AND range_pct = ?
+                  AND bucket_start_ms = ?
+                """,
+                (
+                    str(exchange).lower(),
+                    symbol,
+                    _decimal_text(range_pct),
+                    int(bucket_start_ms),
+                ),
+            ).fetchone()
+        return None if row is None else _micro_repair_job_from_row(row)
+
+    def mark_micro_repair_status(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        range_pct: str,
+        bucket_start_ms: int,
+        status: str,
+        updated_at_ms: int,
+        last_error: str | None = None,
+    ) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE range_micro_repair_jobs
+                SET status = ?, updated_at_ms = ?, last_error = ?
+                WHERE exchange = ? AND symbol = ? AND range_pct = ?
+                  AND bucket_start_ms = ?
+                """,
+                (
+                    str(status),
+                    int(updated_at_ms),
+                    last_error,
+                    str(exchange).lower(),
+                    symbol,
+                    _decimal_text(range_pct),
+                    int(bucket_start_ms),
+                ),
+            )
+        return int(cursor.rowcount or 0) > 0
+
     def load_complete_history(
         self,
         *,
@@ -293,6 +457,54 @@ class SqliteRangeCheckpointStore:
                     symbol,
                     _decimal_text(range_pct),
                     RangeCoverageStatus.COMPLETE.value,
+                    MIN_VALID_COMPLETED_AGGREGATE_MS,
+                    MIN_VALID_COMPLETED_AGGREGATE_MS,
+                    before_bucket_end_ms,
+                    limit,
+                ),
+            ).fetchall()
+        return [_completed_from_row(row) for row in rows]
+
+    def load_history(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        range_pct: str,
+        before_bucket_end_ms: int,
+        limit: int = 1080,
+    ) -> list[CompletedRangeAggregate]:
+        """Load valid aggregate rows regardless of coverage quality."""
+
+        if limit <= 0:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT exchange, symbol, range_pct, bucket_start_ms, bucket_end_ms,
+                       rf_bar_count, imbalance, close_pos, taker_buy_ratio,
+                       micro_return_pct, delta_notional_sum, notional_sum,
+                       coverage_status, missing_gap_ms, completed_at_ms
+                FROM (
+                    SELECT exchange, symbol, range_pct, bucket_start_ms, bucket_end_ms,
+                           rf_bar_count, imbalance, close_pos, taker_buy_ratio,
+                           micro_return_pct, delta_notional_sum, notional_sum,
+                           coverage_status, missing_gap_ms, completed_at_ms
+                    FROM completed_range_aggregates
+                    WHERE exchange = ? AND symbol = ? AND range_pct = ?
+                      AND bucket_start_ms >= ?
+                      AND bucket_end_ms >= ?
+                      AND bucket_end_ms > bucket_start_ms
+                      AND bucket_end_ms < ?
+                    ORDER BY bucket_end_ms DESC
+                    LIMIT ?
+                )
+                ORDER BY bucket_end_ms ASC
+                """,
+                (
+                    str(exchange).lower(),
+                    symbol,
+                    _decimal_text(range_pct),
                     MIN_VALID_COMPLETED_AGGREGATE_MS,
                     MIN_VALID_COMPLETED_AGGREGATE_MS,
                     before_bucket_end_ms,
@@ -387,6 +599,33 @@ class SqliteRangeCheckpointStore:
                 ON completed_range_aggregates(
                     exchange, symbol, range_pct, coverage_status, bucket_end_ms
                 )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS range_micro_repair_jobs (
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    range_pct TEXT NOT NULL,
+                    bucket_start_ms INTEGER NOT NULL,
+                    bucket_end_ms INTEGER NOT NULL,
+                    checkpoint_last_trade_id TEXT,
+                    checkpoint_last_trade_ts_ms INTEGER,
+                    builder_state_json TEXT NOT NULL,
+                    coverage_status TEXT NOT NULL,
+                    missing_gap_ms INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    last_error TEXT,
+                    PRIMARY KEY (exchange, symbol, range_pct, bucket_start_ms)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_range_micro_repair_due
+                ON range_micro_repair_jobs(status, bucket_end_ms)
                 """
             )
 
@@ -561,6 +800,25 @@ def _completed_from_row(row: Sequence[object]) -> CompletedRangeAggregate:
         coverage_status=str(row[12]),
         missing_gap_ms=int(row[13]),
         completed_at_ms=int(row[14]),
+    )
+
+
+def _micro_repair_job_from_row(row: Sequence[object]) -> RangeMicroRepairJob:
+    return RangeMicroRepairJob(
+        exchange=str(row[0]),
+        symbol=str(row[1]),
+        range_pct=str(row[2]),
+        bucket_start_ms=int(row[3]),
+        bucket_end_ms=int(row[4]),
+        checkpoint_last_trade_id=None if row[5] is None else str(row[5]),
+        checkpoint_last_trade_ts_ms=None if row[6] is None else int(row[6]),
+        builder_state=json.loads(str(row[7])),
+        coverage_status=str(row[8]),
+        missing_gap_ms=int(row[9]),
+        status=str(row[10]),
+        created_at_ms=int(row[11]),
+        updated_at_ms=int(row[12]),
+        last_error=None if row[13] is None else str(row[13]),
     )
 
 

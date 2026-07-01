@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 import subprocess
 import sys
@@ -28,6 +28,8 @@ REASON_CURRENT_DAY_ARCHIVE_NOT_READY = "current_day_archive_not_ready"
 REASON_CURRENT_DAY_GAP_TOO_LARGE = "current_day_gap_too_large"
 REASON_REPAIR_FAILED_COOLDOWN = "repair_failed_cooldown"
 REASON_STALE_WORKER_MISSING = "stale_worker_missing"
+DAILY_ARCHIVE_BACKFILL_RUNNING = "daily_archive_backfill_running"
+DAILY_ARCHIVE_BACKFILL_FAILED = "daily_archive_backfill_failed"
 DEFERRED_REPAIR_REASONS = frozenset(
     {
         REASON_ARCHIVE_GAP_NO_PROGRESS,
@@ -147,6 +149,7 @@ class RangeBackfillSupervisor:
             self.status_store.patch(
                 range_speed_available=False,
                 range_speed_reason=REASON_ARCHIVE_GAP_BACKFILLING,
+                repair_status=DAILY_ARCHIVE_BACKFILL_RUNNING,
                 next_retry_after_ms=None,
             )
             logger.warning(
@@ -161,6 +164,7 @@ class RangeBackfillSupervisor:
                 phase="failed",
                 range_speed_available=False,
                 range_speed_reason=REASON_REPAIR_FAILED_COOLDOWN,
+                repair_status=DAILY_ARCHIVE_BACKFILL_FAILED,
                 next_retry_after_ms=retry_after_ms,
                 last_error=str(exc),
                 exit_code=1,
@@ -186,7 +190,9 @@ class RangeBackfillSupervisor:
                     range_pct=range_pct,
                     bucket_interval=bucket_interval,
                 )
-                archive_max_target_end_ms = _archive_complete_max_target_end_ms()
+                archive_max_target_end_ms = _archive_complete_max_target_end_ms(
+                    exchange=exchange
+                )
                 reason = self._coverage_reason(
                     coverage,
                     archive_max_target_end_ms=archive_max_target_end_ms,
@@ -367,6 +373,13 @@ class RangeBackfillSupervisor:
             "range_speed_reason": reason,
             "complete_after": int(getattr(coverage, "required_window_complete_count", 0)),
             "missing_after": int(getattr(coverage, "required_window_missing_count", 0)),
+            "missing_bucket": sum(
+                getattr(gap, "reason", "missing_bucket") == "missing_bucket"
+                for gap in getattr(coverage, "required_window_missing_buckets", ())
+            ),
+            "degraded_bucket": len(
+                getattr(coverage, "required_window_degraded_buckets", ())
+            ),
             "required_buckets": int(
                 getattr(coverage, "required_buckets", self.config.required_buckets)
             ),
@@ -443,7 +456,21 @@ class RangeBackfillSupervisor:
                 pass
 
 
-def _archive_complete_max_target_end_ms(now_ms_value: int | None = None) -> int:
+def _archive_complete_max_target_end_ms(
+    now_ms_value: int | None = None,
+    *,
+    exchange: str = "okx",
+) -> int:
     now = datetime.now(UTC) if now_ms_value is None else datetime.fromtimestamp(int(now_ms_value) / 1000, tz=UTC)
-    today_start = datetime(now.year, now.month, now.day, tzinfo=UTC)
-    return int(today_start.timestamp() * 1000) - 1
+    if str(exchange).strip().lower() != "okx":
+        today_start = datetime(now.year, now.month, now.day, tzinfo=UTC)
+        return int(today_start.timestamp() * 1000) - 1
+    okx_tz = timezone(timedelta(hours=8))
+    okx_now = now.astimezone(okx_tz)
+    current_archive_start = datetime(
+        okx_now.year,
+        okx_now.month,
+        okx_now.day,
+        tzinfo=okx_tz,
+    )
+    return int(current_archive_start.timestamp() * 1000) - 1

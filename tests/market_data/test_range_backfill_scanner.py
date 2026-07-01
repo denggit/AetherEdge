@@ -162,6 +162,57 @@ def test_latest_closed_bucket_missing_is_unavailable(tmp_path) -> None:
     assert coverage.available is False
 
 
+def test_degraded_bucket_is_explicit_repair_target_and_can_be_replaced(tmp_path) -> None:
+    store = SqliteRangeCheckpointStore(tmp_path / "checkpoint.sqlite3")
+    bucket_ms = 4 * 60 * 60_000
+    now_ms = 1782835200000
+    closed_end = now_ms - 1
+    aggregate = _aggregate(closed_end - bucket_ms + 1, closed_end, 25)
+    store.save_completed_aggregate(
+        exchange="okx",
+        aggregate=aggregate,
+        coverage_status=RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value,
+        missing_gap_ms=87_580,
+        completed_at_ms=closed_end,
+    )
+
+    scanner = RangeBackfillScanner(store)
+    before = scanner.scan(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+        bucket_interval="4h",
+        required_buckets=1,
+        lookback_buckets=1,
+        now_ms=now_ms,
+    )
+
+    assert before.required_window_missing_buckets[0].reason == "degraded_bucket"
+    assert (
+        before.required_window_missing_buckets[0].coverage_status
+        == RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value
+    )
+    assert before.required_window_degraded_buckets
+
+    store.save_completed_aggregate(
+        exchange="okx",
+        aggregate=aggregate,
+        coverage_status=RangeCoverageStatus.COMPLETE.value,
+        missing_gap_ms=0,
+        completed_at_ms=closed_end + 1,
+    )
+    after = scanner.scan(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+        bucket_interval="4h",
+        required_buckets=1,
+        lookback_buckets=1,
+        now_ms=now_ms,
+    )
+    assert after.available is True
+
+
 def test_scanner_caps_target_end_to_historical_complete_day(tmp_path) -> None:
     store = SqliteRangeCheckpointStore(tmp_path / "checkpoint.sqlite3")
     bucket_ms = 4 * 60 * 60_000

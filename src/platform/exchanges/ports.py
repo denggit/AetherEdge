@@ -74,6 +74,7 @@ class ExchangeMarketDataClient(ExchangeIdentity, Protocol):
         end_time_ms: int | None = None,
         limit: int = 1000,
         oldest_first: bool = True,
+        max_pages: int | None = None,
     ) -> list[Trade]:
         ...
 

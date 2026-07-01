@@ -57,6 +57,34 @@ def test_live_runtime_config_loads_range_repair_cooldowns(tmp_path):
     assert cfg.range_repair_daily_retry_after_utc_hour == 2
 
 
+def test_live_runtime_config_loads_micro_repair_limits(tmp_path):
+    cfg = live_runtime_config_from_app(
+        _app_config(),
+        defaults_path=tmp_path / "missing.json",
+        environ={
+            "AETHER_RANGE_MICRO_REPAIR_ENABLED": "false",
+            "AETHER_RANGE_MICRO_REPAIR_MAX_GAP_MS": "123",
+            "AETHER_RANGE_MICRO_REPAIR_MAX_SECONDS": "7.5",
+            "AETHER_RANGE_MICRO_REPAIR_MAX_PAGES": "8",
+            "AETHER_RANGE_MICRO_REPAIR_PAGE_LIMIT": "9",
+            "AETHER_RANGE_MICRO_REPAIR_MONITOR_SECONDS": "11",
+            "AETHER_RANGE_MICRO_REPAIR_MISSING_BUCKET_GRACE_SECONDS": "12",
+            "AETHER_RANGE_MICRO_REPAIR_STATUS_PATH": "state/micro.json",
+            "AETHER_RANGE_MICRO_REPAIR_LOCK_PATH": "state/micro.lock",
+        },
+    )
+
+    assert cfg.range_micro_repair_enabled is False
+    assert cfg.range_micro_repair_max_gap_ms == 123
+    assert cfg.range_micro_repair_max_seconds == 7.5
+    assert cfg.range_micro_repair_max_pages == 8
+    assert cfg.range_micro_repair_page_limit == 9
+    assert cfg.range_micro_repair_monitor_seconds == 11
+    assert cfg.range_micro_repair_missing_bucket_grace_seconds == 12
+    assert cfg.range_micro_repair_status_path == "state/micro.json"
+    assert cfg.range_micro_repair_lock_path == "state/micro.lock"
+
+
 def test_live_runtime_config_injected_environ_ignores_project_master_follower_env(tmp_path, monkeypatch):
     def fake_load_env_config(env_file=None, *, environ=None):
         values = {"AETHER_FOLLOWER_EXCHANGES": "binance"}

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 import time
+from typing import Iterator
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 import zipfile
@@ -60,6 +61,27 @@ def okx_daily_trade_url(*, raw_symbol: str, day: date) -> str:
         symbol=raw_symbol,
         date=text,
     )
+
+
+def okx_archive_date_from_utc_ms(ts_ms: int) -> date:
+    """Map a UTC instant to OKX's UTC+8 daily archive filename date."""
+
+    utc = datetime.fromtimestamp(int(ts_ms) / 1000, tz=UTC)
+    return (utc + timedelta(hours=8)).date()
+
+
+def iter_okx_archive_dates_for_utc_range(
+    start_ms: int, end_ms: int
+) -> Iterator[date]:
+    """Yield every UTC+8 archive date intersecting an inclusive UTC range."""
+
+    if int(end_ms) < int(start_ms):
+        raise ValueError("end_ms must be greater than or equal to start_ms")
+    day = okx_archive_date_from_utc_ms(start_ms)
+    end_day = okx_archive_date_from_utc_ms(end_ms)
+    while day <= end_day:
+        yield day
+        day += timedelta(days=1)
 
 
 @dataclass(frozen=True)

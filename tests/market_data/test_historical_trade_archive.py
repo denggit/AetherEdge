@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import UTC, date, datetime
 from io import BytesIO
 import zipfile
 
@@ -9,7 +9,37 @@ from src.market_data.historical_trades.importer import (
     iter_trade_csv_chunks,
     normalize_okx_trade_chunk,
 )
-from src.market_data.historical_trades.okx_archive import OkxHistoricalTradeArchive, OkxHistoricalTradeDownloadError, okx_raw_symbol_from_canonical
+from src.market_data.historical_trades.okx_archive import (
+    OkxHistoricalTradeArchive,
+    OkxHistoricalTradeDownloadError,
+    iter_okx_archive_dates_for_utc_range,
+    okx_archive_date_from_utc_ms,
+    okx_raw_symbol_from_canonical,
+)
+
+
+def _utc_ms(value: str) -> int:
+    return int(datetime.fromisoformat(value).replace(tzinfo=UTC).timestamp() * 1000)
+
+
+def test_okx_archive_date_uses_utc_plus_8_boundary() -> None:
+    assert (
+        okx_archive_date_from_utc_ms(_utc_ms("2026-06-30T15:59:59.999"))
+        == date(2026, 6, 30)
+    )
+    assert (
+        okx_archive_date_from_utc_ms(_utc_ms("2026-06-30T16:00:00.000"))
+        == date(2026, 7, 1)
+    )
+
+
+def test_okx_archive_dates_cover_cross_boundary_utc_range() -> None:
+    assert list(
+        iter_okx_archive_dates_for_utc_range(
+            _utc_ms("2026-06-30T15:59:00"),
+            _utc_ms("2026-06-30T16:01:00"),
+        )
+    ) == [date(2026, 6, 30), date(2026, 7, 1)]
 
 
 def test_okx_raw_symbol_default_mapping() -> None:

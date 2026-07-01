@@ -2,11 +2,17 @@ from __future__ import annotations
 
 import sqlite3
 import zipfile
+from decimal import Decimal
 
 from src.market_data.backfill.coverage import current_closed_bucket_end_ms
 from src.market_data.backfill.models import RangeBackfillRequest
 from src.market_data.backfill.service import RangeBackfillService
-from src.market_data.historical_trades.okx_archive import okx_raw_symbol_from_canonical
+from src.market_data.historical_trades.okx_archive import (
+    OkxHistoricalTradeArchive,
+    OkxHistoricalTradeDownloadError,
+    okx_raw_symbol_from_canonical,
+)
+from src.market_data.models import RangeBarAggregate, RangeCoverageStatus
 from src.market_data.storage import SqliteTradeStore
 
 
@@ -61,6 +67,14 @@ def test_service_builds_forward_and_marks_only_closed_complete(tmp_path) -> None
     assert summary.raw_rows == 2
     assert summary.filtered_rows == 2
     assert summary.dropped_rows == 0
+    assert summary.selected_archive_dates == ("2026-06-29", "2026-06-30")
+    assert summary.target_trade_count == 2
+    assert summary.candidate_range_bars == 1
+    assert summary.candidate_aggregates == 1
+    assert summary.filtered_reason_if_zero is None
+    status = service.status_store.read()
+    assert status["selected_archive_dates"] == ["2026-06-29", "2026-06-30"]
+    assert status["aggregates_written"] == 1
     with sqlite3.connect(market_db) as conn:
         assert conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM trade_coverage").fetchone()[0] == 0
@@ -113,6 +127,119 @@ def test_service_explicitly_enabled_raw_trade_persistence_still_works(
     assert (
         "Raw trades persistence enabled; market DB may grow quickly"
         in caplog.text
+    )
+
+
+def test_service_repairs_existing_degraded_bucket_to_complete(tmp_path) -> None:
+    symbol = "ETH-USDT-PERP"
+    raw = okx_raw_symbol_from_canonical(symbol)
+    raw_root = tmp_path / "raw"
+    now_ms = 1782835200000
+    closed_end = current_closed_bucket_end_ms(now_ms, "4h")
+    target_start = closed_end - 4 * 60 * 60_000 + 1
+    _write_zip(raw_root, raw, "2026-06-29", "")
+    _write_zip(
+        raw_root,
+        raw,
+        "2026-06-30",
+        f"{target_start + 1},100,1,buy,a\n"
+        f"{target_start + 2},101.5,1,buy,b\n",
+    )
+    request = RangeBackfillRequest(
+        symbol=symbol,
+        exchange="okx",
+        raw_symbol=raw,
+        range_pct="0.01",
+        required_buckets=1,
+        lookback_buckets=1,
+        max_buckets_per_cycle=1,
+        market_db_path=tmp_path / "market.sqlite3",
+        checkpoint_db_path=tmp_path / "checkpoint.sqlite3",
+        raw_root=raw_root,
+        status_path=tmp_path / "status.json",
+        lock_path=tmp_path / "range.lock",
+        allow_download=False,
+    )
+    service = RangeBackfillService(request)
+    service.checkpoint_store.save_completed_aggregate(
+        exchange="okx",
+        aggregate=RangeBarAggregate(
+            symbol=symbol,
+            range_pct=Decimal("0.01"),
+            bucket_start_ms=target_start,
+            bucket_end_ms=closed_end,
+            bar_count=25,
+            first_open=Decimal("100"),
+            last_close=Decimal("101"),
+            high=Decimal("101"),
+            low=Decimal("100"),
+            buy_notional_sum=Decimal("1"),
+            sell_notional_sum=Decimal("1"),
+            delta_notional_sum=Decimal("0"),
+            notional_sum=Decimal("2"),
+        ),
+        coverage_status=RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value,
+        missing_gap_ms=87_580,
+        completed_at_ms=closed_end,
+    )
+
+    before = service.check_coverage(now_ms_value=now_ms)
+    assert before.required_window_missing_buckets[0].reason == "degraded_bucket"
+
+    summary = service.run_once(now_ms_value=now_ms)
+
+    assert summary.aggregates_written == 1
+    history = service.checkpoint_store.load_complete_history(
+        exchange="okx",
+        symbol=symbol,
+        range_pct="0.01",
+        before_bucket_end_ms=closed_end + 1,
+        limit=1,
+    )
+    assert len(history) == 1
+    assert history[0].coverage_status == "COMPLETE"
+    assert history[0].missing_gap_ms == 0
+
+
+def test_zero_aggregate_reports_filtered_reason_and_no_progress(tmp_path) -> None:
+    symbol = "ETH-USDT-PERP"
+    raw = okx_raw_symbol_from_canonical(symbol)
+    raw_root = tmp_path / "raw"
+    now_ms = 1782835200000
+    closed_end = current_closed_bucket_end_ms(now_ms, "4h")
+    target_start = closed_end - 4 * 60 * 60_000 + 1
+    _write_zip(raw_root, raw, "2026-06-29", "")
+    _write_zip(
+        raw_root,
+        raw,
+        "2026-06-30",
+        f"{target_start + 1},100,1,buy,a\n"
+        f"{target_start + 2},100,1,buy,b\n",
+    )
+    request = RangeBackfillRequest(
+        symbol=symbol,
+        exchange="okx",
+        raw_symbol=raw,
+        range_pct="0.01",
+        required_buckets=1,
+        lookback_buckets=1,
+        max_buckets_per_cycle=1,
+        market_db_path=tmp_path / "market.sqlite3",
+        checkpoint_db_path=tmp_path / "checkpoint.sqlite3",
+        raw_root=raw_root,
+        status_path=tmp_path / "status.json",
+        lock_path=tmp_path / "range.lock",
+        allow_download=False,
+    )
+
+    service = RangeBackfillService(request)
+    summary = service.run_once(now_ms_value=now_ms)
+
+    assert summary.status == "no_progress"
+    assert summary.aggregates_written == 0
+    assert summary.filtered_reason_if_zero == "no_range_bar_closed_in_target_window"
+    assert service.status_store.read()["filtered_reason_if_zero"] == (
+        "no_range_bar_closed_in_target_window"
     )
 
 
@@ -386,9 +513,10 @@ def test_live_current_day_archive_missing_exits_before_download_or_csv_read(
         ),
     )
 
-    summary = service.run_once(now_ms_value=1782835200000)
+    # 2026-06-30 15:00 UTC is still the 2026-06-30 UTC+8 archive day.
+    summary = service.run_once(now_ms_value=1782831600000)
 
-    assert summary.status == "no_progress"
+    assert summary.status == "archive_not_ready"
     assert summary.raw_rows == 0
     assert summary.trades_loaded == 0
     assert summary.aggregates_written == 0
@@ -396,3 +524,52 @@ def test_live_current_day_archive_missing_exits_before_download_or_csv_read(
     assert summary.failed_downloads[0].endswith(
         "/20260630/ETH-USDT-SWAP-trades-2026-06-30.zip"
     )
+
+
+def test_live_just_closed_okx_archive_404_is_archive_not_ready(
+    tmp_path, monkeypatch
+) -> None:
+    symbol = "ETH-USDT-PERP"
+    raw = okx_raw_symbol_from_canonical(symbol)
+    raw_root = tmp_path / "raw"
+    _write_zip(raw_root, raw, "2026-06-30", "")
+    request = RangeBackfillRequest(
+        symbol=symbol,
+        exchange="okx",
+        raw_symbol=raw,
+        range_pct="0.01",
+        required_buckets=1,
+        lookback_buckets=1,
+        max_buckets_per_cycle=1,
+        market_db_path=tmp_path / "market.sqlite3",
+        checkpoint_db_path=tmp_path / "checkpoint.sqlite3",
+        raw_root=raw_root,
+        status_path=tmp_path / "status.json",
+        lock_path=tmp_path / "range.lock",
+        allow_download=True,
+        mode="live",
+    )
+    original = OkxHistoricalTradeArchive.ensure_daily_file
+
+    def fake_ensure(self, *, day, **kwargs):
+        if day.isoformat() == "2026-07-01":
+            raise OkxHistoricalTradeDownloadError(
+                url="https://example.test/2026-07-01.zip",
+                day=day,
+                status=404,
+            )
+        return original(self, day=day, **kwargs)
+
+    monkeypatch.setattr(OkxHistoricalTradeArchive, "ensure_daily_file", fake_ensure)
+
+    # 2026-07-01 16:00 UTC has just closed the 2026-07-01 UTC+8 archive.
+    summary = RangeBackfillService(request).run_once(
+        now_ms_value=1782921600000
+    )
+
+    assert summary.status == "archive_not_ready"
+    assert summary.missing_raw_days == ("2026-07-01",)
+    assert summary.filtered_reason_if_zero == "archive_not_ready"
+    assert summary.raw_rows == 0
+    assert summary.trades_loaded == 0
+    assert summary.aggregates_written == 0

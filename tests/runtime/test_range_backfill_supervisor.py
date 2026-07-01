@@ -6,7 +6,26 @@ from pathlib import Path
 import pytest
 
 from src.market_data.backfill.models import BucketGap
-from src.runtime.range_backfill_supervisor import RangeBackfillSupervisor, RangeBackfillSupervisorConfig
+from src.runtime.range_backfill_supervisor import (
+    RangeBackfillSupervisor,
+    RangeBackfillSupervisorConfig,
+    _archive_complete_max_target_end_ms,
+)
+
+
+def test_archive_complete_boundary_uses_okx_utc_plus_8_day() -> None:
+    assert _archive_complete_max_target_end_ms(
+        1782835199999, exchange="okx"
+    ) == 1782748799999
+    assert _archive_complete_max_target_end_ms(
+        1782835200000, exchange="okx"
+    ) == 1782835199999
+
+
+def test_archive_complete_boundary_keeps_non_okx_utc_behavior() -> None:
+    assert _archive_complete_max_target_end_ms(
+        1782835200000, exchange="binance"
+    ) == 1782777599999
 
 
 class FakeProcess:
@@ -140,7 +159,7 @@ async def test_supervisor_monitor_starts_worker_when_coverage_insufficient(tmp_p
     )
     monkeypatch.setattr(
         "src.runtime.range_backfill_supervisor._archive_complete_max_target_end_ms",
-        lambda: 1782777599999,
+        lambda **kwargs: 1782777599999,
     )
     monkeypatch.setattr(
         supervisor,
@@ -181,7 +200,7 @@ async def test_supervisor_current_day_gap_only_writes_status_without_starting(tm
     monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not start")))
     monkeypatch.setattr(
         "src.runtime.range_backfill_supervisor._archive_complete_max_target_end_ms",
-        lambda: 1782777599999,
+        lambda **kwargs: 1782777599999,
     )
     supervisor = RangeBackfillSupervisor(
         RangeBackfillSupervisorConfig(

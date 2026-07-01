@@ -7,6 +7,9 @@ import pytest
 from src.market_data.backfill.models import RangeBackfillSummary
 from src.market_data.backfill.status_store import RangeBackfillStatusStore
 from tools import range_backfill_worker as worker
+from src.market_data.historical_trades.okx_archive import (
+    okx_archive_date_from_utc_ms,
+)
 
 
 def test_worker_cli_defaults_parse() -> None:
@@ -258,7 +261,9 @@ def test_live_worker_current_day_archive_missing_defers_until_next_utc_day(
     tmp_path,
     monkeypatch,
 ) -> None:
-    today = datetime.now(UTC).date().isoformat()
+    today = okx_archive_date_from_utc_ms(
+        int(datetime.now(UTC).timestamp() * 1000)
+    ).isoformat()
 
     class FakeService:
         def __init__(self, request) -> None:
@@ -295,7 +300,9 @@ def test_partial_cycle_with_only_current_day_missing_also_exits(
     tmp_path,
     monkeypatch,
 ) -> None:
-    today = datetime.now(UTC).date().isoformat()
+    today = okx_archive_date_from_utc_ms(
+        int(datetime.now(UTC).timestamp() * 1000)
+    ).isoformat()
     calls = 0
 
     class FakeService:

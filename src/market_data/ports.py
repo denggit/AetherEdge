@@ -42,12 +42,27 @@ class TradeCoverageRepository(Protocol):
         ...
 
 
-class HistoricalTradeFeed(Protocol):
-    """Port for paginated historical trade retrieval.
+class HistoricalTradeProvider(Protocol):
+    """Port for one ascending page of normalized historical trades.
 
-    Concrete exchange adapters can implement this later. The market-data domain
-    only depends on this protocol and never imports OKX/Binance raw clients.
+    Implementations return the oldest available page inside the inclusive time
+    range.  Callers can advance the start time to page forward without knowing
+    any exchange-specific cursor format.
     """
+
+    async def fetch_trades(
+        self,
+        *,
+        symbol: str,
+        start_time_ms: int,
+        end_time_ms: int,
+        limit: int = 100,
+    ) -> Sequence[MarketTrade]:
+        ...
+
+
+class HistoricalTradeFeed(HistoricalTradeProvider, Protocol):
+    """Legacy warmup port with explicit ordering control."""
 
     async def fetch_trades(
         self,
@@ -57,7 +72,7 @@ class HistoricalTradeFeed(Protocol):
         end_time_ms: int,
         limit: int = 1000,
         oldest_first: bool = True,
-    ) -> list[MarketTrade]:
+    ) -> Sequence[MarketTrade]:
         ...
 
 

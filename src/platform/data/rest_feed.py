@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from typing import AsyncIterator
 
 from src.platform.data.models import (
@@ -38,6 +39,7 @@ class RestMarketDataFeed:
         self._trade_stream = trade_stream
         self._order_book_stream = order_book_stream
         self._store = store
+        self.last_historical_trade_pages = 0
 
     @property
     def exchange(self) -> ExchangeName:
@@ -98,18 +100,38 @@ class RestMarketDataFeed:
         end_time_ms: int | None = None,
         limit: int = 1000,
         oldest_first: bool = True,
+        max_pages: int | None = None,
     ) -> list[MarketTrade]:
         if symbol is not None and symbol != self._symbol:
             raise ValueError(f"data feed is bound to {self._symbol}, got {symbol}")
         fetch = getattr(self._exchange_client, "fetch_trades", None)
         if not callable(fetch):
             raise NotImplementedError(f"Historical trades are not supported for {self.exchange.value}")
-        rows = await fetch(
-            self._symbol,
-            start_time_ms=start_time_ms,
-            end_time_ms=end_time_ms,
-            limit=limit,
-            oldest_first=oldest_first,
+        kwargs = {
+            "start_time_ms": start_time_ms,
+            "end_time_ms": end_time_ms,
+            "limit": limit,
+            "oldest_first": oldest_first,
+        }
+        try:
+            accepts_max_pages = (
+                "max_pages" in inspect.signature(fetch).parameters
+            )
+        except (TypeError, ValueError):
+            accepts_max_pages = False
+        if max_pages is not None and accepts_max_pages:
+            kwargs["max_pages"] = int(max_pages)
+        rows = await fetch(self._symbol, **kwargs)
+        self.last_historical_trade_pages = max(
+            1,
+            int(
+                getattr(
+                    self._exchange_client,
+                    "last_historical_trade_pages",
+                    1,
+                )
+                or 1
+            ),
         )
         return [market_trade_from_exchange(row) for row in rows]
 

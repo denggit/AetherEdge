@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from dataclasses import dataclass, replace
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 import time
 from typing import Callable, Mapping
@@ -20,6 +20,8 @@ from src.market_data.historical_trades.importer import (
 from src.market_data.historical_trades.okx_archive import (
     OkxHistoricalTradeArchive,
     OkxHistoricalTradeDownloadError,
+    iter_okx_archive_dates_for_utc_range,
+    okx_archive_date_from_utc_ms,
     okx_daily_trade_url,
     okx_raw_symbol_from_canonical,
 )
@@ -47,6 +49,15 @@ class _BuildWindowResult:
     missing_raw_days: tuple[str, ...] = ()
     failed_downloads: tuple[str, ...] = ()
     skipped_buckets_due_missing_raw: int = 0
+    target_bucket_start_ms: int | None = None
+    target_bucket_end_ms: int | None = None
+    selected_archive_dates: tuple[str, ...] = ()
+    per_file_min_trade_time_ms: tuple[tuple[str, int | None], ...] = ()
+    per_file_max_trade_time_ms: tuple[tuple[str, int | None], ...] = ()
+    target_trade_count: int = 0
+    candidate_range_bars: int = 0
+    candidate_aggregates: int = 0
+    filtered_reason_if_zero: str | None = None
 
 
 class RangeBackfillService:
@@ -72,6 +83,7 @@ class RangeBackfillService:
         self.archive = OkxHistoricalTradeArchive(request.raw_root)
         self._now_ms_value: int | None = None
         self._raw_day_failures: dict[tuple[str, str], str] = {}
+        self._archive_not_ready_days: set[str] = set()
 
     def _emit(self, event: str, **payload: object) -> None:
         if self.progress_callback is None:
@@ -101,12 +113,18 @@ class RangeBackfillService:
     ) -> RangeBackfillSummary:
         self._now_ms_value = now_ms_value
         self._raw_day_failures = {}
+        self._archive_not_ready_days = set()
         started = time.monotonic()
         coverage_before = self.check_coverage(now_ms_value=now_ms_value)
         self._emit(
             "coverage_checked",
             complete=coverage_before.required_window_complete_count,
             missing=coverage_before.missing_periods,
+            missing_bucket=sum(
+                gap.reason == "missing_bucket"
+                for gap in coverage_before.required_window_missing_buckets
+            ),
+            degraded_bucket=len(coverage_before.required_window_degraded_buckets),
             available=coverage_before.available,
             current_closed_bucket_end_ms=coverage_before.current_closed_bucket_end_ms,
         )
@@ -198,6 +216,13 @@ class RangeBackfillService:
             "lookback_buckets": self.request.lookback_buckets,
             "complete_before": coverage_before.required_window_complete_count,
             "missing_before": coverage_before.missing_periods,
+            "missing_bucket": sum(
+                gap.reason == "missing_bucket"
+                for gap in coverage_before.required_window_missing_buckets
+            ),
+            "degraded_bucket": len(
+                coverage_before.required_window_degraded_buckets
+            ),
             "save_raw_trades": self.request.save_raw_trades,
             "chunk_sleep_seconds": self.request.chunk_sleep_seconds,
             "max_seconds_per_cycle": self.request.max_seconds_per_cycle,
@@ -274,10 +299,59 @@ class RangeBackfillService:
         )
         skipped_buckets = sum(result.skipped_buckets_due_missing_raw for result in results)
         resource_limited = any(result.resource_limited for result in results)
-        if missing_raw_days and aggregates_written == 0 and written_bars == 0:
+        target_bucket_start_ms = min(
+            (
+                result.target_bucket_start_ms
+                for result in results
+                if result.target_bucket_start_ms is not None
+            ),
+            default=None,
+        )
+        target_bucket_end_ms = max(
+            (
+                result.target_bucket_end_ms
+                for result in results
+                if result.target_bucket_end_ms is not None
+            ),
+            default=None,
+        )
+        selected_archive_dates = tuple(
+            dict.fromkeys(
+                day for result in results for day in result.selected_archive_dates
+            )
+        )
+        per_file_min_trade_time_ms = tuple(
+            item
+            for result in results
+            for item in result.per_file_min_trade_time_ms
+        )
+        per_file_max_trade_time_ms = tuple(
+            item
+            for result in results
+            for item in result.per_file_max_trade_time_ms
+        )
+        target_trade_count = sum(result.target_trade_count for result in results)
+        candidate_range_bars = sum(result.candidate_range_bars for result in results)
+        candidate_aggregates = sum(result.candidate_aggregates for result in results)
+        filtered_reason_if_zero = next(
+            (
+                result.filtered_reason_if_zero
+                for result in reversed(results)
+                if result.filtered_reason_if_zero
+            ),
+            None,
+        )
+        archive_not_ready = any(
+            self._live_archive_is_not_ready(result) for result in results
+        )
+        if archive_not_ready and aggregates_written == 0:
+            status = "archive_not_ready"
+        elif missing_raw_days and aggregates_written == 0 and written_bars == 0:
             status = "no_progress"
         elif missing_raw_days or resource_limited:
             status = "partial"
+        elif aggregates_written == 0:
+            status = "no_progress"
         else:
             status = "ok"
         hint = (
@@ -303,6 +377,15 @@ class RangeBackfillService:
             skipped_buckets_due_missing_raw=skipped_buckets,
             hint=hint,
             mark_process_finished=mark_process_finished_on_summary,
+            target_bucket_start_ms=target_bucket_start_ms,
+            target_bucket_end_ms=target_bucket_end_ms,
+            selected_archive_dates=selected_archive_dates,
+            per_file_min_trade_time_ms=per_file_min_trade_time_ms,
+            per_file_max_trade_time_ms=per_file_max_trade_time_ms,
+            target_trade_count=target_trade_count,
+            candidate_range_bars=candidate_range_bars,
+            candidate_aggregates=candidate_aggregates,
+            filtered_reason_if_zero=filtered_reason_if_zero,
         )
 
     def _run_build_window(
@@ -316,7 +399,12 @@ class RangeBackfillService:
         earliest_start = min(gap.bucket_start_ms for gap in gaps)
         latest_end = max(gap.bucket_end_ms for gap in gaps)
         anchor_start = previous_utc_day_start_ms(earliest_start)
-        raw_days = tuple(iter_utc_dates(anchor_start, latest_end))
+        raw_days = (
+            tuple(iter_okx_archive_dates_for_utc_range(anchor_start, latest_end))
+            if str(self.request.exchange).strip().lower() == "okx"
+            else tuple(iter_utc_dates(anchor_start, latest_end))
+        )
+        selected_archive_dates = tuple(day.isoformat() for day in raw_days)
         self._emit(
             "build_window_started",
             gaps=len(gaps),
@@ -325,6 +413,14 @@ class RangeBackfillService:
             target_start_ms=earliest_start,
             target_end_ms=latest_end,
             anchor_start_ms=anchor_start,
+            target_bucket_start_ms=earliest_start,
+            target_bucket_end_ms=latest_end,
+            selected_archive_dates=list(selected_archive_dates),
+        )
+        self.status_store.patch(
+            target_bucket_start_ms=earliest_start,
+            target_bucket_end_ms=latest_end,
+            selected_archive_dates=list(selected_archive_dates),
         )
         self._emit(
             "ensuring_raw_days",
@@ -338,7 +434,17 @@ class RangeBackfillService:
             skipped_buckets=len(gaps),
         )
         if raw_result.missing_raw_days:
-            return raw_result
+            return replace(
+                raw_result,
+                target_bucket_start_ms=earliest_start,
+                target_bucket_end_ms=latest_end,
+                selected_archive_dates=selected_archive_dates,
+                filtered_reason_if_zero=(
+                    "archive_not_ready"
+                    if self._live_archive_is_not_ready(raw_result)
+                    else "selected_archive_file_missing"
+                ),
+            )
 
         downloaded = raw_result.downloaded_files
         builder = RangeBarBuilder(
@@ -355,8 +461,12 @@ class RangeBackfillService:
         resource_limited = False
         chunk_index = 0
         last_progress_at = started
+        per_file_min: dict[str, int | None] = {}
+        per_file_max: dict[str, int | None] = {}
+        target_trade_count = 0
         max_valid_trade_time_ms = (self._now_ms_value if self._now_ms_value is not None else now_ms()) + 86_400_000
         for day in raw_days:
+            day_iso = day.isoformat()
             file_path = self.archive.local_path(raw_symbol=raw_symbol, day=day)
             self._emit(
                 "file_read_started",
@@ -376,6 +486,25 @@ class RangeBackfillService:
                 )
                 raw_rows += filtered.raw_rows
                 filtered_rows += filtered.filtered_rows
+                observed_times = [
+                    value
+                    for value in (
+                        filtered.first_trade_time_ms,
+                        filtered.last_trade_time_ms,
+                    )
+                    if value is not None
+                ]
+                if observed_times:
+                    chunk_min = min(observed_times)
+                    chunk_max = max(observed_times)
+                    per_file_min[day_iso] = min(
+                        chunk_min,
+                        per_file_min.get(day_iso, chunk_min) or chunk_min,
+                    )
+                    per_file_max[day_iso] = max(
+                        chunk_max,
+                        per_file_max.get(day_iso, chunk_max) or chunk_max,
+                    )
                 trades = normalize_okx_trade_chunk(
                     filtered.rows,
                     symbol=self.request.symbol,
@@ -388,6 +517,13 @@ class RangeBackfillService:
                     if self.trade_store is not None:
                         self.trade_store.save_trades(trades)
                     trades_loaded += len(trades)
+                    target_trade_count += sum(
+                        1
+                        for trade in trades
+                        if target_time.start_time_ms
+                        <= int(trade.trade_time_ms or trade.event_time_ms or -1)
+                        <= target_time.end_time_ms
+                    )
                     processed_through_ms = trades[-1].trade_time_ms or trades[-1].event_time_ms or processed_through_ms
                 for trade in trades:
                     for bar in builder.on_trade(trade):
@@ -464,6 +600,13 @@ class RangeBackfillService:
             if resource_limited:
                 break
 
+            self._emit(
+                "file_read_completed",
+                day=day_iso,
+                per_file_min_trade_time_ms=per_file_min.get(day_iso),
+                per_file_max_trade_time_ms=per_file_max.get(day_iso),
+            )
+
         bars.sort(key=lambda item: (item.end_time_ms, item.bar_id))
         bucket_ms = interval_to_ms(self.request.bucket_interval)
         target_ends = {gap.bucket_end_ms for gap in gaps}
@@ -499,11 +642,15 @@ class RangeBackfillService:
                 rows=writable_bars,
             )
             self._emit("range_bars_written", rows=written_bars)
-        aggregates = [
+        candidate_aggregate_rows = [
             aggregate
             for aggregate in RangeBarAggregator().aggregate(bars, bucket_ms=bucket_ms)
             if aggregate.bucket_end_ms in target_ends
-            and target_time.start_time_ms <= aggregate.bucket_start_ms
+        ]
+        aggregates = [
+            aggregate
+            for aggregate in candidate_aggregate_rows
+            if target_time.start_time_ms <= aggregate.bucket_start_ms
             and aggregate.bucket_end_ms <= target_time.end_time_ms
             and aggregate.bucket_end_ms <= coverage_before.current_closed_bucket_end_ms
             and aggregate.bucket_end_ms <= complete_through_ms
@@ -511,7 +658,27 @@ class RangeBackfillService:
             and aggregate.bucket_end_ms >= MIN_VALID_COMPLETED_AGGREGATE_MS
             and aggregate.bucket_end_ms > aggregate.bucket_start_ms
         ]
-        self._emit("writing_aggregates", rows=len(aggregates))
+        filtered_reason_if_zero = _aggregate_zero_reason(
+            aggregates=aggregates,
+            candidate_aggregates=candidate_aggregate_rows,
+            bars=bars,
+            trades_loaded=trades_loaded,
+            target_trade_count=target_trade_count,
+            resource_limited=resource_limited,
+        )
+        self._emit(
+            "writing_aggregates",
+            rows=len(aggregates),
+            target_bucket_start_ms=target_time.start_time_ms,
+            target_bucket_end_ms=target_time.end_time_ms,
+            selected_archive_dates=list(selected_archive_dates),
+            per_file_min_trade_time_ms=dict(per_file_min),
+            per_file_max_trade_time_ms=dict(per_file_max),
+            target_trade_count=target_trade_count,
+            candidate_range_bars=len(bars),
+            candidate_aggregates=len(candidate_aggregate_rows),
+            filtered_reason_if_zero=filtered_reason_if_zero,
+        )
         completed_at = now_ms()
         for aggregate in aggregates:
             self.checkpoint_store.save_completed_aggregate(
@@ -521,7 +688,11 @@ class RangeBackfillService:
                 missing_gap_ms=0,
                 completed_at_ms=completed_at,
             )
-        self._emit("aggregates_written", rows=len(aggregates))
+        self._emit(
+            "aggregates_written",
+            rows=len(aggregates),
+            filtered_reason_if_zero=filtered_reason_if_zero,
+        )
         return _BuildWindowResult(
             downloaded_files=downloaded,
             raw_rows=raw_rows,
@@ -531,6 +702,15 @@ class RangeBackfillService:
             range_bars_written=written_bars,
             aggregates_written=len(aggregates),
             resource_limited=resource_limited,
+            target_bucket_start_ms=target_time.start_time_ms,
+            target_bucket_end_ms=target_time.end_time_ms,
+            selected_archive_dates=selected_archive_dates,
+            per_file_min_trade_time_ms=tuple(per_file_min.items()),
+            per_file_max_trade_time_ms=tuple(per_file_max.items()),
+            target_trade_count=target_trade_count,
+            candidate_range_bars=len(bars),
+            candidate_aggregates=len(candidate_aggregate_rows),
+            filtered_reason_if_zero=filtered_reason_if_zero,
         )
 
     def _ensure_raw_days(
@@ -543,11 +723,11 @@ class RangeBackfillService:
         downloaded = 0
         missing_days: list[str] = []
         failed_downloads: list[str] = []
-        current_utc_day = self._current_utc_date()
+        current_archive_day = self._current_archive_date()
         unavailable_archive_days = tuple(
             day
             for day in days
-            if day >= current_utc_day
+            if day >= current_archive_day
             and not self.archive.local_path(raw_symbol=raw_symbol, day=day).exists()
         )
         if unavailable_archive_days:
@@ -555,6 +735,7 @@ class RangeBackfillService:
                 day_iso = day.isoformat()
                 failed_url = okx_daily_trade_url(raw_symbol=raw_symbol, day=day)
                 self._raw_day_failures[(raw_symbol, day_iso)] = failed_url
+                self._archive_not_ready_days.add(day_iso)
                 missing_days.append(day_iso)
                 failed_downloads.append(failed_url)
                 self._emit(
@@ -601,6 +782,12 @@ class RangeBackfillService:
                 break
             except OkxHistoricalTradeDownloadError as exc:
                 self._raw_day_failures[cache_key] = exc.url
+                if (
+                    str(self.request.mode).strip().lower() == "live"
+                    and exc.status == 404
+                    and day >= current_archive_day - timedelta(days=1)
+                ):
+                    self._archive_not_ready_days.add(day_iso)
                 missing_days.append(day_iso)
                 failed_downloads.append(exc.url)
                 self._emit("raw_day_missing", day=day_iso, url=exc.url, error=str(exc))
@@ -617,17 +804,21 @@ class RangeBackfillService:
     def _live_archive_is_not_ready(self, result: _BuildWindowResult) -> bool:
         if str(self.request.mode).strip().lower() != "live" or not result.missing_raw_days:
             return False
-        current_utc_day = self._current_utc_date()
         parsed_days: list[date] = []
         for value in result.missing_raw_days:
             try:
                 parsed_days.append(date.fromisoformat(value))
             except ValueError:
                 return False
-        return bool(parsed_days) and all(day >= current_utc_day for day in parsed_days)
+        return bool(parsed_days) and all(
+            day.isoformat() in self._archive_not_ready_days
+            for day in parsed_days
+        )
 
-    def _current_utc_date(self) -> date:
+    def _current_archive_date(self) -> date:
         value = self._now_ms_value if self._now_ms_value is not None else now_ms()
+        if str(self.request.exchange).strip().lower() == "okx":
+            return okx_archive_date_from_utc_ms(int(value))
         return datetime.fromtimestamp(int(value) / 1000, tz=UTC).date()
 
     def _writable_time_range(
@@ -696,6 +887,15 @@ class RangeBackfillService:
         failed_downloads: tuple[str, ...] = (),
         skipped_buckets_due_missing_raw: int = 0,
         hint: str | None = None,
+        target_bucket_start_ms: int | None = None,
+        target_bucket_end_ms: int | None = None,
+        selected_archive_dates: tuple[str, ...] = (),
+        per_file_min_trade_time_ms: tuple[tuple[str, int | None], ...] = (),
+        per_file_max_trade_time_ms: tuple[tuple[str, int | None], ...] = (),
+        target_trade_count: int = 0,
+        candidate_range_bars: int = 0,
+        candidate_aggregates: int = 0,
+        filtered_reason_if_zero: str | None = None,
     ) -> RangeBackfillSummary:
         after = self.check_coverage(now_ms_value=self._now_ms_value, direction=self.request.direction)
         summary = RangeBackfillSummary(
@@ -722,13 +922,22 @@ class RangeBackfillService:
             failed_downloads=failed_downloads,
             skipped_buckets_due_missing_raw=skipped_buckets_due_missing_raw,
             hint=hint,
+            target_bucket_start_ms=target_bucket_start_ms,
+            target_bucket_end_ms=target_bucket_end_ms,
+            selected_archive_dates=selected_archive_dates,
+            per_file_min_trade_time_ms=per_file_min_trade_time_ms,
+            per_file_max_trade_time_ms=per_file_max_trade_time_ms,
+            target_trade_count=target_trade_count,
+            candidate_range_bars=candidate_range_bars,
+            candidate_aggregates=candidate_aggregates,
+            filtered_reason_if_zero=filtered_reason_if_zero,
         )
         if update_status:
             if status == "error":
                 phase = "failed"
             elif status == "partial":
                 phase = "partial"
-            elif mark_process_finished and status in {"ok", "dry_run", "no_progress"}:
+            elif mark_process_finished and status in {"ok", "dry_run", "no_progress", "archive_not_ready"}:
                 phase = "completed"
             else:
                 phase = "sleeping"
@@ -736,6 +945,18 @@ class RangeBackfillService:
             self.status_store.patch(
                 running=False if mark_process_finished else True,
                 phase=phase,
+                cycle_status=status,
+                repair_target_status=(
+                    "archive_not_ready"
+                    if status == "archive_not_ready"
+                    else (
+                        "degraded_bucket"
+                        if getattr(
+                            before, "required_window_degraded_buckets", ()
+                        )
+                        else "missing_bucket"
+                    )
+                ),
                 worker_heartbeat_ms=heartbeat,
                 heartbeat_ms=heartbeat,
                 complete_after=summary.complete_after,
@@ -754,7 +975,16 @@ class RangeBackfillService:
                 failed_downloads=list(failed_downloads),
                 skipped_buckets_due_missing_raw=skipped_buckets_due_missing_raw,
                 hint=hint,
-                exit_code=0 if status in {"ok", "dry_run", "partial", "no_progress"} else 1,
+                target_bucket_start_ms=summary.target_bucket_start_ms,
+                target_bucket_end_ms=summary.target_bucket_end_ms,
+                selected_archive_dates=list(summary.selected_archive_dates),
+                per_file_min_trade_time_ms=dict(summary.per_file_min_trade_time_ms),
+                per_file_max_trade_time_ms=dict(summary.per_file_max_trade_time_ms),
+                target_trade_count=summary.target_trade_count,
+                candidate_range_bars=summary.candidate_range_bars,
+                candidate_aggregates=summary.candidate_aggregates,
+                filtered_reason_if_zero=summary.filtered_reason_if_zero,
+                exit_code=0 if status in {"ok", "dry_run", "partial", "no_progress", "archive_not_ready"} else 1,
                 finished_at_ms=now_ms() if mark_process_finished else None,
             )
         self._emit(
@@ -768,6 +998,39 @@ class RangeBackfillService:
             trades_loaded=summary.trades_loaded,
             range_bars_written=summary.range_bars_written,
             aggregates_written=summary.aggregates_written,
+            target_bucket_start_ms=summary.target_bucket_start_ms,
+            target_bucket_end_ms=summary.target_bucket_end_ms,
+            selected_archive_dates=list(summary.selected_archive_dates),
+            per_file_min_trade_time_ms=dict(summary.per_file_min_trade_time_ms),
+            per_file_max_trade_time_ms=dict(summary.per_file_max_trade_time_ms),
+            target_trade_count=summary.target_trade_count,
+            candidate_range_bars=summary.candidate_range_bars,
+            candidate_aggregates=summary.candidate_aggregates,
+            filtered_reason_if_zero=summary.filtered_reason_if_zero,
             elapsed_seconds=summary.elapsed_seconds,
         )
         return summary
+
+
+def _aggregate_zero_reason(
+    *,
+    aggregates,
+    candidate_aggregates,
+    bars,
+    trades_loaded: int,
+    target_trade_count: int,
+    resource_limited: bool,
+) -> str | None:
+    if aggregates:
+        return None
+    if resource_limited:
+        return "resource_limit_before_target_complete"
+    if trades_loaded <= 0:
+        return "no_valid_trades_in_selected_archives"
+    if target_trade_count <= 0:
+        return "no_trades_in_target_bucket"
+    if not bars:
+        return "no_range_bar_closed_in_target_window"
+    if not candidate_aggregates:
+        return "range_bars_did_not_form_target_aggregate"
+    return "candidate_aggregate_filtered_by_coverage_guard"

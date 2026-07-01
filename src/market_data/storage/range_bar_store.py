@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Sequence
 
 from src.market_data.models import RangeBar, TimeRange
+
+_BAR_ID_MULT = 1_000_000
+_REPAIR_BAR_ID_FIRST_SEQ = 500_000
 
 
 class SqliteRangeBarStore:
@@ -82,6 +86,80 @@ class SqliteRangeBarStore:
                     [_range_bar_params(row) for row in rows],
                 )
         return len(rows)
+
+    def replace_range_for_repair(
+        self,
+        *,
+        symbol: str,
+        range_pct: str,
+        time_range: TimeRange,
+        rows: Sequence[RangeBar],
+    ) -> int:
+        """Atomically replace repaired rows without colliding with live IDs.
+
+        A repaired bucket can contain more bars than the degraded live build.
+        Reusing the checkpoint's low per-day sequence IDs could then overwrite
+        bars already persisted for the following live bucket. Repaired rows
+        use the upper half of the same per-day ID namespace instead.
+        """
+
+        pct = _normalize_decimal_text(Decimal(str(range_pct)))
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                DELETE FROM range_bars
+                WHERE symbol = ? AND range_pct = ?
+                  AND end_time_ms BETWEEN ? AND ?
+                """,
+                (
+                    symbol,
+                    pct,
+                    time_range.start_time_ms,
+                    time_range.end_time_ms,
+                ),
+            )
+            used_ids = {
+                int(row[0])
+                for row in conn.execute(
+                    """
+                    SELECT bar_id
+                    FROM range_bars
+                    WHERE symbol = ? AND range_pct = ?
+                    """,
+                    (symbol, pct),
+                ).fetchall()
+            }
+            next_seq_by_day: dict[int, int] = {}
+            repaired_rows: list[RangeBar] = []
+            for row in sorted(
+                rows, key=lambda item: (item.end_time_ms, item.bar_id)
+            ):
+                day = int(row.bar_id) // _BAR_ID_MULT
+                seq = next_seq_by_day.get(day, _REPAIR_BAR_ID_FIRST_SEQ)
+                candidate = day * _BAR_ID_MULT + seq
+                while candidate in used_ids and seq < _BAR_ID_MULT:
+                    seq += 1
+                    candidate = day * _BAR_ID_MULT + seq
+                if seq >= _BAR_ID_MULT:
+                    raise RuntimeError(
+                        f"repair range-bar ID space exhausted for day={day}"
+                    )
+                used_ids.add(candidate)
+                next_seq_by_day[day] = seq + 1
+                repaired_rows.append(replace(row, bar_id=candidate))
+            if repaired_rows:
+                conn.executemany(
+                    """
+                    INSERT INTO range_bars (
+                        symbol, range_pct, bar_id, start_time_ms, end_time_ms,
+                        open, high, low, close, volume, buy_notional,
+                        sell_notional, trade_count
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [_range_bar_params(row) for row in repaired_rows],
+                )
+        return len(repaired_rows)
 
     def load(self, *, symbol: str, range_pct: str, time_range: TimeRange) -> list[RangeBar]:
         pct = _normalize_decimal_text(Decimal(str(range_pct)))

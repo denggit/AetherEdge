@@ -49,6 +49,10 @@ from src.runtime.features import closed_kline_feature, range_aggregate_feature, 
 from src.runtime.heartbeat import RuntimeHeartbeatService
 from src.runtime.models import RuntimeHealth, RuntimeMode, RuntimePhase
 from src.runtime.range_backfill_supervisor import RangeBackfillSupervisor, RangeBackfillSupervisorConfig
+from src.runtime.range_micro_repair_supervisor import (
+    RangeMicroRepairSupervisor,
+    RangeMicroRepairSupervisorConfig,
+)
 from src.runtime.range_speed_history import RangeSpeedHistoryRefresher
 from src.runtime.requirements import StrategyRuntimeRequirements, resolve_strategy_runtime_requirements
 from src.runtime.startup_catchup import (
@@ -237,6 +241,9 @@ class LiveRuntimeRunner:
         self._range_speed_complete_history = 0
         self._range_speed_min_periods = 0
         self._range_backfill_supervisor = self.services.get("range_backfill_supervisor")
+        self._range_micro_repair_supervisor = self.services.get(
+            "range_micro_repair_supervisor"
+        )
         self._range_speed_history_refresher = self.services.get("range_speed_history_refresher")
 
     async def run(self, *, max_market_events: int | None = None) -> LiveRuntimeStats:
@@ -467,6 +474,7 @@ class LiveRuntimeRunner:
         else:
             self._closed_bar_scheduler.last_emitted_open_time_ms = open_time_ms
         features = [event]
+        self._refresh_range_micro_repair_coverage(open_time_ms)
         is_mid_bucket_restart = (
             self.requirements.range_bars.enabled
             and self.requirements.trades.enabled
@@ -806,6 +814,7 @@ class LiveRuntimeRunner:
                 degraded_fast_margin=self.runtime_config.degraded_fast_margin
             )
         self._get_range_checkpoint_writer().start()
+        self._launch_range_micro_repair_subprocess(recovery)
         logger.info(
             "Rangebar checkpoint recovery initialized | symbol=%s interval=%s now_ms=%s current_bucket_ms=%s trust_start_bucket_ms=%s coverage_status=%s checkpoint_age_ms=%s recovered=%s missing_gap_ms=%s",
             self.app_config.symbol,
@@ -817,6 +826,76 @@ class LiveRuntimeRunner:
             recovery.checkpoint_age_ms,
             recovery.recovered_from_checkpoint,
             recovery.missing_gap_ms,
+        )
+
+    def _launch_range_micro_repair_subprocess(
+        self,
+        recovery: RangeCheckpointRecovery,
+    ) -> None:
+        if not self.runtime_config.range_micro_repair_enabled:
+            return
+        checkpoint = recovery.checkpoint
+        repairable = (
+            recovery.recovered_from_checkpoint
+            and checkpoint is not None
+            and checkpoint.last_trade_ts_ms is not None
+            and recovery.missing_gap_ms > 0
+            and recovery.missing_gap_ms
+            <= self.runtime_config.range_micro_repair_max_gap_ms
+            and recovery.coverage_status
+            != RangeCoverageStatus.COMPLETE.value
+        )
+        if not repairable:
+            if recovery.missing_gap_ms > 0:
+                bucket_start_ms = int(self._initial_range_bucket_ms or 0)
+                logger.warning(
+                    "range_micro_repair_skipped | symbol=%s "
+                    "exchange=%s range_pct=%s bucket_start_ms=%s "
+                    "bucket_end_ms=%s checkpoint_last_trade_ts_ms=%s "
+                    "checkpoint_last_trade_id=%s missing_gap_ms=%s "
+                    "coverage_before=%s coverage_after=%s failure_reason=%s",
+                    self.app_config.symbol,
+                    self.app_config.data_exchange.value,
+                    str(self._range_pct),
+                    bucket_start_ms,
+                    bucket_start_ms
+                    + self._closed_bar_interval_ms
+                    - 1,
+                    None,
+                    None,
+                    recovery.missing_gap_ms,
+                    recovery.coverage_status,
+                    recovery.coverage_status,
+                    "missing_checkpoint_or_gap_exceeds_limit",
+                )
+            return
+        started = self._get_range_micro_repair_supervisor().start_for_recovery(
+            exchange=self.app_config.data_exchange.value,
+            symbol=self.app_config.symbol,
+            range_pct=str(self._range_pct),
+            bucket_start_ms=checkpoint.bucket_start_ms,
+            bucket_end_ms=checkpoint.bucket_end_ms,
+            coverage_status=recovery.coverage_status,
+            missing_gap_ms=recovery.missing_gap_ms,
+        )
+        logger.warning(
+            "range_micro_repair_subprocess_launch | symbol=%s exchange=%s "
+            "range_pct=%s bucket_start_ms=%s bucket_end_ms=%s "
+            "checkpoint_last_trade_ts_ms=%s checkpoint_last_trade_id=%s "
+            "missing_gap_ms=%s repair_start_ms=%s repair_end_ms=%s "
+            "coverage_before=%s started=%s",
+            self.app_config.symbol,
+            self.app_config.data_exchange.value,
+            str(self._range_pct),
+            checkpoint.bucket_start_ms,
+            checkpoint.bucket_end_ms,
+            checkpoint.last_trade_ts_ms,
+            checkpoint.last_trade_id,
+            recovery.missing_gap_ms,
+            int(checkpoint.last_trade_ts_ms) + 1,
+            checkpoint.bucket_end_ms,
+            recovery.coverage_status,
+            started,
         )
 
     async def _warmup_range_speed_history(self) -> int:
@@ -3263,6 +3342,16 @@ class LiveRuntimeRunner:
         if not self.requirements.range_bars.enabled:
             return
         try:
+            if self.runtime_config.range_micro_repair_enabled:
+                self._get_range_micro_repair_supervisor().start_monitor(
+                    stop_event=self._stop_event
+                )
+        except Exception as exc:
+            logger.warning(
+                "Range micro repair supervisor initialization failed | error=%s",
+                exc,
+            )
+        try:
             if self.runtime_config.range_backfill_enabled:
                 supervisor = self._get_range_backfill_supervisor()
                 supervisor.start_monitor(
@@ -3315,6 +3404,56 @@ class LiveRuntimeRunner:
             )
         return self._range_backfill_supervisor
 
+    def _get_range_micro_repair_supervisor(
+        self,
+    ) -> RangeMicroRepairSupervisor:
+        if self._range_micro_repair_supervisor is None:
+            repo_root = Path(__file__).resolve().parents[2]
+            self._range_micro_repair_supervisor = (
+                RangeMicroRepairSupervisor(
+                    RangeMicroRepairSupervisorConfig(
+                        enabled=self.runtime_config.range_micro_repair_enabled,
+                        monitor_seconds=(
+                            self.runtime_config.range_micro_repair_monitor_seconds
+                        ),
+                        status_path=Path(
+                            self.runtime_config.range_micro_repair_status_path
+                        ),
+                        lock_path=Path(
+                            self.runtime_config.range_micro_repair_lock_path
+                        ),
+                        checkpoint_db_path=Path(
+                            self.runtime_config.range_checkpoint_db_path
+                        ),
+                        market_db_path=Path(
+                            self.runtime_config.market_data_db_path
+                        ),
+                        page_limit=(
+                            self.runtime_config.range_micro_repair_page_limit
+                        ),
+                        max_pages=(
+                            self.runtime_config.range_micro_repair_max_pages
+                        ),
+                        max_seconds=(
+                            self.runtime_config.range_micro_repair_max_seconds
+                        ),
+                        missing_bucket_grace_seconds=(
+                            self.runtime_config
+                            .range_micro_repair_missing_bucket_grace_seconds
+                        ),
+                        repo_root=repo_root,
+                    ),
+                    on_failure=lambda reason: self.context.alerts.emit(
+                        AppAlert(
+                            subject="AetherEdge range micro repair failed",
+                            content=str(reason),
+                            severity="warning",
+                        )
+                    ),
+                )
+            )
+        return self._range_micro_repair_supervisor
+
     def _get_range_speed_history_refresher(self) -> RangeSpeedHistoryRefresher:
         if self._range_speed_history_refresher is None:
             self._range_speed_history_refresher = RangeSpeedHistoryRefresher(
@@ -3344,10 +3483,15 @@ class LiveRuntimeRunner:
             stop_async = getattr(supervisor, "stop_async", None)
             if callable(stop_async):
                 await stop_async()
-                return
-            stop = getattr(supervisor, "stop", None)
-            if callable(stop):
-                await asyncio.to_thread(stop)
+            else:
+                stop = getattr(supervisor, "stop", None)
+                if callable(stop):
+                    await asyncio.to_thread(stop)
+        micro_supervisor = self._range_micro_repair_supervisor
+        if micro_supervisor is not None:
+            stop_async = getattr(micro_supervisor, "stop_async", None)
+            if callable(stop_async):
+                await stop_async()
 
     async def _stop_range_checkpoint_writer(self) -> None:
         writer = self._range_checkpoint_writer
@@ -3371,6 +3515,50 @@ class LiveRuntimeRunner:
             checkpoint_age_ms=None,
             missing_gap_ms=0,
             recovered_from_checkpoint=False,
+        )
+
+    def _refresh_range_micro_repair_coverage(
+        self, bucket_start_ms: int
+    ) -> None:
+        """Adopt a repaired DB aggregate without replaying live trades."""
+
+        if (
+            self._initial_range_bucket_ms != bucket_start_ms
+            or self._initial_range_recovery is None
+            or self._initial_range_recovery.coverage_status
+            == RangeCoverageStatus.COMPLETE.value
+        ):
+            return
+        bucket_end_ms = (
+            bucket_start_ms + self._closed_bar_interval_ms - 1
+        )
+        completed = self._get_range_checkpoint_store().load_completed_aggregate(
+            exchange=self.app_config.data_exchange.value,
+            symbol=self.app_config.symbol,
+            range_pct=str(self._range_pct),
+            bucket_end_ms=bucket_end_ms,
+        )
+        if (
+            completed is None
+            or completed.coverage_status
+            != RangeCoverageStatus.COMPLETE.value
+        ):
+            return
+        self._initial_range_recovery = RangeCheckpointRecovery(
+            coverage_status=RangeCoverageStatus.COMPLETE.value,
+            checkpoint=None,
+            checkpoint_age_ms=None,
+            missing_gap_ms=0,
+            recovered_from_checkpoint=True,
+        )
+        self._rangebar_trust_start_bucket_ms = bucket_start_ms
+        logger.info(
+            "Range micro repair COMPLETE aggregate adopted | symbol=%s "
+            "exchange=%s bucket_start_ms=%s bucket_end_ms=%s",
+            self.app_config.symbol,
+            self.app_config.data_exchange.value,
+            bucket_start_ms,
+            bucket_end_ms,
         )
 
     def _set_health(

@@ -18,6 +18,7 @@ from src.market_data.backfill.lock import RangeBackfillLock
 from src.market_data.backfill.service import RangeBackfillService
 from src.market_data.backfill.status_store import RangeBackfillStatusStore, now_ms
 from src.market_data.historical_trades.okx_archive import okx_raw_symbol_from_canonical
+from src.market_data.historical_trades.okx_archive import okx_archive_date_from_utc_ms
 
 REASON_AVAILABLE = "available"
 REASON_ARCHIVE_GAP_BACKFILLING = "archive_gap_backfilling"
@@ -25,6 +26,9 @@ REASON_ARCHIVE_GAP_NO_PROGRESS = "archive_gap_no_progress"
 REASON_ARCHIVE_GAP_PARTIAL_NO_PROGRESS = "archive_gap_partial_no_progress"
 REASON_CURRENT_DAY_ARCHIVE_NOT_READY = "current_day_archive_not_ready"
 REASON_REPAIR_FAILED_COOLDOWN = "repair_failed_cooldown"
+DAILY_ARCHIVE_BACKFILL_RUNNING = "daily_archive_backfill_running"
+DAILY_ARCHIVE_BACKFILL_FAILED = "daily_archive_backfill_failed"
+DAILY_ARCHIVE_BACKFILL_SUCCESS = "daily_archive_backfill_success"
 _DATE_PATTERN = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})(?!\d)")
 
 
@@ -180,6 +184,15 @@ def main(argv: list[str] | None = None) -> int:
                 "Range backfill cycle completed | "
                 f"status={summary.status} complete_after={summary.complete_after} "
                 f"missing_after={summary.missing_after} aggregates_written={summary.aggregates_written} "
+                f"target_bucket_start_ms={summary.target_bucket_start_ms} "
+                f"target_bucket_end_ms={summary.target_bucket_end_ms} "
+                f"selected_archive_dates={list(summary.selected_archive_dates)} "
+                f"per_file_min_trade_time_ms={dict(summary.per_file_min_trade_time_ms)} "
+                f"per_file_max_trade_time_ms={dict(summary.per_file_max_trade_time_ms)} "
+                f"target_trade_count={summary.target_trade_count} "
+                f"candidate_range_bars={summary.candidate_range_bars} "
+                f"candidate_aggregates={summary.candidate_aggregates} "
+                f"filtered_reason_if_zero={summary.filtered_reason_if_zero} "
                 f"last_error={summary.last_error}",
                 flush=True,
             )
@@ -199,7 +212,9 @@ def main(argv: list[str] | None = None) -> int:
                 exit_phase = "completed"
                 range_speed_reason = REASON_AVAILABLE
                 return exit_code
-            no_progress_reason = _no_progress_reason(summary)
+            no_progress_reason = _no_progress_reason(
+                summary, exchange=request.exchange
+            )
             partial_without_progress = _partial_without_progress(summary)
             if (
                 summary.status == "no_progress"
@@ -219,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
                     failure_cooldown_seconds=int(args.failure_cooldown_seconds),
                     archive_not_ready_cooldown_seconds=int(args.archive_not_ready_cooldown_seconds),
                     daily_retry_after_utc_hour=int(args.daily_retry_after_utc_hour),
+                    archive_day=max(_summary_raw_days(summary), default=None),
                 )
                 print(
                     "Range backfill worker exiting without progress | "
@@ -227,7 +243,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return exit_code
             if once:
-                exit_code = 0 if summary.status in {"ok", "dry_run", "partial", "no_progress"} else 1
+                exit_code = 0 if summary.status in {"ok", "dry_run", "partial", "no_progress", "archive_not_ready"} else 1
                 exit_phase = "completed" if exit_code == 0 else "failed"
                 return exit_code
             time.sleep(max(0.0, float(args.sleep_seconds)))
@@ -278,6 +294,15 @@ def _write_process_status(
         "required_buckets": request.required_buckets,
         "lookback_buckets": request.lookback_buckets,
         "exit_code": exit_code,
+        "repair_status": (
+            DAILY_ARCHIVE_BACKFILL_RUNNING
+            if running
+            else (
+                DAILY_ARCHIVE_BACKFILL_FAILED
+                if exit_code not in (None, 0)
+                else DAILY_ARCHIVE_BACKFILL_SUCCESS
+            )
+        ),
         "finished_at_ms": now_ms() if not running else None,
     }
     if range_speed_reason is not None:
@@ -291,19 +316,44 @@ def _write_process_status(
         payload.update(
             complete_after=int(summary.complete_after),
             missing_after=int(summary.missing_after),
+            cycle_status=summary.status,
             missing_raw_days=list(summary.missing_raw_days),
             failed_downloads=list(summary.failed_downloads),
             last_error=summary.last_error,
+            target_bucket_start_ms=summary.target_bucket_start_ms,
+            target_bucket_end_ms=summary.target_bucket_end_ms,
+            selected_archive_dates=list(summary.selected_archive_dates),
+            per_file_min_trade_time_ms=dict(summary.per_file_min_trade_time_ms),
+            per_file_max_trade_time_ms=dict(summary.per_file_max_trade_time_ms),
+            target_trade_count=int(summary.target_trade_count),
+            candidate_range_bars=int(summary.candidate_range_bars),
+            candidate_aggregates=int(summary.candidate_aggregates),
+            aggregates_written=int(summary.aggregates_written),
+            filtered_reason_if_zero=summary.filtered_reason_if_zero,
         )
     status_store.patch(**payload)
 
 
-def _no_progress_reason(summary, *, now_ms_value: int | None = None) -> str | None:
+def _no_progress_reason(
+    summary,
+    *,
+    now_ms_value: int | None = None,
+    exchange: str = "okx",
+) -> str | None:
     failed_days = _summary_raw_days(summary)
     if not failed_days:
         return REASON_ARCHIVE_GAP_NO_PROGRESS if summary.status == "no_progress" else None
-    now = _utc_datetime(now_ms_value)
-    if all(day >= now.date() for day in failed_days):
+    now_value = (
+        int(datetime.now(UTC).timestamp() * 1000)
+        if now_ms_value is None
+        else int(now_ms_value)
+    )
+    current_source_day = (
+        okx_archive_date_from_utc_ms(now_value)
+        if str(exchange).strip().lower() == "okx"
+        else datetime.fromtimestamp(now_value / 1000, tz=UTC).date()
+    )
+    if all(day >= current_source_day for day in failed_days):
         return REASON_CURRENT_DAY_ARCHIVE_NOT_READY
     return REASON_ARCHIVE_GAP_NO_PROGRESS if summary.status == "no_progress" else None
 
@@ -339,11 +389,16 @@ def _next_retry_after_ms(
     archive_not_ready_cooldown_seconds: int,
     daily_retry_after_utc_hour: int,
     now_ms_value: int | None = None,
+    archive_day: date | None = None,
 ) -> int:
     now = _utc_datetime(now_ms_value)
     if reason == REASON_CURRENT_DAY_ARCHIVE_NOT_READY:
         retry_hour = min(23, max(0, int(daily_retry_after_utc_hour)))
-        next_day = (now + timedelta(days=1)).date()
+        next_day = (
+            archive_day + timedelta(days=1)
+            if archive_day is not None
+            else (now + timedelta(days=1)).date()
+        )
         daily_retry = datetime(
             next_day.year,
             next_day.month,

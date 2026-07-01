@@ -49,6 +49,17 @@ class LiveRuntimeConfig:
     range_checkpoint_writer_max_pending: int = 8
     range_checkpoint_max_age_for_recovered_minor_ms: int = 60_000
     range_checkpoint_max_age_for_restore_ms: int = 300_000
+    range_micro_repair_enabled: bool = True
+    range_micro_repair_max_gap_ms: int = 600_000
+    range_micro_repair_max_seconds: float = 30.0
+    range_micro_repair_max_pages: int = 20
+    range_micro_repair_page_limit: int = 100
+    range_micro_repair_monitor_seconds: float = 30.0
+    range_micro_repair_missing_bucket_grace_seconds: int = 120
+    range_micro_repair_status_path: str = (
+        "data/state/range_micro_repair_status.json"
+    )
+    range_micro_repair_lock_path: str = "data/state/range_micro_repair.lock"
     degraded_fast_margin: float = 1.05
     producer_stale_timeout_ms: int = 60_000
     range_speed_refresh_enabled: bool = True
@@ -156,6 +167,68 @@ def live_runtime_config_from_app(
             env.get(
                 "AETHER_RANGE_CHECKPOINT_MAX_AGE_FOR_RESTORE_MS",
                 defaults.get("range_checkpoint_max_age_for_restore_ms", 300_000),
+            )
+        ),
+        range_micro_repair_enabled=_bool(
+            env.get(
+                "AETHER_RANGE_MICRO_REPAIR_ENABLED",
+                defaults.get("range_micro_repair_enabled", True),
+            )
+        ),
+        range_micro_repair_max_gap_ms=int(
+            env.get(
+                "AETHER_RANGE_MICRO_REPAIR_MAX_GAP_MS",
+                defaults.get("range_micro_repair_max_gap_ms", 600_000),
+            )
+        ),
+        range_micro_repair_max_seconds=float(
+            env.get(
+                "AETHER_RANGE_MICRO_REPAIR_MAX_SECONDS",
+                defaults.get("range_micro_repair_max_seconds", 30),
+            )
+        ),
+        range_micro_repair_max_pages=int(
+            env.get(
+                "AETHER_RANGE_MICRO_REPAIR_MAX_PAGES",
+                defaults.get("range_micro_repair_max_pages", 20),
+            )
+        ),
+        range_micro_repair_page_limit=int(
+            env.get(
+                "AETHER_RANGE_MICRO_REPAIR_PAGE_LIMIT",
+                defaults.get("range_micro_repair_page_limit", 100),
+            )
+        ),
+        range_micro_repair_monitor_seconds=float(
+            env.get(
+                "AETHER_RANGE_MICRO_REPAIR_MONITOR_SECONDS",
+                defaults.get("range_micro_repair_monitor_seconds", 30),
+            )
+        ),
+        range_micro_repair_missing_bucket_grace_seconds=int(
+            env.get(
+                "AETHER_RANGE_MICRO_REPAIR_MISSING_BUCKET_GRACE_SECONDS",
+                defaults.get(
+                    "range_micro_repair_missing_bucket_grace_seconds", 120
+                ),
+            )
+        ),
+        range_micro_repair_status_path=str(
+            env.get(
+                "AETHER_RANGE_MICRO_REPAIR_STATUS_PATH",
+                defaults.get(
+                    "range_micro_repair_status_path",
+                    "data/state/range_micro_repair_status.json",
+                ),
+            )
+        ),
+        range_micro_repair_lock_path=str(
+            env.get(
+                "AETHER_RANGE_MICRO_REPAIR_LOCK_PATH",
+                defaults.get(
+                    "range_micro_repair_lock_path",
+                    "data/state/range_micro_repair.lock",
+                ),
             )
         ),
         degraded_fast_margin=float(

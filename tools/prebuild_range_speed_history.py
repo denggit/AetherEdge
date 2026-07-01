@@ -17,7 +17,10 @@ if str(REPO_ROOT) not in sys.path:
 from src.market_data.backfill.models import RangeBackfillRequest, RangeBackfillSummary
 from src.market_data.backfill.coverage import iter_utc_dates, previous_utc_day_start_ms
 from src.market_data.backfill.service import RangeBackfillService
-from src.market_data.historical_trades.okx_archive import okx_raw_symbol_from_canonical
+from src.market_data.historical_trades.okx_archive import (
+    iter_okx_archive_dates_for_utc_range,
+    okx_raw_symbol_from_canonical,
+)
 from src.market_data.range_checkpoint import MIN_VALID_COMPLETED_AGGREGATE_MS
 from src.utils.sqlite_backup import backup_sqlite_database
 
@@ -217,6 +220,8 @@ class ProgressPrinter:
             print(
                 "Coverage checked | "
                 f"{prefix}complete={payload.get('complete')} missing={payload.get('missing')} "
+                f"missing_bucket={payload.get('missing_bucket')} "
+                f"degraded_bucket={payload.get('degraded_bucket')} "
                 f"available={str(payload.get('available')).lower()}",
                 flush=True,
             )
@@ -232,7 +237,8 @@ class ProgressPrinter:
                 "Batch started | "
                 f"{prefix}gaps={payload.get('gaps')} first={payload.get('first_bucket_end_ms')} "
                 f"last={payload.get('last_bucket_end_ms')} anchor_start={payload.get('anchor_start_ms')} "
-                f"target_end={payload.get('target_end_ms')}",
+                f"target_end={payload.get('target_end_ms')} "
+                f"selected_archive_dates={payload.get('selected_archive_dates')}",
                 flush=True,
             )
         elif event == "ensuring_raw_days":
@@ -286,9 +292,26 @@ class ProgressPrinter:
         elif event == "range_bars_written":
             print(f"Range bars written | {prefix}rows={payload.get('rows')}", flush=True)
         elif event == "writing_aggregates":
-            print(f"Writing aggregates | {prefix}rows={payload.get('rows')}", flush=True)
+            print(
+                "Writing aggregates | "
+                f"{prefix}rows={payload.get('rows')} "
+                f"target_bucket_start_ms={payload.get('target_bucket_start_ms')} "
+                f"target_bucket_end_ms={payload.get('target_bucket_end_ms')} "
+                f"selected_archive_dates={payload.get('selected_archive_dates')} "
+                f"per_file_min_trade_time_ms={payload.get('per_file_min_trade_time_ms')} "
+                f"per_file_max_trade_time_ms={payload.get('per_file_max_trade_time_ms')} "
+                f"target_trade_count={payload.get('target_trade_count')} "
+                f"candidate_range_bars={payload.get('candidate_range_bars')} "
+                f"candidate_aggregates={payload.get('candidate_aggregates')} "
+                f"filtered_reason_if_zero={payload.get('filtered_reason_if_zero')}",
+                flush=True,
+            )
         elif event == "aggregates_written":
-            print(f"Aggregates written | {prefix}rows={payload.get('rows')}", flush=True)
+            print(
+                f"Aggregates written | {prefix}rows={payload.get('rows')} "
+                f"filtered_reason_if_zero={payload.get('filtered_reason_if_zero')}",
+                flush=True,
+            )
         elif event == "file_read_stopped":
             print(
                 "Reading raw zip stopped | "
@@ -317,6 +340,21 @@ def print_summary(summary: RangeBackfillSummary, *, title: str = "Range speed pr
     print(f"trades_loaded: {summary.trades_loaded}", flush=True)
     print(f"range_bars_written: {summary.range_bars_written}", flush=True)
     print(f"aggregates_written: {summary.aggregates_written}", flush=True)
+    print(f"target_bucket_start_ms: {summary.target_bucket_start_ms}", flush=True)
+    print(f"target_bucket_end_ms: {summary.target_bucket_end_ms}", flush=True)
+    print(f"selected_archive_dates: {list(summary.selected_archive_dates)}", flush=True)
+    print(
+        f"per_file_min_trade_time_ms: {dict(summary.per_file_min_trade_time_ms)}",
+        flush=True,
+    )
+    print(
+        f"per_file_max_trade_time_ms: {dict(summary.per_file_max_trade_time_ms)}",
+        flush=True,
+    )
+    print(f"target_trade_count: {summary.target_trade_count}", flush=True)
+    print(f"candidate_range_bars: {summary.candidate_range_bars}", flush=True)
+    print(f"candidate_aggregates: {summary.candidate_aggregates}", flush=True)
+    print(f"filtered_reason_if_zero: {summary.filtered_reason_if_zero}", flush=True)
     print(f"missing_raw_days: {list(summary.missing_raw_days)}", flush=True)
     print(f"failed_downloads: {list(summary.failed_downloads)}", flush=True)
     print(f"skipped_buckets_due_missing_raw: {summary.skipped_buckets_due_missing_raw}", flush=True)
@@ -433,7 +471,12 @@ def raw_coverage_report(service: RangeBackfillService, *, coverage, raw_symbol: 
     days = []
     for gap in coverage.lookback_missing_buckets:
         anchor = previous_utc_day_start_ms(gap.bucket_start_ms)
-        days.extend(day.isoformat() for day in iter_utc_dates(anchor, gap.bucket_end_ms))
+        archive_days = (
+            iter_okx_archive_dates_for_utc_range(anchor, gap.bucket_end_ms)
+            if str(service.request.exchange).lower() == "okx"
+            else iter_utc_dates(anchor, gap.bucket_end_ms)
+        )
+        days.extend(day.isoformat() for day in archive_days)
     unique_days = tuple(dict.fromkeys(days))
     missing = [
         day

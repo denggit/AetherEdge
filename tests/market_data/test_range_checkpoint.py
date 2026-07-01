@@ -6,9 +6,12 @@ from decimal import Decimal
 
 from src.market_data.models import RangeBarAggregate, RangeCoverageStatus
 from src.market_data.range_checkpoint import (
+    MICRO_REPAIR_FAILED,
+    MICRO_REPAIR_QUEUED,
     MIN_VALID_COMPLETED_AGGREGATE_MS,
     RangeBuilderCheckpoint,
     RangeCheckpointWriter,
+    RangeMicroRepairJob,
     SqliteRangeCheckpointStore,
 )
 
@@ -188,3 +191,55 @@ def test_completed_aggregate_rejects_suspicious_timestamp(tmp_path) -> None:
         symbol="ETH-USDT-PERP",
         range_pct="0.002",
     ) == (0, 0)
+
+
+def test_micro_repair_worker_checkpoint_and_status_are_persisted(
+    tmp_path,
+) -> None:
+    store = SqliteRangeCheckpointStore(tmp_path / "range.sqlite3")
+    start = MIN_VALID_COMPLETED_AGGREGATE_MS + 100_000
+    aggregate = _aggregate(bucket_start_ms=start, count=3)
+    job = RangeMicroRepairJob(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+        bucket_start_ms=aggregate.bucket_start_ms,
+        bucket_end_ms=aggregate.bucket_end_ms,
+        checkpoint_last_trade_id="10",
+        checkpoint_last_trade_ts_ms=start + 100,
+        builder_state={"version": 1},
+        coverage_status=RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value,
+        missing_gap_ms=87_580,
+        status=MICRO_REPAIR_QUEUED,
+        created_at_ms=start,
+        updated_at_ms=start,
+    )
+    store.enqueue_micro_repair(job)
+
+    saved = store.load_micro_repair_job(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+        bucket_start_ms=start,
+    )
+    assert saved is not None
+    assert saved.checkpoint_last_trade_id == "10"
+
+    assert store.mark_micro_repair_status(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+        bucket_start_ms=start,
+        status=MICRO_REPAIR_FAILED,
+        updated_at_ms=aggregate.bucket_end_ms + 2,
+        last_error="REST unavailable",
+    )
+    failed = store.load_micro_repair_job(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+        bucket_start_ms=start,
+    )
+    assert failed is not None
+    assert failed.status == MICRO_REPAIR_FAILED
+    assert failed.last_error == "REST unavailable"

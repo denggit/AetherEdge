@@ -132,7 +132,7 @@ def test_prebuild_no_download_missing_raw_prints_clear_summary(tmp_path, capsys)
     assert "hint: raw OKX trades zip missing; run downloader or remove --no-download" in output
 
 
-def test_profile_one_bucket_respects_historical_complete_boundary(tmp_path, capsys) -> None:
+def test_profile_one_bucket_maps_utc_boundary_to_okx_archive_dates(tmp_path, capsys) -> None:
     result = tool.main(
         [
             "--profile-one-bucket",
@@ -155,7 +155,7 @@ def test_profile_one_bucket_respects_historical_complete_boundary(tmp_path, caps
     output = capsys.readouterr().out
     assert result == 0
     assert "2026-06-30.zip" not in output
-    assert "2026-06-30']" not in output
+    assert "selected_archive_dates=['2026-06-28', '2026-06-29', '2026-06-30']" in output
     assert "max_target_end_ms=1782777599999" in output
 
 

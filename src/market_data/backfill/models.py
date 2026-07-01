@@ -8,6 +8,8 @@ from pathlib import Path
 class BucketGap:
     bucket_start_ms: int
     bucket_end_ms: int
+    reason: str = "missing_bucket"
+    coverage_status: str | None = None
 
 
 @dataclass(frozen=True)
@@ -26,6 +28,8 @@ class RangeSpeedCoverage:
     required_window_missing_buckets: tuple[BucketGap, ...]
     lookback_missing_buckets: tuple[BucketGap, ...]
     has_latest_closed_bucket: bool
+    required_window_degraded_buckets: tuple[BucketGap, ...] = ()
+    lookback_degraded_buckets: tuple[BucketGap, ...] = ()
 
     @property
     def missing_periods(self) -> int:
@@ -94,3 +98,12 @@ class RangeBackfillSummary:
     failed_downloads: tuple[str, ...] = ()
     skipped_buckets_due_missing_raw: int = 0
     hint: str | None = None
+    target_bucket_start_ms: int | None = None
+    target_bucket_end_ms: int | None = None
+    selected_archive_dates: tuple[str, ...] = ()
+    per_file_min_trade_time_ms: tuple[tuple[str, int | None], ...] = ()
+    per_file_max_trade_time_ms: tuple[tuple[str, int | None], ...] = ()
+    target_trade_count: int = 0
+    candidate_range_bars: int = 0
+    candidate_aggregates: int = 0
+    filtered_reason_if_zero: str | None = None

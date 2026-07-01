@@ -1,6 +1,8 @@
 import asyncio
 from decimal import Decimal
 
+import pytest
+
 from src.platform.exchanges.errors import ExchangeApiError
 from src.platform.exchanges import (
     CancelOrderRequest,
@@ -260,3 +262,38 @@ def test_okx_public_request_does_not_retry_non_retryable_error(monkeypatch):
         raise AssertionError("expected ExchangeApiError")
 
     assert len(http.calls) == 1
+
+
+def test_okx_history_trades_fails_when_page_cap_cannot_prove_start(
+    monkeypatch,
+):
+    monkeypatch.setenv("OKX_HISTORY_TRADES_MAX_PAGES", "1")
+    http = FakeHttpClient(
+        [
+            {
+                "code": "0",
+                "data": [
+                    {
+                        "tradeId": "2",
+                        "px": "100",
+                        "sz": "1",
+                        "side": "buy",
+                        "ts": "2000",
+                    }
+                ],
+            }
+        ]
+    )
+    client = create_exchange_client(
+        ExchangeName.OKX, ExchangeConfig(), http_client=http
+    )
+
+    with pytest.raises(ExchangeApiError, match="pagination limit"):
+        asyncio.run(
+            client.fetch_trades(
+                "ETH-USDT-PERP",
+                start_time_ms=1000,
+                end_time_ms=3000,
+                limit=100,
+            )
+        )
