@@ -14,12 +14,9 @@ from src.market_data.derived import RangeBarAggregator, RangeBarBuilder
 from src.market_data.events import MarketFeatureEvent
 from src.market_data.models import MarketDataSet, RangeBar, RangeBarAggregate, RangeCoverageStatus, TimeRange, WarmupRequest
 from src.market_data.range_checkpoint import (
-    MICRO_REPAIR_FAILED,
-    MICRO_REPAIR_QUEUED,
     RangeBuilderCheckpoint,
     RangeCheckpointRecovery,
     RangeCheckpointWriter,
-    RangeMicroRepairJob,
     SqliteRangeCheckpointStore,
     aggregate_snapshot,
 )
@@ -28,10 +25,8 @@ from src.market_data.range_repair import (
     JOURNAL_INVALID_MARKET_QUEUE_DRAIN_INCOMPLETE,
     JOURNAL_INVALID_PRODUCER_FAILED,
     JOURNAL_INVALID_PRODUCER_STALE,
-    JOURNAL_OPEN,
     RangeRepairJournalWriter,
     RangeRepairTrade,
-    SqliteRangeRepairJournalStore,
 )
 from src.market_data.storage import SqliteKlineStore, SqliteRangeBarStore
 from src.market_data.warmup.gap_detector import interval_to_ms
@@ -64,8 +59,8 @@ from src.runtime.models import RuntimeHealth, RuntimeMode, RuntimePhase
 from src.runtime.range_backfill_supervisor import RangeBackfillSupervisor, RangeBackfillSupervisorConfig
 from src.runtime.range_micro_repair_supervisor import (
     RangeMicroRepairSupervisor,
-    RangeMicroRepairSupervisorConfig,
 )
+from src.runtime.range_repair_bootstrap import RangeRepairBootstrapService
 from src.runtime.range_speed_history import RangeSpeedHistoryRefresher
 from src.runtime.requirements import StrategyRuntimeRequirements, resolve_strategy_runtime_requirements
 from src.runtime.startup_catchup import (
@@ -201,6 +196,9 @@ class LiveRuntimeRunner:
         )
         self._range_repair_journal_writer = self.services.get(
             "range_repair_journal_writer"
+        )
+        self._range_repair_bootstrap_service = self.services.get(
+            "range_repair_bootstrap_service"
         )
         self._range_repair_journal_bucket_ms: int | None = None
         self._range_repair_checkpoint_last_trade_ts_ms: int | None = None
@@ -862,101 +860,25 @@ class LiveRuntimeRunner:
         self,
         recovery: RangeCheckpointRecovery,
     ) -> None:
-        if not self.runtime_config.range_micro_repair_enabled:
-            return
-        checkpoint = recovery.checkpoint
-        repairable = (
-            recovery.recovered_from_checkpoint
-            and checkpoint is not None
-            and checkpoint.last_trade_ts_ms is not None
-            and recovery.missing_gap_ms > 0
-            and recovery.coverage_status
-            != RangeCoverageStatus.COMPLETE.value
-            and self.runtime_config.range_repair_journal_enabled
+        result = self._get_range_repair_bootstrap_service().start_if_needed(
+            recovery,
+            initial_bucket_ms=self._initial_range_bucket_ms,
         )
-        if not repairable:
-            if recovery.missing_gap_ms > 0:
-                bucket_start_ms = int(self._initial_range_bucket_ms or 0)
-                logger.warning(
-                    "range_micro_repair_skipped | symbol=%s "
-                    "exchange=%s range_pct=%s bucket_start_ms=%s "
-                    "bucket_end_ms=%s checkpoint_last_trade_ts_ms=%s "
-                    "checkpoint_last_trade_id=%s missing_gap_ms=%s "
-                    "coverage_before=%s coverage_after=%s failure_reason=%s",
-                    self.app_config.symbol,
-                    self.app_config.data_exchange.value,
-                    str(self._range_pct),
-                    bucket_start_ms,
-                    bucket_start_ms
-                    + self._closed_bar_interval_ms
-                    - 1,
-                    None,
-                    None,
-                    recovery.missing_gap_ms,
-                    recovery.coverage_status,
-                    recovery.coverage_status,
-                    "missing_checkpoint_or_repair_journal_disabled",
-                )
-            return
-        job = RangeMicroRepairJob(
-            exchange=self.app_config.data_exchange.value,
-            symbol=self.app_config.symbol,
-            range_pct=str(self._range_pct),
-            bucket_start_ms=checkpoint.bucket_start_ms,
-            bucket_end_ms=checkpoint.bucket_end_ms,
-            checkpoint_last_trade_id=checkpoint.last_trade_id,
-            checkpoint_last_trade_ts_ms=checkpoint.last_trade_ts_ms,
-            builder_state=dict(checkpoint.builder_state),
-            coverage_status=recovery.coverage_status,
-            missing_gap_ms=recovery.missing_gap_ms,
-            journal_required=True,
-            journal_status=JOURNAL_OPEN,
-            status=MICRO_REPAIR_QUEUED,
-            created_at_ms=int(time.time() * 1000),
-            updated_at_ms=int(time.time() * 1000),
+        self._range_repair_journal_store = result.journal_store
+        self._range_repair_journal_writer = result.journal_writer
+        self._range_micro_repair_supervisor = (
+            result.micro_repair_supervisor
         )
-        self._get_range_checkpoint_store().enqueue_micro_repair(job)
-        journal_started = self._start_range_repair_journal(checkpoint)
-        if not journal_started:
-            logger.warning(
-                "startup_recovery_micro_repair skipped | symbol=%s "
-                "bucket_start_ms=%s failure_reason=journal_writer_start_failed",
-                checkpoint.symbol,
-                checkpoint.bucket_start_ms,
+        if result.journal_bucket_start_ms is not None:
+            self._range_repair_journal_bucket_ms = (
+                result.journal_bucket_start_ms
             )
-            return
-        started = (
-            self._get_range_micro_repair_supervisor()
-            .start_startup_recovery(
-                exchange=self.app_config.data_exchange.value,
-                symbol=self.app_config.symbol,
-                range_pct=str(self._range_pct),
-                bucket_start_ms=checkpoint.bucket_start_ms,
-                bucket_end_ms=checkpoint.bucket_end_ms,
-                coverage_status=recovery.coverage_status,
-                missing_gap_ms=recovery.missing_gap_ms,
+            self._range_repair_checkpoint_last_trade_ts_ms = (
+                result.checkpoint_last_trade_ts_ms
             )
-        )
-        logger.warning(
-            "startup_recovery_micro_repair_subprocess_launch | "
-            "symbol=%s exchange=%s "
-            "range_pct=%s bucket_start_ms=%s bucket_end_ms=%s "
-            "checkpoint_last_trade_ts_ms=%s checkpoint_last_trade_id=%s "
-            "missing_gap_ms=%s repair_gap_start_ms=%s "
-            "repair_gap_end_ms=pending_first_live_trade "
-            "coverage_before=%s started=%s",
-            self.app_config.symbol,
-            self.app_config.data_exchange.value,
-            str(self._range_pct),
-            checkpoint.bucket_start_ms,
-            checkpoint.bucket_end_ms,
-            checkpoint.last_trade_ts_ms,
-            checkpoint.last_trade_id,
-            recovery.missing_gap_ms,
-            int(checkpoint.last_trade_ts_ms) + 1,
-            recovery.coverage_status,
-            started,
-        )
+            self._range_repair_first_live_submitted = False
+            self._range_repair_journal_finalize_submitted = False
+            self._range_repair_journal_append_failure_warned = False
 
     async def _warmup_range_speed_history(self) -> int:
         if not self.requirements.range_bars.enabled:
@@ -3456,136 +3378,41 @@ class LiveRuntimeRunner:
             )
         return self._range_checkpoint_writer
 
-    def _get_range_repair_journal_store(
+    def _get_range_repair_bootstrap_service(
         self,
-    ) -> SqliteRangeRepairJournalStore:
-        if self._range_repair_journal_store is None:
-            self._range_repair_journal_store = (
-                SqliteRangeRepairJournalStore(
-                    self.runtime_config.range_repair_journal_db
+    ) -> RangeRepairBootstrapService:
+        if self._range_repair_bootstrap_service is None:
+            self._range_repair_bootstrap_service = (
+                RangeRepairBootstrapService(
+                    runtime_config=self.runtime_config,
+                    exchange=self.app_config.data_exchange.value,
+                    symbol=self.app_config.symbol,
+                    range_pct=str(self._range_pct),
+                    closed_bar_interval_ms=self._closed_bar_interval_ms,
+                    checkpoint_store=self._get_range_checkpoint_store(),
+                    emit_alert=self.context.alerts.emit,
+                    journal_store=self._range_repair_journal_store,
+                    journal_writer=self._range_repair_journal_writer,
+                    micro_repair_supervisor=(
+                        self._range_micro_repair_supervisor
+                    ),
+                    clock_ms=lambda: int(time.time() * 1000),
                 )
             )
-        return self._range_repair_journal_store
+        return self._range_repair_bootstrap_service
 
     def _get_range_repair_journal_writer(
         self,
     ) -> RangeRepairJournalWriter:
         if self._range_repair_journal_writer is None:
-            loop = asyncio.get_running_loop()
-
-            def on_error(exc: BaseException) -> None:
-                logger.warning(
-                    "Range repair journal writer failed | error=%s", exc
-                )
-                loop.call_soon_threadsafe(
-                    self.context.alerts.emit,
-                    AppAlert(
-                        subject="AetherEdge range repair journal failed",
-                        content=str(exc),
-                        severity="warning",
-                    ),
-                )
-
-            def on_invalidated(
-                key: tuple[str, str, str, int],
-                status: str,
-                error: str,
-            ) -> None:
-                exchange, symbol, range_pct, bucket_start_ms = key
-                timestamp = int(time.time() * 1000)
-                store = self._get_range_checkpoint_store()
-                store.invalidate_completed_aggregate(
-                    exchange=exchange,
-                    symbol=symbol,
-                    range_pct=range_pct,
-                    bucket_end_ms=(
-                        bucket_start_ms
-                        + self._closed_bar_interval_ms
-                        - 1
-                    ),
-                    coverage_status=(
-                        RangeCoverageStatus.RECOVERED_INCOMPLETE.value
-                    ),
-                    missing_gap_ms=1,
-                    completed_at_ms=timestamp,
-                )
-                store.mark_micro_repair_status(
-                    exchange=exchange,
-                    symbol=symbol,
-                    range_pct=range_pct,
-                    bucket_start_ms=bucket_start_ms,
-                    status=MICRO_REPAIR_FAILED,
-                    updated_at_ms=timestamp,
-                    last_error=f"{status}:{error}",
-                )
-                logger.warning(
-                    "Range repair journal invalidated; COMPLETE aggregate "
-                    "revoked if present | symbol=%s bucket_start_ms=%s "
-                    "journal_status=%s error=%s",
-                    symbol,
-                    bucket_start_ms,
-                    status,
-                    error,
-                )
-
-            self._range_repair_journal_writer = RangeRepairJournalWriter(
-                self._get_range_repair_journal_store(),
-                max_pending=(
-                    self.runtime_config
-                    .range_repair_journal_writer_max_pending
-                ),
-                flush_interval_ms=(
-                    self.runtime_config
-                    .range_repair_journal_flush_interval_ms
-                ),
-                batch_size=(
-                    self.runtime_config.range_repair_journal_batch_size
-                ),
-                retention_hours=(
-                    self.runtime_config.range_repair_journal_retention_hours
-                ),
-                on_error=on_error,
-                on_invalidated=on_invalidated,
+            service = self._get_range_repair_bootstrap_service()
+            self._range_repair_journal_writer = (
+                service.get_journal_writer()
+            )
+            self._range_repair_journal_store = (
+                service.get_journal_store()
             )
         return self._range_repair_journal_writer
-
-    def _start_range_repair_journal(
-        self, checkpoint: RangeBuilderCheckpoint
-    ) -> bool:
-        writer = self._get_range_repair_journal_writer()
-        writer.start()
-        accepted = writer.submit_open(
-            exchange=checkpoint.exchange,
-            symbol=checkpoint.symbol,
-            range_pct=checkpoint.range_pct,
-            bucket_start_ms=checkpoint.bucket_start_ms,
-            bucket_end_ms=checkpoint.bucket_end_ms,
-            checkpoint_last_trade_ts_ms=checkpoint.last_trade_ts_ms,
-            checkpoint_last_trade_id=checkpoint.last_trade_id,
-            updated_at_ms=int(time.time() * 1000),
-        )
-        if not accepted:
-            return False
-        self._range_repair_journal_bucket_ms = checkpoint.bucket_start_ms
-        self._range_repair_checkpoint_last_trade_ts_ms = (
-            checkpoint.last_trade_ts_ms
-        )
-        self._range_repair_first_live_submitted = False
-        self._range_repair_journal_finalize_submitted = False
-        self._range_repair_journal_append_failure_warned = False
-        logger.info(
-            "range_repair_journal_started | symbol=%s exchange=%s "
-            "range_pct=%s bucket_start_ms=%s bucket_end_ms=%s "
-            "checkpoint_last_trade_ts_ms=%s checkpoint_last_trade_id=%s",
-            checkpoint.symbol,
-            checkpoint.exchange,
-            checkpoint.range_pct,
-            checkpoint.bucket_start_ms,
-            checkpoint.bucket_end_ms,
-            checkpoint.last_trade_ts_ms,
-            checkpoint.last_trade_id,
-        )
-        return True
 
     def _append_range_repair_trade(self, trade: MarketTrade) -> None:
         bucket_start_ms = self._range_repair_journal_bucket_ms
@@ -3798,55 +3625,9 @@ class LiveRuntimeRunner:
         self,
     ) -> RangeMicroRepairSupervisor:
         if self._range_micro_repair_supervisor is None:
-            repo_root = Path(__file__).resolve().parents[2]
             self._range_micro_repair_supervisor = (
-                RangeMicroRepairSupervisor(
-                    RangeMicroRepairSupervisorConfig(
-                        enabled=self.runtime_config.range_micro_repair_enabled,
-                        monitor_seconds=(
-                            self.runtime_config.range_micro_repair_monitor_seconds
-                        ),
-                        status_path=Path(
-                            self.runtime_config.range_micro_repair_status_path
-                        ),
-                        lock_path=Path(
-                            self.runtime_config.range_micro_repair_lock_path
-                        ),
-                        checkpoint_db_path=Path(
-                            self.runtime_config.range_checkpoint_db_path
-                        ),
-                        market_db_path=Path(
-                            self.runtime_config.market_data_db_path
-                        ),
-                        journal_db_path=Path(
-                            self.runtime_config.range_repair_journal_db
-                        ),
-                        max_gap_ms=(
-                            self.runtime_config.range_micro_repair_max_gap_ms
-                        ),
-                        page_limit=(
-                            self.runtime_config.range_micro_repair_page_limit
-                        ),
-                        max_pages=(
-                            self.runtime_config.range_micro_repair_max_pages
-                        ),
-                        max_seconds=(
-                            self.runtime_config.range_micro_repair_max_seconds
-                        ),
-                        missing_bucket_grace_seconds=(
-                            self.runtime_config
-                            .range_micro_repair_missing_bucket_grace_seconds
-                        ),
-                        repo_root=repo_root,
-                    ),
-                    on_failure=lambda reason: self.context.alerts.emit(
-                        AppAlert(
-                            subject="AetherEdge range micro repair failed",
-                            content=str(reason),
-                            severity="warning",
-                        )
-                    ),
-                )
+                self._get_range_repair_bootstrap_service()
+                .get_micro_repair_supervisor()
             )
         return self._range_micro_repair_supervisor
 

@@ -253,6 +253,74 @@ def test_journal_job_helper_preserves_checkpoint_update_fields() -> None:
     }
 
 
+def test_waiting_loop_reuses_updated_at_for_db_and_returned_job(
+    monkeypatch,
+) -> None:
+    class CheckpointStore:
+        def __init__(self) -> None:
+            self.journal_updates = []
+
+        def load_completed_aggregate(self, **kwargs):
+            return None
+
+        def update_micro_repair_journal_status(self, **kwargs) -> None:
+            pass
+
+        def update_micro_repair_journal(self, **kwargs) -> None:
+            self.journal_updates.append(kwargs)
+
+    class JournalStore:
+        def load_state(self, **kwargs):
+            return _finalized_journal_state()
+
+    checkpoint_store = CheckpointStore()
+    job = RangeMicroRepairJob(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=BUCKET_START,
+        bucket_end_ms=BUCKET_END,
+        checkpoint_last_trade_id="cp",
+        checkpoint_last_trade_ts_ms=CHECKPOINT_TS,
+        builder_state={"version": 1},
+        coverage_status=RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value,
+        missing_gap_ms=500,
+    )
+    clock_values = iter(range(BUCKET_END + 10, BUCKET_END + 30))
+    clock_calls = []
+
+    def incrementing_now_ms() -> int:
+        value = next(clock_values)
+        clock_calls.append(value)
+        return value
+
+    monkeypatch.setattr(worker, "now_ms", incrementing_now_ms)
+    monkeypatch.setattr(worker, "_write_status", lambda *args, **kwargs: None)
+    monkeypatch.setattr(worker.time, "sleep", lambda seconds: None)
+
+    ready = worker._wait_until_bucket_can_be_repaired(
+        checkpoint_store,
+        JournalStore(),
+        SimpleNamespace(),
+        args=SimpleNamespace(
+            missing_bucket_grace_seconds=120,
+            wait_poll_seconds=0.01,
+            max_gap_ms=600_000,
+        ),
+        job=job,
+    )
+
+    assert ready is not None
+    returned_job, _ = ready
+    assert len(checkpoint_store.journal_updates) == 2
+    assert len(clock_calls) == 6
+    assert (
+        checkpoint_store.journal_updates[-1]["updated_at_ms"]
+        == returned_job.updated_at_ms
+        == clock_calls[4]
+    )
+
+
 def test_worker_status_helpers_preserve_complete_payload(
     monkeypatch,
 ) -> None:

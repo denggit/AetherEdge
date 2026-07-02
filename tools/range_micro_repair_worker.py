@@ -532,28 +532,24 @@ def _wait_until_bucket_can_be_repaired(
                 "real REST repair gap exceeds configured maximum: "
                 f"repair_gap_ms={repair_gap_ms} max_gap_ms={args.max_gap_ms}"
             )
+        updated_at_ms = now_ms()
+        journal_job_fields = _journal_job_fields(
+            job,
+            state,
+            repair_gap_start_ms=repair_gap_start_ms,
+            repair_gap_end_ms=repair_gap_end_ms,
+            updated_at_ms=updated_at_ms,
+        )
         checkpoint_store.update_micro_repair_journal(
             exchange=job.exchange,
             symbol=job.symbol,
             range_pct=job.range_pct,
             bucket_start_ms=job.bucket_start_ms,
-            **_journal_job_fields(
-                job,
-                state,
-                repair_gap_start_ms=repair_gap_start_ms,
-                repair_gap_end_ms=repair_gap_end_ms,
-                updated_at_ms=now_ms(),
-            ),
+            **journal_job_fields,
         )
         job = replace(
             job,
-            **_journal_job_fields(
-                job,
-                state,
-                repair_gap_start_ms=repair_gap_start_ms,
-                repair_gap_end_ms=repair_gap_end_ms,
-                updated_at_ms=now_ms(),
-            ),
+            **journal_job_fields,
         )
         current_ms = now_ms()
         if current_ms <= job.bucket_end_ms:
