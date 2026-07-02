@@ -20,7 +20,7 @@ from src.market_data.micro_repair import (
     RangeMicroRepairRebuildService,
 )
 from src.market_data.models import RangeCoverageStatus
-from src.market_data.range_repair_journal import (
+from src.market_data.range_repair import (
     RangeRepairJournalState,
     SqliteRangeRepairJournalStore,
     journal_status_is_invalid,
@@ -421,6 +421,26 @@ def _earliest_checkpoint_job(
     return existing if existing_ts <= captured_ts else captured
 
 
+def _journal_job_fields(
+    job: RangeMicroRepairJob,
+    state: RangeRepairJournalState,
+    *,
+    repair_gap_start_ms: int,
+    repair_gap_end_ms: int,
+    updated_at_ms: int,
+) -> dict[str, object]:
+    return {
+        "first_live_trade_ts_ms": state.first_live_trade_ts_ms,
+        "first_live_trade_id": state.first_live_trade_id,
+        "repair_gap_start_ms": repair_gap_start_ms,
+        "repair_gap_end_ms": repair_gap_end_ms,
+        "journal_start_ms": state.first_live_trade_ts_ms,
+        "journal_end_ms": job.bucket_end_ms,
+        "journal_status": state.status,
+        "updated_at_ms": updated_at_ms,
+    }
+
+
 def _wait_until_bucket_can_be_repaired(
     checkpoint_store: SqliteRangeCheckpointStore,
     journal_store: SqliteRangeRepairJournalStore,
@@ -517,25 +537,23 @@ def _wait_until_bucket_can_be_repaired(
             symbol=job.symbol,
             range_pct=job.range_pct,
             bucket_start_ms=job.bucket_start_ms,
-            first_live_trade_ts_ms=state.first_live_trade_ts_ms,
-            first_live_trade_id=state.first_live_trade_id,
-            repair_gap_start_ms=repair_gap_start_ms,
-            repair_gap_end_ms=repair_gap_end_ms,
-            journal_start_ms=state.first_live_trade_ts_ms,
-            journal_end_ms=job.bucket_end_ms,
-            journal_status=state.status,
-            updated_at_ms=now_ms(),
+            **_journal_job_fields(
+                job,
+                state,
+                repair_gap_start_ms=repair_gap_start_ms,
+                repair_gap_end_ms=repair_gap_end_ms,
+                updated_at_ms=now_ms(),
+            ),
         )
         job = replace(
             job,
-            first_live_trade_ts_ms=state.first_live_trade_ts_ms,
-            first_live_trade_id=state.first_live_trade_id,
-            repair_gap_start_ms=repair_gap_start_ms,
-            repair_gap_end_ms=repair_gap_end_ms,
-            journal_start_ms=state.first_live_trade_ts_ms,
-            journal_end_ms=job.bucket_end_ms,
-            journal_status=state.status,
-            updated_at_ms=now_ms(),
+            **_journal_job_fields(
+                job,
+                state,
+                repair_gap_start_ms=repair_gap_start_ms,
+                repair_gap_end_ms=repair_gap_end_ms,
+                updated_at_ms=now_ms(),
+            ),
         )
         current_ms = now_ms()
         if current_ms <= job.bucket_end_ms:
@@ -646,7 +664,33 @@ def _write_status(
     failure_reason: str | None = None,
 ) -> None:
     timestamp = now_ms()
-    payload = {
+    payload = _base_status_payload(
+        status=status,
+        args=args,
+        running=running,
+        timestamp=timestamp,
+        waiting_reason=waiting_reason,
+        failure_reason=failure_reason,
+    )
+    if job is not None:
+        payload.update(_status_fields_from_job(job))
+    if journal_state is not None:
+        payload.update(_status_fields_from_journal_state(journal_state))
+    if result is not None:
+        payload.update(_status_fields_from_result(result))
+    store.write(payload)
+
+
+def _base_status_payload(
+    *,
+    status: str,
+    args,
+    running: bool,
+    timestamp: int,
+    waiting_reason: str | None,
+    failure_reason: str | None,
+) -> dict[str, object]:
+    return {
         "pid": os.getpid(),
         "running": bool(running),
         "repair_status": status,
@@ -686,71 +730,78 @@ def _write_status(
         "coverage_before": None,
         "coverage_after": None,
     }
-    if job is not None:
-        payload.update(
-            bucket_end_ms=job.bucket_end_ms,
-            checkpoint_last_trade_ts_ms=job.checkpoint_last_trade_ts_ms,
-            checkpoint_last_trade_id=job.checkpoint_last_trade_id,
-            coverage_before=job.coverage_status,
-            coverage_after=job.coverage_status,
-            missing_gap_ms=job.missing_gap_ms,
-            first_live_trade_ts_ms=job.first_live_trade_ts_ms,
-            first_live_trade_id=job.first_live_trade_id,
-            repair_gap_start_ms=job.repair_gap_start_ms,
-            repair_gap_end_ms=job.repair_gap_end_ms,
-            repair_gap_ms=(
-                None
-                if job.repair_gap_start_ms is None
-                or job.repair_gap_end_ms is None
-                else max(
-                    0,
-                    job.repair_gap_end_ms
-                    - job.repair_gap_start_ms
-                    + 1,
-                )
-            ),
-            journal_start_ms=job.journal_start_ms,
-            journal_end_ms=job.journal_end_ms,
-            journal_status=job.journal_status,
-            rest_pages=0,
-            rest_raw_trades=0,
-            rest_deduped_trades=0,
-            range_bars_written=0,
-            aggregates_written=0,
-        )
-    if journal_state is not None:
-        payload.update(
-            first_live_trade_ts_ms=journal_state.first_live_trade_ts_ms,
-            first_live_trade_id=journal_state.first_live_trade_id,
-            journal_trade_count=journal_state.journal_trade_count,
-            journal_status=journal_state.status,
-            journal_dropped_trades=journal_state.dropped_trades,
-            journal_writer_failures=journal_state.writer_failures,
-            journal_finalized=journal_state.finalized,
-        )
-    if result is not None:
-        payload.update(
-            repair_start_ms=result.repair_start_ms,
-            repair_end_ms=result.repair_end_ms,
-            repair_gap_start_ms=result.repair_gap_start_ms,
-            repair_gap_end_ms=result.repair_gap_end_ms,
-            repair_gap_ms=result.repair_gap_ms,
-            journal_start_ms=result.journal_start_ms,
-            journal_end_ms=result.journal_end_ms,
-            journal_trade_count=result.journal_trade_count,
-            rest_pages=result.rest_pages,
-            rest_raw_trades=result.rest_raw_trades,
-            rest_deduped_trades=result.rest_deduped_trades,
-            fetch_mode=result.fetch_mode,
-            fallback_reason=result.fallback_reason,
-            replayed_rest_trades=result.replayed_rest_trades,
-            replayed_journal_trades=result.replayed_journal_trades,
-            range_bars_written=result.range_bars_written,
-            aggregate_written=bool(result.aggregate_written),
-            aggregates_written=int(result.aggregate_written),
-            coverage_after="COMPLETE",
-        )
-    store.write(payload)
+
+
+def _status_fields_from_job(
+    job: RangeMicroRepairJob,
+) -> dict[str, object]:
+    return {
+        "bucket_end_ms": job.bucket_end_ms,
+        "checkpoint_last_trade_ts_ms": job.checkpoint_last_trade_ts_ms,
+        "checkpoint_last_trade_id": job.checkpoint_last_trade_id,
+        "coverage_before": job.coverage_status,
+        "coverage_after": job.coverage_status,
+        "missing_gap_ms": job.missing_gap_ms,
+        "first_live_trade_ts_ms": job.first_live_trade_ts_ms,
+        "first_live_trade_id": job.first_live_trade_id,
+        "repair_gap_start_ms": job.repair_gap_start_ms,
+        "repair_gap_end_ms": job.repair_gap_end_ms,
+        "repair_gap_ms": (
+            None
+            if job.repair_gap_start_ms is None
+            or job.repair_gap_end_ms is None
+            else max(
+                0,
+                job.repair_gap_end_ms - job.repair_gap_start_ms + 1,
+            )
+        ),
+        "journal_start_ms": job.journal_start_ms,
+        "journal_end_ms": job.journal_end_ms,
+        "journal_status": job.journal_status,
+        "rest_pages": 0,
+        "rest_raw_trades": 0,
+        "rest_deduped_trades": 0,
+        "range_bars_written": 0,
+        "aggregates_written": 0,
+    }
+
+
+def _status_fields_from_journal_state(
+    journal_state: RangeRepairJournalState,
+) -> dict[str, object]:
+    return {
+        "first_live_trade_ts_ms": journal_state.first_live_trade_ts_ms,
+        "first_live_trade_id": journal_state.first_live_trade_id,
+        "journal_trade_count": journal_state.journal_trade_count,
+        "journal_status": journal_state.status,
+        "journal_dropped_trades": journal_state.dropped_trades,
+        "journal_writer_failures": journal_state.writer_failures,
+        "journal_finalized": journal_state.finalized,
+    }
+
+
+def _status_fields_from_result(result) -> dict[str, object]:
+    return {
+        "repair_start_ms": result.repair_start_ms,
+        "repair_end_ms": result.repair_end_ms,
+        "repair_gap_start_ms": result.repair_gap_start_ms,
+        "repair_gap_end_ms": result.repair_gap_end_ms,
+        "repair_gap_ms": result.repair_gap_ms,
+        "journal_start_ms": result.journal_start_ms,
+        "journal_end_ms": result.journal_end_ms,
+        "journal_trade_count": result.journal_trade_count,
+        "rest_pages": result.rest_pages,
+        "rest_raw_trades": result.rest_raw_trades,
+        "rest_deduped_trades": result.rest_deduped_trades,
+        "fetch_mode": result.fetch_mode,
+        "fallback_reason": result.fallback_reason,
+        "replayed_rest_trades": result.replayed_rest_trades,
+        "replayed_journal_trades": result.replayed_journal_trades,
+        "range_bars_written": result.range_bars_written,
+        "aggregate_written": bool(result.aggregate_written),
+        "aggregates_written": int(result.aggregate_written),
+        "coverage_after": "COMPLETE",
+    }
 
 
 def _market_trade_from_journal(row) -> MarketTrade:

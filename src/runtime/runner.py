@@ -23,7 +23,7 @@ from src.market_data.range_checkpoint import (
     SqliteRangeCheckpointStore,
     aggregate_snapshot,
 )
-from src.market_data.range_repair_journal import (
+from src.market_data.range_repair import (
     JOURNAL_INVALID_DROPPED_TRADE,
     JOURNAL_INVALID_MARKET_QUEUE_DRAIN_INCOMPLETE,
     JOURNAL_INVALID_PRODUCER_FAILED,

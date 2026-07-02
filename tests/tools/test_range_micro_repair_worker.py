@@ -15,11 +15,12 @@ from src.market_data.range_checkpoint import (
     RangeMicroRepairJob,
     SqliteRangeCheckpointStore,
 )
-from src.market_data.range_repair_journal import (
+from src.market_data.range_repair import (
     JOURNAL_INVALID_DROPPED_TRADE,
     JOURNAL_INVALID_MARKET_QUEUE_DRAIN_INCOMPLETE,
     JOURNAL_INVALID_QUEUE_OVERFLOW,
     JOURNAL_INVALID_WRITER_ERROR,
+    RangeRepairJournalState,
     RangeRepairTrade,
     SqliteRangeRepairJournalStore,
 )
@@ -194,6 +195,174 @@ def _seed_journal(tmp_path, *, invalid_status: str | None = None):
         finalized_at_ms=BUCKET_END + 1,
     )
     return journal
+
+
+def _finalized_journal_state() -> RangeRepairJournalState:
+    return RangeRepairJournalState(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=BUCKET_START,
+        bucket_end_ms=BUCKET_END,
+        checkpoint_last_trade_ts_ms=CHECKPOINT_TS,
+        checkpoint_last_trade_id="cp",
+        first_live_trade_ts_ms=FIRST_LIVE_TS,
+        first_live_trade_id="j1",
+        first_live_trade_recorded_at_ms=FIRST_LIVE_TS,
+        last_journal_trade_ts_ms=FIRST_LIVE_TS + 10,
+        journal_trade_count=7,
+        dropped_trades=0,
+        writer_failures=0,
+        finalized=True,
+        finalized_at_ms=BUCKET_END + 1,
+        status="journal_finalized",
+        last_error=None,
+        updated_at_ms=BUCKET_END + 2,
+    )
+
+
+def test_journal_job_helper_preserves_checkpoint_update_fields() -> None:
+    job = RangeMicroRepairJob(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=BUCKET_START,
+        bucket_end_ms=BUCKET_END,
+        checkpoint_last_trade_id="cp",
+        checkpoint_last_trade_ts_ms=CHECKPOINT_TS,
+        builder_state={"version": 1},
+        coverage_status=RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value,
+        missing_gap_ms=500,
+    )
+
+    assert worker._journal_job_fields(
+        job,
+        _finalized_journal_state(),
+        repair_gap_start_ms=CHECKPOINT_TS + 1,
+        repair_gap_end_ms=FIRST_LIVE_TS - 1,
+        updated_at_ms=BUCKET_END + 3,
+    ) == {
+        "first_live_trade_ts_ms": FIRST_LIVE_TS,
+        "first_live_trade_id": "j1",
+        "repair_gap_start_ms": CHECKPOINT_TS + 1,
+        "repair_gap_end_ms": FIRST_LIVE_TS - 1,
+        "journal_start_ms": FIRST_LIVE_TS,
+        "journal_end_ms": BUCKET_END,
+        "journal_status": "journal_finalized",
+        "updated_at_ms": BUCKET_END + 3,
+    }
+
+
+def test_worker_status_helpers_preserve_complete_payload(
+    monkeypatch,
+) -> None:
+    job = RangeMicroRepairJob(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=BUCKET_START,
+        bucket_end_ms=BUCKET_END,
+        checkpoint_last_trade_id="cp",
+        checkpoint_last_trade_ts_ms=CHECKPOINT_TS,
+        builder_state={"version": 1},
+        coverage_status=RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value,
+        missing_gap_ms=500,
+        first_live_trade_ts_ms=FIRST_LIVE_TS,
+        first_live_trade_id="j1",
+        repair_gap_start_ms=CHECKPOINT_TS + 1,
+        repair_gap_end_ms=FIRST_LIVE_TS - 1,
+        journal_start_ms=FIRST_LIVE_TS,
+        journal_end_ms=BUCKET_END,
+        journal_status="journal_finalized",
+    )
+    result = SimpleNamespace(
+        repair_start_ms=CHECKPOINT_TS + 1,
+        repair_end_ms=BUCKET_END,
+        repair_gap_start_ms=CHECKPOINT_TS + 1,
+        repair_gap_end_ms=FIRST_LIVE_TS - 1,
+        repair_gap_ms=87,
+        journal_start_ms=FIRST_LIVE_TS,
+        journal_end_ms=BUCKET_END,
+        journal_trade_count=7,
+        rest_pages=2,
+        rest_raw_trades=4,
+        rest_deduped_trades=3,
+        fetch_mode="trade_id_anchor",
+        fallback_reason=None,
+        replayed_rest_trades=3,
+        replayed_journal_trades=7,
+        range_bars_written=5,
+        aggregate_written=True,
+    )
+    written = []
+    monkeypatch.setattr(worker, "now_ms", lambda: BUCKET_END + 4)
+    monkeypatch.setattr(worker.os, "getpid", lambda: 4321)
+
+    worker._write_status(
+        SimpleNamespace(write=written.append),
+        status=MICRO_REPAIR_SUCCESS,
+        args=SimpleNamespace(
+            exchange="okx",
+            symbol="ETH-USDT-PERP",
+            range_pct="0.001",
+            bucket_start_ms=BUCKET_START,
+        ),
+        running=False,
+        job=job,
+        result=result,
+        journal_state=_finalized_journal_state(),
+    )
+
+    assert written == [
+        {
+            "pid": 4321,
+            "running": False,
+            "repair_status": MICRO_REPAIR_SUCCESS,
+            "phase": MICRO_REPAIR_SUCCESS,
+            "repair_scope": "startup_recovery_current_bucket",
+            "exchange": "okx",
+            "symbol": "ETH-USDT-PERP",
+            "range_pct": "0.001",
+            "bucket_start_ms": BUCKET_START,
+            "worker_heartbeat_ms": BUCKET_END + 4,
+            "heartbeat_ms": BUCKET_END + 4,
+            "failure_reason": None,
+            "waiting_reason": None,
+            "finished_at_ms": BUCKET_END + 4,
+            "checkpoint_last_trade_ts_ms": CHECKPOINT_TS,
+            "checkpoint_last_trade_id": "cp",
+            "first_live_trade_ts_ms": FIRST_LIVE_TS,
+            "first_live_trade_id": "j1",
+            "repair_gap_start_ms": CHECKPOINT_TS + 1,
+            "repair_gap_end_ms": FIRST_LIVE_TS - 1,
+            "repair_gap_ms": 87,
+            "journal_start_ms": FIRST_LIVE_TS,
+            "journal_end_ms": BUCKET_END,
+            "journal_trade_count": 7,
+            "journal_status": "journal_finalized",
+            "journal_dropped_trades": 0,
+            "journal_writer_failures": 0,
+            "rest_pages": 2,
+            "rest_raw_trades": 4,
+            "rest_deduped_trades": 3,
+            "fetch_mode": "trade_id_anchor",
+            "fallback_reason": None,
+            "replayed_rest_trades": 3,
+            "replayed_journal_trades": 7,
+            "range_bars_written": 5,
+            "aggregate_written": True,
+            "coverage_before": (
+                RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value
+            ),
+            "coverage_after": "COMPLETE",
+            "bucket_end_ms": BUCKET_END,
+            "missing_gap_ms": 500,
+            "aggregates_written": 1,
+            "journal_finalized": True,
+            "repair_start_ms": CHECKPOINT_TS + 1,
+            "repair_end_ms": BUCKET_END,
+        }
+    ]
 
 
 def test_worker_repairs_bucket_in_subprocess_mode_without_raw_persistence(

@@ -14,7 +14,7 @@ from src.market_data.range_checkpoint import (
     RangeMicroRepairJob,
     SqliteRangeCheckpointStore,
 )
-from src.market_data.range_repair_journal import JOURNAL_FINALIZED
+from src.market_data.range_repair import JOURNAL_FINALIZED
 from src.market_data.storage import SqliteRangeBarStore
 # Legacy compatibility: normalized MarketTrade still lives under platform.
 # Keep this dependency contained until the shared model migration is done.

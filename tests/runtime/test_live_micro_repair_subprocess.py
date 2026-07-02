@@ -17,7 +17,7 @@ from src.market_data.range_checkpoint import (
     RangeBuilderCheckpoint,
     SqliteRangeCheckpointStore,
 )
-from src.market_data.range_repair_journal import (
+from src.market_data.range_repair import (
     SqliteRangeRepairJournalStore,
 )
 from src.market_data.storage import SqliteRangeBarStore

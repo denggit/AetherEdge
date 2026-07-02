@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import sqlite3
+from pathlib import Path
 
-from src.market_data.range_repair_journal import (
+from src.market_data.range_repair import (
     JOURNAL_FINALIZED,
     JOURNAL_INVALID_QUEUE_OVERFLOW,
     RangeRepairJournalWriter,
@@ -11,8 +12,12 @@ from src.market_data.range_repair_journal import (
 )
 
 
-def test_range_repair_journal_facade_preserves_public_imports() -> None:
-    from src.market_data.range_repair_journal import (
+def test_legacy_range_repair_facade_is_removed() -> None:
+    assert not Path("src/market_data/range_repair_journal.py").exists()
+
+
+def test_range_repair_public_api_exports_journal_contracts() -> None:
+    from src.market_data.range_repair import (
         DEFAULT_RANGE_REPAIR_JOURNAL_DB,
         JOURNAL_FINALIZED,
         JOURNAL_INVALID_DROPPED_TRADE,
