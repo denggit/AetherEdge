@@ -740,6 +740,20 @@ async def _run_smoke(tmp_path, *, binance_fail: bool):
         strategy,
         data=data,
         services={
+            "runtime_requirements": StrategyRuntimeRequirements.from_mapping(
+                {
+                    "closed_kline": {"enabled": False},
+                    "trades": {
+                        "enabled": True,
+                        "stream_enabled": True,
+                    },
+                    "range_bars": {
+                        "enabled": True,
+                        "range_pct": "0.002",
+                        "aggregate_interval": "4h",
+                    },
+                }
+            ),
             "recovery_service": FakeRecoveryService(),
             "execution_clients": (okx, binance),
             "account_clients": (FakeAccountClient(ExchangeName.OKX), FakeAccountClient(ExchangeName.BINANCE)),

@@ -126,6 +126,7 @@ class RangeRepairBootstrapService:
                 )
             return self._result()
 
+        timestamp_ms = self._clock_ms()
         job = RangeMicroRepairJob(
             exchange=self.exchange,
             symbol=self.symbol,
@@ -140,8 +141,8 @@ class RangeRepairBootstrapService:
             journal_required=True,
             journal_status=JOURNAL_OPEN,
             status=MICRO_REPAIR_QUEUED,
-            created_at_ms=self._clock_ms(),
-            updated_at_ms=self._clock_ms(),
+            created_at_ms=timestamp_ms,
+            updated_at_ms=timestamp_ms,
         )
         self.checkpoint_store.enqueue_micro_repair(job)
         if not self._start_journal(checkpoint):

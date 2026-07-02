@@ -146,7 +146,7 @@ async def test_bootstrap_does_not_start_without_degraded_bucket(
 async def test_bootstrap_starts_journal_and_supervisor_with_runtime_config(
     tmp_path,
 ) -> None:
-    timestamps = iter([1_001, 1_002, 1_003])
+    timestamps = iter([1_001, 1_002])
     checkpoint_store = _CheckpointStore()
     service = _service(
         tmp_path,
@@ -185,12 +185,12 @@ async def test_bootstrap_starts_journal_and_supervisor_with_runtime_config(
             "bucket_end_ms": BUCKET_END,
             "checkpoint_last_trade_ts_ms": CHECKPOINT_TS,
             "checkpoint_last_trade_id": "checkpoint-trade",
-            "updated_at_ms": 1_003,
+            "updated_at_ms": 1_002,
         }
     ]
     assert len(checkpoint_store.jobs) == 1
     assert checkpoint_store.jobs[0].created_at_ms == 1_001
-    assert checkpoint_store.jobs[0].updated_at_ms == 1_002
+    assert checkpoint_store.jobs[0].updated_at_ms == 1_001
     supervisor = result.micro_repair_supervisor
     assert supervisor.config.status_path == tmp_path / "status.json"
     assert supervisor.config.lock_path == tmp_path / "repair.lock"
