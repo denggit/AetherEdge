@@ -28,17 +28,17 @@ class RangeRepairJournalWriter:
     """Non-blocking bounded journal writer for the live process."""
 
     def __init__(
-        self,
-        store: SqliteRangeRepairJournalStore,
-        *,
-        max_pending: int = 20_000,
-        flush_interval_ms: int = 500,
-        batch_size: int = 1_000,
-        retention_hours: int = 12,
-        on_error: Callable[[BaseException], None] | None = None,
-        on_invalidated: (
-            Callable[[tuple[str, str, str, int], str, str], None] | None
-        ) = None,
+            self,
+            store: SqliteRangeRepairJournalStore,
+            *,
+            max_pending: int = 20_000,
+            flush_interval_ms: int = 500,
+            batch_size: int = 1_000,
+            retention_hours: int = 12,
+            on_error: Callable[[BaseException], None] | None = None,
+            on_invalidated: (
+                    Callable[[tuple[str, str, str, int], str, str], None] | None
+            ) = None,
     ) -> None:
         if max_pending <= 0 or batch_size <= 0:
             raise ValueError("journal writer limits must be positive")
@@ -111,16 +111,16 @@ class RangeRepairJournalWriter:
             return True
 
     def submit_invalidation(
-        self,
-        *,
-        exchange: str,
-        symbol: str,
-        range_pct: str,
-        bucket_start_ms: int,
-        status: str,
-        last_error: str,
-        dropped_trades: int = 0,
-        writer_failures: int = 0,
+            self,
+            *,
+            exchange: str,
+            symbol: str,
+            range_pct: str,
+            bucket_start_ms: int,
+            status: str,
+            last_error: str,
+            dropped_trades: int = 0,
+            writer_failures: int = 0,
     ) -> bool:
         key = (
             str(exchange).lower(),
@@ -168,13 +168,13 @@ class RangeRepairJournalWriter:
             return True
 
     def _add_invalidation(
-        self,
-        key: tuple[str, str, str, int],
-        status: str,
-        error: str,
-        *,
-        dropped: int = 0,
-        failures: int = 0,
+            self,
+            key: tuple[str, str, str, int],
+            status: str,
+            error: str,
+            *,
+            dropped: int = 0,
+            failures: int = 0,
     ) -> None:
         existing = self._invalidations.get(key)
         self._disabled_keys.add(key)
@@ -200,27 +200,27 @@ class RangeRepairJournalWriter:
             command = None
             with self._condition:
                 while (
-                    not self._commands
-                    and not self._invalidations
-                    and not self._stopping
+                        not self._commands
+                        and not self._invalidations
+                        and not self._stopping
                 ):
                     self._condition.wait()
                 if (
-                    not self._commands
-                    and not self._invalidations
-                    and self._stopping
+                        not self._commands
+                        and not self._invalidations
+                        and self._stopping
                 ):
                     return
                 if self._invalidations and not (
-                    self._commands and self._commands[0].kind == "open"
+                        self._commands and self._commands[0].kind == "open"
                 ):
                     invalidations = self._invalidations
                     self._invalidations = {}
                 if self._commands:
                     if (
-                        self._commands[0].kind == "trade"
-                        and len(self._commands) < self.batch_size
-                        and not self._stopping
+                            self._commands[0].kind == "trade"
+                            and len(self._commands) < self.batch_size
+                            and not self._stopping
                     ):
                         self._condition.wait(
                             timeout=self.flush_interval_ms / 1000
@@ -243,9 +243,9 @@ class RangeRepairJournalWriter:
                 trades = [command.payload]
                 with self._condition:
                     while (
-                        self._commands
-                        and self._commands[0].kind == "trade"
-                        and len(trades) < self.batch_size
+                            self._commands
+                            and self._commands[0].kind == "trade"
+                            and len(trades) < self.batch_size
                     ):
                         trades.append(self._commands.popleft().payload)
                         self._pending_trades -= 1
@@ -266,8 +266,8 @@ class RangeRepairJournalWriter:
                 state = self.store.finalize(**payload)
                 if state is not None:
                     cutoff = (
-                        int(state.finalized_at_ms or _now_ms())
-                        - self.retention_hours * 60 * 60_000
+                            int(state.finalized_at_ms or _now_ms())
+                            - self.retention_hours * 60 * 60_000
                     )
                     self.store.cleanup(older_than_ms=cutoff)
         except BaseException as exc:
@@ -304,13 +304,13 @@ class RangeRepairJournalWriter:
             self._notify_error(exc)
 
     def _safe_invalidate(
-        self,
-        key: tuple[str, str, str, int],
-        *,
-        status: str,
-        error: str,
-        dropped: int = 0,
-        failures: int = 0,
+            self,
+            key: tuple[str, str, str, int],
+            *,
+            status: str,
+            error: str,
+            dropped: int = 0,
+            failures: int = 0,
     ) -> None:
         try:
             invalidated = self.store.invalidate(
@@ -348,7 +348,7 @@ def _trade_key(row: RangeRepairTrade) -> tuple[str, str, str, int]:
 
 
 def _payload_key(
-    payload: dict[str, object],
+        payload: dict[str, object],
 ) -> tuple[str, str, str, int]:
     return (
         str(payload["exchange"]).lower(),

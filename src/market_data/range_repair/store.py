@@ -17,28 +17,29 @@ from src.market_data.range_repair.models import (
     journal_status_is_invalid,
 )
 
+
 class SqliteRangeRepairJournalStore:
     """Short-lived recovery journal; never writes market-data raw tables."""
 
     def __init__(
-        self,
-        path: str | Path = DEFAULT_RANGE_REPAIR_JOURNAL_DB,
+            self,
+            path: str | Path = DEFAULT_RANGE_REPAIR_JOURNAL_DB,
     ) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
     def open_bucket(
-        self,
-        *,
-        exchange: str,
-        symbol: str,
-        range_pct: str,
-        bucket_start_ms: int,
-        bucket_end_ms: int,
-        checkpoint_last_trade_ts_ms: int | None,
-        checkpoint_last_trade_id: str | None,
-        updated_at_ms: int,
+            self,
+            *,
+            exchange: str,
+            symbol: str,
+            range_pct: str,
+            bucket_start_ms: int,
+            bucket_end_ms: int,
+            checkpoint_last_trade_ts_ms: int | None,
+            checkpoint_last_trade_id: str | None,
+            updated_at_ms: int,
     ) -> None:
         with self._connect() as conn:
             existing = conn.execute(
@@ -103,12 +104,12 @@ class SqliteRangeRepairJournalStore:
                 ),
             )
             if (
-                existing is not None
-                and existing[1] is not None
-                and not bool(existing[2])
-                and checkpoint_last_trade_ts_ms is not None
-                and existing[0] is not None
-                and int(checkpoint_last_trade_ts_ms) > int(existing[0])
+                    existing is not None
+                    and existing[1] is not None
+                    and not bool(existing[2])
+                    and checkpoint_last_trade_ts_ms is not None
+                    and existing[0] is not None
+                    and int(checkpoint_last_trade_ts_ms) > int(existing[0])
             ):
                 conn.execute(
                     """
@@ -132,15 +133,15 @@ class SqliteRangeRepairJournalStore:
                 )
 
     def record_first_live_trade(
-        self,
-        *,
-        exchange: str,
-        symbol: str,
-        range_pct: str,
-        bucket_start_ms: int,
-        trade_time_ms: int,
-        trade_id: str | None,
-        recorded_at_ms: int,
+            self,
+            *,
+            exchange: str,
+            symbol: str,
+            range_pct: str,
+            bucket_start_ms: int,
+            trade_time_ms: int,
+            trade_id: str | None,
+            recorded_at_ms: int,
     ) -> bool:
         with self._connect() as conn:
             cursor = conn.execute(
@@ -258,17 +259,17 @@ class SqliteRangeRepairJournalStore:
         return inserted_total
 
     def invalidate(
-        self,
-        *,
-        exchange: str,
-        symbol: str,
-        range_pct: str,
-        bucket_start_ms: int,
-        status: str,
-        last_error: str,
-        dropped_trades: int = 0,
-        writer_failures: int = 0,
-        updated_at_ms: int | None = None,
+            self,
+            *,
+            exchange: str,
+            symbol: str,
+            range_pct: str,
+            bucket_start_ms: int,
+            status: str,
+            last_error: str,
+            dropped_trades: int = 0,
+            writer_failures: int = 0,
+            updated_at_ms: int | None = None,
     ) -> bool:
         if not journal_status_is_invalid(status):
             raise ValueError(f"journal invalid status required, got {status}")
@@ -303,13 +304,13 @@ class SqliteRangeRepairJournalStore:
         return int(cursor.rowcount or 0) > 0
 
     def finalize(
-        self,
-        *,
-        exchange: str,
-        symbol: str,
-        range_pct: str,
-        bucket_start_ms: int,
-        finalized_at_ms: int,
+            self,
+            *,
+            exchange: str,
+            symbol: str,
+            range_pct: str,
+            bucket_start_ms: int,
+            finalized_at_ms: int,
     ) -> RangeRepairJournalState | None:
         with self._connect() as conn:
             conn.execute(
@@ -349,12 +350,12 @@ class SqliteRangeRepairJournalStore:
         )
 
     def load_state(
-        self,
-        *,
-        exchange: str,
-        symbol: str,
-        range_pct: str,
-        bucket_start_ms: int,
+            self,
+            *,
+            exchange: str,
+            symbol: str,
+            range_pct: str,
+            bucket_start_ms: int,
     ) -> RangeRepairJournalState | None:
         with self._connect() as conn:
             row = conn.execute(
@@ -380,14 +381,14 @@ class SqliteRangeRepairJournalStore:
         return None if row is None else _state_from_row(row)
 
     def load_trades(
-        self,
-        *,
-        exchange: str,
-        symbol: str,
-        range_pct: str,
-        bucket_start_ms: int,
-        start_time_ms: int,
-        end_time_ms: int,
+            self,
+            *,
+            exchange: str,
+            symbol: str,
+            range_pct: str,
+            bucket_start_ms: int,
+            start_time_ms: int,
+            end_time_ms: int,
     ) -> list[RangeRepairTrade]:
         with self._connect() as conn:
             rows = conn.execute(

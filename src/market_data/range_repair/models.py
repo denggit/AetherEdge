@@ -66,9 +66,9 @@ class RangeRepairJournalState:
     @property
     def valid_for_repair(self) -> bool:
         return (
-            self.finalized
-            and self.status == JOURNAL_FINALIZED
-            and self.first_live_trade_ts_ms is not None
-            and self.dropped_trades == 0
-            and self.writer_failures == 0
+                self.finalized
+                and self.status == JOURNAL_FINALIZED
+                and self.first_live_trade_ts_ms is not None
+                and self.dropped_trades == 0
+                and self.writer_failures == 0
         )

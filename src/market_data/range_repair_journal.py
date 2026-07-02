@@ -2,17 +2,6 @@
 
 from __future__ import annotations
 
-# These imports preserve the module attributes that existed before the
-# implementation was split. Core journal behavior lives in the three modules
-# re-exported below.
-import sqlite3
-import threading
-import time
-from collections import deque
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Callable, Sequence
-
 from src.market_data.range_repair import (
     DEFAULT_RANGE_REPAIR_JOURNAL_DB,
     JOURNAL_FINALIZED,
@@ -29,18 +18,10 @@ from src.market_data.range_repair import (
     SqliteRangeRepairJournalStore,
     journal_status_is_invalid,
 )
-from src.market_data.range_repair.store import (
-    _decimal_text,
-    _now_ms,
-    _state_from_row,
-    _trade_from_row,
-    _trade_params,
-)
-from src.market_data.range_repair.writer import (
-    _payload_key,
-    _trade_key,
-    _WriterCommand,
-)
+
+# These imports preserve the module attributes that existed before the
+# implementation was split. Core journal behavior lives in the three modules
+# re-exported below.
 
 __all__ = [
     "DEFAULT_RANGE_REPAIR_JOURNAL_DB",
