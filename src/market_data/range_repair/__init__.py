@@ -1,19 +1,6 @@
-"""Compatibility facade for the short-lived range repair journal."""
+"""Public API for the range repair journal subdomain."""
 
-from __future__ import annotations
-
-# These imports preserve the module attributes that existed before the
-# implementation was split. Core journal behavior lives in the three modules
-# re-exported below.
-import sqlite3
-import threading
-import time
-from collections import deque
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Callable, Sequence
-
-from src.market_data.range_repair import (
+from src.market_data.range_repair.models import (
     DEFAULT_RANGE_REPAIR_JOURNAL_DB,
     JOURNAL_FINALIZED,
     JOURNAL_INVALID_DROPPED_TRADE,
@@ -24,23 +11,13 @@ from src.market_data.range_repair import (
     JOURNAL_INVALID_WRITER_ERROR,
     JOURNAL_OPEN,
     RangeRepairJournalState,
-    RangeRepairJournalWriter,
     RangeRepairTrade,
-    SqliteRangeRepairJournalStore,
     journal_status_is_invalid,
 )
 from src.market_data.range_repair.store import (
-    _decimal_text,
-    _now_ms,
-    _state_from_row,
-    _trade_from_row,
-    _trade_params,
+    SqliteRangeRepairJournalStore,
 )
-from src.market_data.range_repair.writer import (
-    _payload_key,
-    _trade_key,
-    _WriterCommand,
-)
+from src.market_data.range_repair.writer import RangeRepairJournalWriter
 
 __all__ = [
     "DEFAULT_RANGE_REPAIR_JOURNAL_DB",

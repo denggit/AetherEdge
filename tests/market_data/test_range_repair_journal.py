@@ -11,6 +11,66 @@ from src.market_data.range_repair_journal import (
 )
 
 
+def test_range_repair_journal_facade_preserves_public_imports() -> None:
+    from src.market_data.range_repair_journal import (
+        DEFAULT_RANGE_REPAIR_JOURNAL_DB,
+        JOURNAL_FINALIZED,
+        JOURNAL_INVALID_DROPPED_TRADE,
+        JOURNAL_INVALID_MARKET_QUEUE_DRAIN_INCOMPLETE,
+        JOURNAL_INVALID_PRODUCER_FAILED,
+        JOURNAL_INVALID_PRODUCER_STALE,
+        JOURNAL_INVALID_QUEUE_OVERFLOW,
+        JOURNAL_INVALID_WRITER_ERROR,
+        JOURNAL_OPEN,
+        RangeRepairJournalState,
+        RangeRepairJournalWriter,
+        RangeRepairTrade,
+        SqliteRangeRepairJournalStore,
+        journal_status_is_invalid,
+    )
+
+    assert DEFAULT_RANGE_REPAIR_JOURNAL_DB
+    assert JOURNAL_OPEN == "journal_open"
+    assert JOURNAL_FINALIZED == "journal_finalized"
+    assert journal_status_is_invalid(JOURNAL_INVALID_DROPPED_TRADE)
+    assert RangeRepairTrade is not None
+    assert RangeRepairJournalState is not None
+    assert SqliteRangeRepairJournalStore is not None
+    assert RangeRepairJournalWriter is not None
+    assert JOURNAL_INVALID_MARKET_QUEUE_DRAIN_INCOMPLETE
+    assert JOURNAL_INVALID_PRODUCER_FAILED
+    assert JOURNAL_INVALID_PRODUCER_STALE
+    assert JOURNAL_INVALID_QUEUE_OVERFLOW
+    assert JOURNAL_INVALID_WRITER_ERROR
+
+
+def test_range_repair_journal_schema_is_preserved(tmp_path) -> None:
+    path = tmp_path / "journal.sqlite3"
+    SqliteRangeRepairJournalStore(path)
+
+    with sqlite3.connect(path) as conn:
+        objects = {
+            (str(row[0]), str(row[1]))
+            for row in conn.execute(
+                """
+                SELECT type, name
+                FROM sqlite_master
+                WHERE name IN (
+                    'range_repair_trades',
+                    'range_repair_journal_state',
+                    'idx_range_repair_trades_time'
+                )
+                """
+            )
+        }
+
+    assert objects == {
+        ("table", "range_repair_trades"),
+        ("table", "range_repair_journal_state"),
+        ("index", "idx_range_repair_trades_time"),
+    }
+
+
 def _trade(ts: int, trade_id: str) -> RangeRepairTrade:
     return RangeRepairTrade(
         exchange="okx",
