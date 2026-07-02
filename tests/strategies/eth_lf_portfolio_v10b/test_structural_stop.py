@@ -15,7 +15,6 @@ from strategies.eth_lf_portfolio_v8.domain.models import (
     RoutedSignal,
     Side,
 )
-from strategies.eth_lf_portfolio_v10a.strategy import Strategy as V10AStrategy
 from strategies.eth_lf_portfolio_v10b.execution.structural_stop import (
     StructuralStopConfig,
     evaluate_swing_structural_stop,
@@ -138,14 +137,13 @@ def test_rounding_that_crosses_short_close_is_rejected() -> None:
     assert decision.reject_reason == "rounded_candidate_crosses_close"
 
 
-def test_disabled_v10b_stop_output_matches_v10a(tmp_path: Path) -> None:
+def test_disabled_structural_stop_preserves_baseline_stop_output(tmp_path: Path) -> None:
     config = json.loads(
         Path("strategies/eth_lf_portfolio_v10b/config.json").read_text(encoding="utf-8")
     )
     config["structural_stop"]["enabled"] = False
     config_path = tmp_path / "v10b-disabled.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
-    v10a = V10AStrategy()
     v10b = V10BStrategy(config_path=config_path)
     context = _context(
         close=Decimal("120"),
@@ -153,19 +151,24 @@ def test_disabled_v10b_stop_output_matches_v10a(tmp_path: Path) -> None:
         low=Decimal("115"),
         atr=Decimal("5"),
     )
-    _open_long(v10a, old_stop=Decimal("90"))
     _open_long(v10b, old_stop=Decimal("90"))
 
-    v10a_signals = v10a._stop_update_signals_if_needed(context)
     v10b_signals = v10b._stop_update_signals_if_needed(context)
 
-    assert [_signal_fingerprint(signal) for signal in v10b_signals] == [
-        _signal_fingerprint(signal) for signal in v10a_signals
+    assert [signal.action for signal in v10b_signals] == [
+        SignalAction.CANCEL_ALL_STOP_ORDERS,
+        SignalAction.PLACE_STOP_LOSS_LONG,
     ]
+    place = v10b_signals[1]
+    assert place.trigger_price == Decimal("100.0")
+    assert place.reason == "V8_PROTECTED_TRAILING_STOP_UPDATE"
+    assert v10b.position.desired_stop_price == Decimal("100.0")
     assert v10b.last_structural_stop_audit is None
 
 
-def test_insufficient_warmup_preserves_v10a_stop_update(caplog: pytest.LogCaptureFixture) -> None:
+def test_insufficient_warmup_preserves_baseline_stop_update(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     strategy = V10BStrategy()
     _open_long(strategy, old_stop=Decimal("90"))
     context = _context(
@@ -366,17 +369,4 @@ def _context(
         global_risk_scale=Decimal("1.3"),
         routed_signal=routed or RoutedSignal.flat(),
         engine_features={"momentum": {}} if atr is None else {"momentum": {"atr": atr}},
-    )
-
-
-def _signal_fingerprint(signal) -> tuple:
-    metadata = dict(signal.metadata)
-    metadata.pop("strategy_id", None)
-    return (
-        signal.symbol,
-        signal.action,
-        signal.quantity,
-        signal.trigger_price,
-        signal.reason,
-        metadata,
     )
