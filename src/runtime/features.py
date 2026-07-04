@@ -148,5 +148,70 @@ def range_aggregate_unavailable_feature(
     )
 
 
+def fixed_time_trade_bar_feature(bar, *, exchange) -> "MarketFeatureEvent":
+    from src.market_data.models import FixedTimeTradeBar as _FTB
+    ftb: _FTB = bar  # type: ignore[no-redef]
+    return MarketFeatureEvent(
+        event_type=MarketFeatureEventType.FIXED_TIME_TRADE_BAR,
+        symbol=ftb.symbol,
+        exchange=exchange,
+        timeframe=ftb.timeframe,
+        event_time_ms=ftb.close_time_ms,
+        available_time_ms=ftb.available_time_ms,
+        data={
+            "open_time_ms": ftb.open_time_ms,
+            "close_time_ms": ftb.close_time_ms,
+            "available_time_ms": ftb.available_time_ms,
+            "open": _d(ftb.open),
+            "high": _d(ftb.high),
+            "low": _d(ftb.low),
+            "close": _d(ftb.close),
+            "volume": _d(ftb.volume),
+            "buy_volume": _d(ftb.buy_volume),
+            "sell_volume": _d(ftb.sell_volume),
+            "buy_notional": _d(ftb.buy_notional),
+            "sell_notional": _d(ftb.sell_notional),
+            "delta_volume": _d(ftb.delta_volume),
+            "delta_notional": _d(ftb.delta_notional),
+            "abs_delta_notional": _d(ftb.abs_delta_notional),
+            "trade_count": ftb.trade_count,
+            "large_buy_notional": _d(ftb.large_buy_notional),
+            "large_sell_notional": _d(ftb.large_sell_notional),
+            "large_trade_count": ftb.large_trade_count,
+            "large_trade_share": _d(ftb.large_trade_share),
+            "quality": ftb.quality,
+            "source": ftb.source,
+        },
+    )
+
+
+def trade_footprint_feature(fpf, *, exchange) -> "MarketFeatureEvent":
+    from src.market_data.models import TradeFootprintFeature as _TFF
+    tf: _TFF = fpf  # type: ignore[no-redef]
+    return MarketFeatureEvent(
+        event_type=MarketFeatureEventType.TRADE_FOOTPRINT_FEATURE,
+        symbol=tf.symbol,
+        exchange=exchange,
+        timeframe=tf.timeframe,
+        event_time_ms=tf.close_time_ms,
+        available_time_ms=tf.available_time_ms,
+        data={
+            "open_time_ms": tf.open_time_ms,
+            "close_time_ms": tf.close_time_ms,
+            "available_time_ms": tf.available_time_ms,
+            "delta_notional": _d(tf.delta_notional),
+            "abs_delta_notional": _d(tf.abs_delta_notional),
+            "taker_buy_ratio": _d(tf.taker_buy_ratio),
+            "close_pos": _d(tf.close_pos),
+            "range_pct": _d(tf.range_pct),
+            "return_pct": _d(tf.return_pct),
+            "fp_max_bucket_abs_delta_pressure": _d(tf.fp_max_bucket_abs_delta_pressure),
+            "context_available": tf.context_available,
+            "quality": tf.quality,
+            "source": tf.source,
+        },
+    )
+
+
 def _d(value: Decimal) -> str:
     return format(value.normalize(), "f")

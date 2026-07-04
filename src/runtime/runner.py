@@ -240,6 +240,7 @@ class LiveRuntimeRunner:
         self._initial_range_bucket_ms: int | None = None
         self._initial_range_recovery: RangeCheckpointRecovery | None = None
         self._range_bars_by_bucket: dict[int, list[RangeBar]] = {}
+        self._range_bars_bucket_prune_count: int = 3
         self._last_range_checkpoint_submit_ms = 0
         self._range_bars_since_checkpoint = 0
         self._range_checkpoint_snapshot_warned = False
@@ -2549,6 +2550,7 @@ class LiveRuntimeRunner:
                 ).append(bar)
                 self._range_bars_since_checkpoint += 1
                 self.stats.range_bars_closed += 1
+                self._prune_range_bars_by_bucket(current_bucket=bucket_start)
                 await self.process_market_feature(range_bar_closed_feature(bar, exchange=trade.exchange))
         self._submit_range_checkpoint_if_due(trade)
         self._append_range_repair_trade(trade)
@@ -2617,7 +2619,35 @@ class LiveRuntimeRunner:
         if accepted:
             self._last_range_checkpoint_submit_ms = now_ms
             self._range_bars_since_checkpoint = 0
+        self._prune_range_bars_by_bucket(current_bucket=bucket_start_ms)
         return accepted
+
+    def _prune_range_bars_by_bucket(self, *, current_bucket: int) -> None:
+        """Drop entries for buckets far behind *current_bucket*.
+
+        Keeps the current bucket plus the N most recent closed-bar buckets
+        so range-aggregate generation and checkpoint submission still have
+        access to a small recent window. This prevents unbounded memory
+        growth in long-running sessions.
+        """
+        keep = max(1, int(getattr(self, "_range_bars_bucket_prune_count", 3)))
+        bucket_keys = sorted(self._range_bars_by_bucket.keys(), reverse=True)
+
+        # Always keep the current bucket and the `keep` most recent earlier
+        # buckets.  The prune target is everything older than that.
+        if len(bucket_keys) <= keep + 1:
+            return
+
+        # current_bucket might not be the latest key yet if it hasn't been
+        # populated; treat the most-recent key as the effective "latest".
+        latest_key = bucket_keys[0] if bucket_keys else current_bucket
+        threshold = latest_key - (keep * self._closed_bar_interval_ms)
+
+        stale = [k for k in bucket_keys if k < threshold]
+        # Never remove the current or latest bucket
+        stale = [k for k in stale if k < current_bucket]
+        for k in stale:
+            del self._range_bars_by_bucket[k]
 
     async def _call_strategy_market_event(self, event: MarketEvent) -> Sequence[TradeSignal]:
         strategy = self.context.strategy

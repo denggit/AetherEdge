@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
+from typing import Any, Mapping
 
 
 class MarketDataSet(str, Enum):
@@ -15,6 +16,16 @@ class MarketDataSet(str, Enum):
     KLINES = "klines"
     TRADES = "trades"
     RANGE_BARS = "range_bars"
+    TRADE_DERIVED_FEATURES = "trade_derived_features"
+
+
+class TradeFeatureQuality(str, Enum):
+    """Quality of a trade-derived feature bar."""
+
+    COMPLETE = "COMPLETE"
+    MISSING_FOOTPRINT_CONTEXT = "MISSING_FOOTPRINT_CONTEXT"
+    DEGRADED_LOW_TRADE_COUNT = "DEGRADED_LOW_TRADE_COUNT"
+    RECOVERED_FROM_JOURNAL = "RECOVERED_FROM_JOURNAL"
 
 
 class RangeCoverageStatus(str, Enum):
@@ -193,3 +204,143 @@ class RangeBarAggregate:
             raise ValueError("bucket_end_ms must be greater than or equal to bucket_start_ms")
         if self.bar_count < 0:
             raise ValueError("bar_count must be non-negative")
+
+
+@dataclass(frozen=True)
+class FixedTimeTradeBar:
+    """Exchange-agnostic 1m trade-derived bar (OHLCV + order-flow).
+
+    All values are derived from raw trades — never from kline/OHLCV sources.
+    """
+
+    exchange: str
+    symbol: str
+    timeframe: str = "1m"
+    open_time_ms: int = 0
+    close_time_ms: int = 0
+    available_time_ms: int = 0
+    open: Decimal = Decimal("0")
+    high: Decimal = Decimal("0")
+    low: Decimal = Decimal("0")
+    close: Decimal = Decimal("0")
+    volume: Decimal = Decimal("0")
+    buy_volume: Decimal = Decimal("0")
+    sell_volume: Decimal = Decimal("0")
+    buy_notional: Decimal = Decimal("0")
+    sell_notional: Decimal = Decimal("0")
+    delta_volume: Decimal = Decimal("0")
+    delta_notional: Decimal = Decimal("0")
+    abs_delta_notional: Decimal = Decimal("0")
+    trade_count: int = 0
+    large_buy_notional: Decimal = Decimal("0")
+    large_sell_notional: Decimal = Decimal("0")
+    large_trade_count: int = 0
+    large_trade_share: Decimal = Decimal("0")
+    quality: str = TradeFeatureQuality.COMPLETE.value
+    source: str = "trade_derived"
+
+    def __post_init__(self) -> None:
+        if not self.exchange:
+            raise ValueError("exchange is required")
+        if not self.symbol:
+            raise ValueError("symbol is required")
+        if not self.timeframe:
+            raise ValueError("timeframe is required")
+        if self.open_time_ms < 0 or self.close_time_ms < 0 or self.available_time_ms < 0:
+            raise ValueError("time fields must be non-negative")
+        if self.available_time_ms < self.close_time_ms:
+            raise ValueError("available_time_ms must be >= close_time_ms")
+        if self.close_time_ms < self.open_time_ms:
+            raise ValueError("close_time_ms must be >= open_time_ms")
+        if self.trade_count < 0:
+            raise ValueError("trade_count must be non-negative")
+
+    @property
+    def notional(self) -> Decimal:
+        return self.buy_notional + self.sell_notional
+
+    @property
+    def taker_buy_ratio(self) -> Decimal:
+        denom = self.buy_notional + self.sell_notional
+        if denom == 0:
+            return Decimal("0")
+        return self.buy_notional / denom
+
+    @property
+    def return_pct(self) -> Decimal:
+        if self.open == 0:
+            return Decimal("0")
+        return self.close / self.open - Decimal("1")
+
+    @property
+    def range_pct(self) -> Decimal:
+        if self.open == 0:
+            return Decimal("0")
+        return (self.high - self.low) / self.open
+
+
+@dataclass(frozen=True)
+class TradeFootprintFeature:
+    """Exchange-agnostic 1m footprint/order-flow feature derived from trades.
+
+    This is a lightweight companion to FixedTimeTradeBar containing
+    order-flow-specific metrics.
+    """
+
+    exchange: str
+    symbol: str
+    timeframe: str = "1m"
+    open_time_ms: int = 0
+    close_time_ms: int = 0
+    available_time_ms: int = 0
+    delta_notional: Decimal = Decimal("0")
+    abs_delta_notional: Decimal = Decimal("0")
+    taker_buy_ratio: Decimal = Decimal("0")
+    close_pos: Decimal = Decimal("0")
+    range_pct: Decimal = Decimal("0")
+    return_pct: Decimal = Decimal("0")
+    fp_max_bucket_abs_delta_pressure: Decimal = Decimal("0")
+    context_available: bool = True
+    quality: str = TradeFeatureQuality.COMPLETE.value
+    source: str = "trade_derived"
+
+    def __post_init__(self) -> None:
+        if not self.exchange:
+            raise ValueError("exchange is required")
+        if not self.symbol:
+            raise ValueError("symbol is required")
+        if not self.timeframe:
+            raise ValueError("timeframe is required")
+        if self.open_time_ms < 0 or self.close_time_ms < 0 or self.available_time_ms < 0:
+            raise ValueError("time fields must be non-negative")
+        if self.available_time_ms < self.close_time_ms:
+            raise ValueError("available_time_ms must be >= close_time_ms")
+        if self.close_time_ms < self.open_time_ms:
+            raise ValueError("close_time_ms must be >= open_time_ms")
+
+
+@dataclass(frozen=True)
+class TradeDerivedFeatureCoverage:
+    """Coverage scan result for trade-derived 1m features."""
+
+    symbol: str
+    exchange: str
+    required_minutes: int = 0
+    complete_minutes: int = 0
+    missing_minutes: int = 0
+    degraded_minutes: int = 0
+    latest_complete_close_time_ms: int | None = None
+    first_missing_range: tuple[int, int] | None = None
+    available: bool = False
+    reason: str = ""
+    extra: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.required_minutes < 0:
+            raise ValueError("required_minutes must be non-negative")
+        if self.complete_minutes < 0:
+            raise ValueError("complete_minutes must be non-negative")
+        if self.missing_minutes < 0:
+            raise ValueError("missing_minutes must be non-negative")
+        if self.degraded_minutes < 0:
+            raise ValueError("degraded_minutes must be non-negative")

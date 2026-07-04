@@ -11,6 +11,8 @@ class MarketFeatureEventType(str, Enum):
     CLOSED_KLINE = "closed_kline"
     RANGE_BAR_CLOSED = "range_bar_closed"
     RANGE_AGGREGATE = "range_aggregate"
+    FIXED_TIME_TRADE_BAR = "fixed_time_trade_bar"
+    TRADE_FOOTPRINT_FEATURE = "trade_footprint_feature"
 
 
 @dataclass(frozen=True)
