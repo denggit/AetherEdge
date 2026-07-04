@@ -29,6 +29,7 @@ from strategies.eth_portfolio_v1.execution.signal_mapper import SignalMapperConf
 from strategies.eth_portfolio_v1.execution.range_exit import RangeExitConfig, evaluate_range_exit
 from strategies.eth_portfolio_v1.execution.scoped_stop_replace import (
     StopIdentifier,
+    build_confirmed_scoped_cancel_signals,
     build_scoped_cancel_signals,
     build_scoped_replace_signals,
 )
@@ -417,15 +418,21 @@ class Strategy:
         target_exchanges = _target_exchanges(signal)
         if not target_exchanges:
             target_exchanges = tuple(result.exchange.value for result in results)
-        successful = [
-            result
+        successful_by_exchange = {
+            result.exchange.value: result
             for result in results
             if result.exchange.value in target_exchanges
             and result.ok
             and result.status in {OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED}
             and (result.order_id is not None or result.client_order_id is not None)
-        ]
-        if target_exchanges and len(successful) == len(set(target_exchanges)):
+        }
+        target_exchange_set = set(target_exchanges)
+        if target_exchange_set and set(successful_by_exchange) == target_exchange_set:
+            successful = [
+                successful_by_exchange[exchange]
+                for exchange in target_exchanges
+                if exchange in successful_by_exchange
+            ]
             stop_price = self.position.desired_stop_price or signal.trigger_price
             initial_stop_pending = self.position.confirmed_stop_price is None
             master_metadata_ok = True
@@ -455,7 +462,14 @@ class Strategy:
                     event_time_ms=event_time_ms,
                     initial_stop_pending=initial_stop_pending,
                 )
-            return self._deferred_add_after_confirmed_stop_update_signals()
+            # The initial replace list contains only the new stop. Exact old
+            # stop cancels become feedback only after every target exchange
+            # confirms that new stop; a failed placement can never reach here.
+            scoped_cancels = build_confirmed_scoped_cancel_signals(signal)
+            return [
+                *scoped_cancels,
+                *self._deferred_add_after_confirmed_stop_update_signals(),
+            ]
         self.position.reject_pending_stop_replace()
         self._clear_pending_add_after_stop_update(reason="stop_update_failed")
         self.recovery_manual_required = True
@@ -2215,9 +2229,9 @@ class Strategy:
             for exchange in target_exchanges
             if (leg := self.position.legs.get(exchange)) is not None
         }
-        # These are orchestration stages, not an atomic batch: submit the new
-        # stop first, verify that it exists, then dispatch exact old-stop
-        # cancels. Sequential runtimes must preserve this list order.
+        # Return only the new stop. Exact old-stop identifiers are attached to
+        # its metadata and converted to cancel feedback only after every target
+        # exchange confirms successful placement.
         return build_scoped_replace_signals(
             strategy_id=self.config.strategy_id,
             position_id=self.position.position_id,

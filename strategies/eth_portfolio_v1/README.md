@@ -23,17 +23,19 @@ strategy_version: V1
 
 ## Scoped stop replacement
 
-V1 stop replacement is staged, not an atomic batch:
+V1 stop replacement is confirmation-gated:
 
-1. Place the new LF-quantity, `reduce_only` stop.
-2. Verify that the new stop exists at the target exchange.
-3. Dispatch a scoped cancel for the old LF stop using its existing exchange
-   order ID and/or client order ID.
+1. `_replace_stop_signals()` emits only the new LF-quantity, `reduce_only`
+   stop. Old-stop identifiers are carried in that signal's metadata.
+2. Order-result feedback verifies that the new stop succeeded on every target
+   exchange.
+3. Only successful feedback emits scoped cancels for the old LF stops, using
+   their existing exchange order IDs and/or client order IDs.
 
-The signal list preserves this order for runtimes that execute signals
-sequentially. It must not be interpreted as an atomic venue operation. Both
-stages retain `target_exchanges`, and the old-stop cancel includes the V1
-strategy, LF sleeve, position, side, symbol, and old stop identifiers.
+Old-stop cancels are never placed in the initial signal list. If any target
+exchange fails to confirm the new stop, feedback emits no cancel and the old
+stop remains in place. A successful scoped cancel includes the V1 strategy,
+LF sleeve, position, side, symbol, target exchange, and old stop identifiers.
 
 If an old stop identifier is unavailable, V1 places the new protective stop
 but does not fall back to a global cancel. The new-stop metadata marks manual

@@ -56,5 +56,6 @@ def test_v1_replace_stop_signals_never_returns_global_stop_cancel() -> None:
     )
 
     assert signals[0].action is SignalAction.PLACE_STOP_LOSS_SHORT
-    assert signals[1].action is SignalAction.CANCEL_STOP_ORDER
+    assert len(signals) == 1
+    assert signals[0].metadata["scoped_cancel_pending"] is True
     assert all(signal.action is not SignalAction.CANCEL_ALL_STOP_ORDERS for signal in signals)

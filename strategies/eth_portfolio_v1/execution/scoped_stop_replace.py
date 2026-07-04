@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from src.order_management.stops import ScopedStopReplaceService, StopScope
 from src.platform.exchanges.models import ExchangeName, PositionSide
@@ -32,22 +32,17 @@ def build_scoped_replace_signals(
     new_stop_signal: TradeSignal,
     replace_reason: str,
 ) -> list[TradeSignal]:
-    """Stage a new LF stop before exact cancellation of the old LF stops.
+    """Build only the new LF stop and attach deferred old-stop cancel scope.
 
-    The returned list is deliberately not an atomic batch. Runtime must submit
-    and verify the first (new, reduce-only) stop before dispatching any later
-    scoped cancel signal.
+    The old-stop cancels are metadata only at this stage. They must be built as
+    order-result feedback after every target venue confirms the new stop.
     """
 
     normalized_targets = tuple(dict.fromkeys(str(exchange).strip().lower() for exchange in target_exchanges))
-    cancel_signals, missing_targets = build_scoped_cancel_signals(
-        strategy_id=strategy_id,
+    cancel_targets, missing_targets = _serialize_cancel_targets(
         position_id=position_id,
-        symbol=symbol,
-        position_side=position_side,
         target_exchanges=normalized_targets,
         stop_identifiers=old_stop_identifiers,
-        replace_reason=replace_reason,
     )
     missing_identifier = bool(missing_targets)
     metadata = {
@@ -61,7 +56,9 @@ def build_scoped_replace_signals(
         "stop_replace_mode": "staged_place_verify_scoped_cancel",
         "stop_replace_atomic_supported": False,
         "stop_replace_non_atomic_reason": "verify_new_stop_before_scoped_cancel",
-        "scoped_cancel_pending": bool(cancel_signals),
+        "scoped_cancel_pending": bool(cancel_targets),
+        "scoped_cancel_targets": cancel_targets,
+        "scoped_cancel_replace_reason": replace_reason,
         "manual_stop_cleanup_required": missing_identifier,
     }
     if missing_identifier:
@@ -69,7 +66,49 @@ def build_scoped_replace_signals(
         metadata["scoped_cancel_missing_target_exchanges"] = list(missing_targets)
 
     staged_new_stop = replace(new_stop_signal, metadata=metadata)
-    return [staged_new_stop, *cancel_signals]
+    # Never put old-stop cancels in this initial list. Runtime continues an
+    # initial list even when an earlier signal fails.
+    return [staged_new_stop]
+
+
+def build_confirmed_scoped_cancel_signals(new_stop_signal: TradeSignal) -> list[TradeSignal]:
+    """Build old-stop cancels only after the caller confirms the new stop."""
+
+    metadata = new_stop_signal.metadata or {}
+    if metadata.get("scoped_cancel_pending") is not True:
+        return []
+
+    identifiers: dict[str, list[StopIdentifier]] = {}
+    raw_targets = metadata.get("scoped_cancel_targets")
+    if isinstance(raw_targets, Sequence) and not isinstance(raw_targets, (str, bytes)):
+        for raw_target in raw_targets:
+            if not isinstance(raw_target, Mapping):
+                continue
+            exchange = str(raw_target.get("exchange") or "").strip().lower()
+            identifier = StopIdentifier(
+                stop_order_id=_identifier_from_unknown(raw_target.get("stop_order_id")),
+                stop_client_order_id=_identifier_from_unknown(raw_target.get("stop_client_order_id")),
+            )
+            if exchange and identifier.is_available:
+                identifiers.setdefault(exchange, []).append(identifier)
+    if not identifiers:
+        return []
+
+    position_side = _position_side(metadata.get("position_side"))
+    cancel_signals, _missing_targets = build_scoped_cancel_signals(
+        strategy_id=str(metadata.get("strategy_id") or "").strip(),
+        position_id=_identifier_from_unknown(metadata.get("position_id")),
+        symbol=new_stop_signal.symbol,
+        position_side=position_side,
+        target_exchanges=tuple(identifiers),
+        stop_identifiers=identifiers,
+        replace_reason=str(
+            metadata.get("scoped_cancel_replace_reason")
+            or new_stop_signal.reason
+            or "V1_STOP_REPLACE"
+        ),
+    )
+    return cancel_signals
 
 
 def build_scoped_cancel_signals(
@@ -123,6 +162,33 @@ def build_scoped_cancel_signals(
     return signals, tuple(missing_targets)
 
 
+def _serialize_cancel_targets(
+    *,
+    position_id: str | None,
+    target_exchanges: Sequence[str],
+    stop_identifiers: Mapping[str, Sequence[StopIdentifier]],
+) -> tuple[list[dict[str, str | None]], tuple[str, ...]]:
+    if _identifier(position_id) is None:
+        return [], tuple(target_exchanges)
+
+    targets: list[dict[str, str | None]] = []
+    missing_targets: list[str] = []
+    for exchange in target_exchanges:
+        identifiers = _unique_available(stop_identifiers.get(exchange, ()))
+        if not identifiers:
+            missing_targets.append(exchange)
+            continue
+        targets.extend(
+            {
+                "exchange": exchange,
+                "stop_order_id": identifier.stop_order_id,
+                "stop_client_order_id": identifier.stop_client_order_id,
+            }
+            for identifier in identifiers
+        )
+    return targets, tuple(missing_targets)
+
+
 def _unique_available(identifiers: Sequence[StopIdentifier]) -> tuple[StopIdentifier, ...]:
     unique: list[StopIdentifier] = []
     seen: set[tuple[str | None, str | None]] = set()
@@ -140,3 +206,14 @@ def _identifier(value: str | None) -> str | None:
     if not text or text.lower() in {"none", "null"}:
         return None
     return text
+
+
+def _identifier_from_unknown(value: Any) -> str | None:
+    return _identifier(None if value is None else str(value))
+
+
+def _position_side(value: Any) -> PositionSide | None:
+    try:
+        return PositionSide(str(value).strip().lower())
+    except ValueError:
+        return None
