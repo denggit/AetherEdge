@@ -5,6 +5,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+RUNTIME_ROOT = PROJECT_ROOT / "src" / "runtime"
 STRATEGY_POSITIONS = PROJECT_ROOT / "src" / "strategy" / "positions.py"
 RUNTIME_RESOLVER = PROJECT_ROOT / "src" / "runtime" / "strategy_positions.py"
 NEW_PRODUCTION_FILES = (STRATEGY_POSITIONS, RUNTIME_RESOLVER)
@@ -29,7 +30,45 @@ def test_strategy_position_model_has_no_forbidden_layer_dependencies() -> None:
 def test_runtime_position_resolver_has_no_concrete_strategy_or_raw_adapter_dependency() -> None:
     imports = _imports(RUNTIME_RESOLVER)
 
-    assert not _has_import_prefix(imports, ("strategies", *RAW_ADAPTER_PREFIXES))
+    assert not _has_import_prefix(
+        imports,
+        ("strategies", "src.order_management", *RAW_ADAPTER_PREFIXES),
+    )
+
+
+def test_runtime_reads_legacy_strategy_position_only_inside_resolver() -> None:
+    violations: list[str] = []
+    for path in RUNTIME_ROOT.rglob("*.py"):
+        if path == RUNTIME_RESOLVER:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            if node.func.id != "getattr" or len(node.args) < 2:
+                continue
+            attribute_name = node.args[1]
+            if isinstance(attribute_name, ast.Constant) and attribute_name.value == "position":
+                violations.append(f"{path.relative_to(PROJECT_ROOT)}:{node.lineno}")
+
+    assert violations == []
+
+
+def test_runtime_has_no_loaded_first_active_strategy_helpers() -> None:
+    violations: list[str] = []
+    for path in RUNTIME_ROOT.rglob("*.py"):
+        if path == RUNTIME_RESOLVER:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name in {"_first_active_position", "_first_active_plan"}:
+                    violations.append(f"{path.relative_to(PROJECT_ROOT)}:{node.lineno}")
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                if node.id in {"_first_active_position", "_first_active_plan"}:
+                    violations.append(f"{path.relative_to(PROJECT_ROOT)}:{node.lineno}")
+
+    assert violations == []
 
 
 def test_position_foundation_has_no_exchange_endpoint_fragments() -> None:

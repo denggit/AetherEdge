@@ -70,6 +70,10 @@ from src.runtime.startup_catchup import (
     _deviation_pct,
     evaluate_startup_catchup_eligibility,
 )
+from src.runtime.strategy_positions import (
+    StrategyPositionSnapshotIndex,
+    resolve_strategy_position_snapshot_index,
+)
 from src.runtime.orders import LiveOrderIntentFactory
 from src.runtime.recovery.service import RecoveryExchangeContext, RuntimeRecoveryService
 from src.runtime.recovery.models import RecoveryReport
@@ -77,6 +81,11 @@ from src.runtime.tasks import ClosedBarScheduler, ProducerHealthMonitor, Produce
 from src.runtime.tasks.scheduler import closed_bar_open_time_ms
 from src.signals import TradeSignal
 from src.signals.models import SignalAction
+from src.strategy.positions import (
+    StrategyPositionSide,
+    StrategyPositionSnapshot,
+    StrategyPositionStatus,
+)
 from src.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -1283,25 +1292,45 @@ class LiveRuntimeRunner:
         if getattr(strategy, "recovery_blocking_manual_required", False):
             return
 
-        strategy_id = getattr(getattr(strategy, "config", None), "strategy_id", "")
-        strategy_position = getattr(strategy, "position", None)
-        position_id = getattr(strategy_position, "position_id", None) if strategy_position is not None else None
-        canonical_stop_price = getattr(strategy_position, "stop_price", None) if strategy_position is not None else None
+        position_index = self._strategy_position_index()
+        if len(position_index.active) > 1:
+            raise LiveRuntimeError(
+                "legacy recovery protection validation requires a single logical position; "
+                f"active_strategy_positions={len(position_index.active)}"
+            )
+        strategy_position = position_index.single_active_or_none_for_legacy()
+        strategy_id = (
+            strategy_position.strategy_id
+            if strategy_position is not None
+            else self.app_config.strategy
+        )
+        position_id = (
+            strategy_position.position_id
+            if strategy_position is not None
+            else None
+        )
+        canonical_stop_price = (
+            strategy_position.stop_price
+            if strategy_position is not None
+            else None
+        )
 
         market_profile = get_market_profile(self.app_config.symbol)
         converter = NativeQuantityConverter()
         validator = RecoveryExitOrderValidator(quantity_converter=converter)
 
         # Collect PLACE_STOP_LOSS signals from recovery for fast lookup.
-        place_stop_exchanges: set[str] = set()
+        place_stop_scopes: dict[str, set[str | None]] = {}
         for signal in report.strategy_signals:
             if signal.action not in {SignalAction.PLACE_STOP_LOSS_LONG, SignalAction.PLACE_STOP_LOSS_SHORT}:
                 continue
+            signal_position_id = _signal_position_id(signal)
             if signal.metadata:
                 targets = signal.metadata.get("target_exchanges", [])
                 if isinstance(targets, (list, tuple)):
                     for t in targets:
-                        place_stop_exchanges.add(str(t).strip().lower())
+                        exchange_scope = str(t).strip().lower()
+                        place_stop_scopes.setdefault(exchange_scope, set()).add(signal_position_id)
 
         master_exchange_str = self.app_config.data_exchange.value
 
@@ -1310,7 +1339,9 @@ class LiveRuntimeRunner:
             exchange_str = exchange_name.value if hasattr(exchange_name, "value") else str(exchange_name)
 
             # Determine whether this exchange holds a position we must protect.
-            active_pos = _first_active_position(getattr(snapshot, "positions", ()) or ())
+            active_pos = _single_active_exchange_position_or_none_for_legacy(
+                getattr(snapshot, "positions", ()) or ()
+            )
             if active_pos is None:
                 continue
 
@@ -1319,8 +1350,7 @@ class LiveRuntimeRunner:
             is_master = exchange_str == master_exchange_str
             is_open_leg = (
                 strategy_position is not None
-                and getattr(strategy_position, "in_pos", False)
-                and exchange_str in getattr(strategy_position, "open_legs", {})
+                and exchange_str in _strategy_position_active_exchanges(strategy_position)
             )
             if not is_master and not is_open_leg:
                 continue
@@ -1349,7 +1379,12 @@ class LiveRuntimeRunner:
                         pass
 
             # ── Check 2: recovery generated PLACE_STOP_LOSS for this exchange ──
-            if exchange_str in place_stop_exchanges:
+            if _place_stop_scope_covers(
+                place_stop_scopes,
+                exchange=exchange_str,
+                position_id=position_id,
+                logical_position_count=len(position_index.active),
+            ):
                 continue
 
             # ── Postcondition FAILED ─────────────────────────────────────
@@ -1377,14 +1412,19 @@ class LiveRuntimeRunner:
         MUST satisfy ``should_keep_existing_stop`` — a valid, bot-owned
         protective stop must be live on the exchange right now.
         """
-        strategy = self.context.strategy
-        strategy_id = getattr(getattr(strategy, "config", None), "strategy_id", "")
-        strategy_position = getattr(strategy, "position", None)
-        if strategy_position is None or not getattr(strategy_position, "in_pos", False):
+        position_index = self._strategy_position_index()
+        if len(position_index.active) > 1:
+            raise LiveRuntimeError(
+                "legacy post-execution stop validation requires a single logical position; "
+                f"active_strategy_positions={len(position_index.active)}"
+            )
+        strategy_position = position_index.single_active_or_none_for_legacy()
+        if strategy_position is None:
             return
 
-        position_id = getattr(strategy_position, "position_id", None)
-        canonical_stop_price = getattr(strategy_position, "stop_price", None)
+        strategy_id = strategy_position.strategy_id
+        position_id = strategy_position.position_id
+        canonical_stop_price = strategy_position.stop_price
         if canonical_stop_price is None:
             raise LiveRuntimeError(
                 "post-execution stop validation failed: no canonical stop price available"
@@ -1400,11 +1440,11 @@ class LiveRuntimeRunner:
         acct_by_exchange = {c.exchange: c for c in account_clients}
 
         master_exchange_str = self.app_config.data_exchange.value
-        open_legs: dict[str, Any] = getattr(strategy_position, "open_legs", {}) or {}
+        active_exchanges = _strategy_position_active_exchanges(strategy_position)
 
         for exchange in self.app_config.exchanges:
             exchange_str = exchange.value
-            if exchange_str != master_exchange_str and exchange_str not in open_legs:
+            if exchange_str != master_exchange_str and exchange_str not in active_exchanges:
                 continue
 
             exec_client = exec_by_exchange.get(exchange)
@@ -1422,7 +1462,7 @@ class LiveRuntimeRunner:
                     f"exchange={exchange_str} error={exc}"
                 ) from exc
 
-            active_pos = _first_active_position(positions or ())
+            active_pos = _single_active_exchange_position_or_none_for_legacy(positions or ())
             if active_pos is None:
                 continue
 
@@ -1523,7 +1563,7 @@ class LiveRuntimeRunner:
 
         Checks (any single true → skip catch-up):
         1. Exchange snapshot positions with non-zero quantity
-        2. Strategy ``position.in_pos`` is True
+        2. Strategy exposes one or more active logical position snapshots
         3. Strategy ``pending_entry`` is not None
         4. PositionPlanStore ``list_active_positions()`` non-empty
         5. StateStore has open orders (including stop orders)
@@ -1535,10 +1575,9 @@ class LiveRuntimeRunner:
                 if qty is not None and qty != 0:
                     return True
 
-        # 2 & 3. Strategy-internal position / pending entry
+        # 2 & 3. Strategy-internal logical positions / pending entry
         strategy = self.context.strategy
-        position = getattr(strategy, "position", None)
-        if position is not None and bool(getattr(position, "in_pos", False)):
+        if self._strategy_position_index().active:
             return True
         if getattr(strategy, "pending_entry", None) is not None:
             return True
@@ -2751,12 +2790,26 @@ class LiveRuntimeRunner:
         if not successful:
             return results
 
-        strategy = self.context.strategy
-        strategy_position = getattr(strategy, "position", None)
-        if strategy_position is None or not getattr(strategy_position, "in_pos", False):
-            return results
+        position_index = self._strategy_position_index()
+        strategy_position = _strategy_position_for_stop_signal(position_index, signal)
+        if strategy_position is None:
+            if not position_index.active:
+                return results
+            return [
+                self._stop_post_check_failed_result(
+                    result,
+                    reason="ambiguous_strategy_position_scope",
+                    metadata={
+                        "post_check": "stop_order_exchange_verification",
+                        "active_strategy_positions": len(position_index.active),
+                    },
+                )
+                if result.ok
+                else result
+                for result in results
+            ]
 
-        canonical_stop_price = getattr(strategy_position, "desired_stop_price", None) or signal.trigger_price
+        canonical_stop_price = signal.trigger_price or strategy_position.stop_price
         if canonical_stop_price is None:
             return [
                 self._stop_post_check_failed_result(
@@ -2771,8 +2824,8 @@ class LiveRuntimeRunner:
 
         execution_by_exchange = {client.exchange: client for client in self._get_execution_clients()}
         account_by_exchange = {client.exchange: client for client in self._get_account_clients()}
-        strategy_id = getattr(getattr(strategy, "config", None), "strategy_id", self.app_config.strategy)
-        position_id = getattr(strategy_position, "position_id", None)
+        strategy_id = strategy_position.strategy_id
+        position_id = strategy_position.position_id
         market_profile = get_market_profile(self.app_config.symbol)
         converter = NativeQuantityConverter()
         validator = RecoveryExitOrderValidator(quantity_converter=converter)
@@ -2849,7 +2902,7 @@ class LiveRuntimeRunner:
                     )
                     break
 
-                active_pos = _first_active_position(positions or ())
+                active_pos = _single_active_exchange_position_or_none_for_legacy(positions or ())
                 if active_pos is None:
                     if attempt < attempts:
                         logger.warning(
@@ -3311,8 +3364,7 @@ class LiveRuntimeRunner:
 
     def _order_sync_active(self) -> bool:
         strategy = self.context.strategy
-        position = getattr(strategy, "position", None)
-        if bool(getattr(position, "in_pos", False)):
+        if self._strategy_position_index().active:
             return True
         if getattr(strategy, "pending_entry", None) is not None:
             return True
@@ -3325,6 +3377,14 @@ class LiveRuntimeRunner:
                 if list_open(exchange=exchange, symbol=self.app_config.symbol, include_stop_orders=True):
                     return True
         return False
+
+    def _strategy_position_index(self) -> StrategyPositionSnapshotIndex:
+        return resolve_strategy_position_snapshot_index(
+            self.context.strategy,
+            legacy_strategy_id=self.app_config.strategy,
+            legacy_symbol=self.app_config.symbol,
+            legacy_base_quantity=Decimal("0"),
+        )
 
     def _get_position_plan_store(self):
         if self._position_plan_store is None:
@@ -3848,11 +3908,89 @@ def _all_exchange_sandbox(exchanges: Sequence[ExchangeName], project_env: Projec
     )
 
 
-def _first_active_position(positions: Sequence[Position]) -> Position | None:
-    for pos in positions:
-        if pos.quantity != 0:
-            return pos
-    return None
+def _single_active_exchange_position_or_none_for_legacy(
+    positions: Sequence[Position],
+) -> Position | None:
+    active = tuple(position for position in positions if position.quantity != 0)
+    return active[0] if len(active) == 1 else None
+
+
+# Backward-compatible import for pre-R004 tests. Runtime paths use the
+# explicitly named helper above, which rejects ambiguous multi-position input.
+_first_active_position = _single_active_exchange_position_or_none_for_legacy
+
+
+def _strategy_position_for_stop_signal(
+    index: StrategyPositionSnapshotIndex,
+    signal: TradeSignal,
+) -> StrategyPositionSnapshot | None:
+    position_id = _signal_position_id(signal)
+    if position_id is not None:
+        matches = tuple(
+            snapshot
+            for snapshot in index.by_position_id(position_id)
+            if snapshot.status is StrategyPositionStatus.ACTIVE
+        )
+        return matches[0] if len(matches) == 1 else None
+
+    side = {
+        SignalAction.PLACE_STOP_LOSS_LONG: StrategyPositionSide.LONG,
+        SignalAction.PLACE_STOP_LOSS_SHORT: StrategyPositionSide.SHORT,
+    }.get(signal.action)
+    if side is not None:
+        matches = tuple(
+            snapshot
+            for snapshot in index.by_symbol_side(signal.symbol, side)
+            if snapshot.status is StrategyPositionStatus.ACTIVE
+        )
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            return None
+
+    # Legacy signals may not carry a position_id. This fallback is safe only
+    # when the strategy exposes exactly one active logical position.
+    return index.single_active_or_none_for_legacy()
+
+
+def _signal_position_id(signal: TradeSignal) -> str | None:
+    if not signal.metadata:
+        return None
+    value = signal.metadata.get("position_id")
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _strategy_position_active_exchanges(
+    snapshot: StrategyPositionSnapshot,
+) -> frozenset[str]:
+    value = snapshot.metadata.get("active_exchanges")
+    if isinstance(value, str):
+        values = (value,)
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        values = value
+    else:
+        return frozenset()
+    return frozenset(
+        normalized
+        for item in values
+        if (normalized := str(item).strip().lower())
+    )
+
+
+def _place_stop_scope_covers(
+    scopes: Mapping[str, set[str | None]],
+    *,
+    exchange: str,
+    position_id: str | None,
+    logical_position_count: int,
+) -> bool:
+    exchange_scopes = scopes.get(exchange, set())
+    if position_id is not None and position_id in exchange_scopes:
+        return True
+    return None in exchange_scopes and logical_position_count <= 1
 
 
 def _position_side_from_quantity(quantity: Decimal) -> PositionSide | None:
@@ -3907,16 +4045,6 @@ def _position_side_label(position: Position) -> str:
     if side is PositionSide.SHORT:
         return "short"
     return "flat"
-
-
-def _strategy_position_side(position: Any) -> PositionSide | None:
-    side = getattr(position, "side", None)
-    value = str(getattr(side, "value", side) or "").strip().lower()
-    if value == "long":
-        return PositionSide.LONG
-    if value == "short":
-        return PositionSide.SHORT
-    return None
 
 
 async def _jittered_sleep(stop_event: asyncio.Event, interval_seconds: float) -> None:

@@ -13,9 +13,11 @@ from src.platform.snapshot import PlatformSnapshot, fetch_platform_snapshot
 from src.platform.state.ports import StateStore
 from src.reconcile.checker import Reconciler
 from src.reconcile.models import ReconcileCategory, ReconcileIssue, ReconcileReport
+from src.runtime.recovery.models import RecoveryReport
+from src.runtime.strategy_positions import resolve_strategy_position_snapshot_index
 from src.signals import TradeSignal
 from src.strategy.ports import StrategyRecoveryContext
-from src.runtime.recovery.models import RecoveryReport
+from src.strategy.positions import StrategyPositionSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -75,19 +77,25 @@ class RuntimeRecoveryService:
 
         order_intents = self._load_order_intents()
         active_position_plans = self._load_active_position_plans()
+        strategy_position_index = resolve_strategy_position_snapshot_index(strategy)
         strategy_signals = await self._call_strategy_recover(
             strategy,
             snapshots=tuple(snapshots),
             reports=tuple(reconcile_reports),
             order_intents=order_intents,
             active_position_plans=active_position_plans,
+            strategy_positions=strategy_position_index.snapshots,
+            active_strategy_positions=strategy_position_index.active,
         )
+        recovered_strategy_position_index = resolve_strategy_position_snapshot_index(strategy)
         ok = not issues
         return RecoveryReport(
             ok=ok,
             snapshots=tuple(snapshots),
             reconcile_reports=tuple(reconcile_reports),
             order_intents=order_intents,
+            strategy_positions=recovered_strategy_position_index.snapshots,
+            active_strategy_positions=recovered_strategy_position_index.active,
             strategy_signals=strategy_signals,
             issues=tuple(issues),
             metadata={
@@ -168,6 +176,8 @@ class RuntimeRecoveryService:
         reports: tuple[ReconcileReport, ...],
         order_intents: tuple[OrderIntent, ...],
         active_position_plans: tuple[dict[str, Any], ...],
+        strategy_positions: tuple[StrategyPositionSnapshot, ...],
+        active_strategy_positions: tuple[StrategyPositionSnapshot, ...],
     ) -> tuple[TradeSignal, ...]:
         recover = getattr(strategy, "recover", None)
         if not callable(recover):
@@ -176,7 +186,12 @@ class RuntimeRecoveryService:
             snapshots=snapshots,
             reconcile_reports=reports,
             order_intent_ids=tuple(intent.intent_id for intent in order_intents),
-            metadata={"order_intent_count": len(order_intents), "active_position_plans": active_position_plans},
+            metadata={
+                "order_intent_count": len(order_intents),
+                "active_position_plans": active_position_plans,
+                "strategy_positions": strategy_positions,
+                "active_strategy_positions": active_strategy_positions,
+            },
         )
         result = await recover(context)
         return tuple(result or ())

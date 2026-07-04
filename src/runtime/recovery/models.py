@@ -7,6 +7,7 @@ from src.order_management.models import OrderIntent
 from src.platform.snapshot import PlatformSnapshot
 from src.reconcile.models import ReconcileReport
 from src.signals import TradeSignal
+from src.strategy.positions import StrategyPositionSnapshot
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,8 @@ class RecoveryReport:
     snapshots: tuple[PlatformSnapshot, ...] = ()
     reconcile_reports: tuple[ReconcileReport, ...] = ()
     order_intents: tuple[OrderIntent, ...] = ()
+    strategy_positions: tuple[StrategyPositionSnapshot, ...] = ()
+    active_strategy_positions: tuple[StrategyPositionSnapshot, ...] = ()
     strategy_signals: tuple[TradeSignal, ...] = ()
     issues: tuple[str, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
