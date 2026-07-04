@@ -216,6 +216,9 @@ class MfFeatureObserver:
         self._last_footprint_ms: int = 0
         self._tradebar_count: int = 0
         self._footprint_count: int = 0
+        self._latest_tradebar_open_time_ms: int | None = None
+        self._latest_footprint_open_time_ms: int | None = None
+        self._latest_footprint_audit: dict[str, Any] | None = None
 
     def on_market_feature(self, event: Any) -> tuple[Any, ...]:
         """Process market feature events, buffer data, return empty signals."""
@@ -246,12 +249,34 @@ class MfFeatureObserver:
                 try:
                     bar = self._event_to_tradebar(event)
                     if bar is not None:
+                        self._latest_tradebar_open_time_ms = bar.open_time_ms
                         self._buffer.append_tradebar(bar)
                 except Exception:
                     pass
+            else:
+                bar = self._event_to_tradebar(event)
+                if bar is not None:
+                    self._latest_tradebar_open_time_ms = bar.open_time_ms
         elif type_val == MarketFeatureEventType.TRADE_FOOTPRINT_FEATURE.value:
             self._footprint_count += 1
             self._last_footprint_ms = getattr(event, "event_time_ms", 0)
+            data = getattr(event, "data", {})
+            if isinstance(data, Mapping):
+                raw_open = data.get("open_time_ms")
+                if raw_open is not None:
+                    try:
+                        self._latest_footprint_open_time_ms = int(raw_open)
+                    except (TypeError, ValueError):
+                        self._latest_footprint_open_time_ms = None
+                self._latest_footprint_audit = {
+                    "open_time_ms": self._latest_footprint_open_time_ms,
+                    "close_time_ms": data.get("close_time_ms"),
+                    "fp_max_bucket_abs_delta_pressure": data.get(
+                        "fp_max_bucket_abs_delta_pressure"
+                    ),
+                    "context_available": data.get("context_available"),
+                    "quality": data.get("quality"),
+                }
 
     @staticmethod
     def _event_to_tradebar(event: Any) -> FixedTimeTradeBar | None:
@@ -260,8 +285,14 @@ class MfFeatureObserver:
         if not data:
             return None
         try:
+            raw_exchange = getattr(event, "exchange", "")
+            exchange = (
+                raw_exchange.value
+                if hasattr(raw_exchange, "value")
+                else str(raw_exchange)
+            )
             return FixedTimeTradeBar(
-                exchange=str(getattr(event, "exchange", "")),
+                exchange=exchange,
                 symbol=str(getattr(event, "symbol", "")),
                 timeframe=str(getattr(event, "timeframe", "1m")),
                 open_time_ms=int(data.get("open_time_ms", 0)),
@@ -291,10 +322,20 @@ class MfFeatureObserver:
             return None
 
     def audit(self) -> Mapping[str, Any]:
+        minute_mismatch = bool(
+            self._latest_tradebar_open_time_ms is not None
+            and self._latest_footprint_open_time_ms is not None
+            and self._latest_tradebar_open_time_ms
+            != self._latest_footprint_open_time_ms
+        )
         return {
             "tradebar_count": self._tradebar_count,
             "footprint_count": self._footprint_count,
             "last_tradebar_ms": self._last_tradebar_ms,
             "last_footprint_ms": self._last_footprint_ms,
+            "latest_tradebar_open_time_ms": self._latest_tradebar_open_time_ms,
+            "latest_footprint_open_time_ms": self._latest_footprint_open_time_ms,
+            "latest_footprint": self._latest_footprint_audit,
+            "minute_mismatch": minute_mismatch,
             "buffer": self._buffer.last_audit() if self._buffer else None,
         }

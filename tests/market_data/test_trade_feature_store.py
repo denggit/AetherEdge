@@ -208,6 +208,29 @@ def test_latest_complete_close_time_ms(tmp_path: Path) -> None:
     assert latest >= _base(2)
 
 
+def test_latest_any_and_earliest_any_times_are_independent(tmp_path: Path) -> None:
+    store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
+    store.upsert_tradebars_many(
+        [_make_bar(open_time_ms=_base(1)), _make_bar(open_time_ms=_base(3))]
+    )
+    store.upsert_footprints_many(
+        [_make_fp(open_time_ms=_base(2)), _make_fp(open_time_ms=_base(4))]
+    )
+
+    assert store.earliest_any_tradebar_open_time_ms(
+        symbol="ETH-USDT-PERP", exchange="okx"
+    ) == _base(1)
+    assert store.earliest_any_footprint_open_time_ms(
+        symbol="ETH-USDT-PERP", exchange="okx"
+    ) == _base(2)
+    assert store.latest_any_tradebar_close_time_ms(
+        symbol="ETH-USDT-PERP", exchange="okx"
+    ) == _base(3) + _MINUTE - 1
+    assert store.latest_any_footprint_close_time_ms(
+        symbol="ETH-USDT-PERP", exchange="okx"
+    ) == _base(4) + _MINUTE - 1
+
+
 # ---------------------------------------------------------------------------
 # coverage_scan
 # ---------------------------------------------------------------------------
@@ -222,6 +245,8 @@ def test_coverage_scan_detects_missing_minutes(tmp_path: Path) -> None:
         symbol="ETH-USDT-PERP",
         exchange="okx",
         required_minutes=5,
+        reference_end_ms=_base(4) + _MINUTE - 1,
+        safe_archive_end_ms=_base(4) + _MINUTE - 1,
     )
     assert coverage.complete_minutes == 3
     assert coverage.missing_minutes >= 1
@@ -238,6 +263,8 @@ def test_coverage_scan_available_when_all_present(tmp_path: Path) -> None:
         symbol="ETH-USDT-PERP",
         exchange="okx",
         required_minutes=5,
+        reference_end_ms=_base(4) + _MINUTE - 1,
+        safe_archive_end_ms=_base(4) + _MINUTE - 1,
     )
     assert coverage.available is True
     assert coverage.missing_minutes == 0
@@ -253,8 +280,42 @@ def test_coverage_scan_detects_degraded_minutes(tmp_path: Path) -> None:
         symbol="ETH-USDT-PERP",
         exchange="okx",
         required_minutes=2,
+        reference_end_ms=_base(1) + _MINUTE - 1,
+        safe_archive_end_ms=_base(1) + _MINUTE - 1,
     )
     assert coverage.degraded_minutes >= 1
+    assert coverage.extra["degraded_footprint"] == 1
+    assert coverage.extra["degraded_tradebar"] == 1
+
+
+def test_coverage_extra_splits_tradebar_and_footprint(tmp_path: Path) -> None:
+    store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
+    store.upsert_tradebars_many([_make_bar(open_time_ms=_base(0))])
+    store.upsert_footprints_many(
+        [
+            _make_fp(
+                open_time_ms=_base(1),
+                quality="MISSING_FOOTPRINT_CONTEXT",
+                context_available=False,
+            )
+        ]
+    )
+    safe_end = _base(1) + _MINUTE - 1
+    coverage = store.coverage_scan(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        required_minutes=2,
+        reference_end_ms=safe_end,
+        safe_archive_end_ms=safe_end,
+    )
+
+    assert coverage.available is False
+    assert coverage.extra["missing_tradebar"] == 1
+    assert coverage.extra["missing_footprint"] == 1
+    assert coverage.extra["degraded_footprint"] == 1
+    assert coverage.extra["latest_any_tradebar_close_time_ms"] is not None
+    assert coverage.extra["latest_any_footprint_close_time_ms"] is not None
+    assert coverage.extra["safe_archive_end_ms"] == safe_end
 
 
 # ---------------------------------------------------------------------------

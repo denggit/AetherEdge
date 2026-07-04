@@ -72,6 +72,18 @@ def test_drain_returns_pending_and_active_bar() -> None:
     assert len(drained) >= 1  # at least the active bar
 
 
+def test_safe_watermark_never_closes_newer_active_minute() -> None:
+    builder = FixedTimeTradeBarBuilder(contract_value="1")
+    t0 = 1_700_000_000_000
+    t0 -= t0 % 60_000
+    builder.on_trade(_trade("1000", t0 + 1_000))
+
+    assert builder.drain_completed_through(t0 + 59_998) == ()
+    assert builder.snapshot_state()["active"] is not None
+    closed = builder.drain_completed_through(t0 + 59_999)
+    assert len(closed) == 1
+
+
 # ---------------------------------------------------------------------------
 # Out-of-order trades
 # ---------------------------------------------------------------------------

@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
+from pathlib import Path
+from types import MappingProxyType
 
 from src.app import AppConfig, AppContext, AsyncAlertDispatcher, NoopAlertSink
 from src.platform import ExchangeName
+from src.platform.config import ProjectEnvConfig
 from src.platform.data.models import MarketTrade, TradeSide
 from src.planner import ExecutionPlanner
 from src.runtime import LiveRuntimeConfig, LiveRuntimeRunner, RuntimeMode, RuntimePhase
@@ -59,6 +62,141 @@ def _app_config() -> AppConfig:
         dry_run=True,
         enable_email_alerts=False,
     )
+
+
+def _app_config_for_strategy(strategy: str) -> AppConfig:
+    config = _app_config()
+    return AppConfig(
+        symbol=config.symbol,
+        exchanges=config.exchanges,
+        data_exchange=config.data_exchange,
+        strategy=strategy,
+        data_streams=config.data_streams,
+        state_db_path=config.state_db_path,
+        market_queue_maxsize=config.market_queue_maxsize,
+        signal_queue_maxsize=config.signal_queue_maxsize,
+        alert_queue_maxsize=config.alert_queue_maxsize,
+        dry_run=config.dry_run,
+        enable_email_alerts=config.enable_email_alerts,
+    )
+
+
+def _context() -> AppContext:
+    return AppContext(
+        data=FakeData(),
+        execution=FakeExecution(),
+        state_store=FakeStateStore(),
+        strategy=FakeStrategy(),
+        planner=ExecutionPlanner(),
+        alerts=AsyncAlertDispatcher(NoopAlertSink()),
+    )
+
+
+def _project_env(**values: str) -> ProjectEnvConfig:
+    return ProjectEnvConfig(
+        values=MappingProxyType(values),
+        source_files=(),
+        env_file=Path(".env"),
+        example_file=None,
+    )
+
+
+class _FakeMfSupervisor:
+    def __init__(self, *, error: Exception | None = None) -> None:
+        self.calls = 0
+        self.error = error
+
+    def check_and_launch(self):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return {"action": "launched", "reason": "coverage_gap"}
+
+
+def test_v10b_startup_does_not_enable_mf_supervisor_by_default() -> None:
+    config = _app_config_for_strategy("eth_lf_portfolio_v10b")
+    supervisor = _FakeMfSupervisor()
+    runner = LiveRuntimeRunner(
+        app_config=config,
+        app_context=_context(),
+        runtime_config=LiveRuntimeConfig(app=config, mode=RuntimeMode.LIVE_RUNTIME),
+        services={
+            "project_env_config": _project_env(),
+            "mf_feature_backfill_supervisor": supervisor,
+        },
+    )
+
+    asyncio.run(runner._check_mf_feature_backfill_at_startup())
+
+    assert supervisor.calls == 0
+    assert "mf_supervisor" not in runner._health.metadata
+
+
+def test_portfolio_v1_enabled_startup_calls_mf_supervisor() -> None:
+    config = _app_config_for_strategy("eth_portfolio_v1")
+    supervisor = _FakeMfSupervisor()
+    runner = LiveRuntimeRunner(
+        app_config=config,
+        app_context=_context(),
+        runtime_config=LiveRuntimeConfig(app=config, mode=RuntimeMode.LIVE_RUNTIME),
+        services={
+            "project_env_config": _project_env(
+                AETHER_MF_FEATURE_BACKFILL_ENABLED="true"
+            ),
+            "mf_feature_backfill_supervisor": supervisor,
+        },
+    )
+
+    asyncio.run(runner._check_mf_feature_backfill_at_startup())
+
+    assert supervisor.calls == 1
+    assert runner._health.metadata["mf_supervisor"]["action"] == "launched"
+    assert runner._health.metadata["mf_supervisor"]["mf_signal_ready"] is False
+
+
+def test_portfolio_v1_disabled_startup_audits_disabled_reason() -> None:
+    config = _app_config_for_strategy("eth_portfolio_v1")
+    supervisor = _FakeMfSupervisor()
+    runner = LiveRuntimeRunner(
+        app_config=config,
+        app_context=_context(),
+        runtime_config=LiveRuntimeConfig(app=config, mode=RuntimeMode.LIVE_RUNTIME),
+        services={
+            "project_env_config": _project_env(),
+            "mf_feature_backfill_supervisor": supervisor,
+        },
+    )
+
+    asyncio.run(runner._check_mf_feature_backfill_at_startup())
+
+    assert supervisor.calls == 0
+    assert (
+        runner._health.metadata["mf_supervisor"]["reason"]
+        == "mf_supervisor_disabled"
+    )
+
+
+def test_portfolio_v1_supervisor_failure_does_not_abort_startup() -> None:
+    config = _app_config_for_strategy("eth_portfolio_v1")
+    supervisor = _FakeMfSupervisor(error=RuntimeError("boom"))
+    runner = LiveRuntimeRunner(
+        app_config=config,
+        app_context=_context(),
+        runtime_config=LiveRuntimeConfig(app=config, mode=RuntimeMode.LIVE_RUNTIME),
+        services={
+            "project_env_config": _project_env(
+                AETHER_MF_FEATURE_BACKFILL_ENABLED="true"
+            ),
+            "mf_feature_backfill_supervisor": supervisor,
+        },
+    )
+
+    asyncio.run(runner._check_mf_feature_backfill_at_startup())
+
+    audit = runner._health.metadata["mf_supervisor"]
+    assert supervisor.calls == 1
+    assert audit["reason"] == "mf_supervisor_failed"
+    assert audit["coverage_ready"] is False
 
 
 def test_live_runtime_runner_exposes_health_without_replacing_app_runner_path():

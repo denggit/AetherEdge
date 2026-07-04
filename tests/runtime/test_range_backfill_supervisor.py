@@ -5,6 +5,10 @@ from pathlib import Path
 
 import pytest
 
+from src.market_data.backfill.coordinator import (
+    MF_FEATURE_BACKFILL_PRIORITY,
+    RawTradeBackfillCoordinator,
+)
 from src.market_data.backfill.models import BucketGap
 from src.runtime.range_backfill_supervisor import (
     RangeBackfillSupervisor,
@@ -115,6 +119,52 @@ def test_supervisor_does_not_start_when_history_available(tmp_path, monkeypatch)
         bucket_interval="4h",
         complete_history=100,
         min_periods=100,
+    )
+
+
+def test_supervisor_does_not_start_while_mf_holds_global_lock(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "subprocess.Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("should not start")
+        ),
+    )
+    global_lock = tmp_path / "global.lock"
+    global_status = tmp_path / "global_status.json"
+    mf = RawTradeBackfillCoordinator(
+        lock_path=global_lock, status_path=global_status
+    )
+    assert mf.try_acquire(
+        owner="mf_feature_backfill",
+        priority=MF_FEATURE_BACKFILL_PRIORITY,
+        symbol="ETH-USDT-PERP",
+    )
+    supervisor = RangeBackfillSupervisor(
+        RangeBackfillSupervisorConfig(
+            status_path=tmp_path / "status.json",
+            lock_path=tmp_path / "range.lock",
+            global_lock_path=global_lock,
+            global_status_path=global_status,
+        )
+    )
+    try:
+        started = supervisor.start_if_needed(
+            symbol="ETH-USDT-PERP",
+            exchange="okx",
+            range_pct="0.002",
+            bucket_interval="4h",
+            complete_history=0,
+            min_periods=100,
+        )
+    finally:
+        mf.release()
+
+    assert started is False
+    assert (
+        supervisor.status_store.read()["range_speed_reason"]
+        == "global_lock_not_acquired"
     )
 
 

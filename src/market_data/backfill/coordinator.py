@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-import time
+import secrets
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -41,6 +41,7 @@ class RawTradeBackfillCoordinator:
         self.status_path = Path(status_path)
         self.stale_after_ms = max(0, int(stale_after_seconds)) * 1000
         self._acquired = False
+        self._token: str | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -64,6 +65,17 @@ class RawTradeBackfillCoordinator:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
 
         existing = self._read_lock()
+        if existing is None and self.lock_path.exists():
+            # Another process may still be atomically creating the file, or a
+            # crashed process may have left a malformed lock behind.
+            try:
+                age_ms = now_ms() - int(self.lock_path.stat().st_mtime * 1000)
+            except OSError:
+                return False
+            if age_ms <= self.stale_after_ms:
+                return False
+            self._delete_lock()
+            self._delete_status()
         if existing is not None:
             existing_priority = int(existing.get("priority", 0))
             if existing_priority > priority:
@@ -106,13 +118,29 @@ class RawTradeBackfillCoordinator:
             self._delete_lock()
             self._delete_status()
 
-        self._write_lock(owner=owner, priority=priority, symbol=symbol, raw_days=raw_days)
-        self._write_status(
-            owner=owner,
-            priority=priority,
-            symbol=symbol,
-            raw_days=raw_days,
-        )
+        self._token = secrets.token_hex(16)
+        try:
+            self._write_lock(
+                owner=owner,
+                priority=priority,
+                symbol=symbol,
+                raw_days=raw_days,
+            )
+        except FileExistsError:
+            # Lost the simultaneous-create race to another worker.
+            self._token = None
+            return False
+        try:
+            self._write_status(
+                owner=owner,
+                priority=priority,
+                symbol=symbol,
+                raw_days=raw_days,
+            )
+        except Exception:
+            self._delete_lock()
+            self._token = None
+            raise
         self._acquired = True
         return True
 
@@ -120,8 +148,12 @@ class RawTradeBackfillCoordinator:
         """Release the global lock."""
         if not self._acquired:
             return
-        self._delete_lock()
+        existing = self._read_lock()
+        if existing is not None and existing.get("token") == self._token:
+            self._delete_lock()
+            self._finish_status()
         self._acquired = False
+        self._token = None
 
     def heartbeat(self) -> None:
         """Update the status heartbeat."""
@@ -135,6 +167,19 @@ class RawTradeBackfillCoordinator:
 
     def current_owner(self) -> Mapping[str, Any] | None:
         return self._read_lock()
+
+    def has_fresh_holder(self) -> bool:
+        """Return whether the lock is held by a non-stale worker."""
+        if not self.lock_path.exists():
+            return False
+        existing = self._read_lock()
+        if existing is not None:
+            return not self._is_stale(existing)
+        try:
+            age_ms = now_ms() - int(self.lock_path.stat().st_mtime * 1000)
+        except OSError:
+            return True
+        return age_ms <= self.stale_after_ms
 
     def status(self) -> Mapping[str, Any] | None:
         try:
@@ -178,20 +223,25 @@ class RawTradeBackfillCoordinator:
     def _write_lock(self, *, owner: str, priority: int, symbol: str, raw_days: int) -> None:
         payload = {
             "pid": os.getpid(),
+            "token": self._token,
             "owner": owner,
             "priority": int(priority),
             "symbol": symbol,
             "raw_days": int(raw_days),
             "started_at_ms": now_ms(),
         }
-        tmp = self.lock_path.with_name(self.lock_path.name + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, self.lock_path)
+        fd = os.open(
+            self.lock_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
 
     def _write_status(self, *, owner: str, priority: int, symbol: str, raw_days: int) -> None:
         payload = {
             "version": 1,
             "pid": os.getpid(),
+            "token": self._token,
             "owner": owner,
             "priority": int(priority),
             "symbol": symbol,
@@ -210,9 +260,28 @@ class RawTradeBackfillCoordinator:
             current = self.status()
             if current is None:
                 return
+            if current.get("token") != self._token:
+                return
             current["worker_heartbeat_ms"] = now_ms()
             tmp = self.status_path.with_name(self.status_path.name + ".tmp")
             tmp.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, self.status_path)
+        except OSError:
+            pass
+
+    def _finish_status(self) -> None:
+        try:
+            current = self.status()
+            if current is None or current.get("token") != self._token:
+                return
+            current["running"] = False
+            current["worker_heartbeat_ms"] = now_ms()
+            current["finished_at_ms"] = now_ms()
+            tmp = self.status_path.with_name(self.status_path.name + ".tmp")
+            tmp.write_text(
+                json.dumps(current, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
             os.replace(tmp, self.status_path)
         except OSError:
             pass

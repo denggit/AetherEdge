@@ -262,6 +262,99 @@ class SqliteTradeFeatureStore:
     # Common
     # ==================================================================
 
+    def latest_any_tradebar_close_time_ms(
+        self, *, symbol: str, exchange: str
+    ) -> int | None:
+        return self._time_scalar(
+            """
+            SELECT MAX(close_time_ms)
+            FROM tradebar_1m_features
+            WHERE symbol = ? AND exchange = ?
+            """,
+            symbol=symbol,
+            exchange=exchange,
+        )
+
+    def latest_any_footprint_close_time_ms(
+        self, *, symbol: str, exchange: str
+    ) -> int | None:
+        return self._time_scalar(
+            """
+            SELECT MAX(close_time_ms)
+            FROM trade_footprint_1m_features
+            WHERE symbol = ? AND exchange = ?
+            """,
+            symbol=symbol,
+            exchange=exchange,
+        )
+
+    def earliest_any_tradebar_open_time_ms(
+        self, *, symbol: str, exchange: str
+    ) -> int | None:
+        return self._time_scalar(
+            """
+            SELECT MIN(open_time_ms)
+            FROM tradebar_1m_features
+            WHERE symbol = ? AND exchange = ?
+            """,
+            symbol=symbol,
+            exchange=exchange,
+        )
+
+    def earliest_any_footprint_open_time_ms(
+        self, *, symbol: str, exchange: str
+    ) -> int | None:
+        return self._time_scalar(
+            """
+            SELECT MIN(open_time_ms)
+            FROM trade_footprint_1m_features
+            WHERE symbol = ? AND exchange = ?
+            """,
+            symbol=symbol,
+            exchange=exchange,
+        )
+
+    def tradebar_without_footprint_bounds(
+        self, *, symbol: str, exchange: str, end_ms: int
+    ) -> tuple[int, int] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT MIN(tb.open_time_ms), MAX(tb.open_time_ms)
+                FROM tradebar_1m_features tb
+                LEFT JOIN trade_footprint_1m_features fp
+                  ON fp.exchange = tb.exchange
+                 AND fp.symbol = tb.symbol
+                 AND fp.timeframe = tb.timeframe
+                 AND fp.open_time_ms = tb.open_time_ms
+                WHERE tb.symbol = ? AND tb.exchange = ?
+                  AND tb.close_time_ms <= ?
+                  AND fp.open_time_ms IS NULL
+                """,
+                (symbol, exchange, int(end_ms)),
+            ).fetchone()
+        if row is None or row[0] is None or row[1] is None:
+            return None
+        return int(row[0]), int(row[1]) + _ONE_MINUTE_MS - 1
+
+    def degraded_footprint_bounds(
+        self, *, symbol: str, exchange: str, end_ms: int
+    ) -> tuple[int, int] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT MIN(open_time_ms), MAX(open_time_ms)
+                FROM trade_footprint_1m_features
+                WHERE symbol = ? AND exchange = ?
+                  AND close_time_ms <= ?
+                  AND (quality != 'COMPLETE' OR context_available != 1)
+                """,
+                (symbol, exchange, int(end_ms)),
+            ).fetchone()
+        if row is None or row[0] is None or row[1] is None:
+            return None
+        return int(row[0]), int(row[1]) + _ONE_MINUTE_MS - 1
+
     def latest_complete_close_time_ms(self, *, symbol: str, exchange: str) -> int | None:
         """Latest close_time_ms where BOTH tradebar and footprint exist and are COMPLETE."""
         with self._connect() as conn:
@@ -291,7 +384,9 @@ class SqliteTradeFeatureStore:
         symbol: str,
         exchange: str,
         required_minutes: int = 4320,
-        current_day_archive_ready: bool = True,
+        current_day_archive_ready: bool = False,
+        reference_end_ms: int | None = None,
+        safe_archive_end_ms: int | None = None,
         extra: dict | None = None,
     ) -> TradeDerivedFeatureCoverage:
         """Scan coverage checking BOTH tradebar + footprint tables.
@@ -300,23 +395,35 @@ class SqliteTradeFeatureStore:
         - tradebar exists with quality=COMPLETE
         - footprint exists with quality=COMPLETE and context_available=1
         """
-        latest = self.latest_complete_close_time_ms(symbol=symbol, exchange=exchange)
-        if latest is None:
-            return TradeDerivedFeatureCoverage(
-                symbol=symbol,
-                exchange=exchange,
-                required_minutes=required_minutes,
-                complete_minutes=0,
-                missing_minutes=required_minutes,
-                degraded_minutes=0,
-                latest_complete_close_time_ms=None,
-                first_missing_range=None,
-                available=False,
-                reason="no_features_stored",
-                extra=extra,
+        required_minutes = max(0, int(required_minutes))
+        latest = self.latest_complete_close_time_ms(
+            symbol=symbol, exchange=exchange
+        )
+        latest_tradebar = self.latest_any_tradebar_close_time_ms(
+            symbol=symbol, exchange=exchange
+        )
+        latest_footprint = self.latest_any_footprint_close_time_ms(
+            symbol=symbol, exchange=exchange
+        )
+        if safe_archive_end_ms is None:
+            from src.market_data.trade_features.coverage import (
+                safe_okx_archive_end_ms,
             )
 
-        end_ms = latest
+            safe_archive_end_ms = safe_okx_archive_end_ms()
+        if reference_end_ms is None:
+            candidates = [
+                value
+                for value in (
+                    latest_tradebar,
+                    latest_footprint,
+                    safe_archive_end_ms,
+                )
+                if value is not None
+            ]
+            reference_end_ms = max(candidates) if candidates else safe_archive_end_ms
+
+        end_ms = int(reference_end_ms)
         start_ms = end_ms - (required_minutes * _ONE_MINUTE_MS) + 1
 
         with self._connect() as conn:
@@ -352,8 +459,16 @@ class SqliteTradeFeatureStore:
         degraded = 0
         missing = 0
         first_missing: tuple[int, int] | None = None
+        first_incomplete: tuple[int, int] | None = None
+        first_degraded_footprint: tuple[int, int] | None = None
+        missing_tb_count = 0
         missing_fp_count = 0
+        degraded_tb_count = 0
         degraded_fp_count = 0
+        tradebar_complete_count = 0
+        footprint_complete_count = 0
+        tradebar_without_footprint = 0
+        footprint_without_tradebar = 0
 
         bucket = _bucket_start_ms(start_ms)
         end_bucket = _bucket_start_ms(end_ms)
@@ -361,42 +476,90 @@ class SqliteTradeFeatureStore:
             tb_quality = tb_map.get(bucket)
             fp_info = fp_map.get(bucket)
 
+            tb_complete = tb_quality == TradeFeatureQuality.COMPLETE.value
+            fp_complete = bool(
+                fp_info is not None
+                and fp_info[0] == TradeFeatureQuality.COMPLETE.value
+                and fp_info[1]
+            )
+            if tb_complete:
+                tradebar_complete_count += 1
+            if fp_complete:
+                footprint_complete_count += 1
             if tb_quality is None:
-                missing += 1
-                if first_missing is None:
-                    first_missing = (bucket, bucket + _ONE_MINUTE_MS - 1)
-            elif fp_info is None:
-                missing += 1
+                missing_tb_count += 1
+            elif not tb_complete:
+                degraded_tb_count += 1
+            if fp_info is None:
                 missing_fp_count += 1
+            elif not fp_complete:
+                degraded_fp_count += 1
+                if first_degraded_footprint is None:
+                    first_degraded_footprint = (
+                        bucket,
+                        bucket + _ONE_MINUTE_MS - 1,
+                    )
+            if tb_quality is not None and fp_info is None:
+                tradebar_without_footprint += 1
+            if fp_info is not None and tb_quality is None:
+                footprint_without_tradebar += 1
+
+            if tb_quality is None or fp_info is None:
+                missing += 1
                 if first_missing is None:
                     first_missing = (bucket, bucket + _ONE_MINUTE_MS - 1)
-            elif tb_quality == TradeFeatureQuality.COMPLETE.value and fp_info[0] == TradeFeatureQuality.COMPLETE.value and fp_info[1]:
+                if first_incomplete is None:
+                    first_incomplete = (bucket, bucket + _ONE_MINUTE_MS - 1)
+            elif tb_complete and fp_complete:
                 complete += 1
             else:
                 degraded += 1
-                if fp_info[0] != TradeFeatureQuality.COMPLETE.value or not fp_info[1]:
-                    degraded_fp_count += 1
+                if first_incomplete is None:
+                    first_incomplete = (bucket, bucket + _ONE_MINUTE_MS - 1)
 
             bucket += _ONE_MINUTE_MS
 
         available = missing == 0 and degraded == 0
 
         reason_parts = []
+        if latest_tradebar is None and latest_footprint is None:
+            reason_parts.append("no_features_stored")
         if missing > 0:
             reason_parts.append(f"missing={missing}")
+        if missing_tb_count > 0:
+            reason_parts.append(f"missing_tradebar={missing_tb_count}")
         if missing_fp_count > 0:
             reason_parts.append(f"missing_footprint={missing_fp_count}")
         if degraded > 0:
             reason_parts.append(f"degraded={degraded}")
+            if degraded_tb_count > 0:
+                reason_parts.append(f"degraded_tradebar={degraded_tb_count}")
             if degraded_fp_count > 0:
                 reason_parts.append(f"degraded_footprint={degraded_fp_count}")
         if not current_day_archive_ready:
             reason_parts.append("current_day_archive_not_ready")
         reason = "; ".join(reason_parts) if reason_parts else ""
 
-        if extra is None:
-            extra = {}
+        extra = dict(extra or {})
         extra.setdefault("current_day_archive_ready", current_day_archive_ready)
+        extra.update(
+            {
+                "tradebar_complete_minutes": tradebar_complete_count,
+                "footprint_complete_minutes": footprint_complete_count,
+                "missing_tradebar": missing_tb_count,
+                "missing_footprint": missing_fp_count,
+                "degraded_tradebar": degraded_tb_count,
+                "degraded_footprint": degraded_fp_count,
+                "tradebar_without_footprint": tradebar_without_footprint,
+                "footprint_without_tradebar": footprint_without_tradebar,
+                "latest_any_tradebar_close_time_ms": latest_tradebar,
+                "latest_any_footprint_close_time_ms": latest_footprint,
+                "safe_archive_end_ms": safe_archive_end_ms,
+                "reference_end_ms": end_ms,
+                "first_incomplete_range": first_incomplete,
+                "first_degraded_footprint_range": first_degraded_footprint,
+            }
+        )
 
         return TradeDerivedFeatureCoverage(
             symbol=symbol,
@@ -411,6 +574,15 @@ class SqliteTradeFeatureStore:
             reason=reason,
             extra=extra,
         )
+
+    def _time_scalar(
+        self, query: str, *, symbol: str, exchange: str
+    ) -> int | None:
+        with self._connect() as conn:
+            row = conn.execute(query, (symbol, exchange)).fetchone()
+        if row is None or row[0] is None:
+            return None
+        return int(row[0])
 
     # ==================================================================
     # Schema

@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
+from types import SimpleNamespace
+
+import pytest
 
 from src.market_data.backfill.coordinator import (
     LF_RANGE_BACKFILL_PRIORITY,
     MF_FEATURE_BACKFILL_PRIORITY,
     RawTradeBackfillCoordinator,
 )
+from tools import range_backfill_worker
 
 
 def test_mf_priority_higher_than_lf() -> None:
@@ -137,3 +143,93 @@ def test_heartbeat_updates_status(tmp_path: Path) -> None:
     assert updated["worker_heartbeat_ms"] >= initial_status["worker_heartbeat_ms"]
 
     coordinator.release()
+
+
+def test_range_worker_acquires_and_releases_global_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    global_lock = tmp_path / "global.lock"
+    observed = {"held_during_run": False}
+
+    class FakeService:
+        def __init__(self, request) -> None:
+            self.request = request
+
+        def run_once(self, **kwargs):
+            observed["held_during_run"] = global_lock.exists()
+            return SimpleNamespace(
+                status="ok",
+                complete_after=1,
+                missing_after=0,
+                aggregates_written=1,
+                target_bucket_start_ms=1,
+                target_bucket_end_ms=2,
+                selected_archive_dates=(),
+                per_file_min_trade_time_ms={},
+                per_file_max_trade_time_ms={},
+                target_trade_count=0,
+                candidate_range_bars=0,
+                candidate_aggregates=0,
+                filtered_reason_if_zero=None,
+                last_error=None,
+                missing_raw_days=(),
+                failed_downloads=(),
+            )
+
+    monkeypatch.setattr(range_backfill_worker, "RangeBackfillService", FakeService)
+    exit_code = range_backfill_worker.main(
+        [
+            "--once",
+            "--mode",
+            "prebuild",
+            "--symbol",
+            "ETH-USDT-PERP",
+            "--status-path",
+            str(tmp_path / "range_status.json"),
+            "--lock-path",
+            str(tmp_path / "range.lock"),
+            "--global-lock-path",
+            str(global_lock),
+            "--global-status-path",
+            str(tmp_path / "global_status.json"),
+            "--market-db",
+            str(tmp_path / "market.sqlite3"),
+            "--checkpoint-db",
+            str(tmp_path / "checkpoint.sqlite3"),
+            "--raw-root",
+            str(tmp_path / "raw"),
+        ]
+    )
+
+    assert exit_code == 0
+    assert observed["held_during_run"] is True
+    assert not global_lock.exists()
+
+
+def test_simultaneous_acquire_has_exactly_one_winner(tmp_path: Path) -> None:
+    lock_path = tmp_path / "global.lock"
+    status_path = tmp_path / "global_status.json"
+    coordinators = [
+        RawTradeBackfillCoordinator(
+            lock_path=lock_path, status_path=status_path
+        )
+        for _ in range(2)
+    ]
+    barrier = Barrier(2)
+
+    def acquire(index: int) -> bool:
+        barrier.wait()
+        return coordinators[index].try_acquire(
+            owner=f"worker_{index}",
+            priority=MF_FEATURE_BACKFILL_PRIORITY,
+            symbol="ETH",
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(acquire, range(2)))
+
+    try:
+        assert sum(results) == 1
+    finally:
+        for coordinator in coordinators:
+            coordinator.release()

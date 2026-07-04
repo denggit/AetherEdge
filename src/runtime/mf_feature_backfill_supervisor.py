@@ -15,6 +15,7 @@ from src.market_data.backfill.status_store import (
     now_ms,
     worker_status_is_running,
 )
+from src.market_data.backfill.coordinator import RawTradeBackfillCoordinator
 from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
 from src.market_data.trade_features.coverage import resolve_mf_readiness
 
@@ -60,6 +61,7 @@ class MfFeatureBackfillSupervisor:
         max_seconds_per_cycle: float = 60.0,
         raw_root: str = "data/okx/raw/trades",
         contract_value: str = "0.01",
+        price_bucket_size: str = "1",
         large_trade_threshold: str = "10000",
     ) -> None:
         self.symbol = symbol
@@ -78,6 +80,7 @@ class MfFeatureBackfillSupervisor:
         self.max_seconds_per_cycle = max_seconds_per_cycle
         self.raw_root = raw_root
         self.contract_value = contract_value
+        self.price_bucket_size = price_bucket_size
         self.large_trade_threshold = large_trade_threshold
 
         self._state = _SupervisorState()
@@ -127,14 +130,13 @@ class MfFeatureBackfillSupervisor:
         if now - self._state.last_failure_ms < self.failure_cooldown_ms:
             return {"action": "none", "reason": "failure_cooldown", "coverage": coverage}
 
-        if coverage.get("current_day_archive_not_ready"):
-            if now - self._state.last_archive_not_ready_ms < self.archive_not_ready_cooldown_ms:
-                return {"action": "none", "reason": "archive_not_ready_cooldown", "coverage": coverage}
-            self._state.last_archive_not_ready_ms = now
-            return {"action": "none", "reason": "archive_not_ready", "coverage": coverage}
-
         # Check global lock
-        if self.global_lock_path.exists():
+        global_coordinator = RawTradeBackfillCoordinator(
+            lock_path=self.global_lock_path,
+            status_path=self.global_status_path,
+            stale_after_seconds=self.stale_after_seconds,
+        )
+        if global_coordinator.has_fresh_holder():
             return {"action": "none", "reason": "global_lock_held", "coverage": coverage}
 
         # Launch worker
@@ -183,6 +185,7 @@ class MfFeatureBackfillSupervisor:
             "--raw-root", self.raw_root,
             "--max-seconds-per-cycle", str(self.max_seconds_per_cycle),
             "--contract-value", str(self.contract_value),
+            "--price-bucket-size", str(self.price_bucket_size),
             "--large-trade-threshold", str(self.large_trade_threshold),
             "--log-file", str(self.worker_log_path),
         ]

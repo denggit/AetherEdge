@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 from src.market_data.backfill.scanner import RangeBackfillScanner
+from src.market_data.backfill.coordinator import LF_RANGE_BACKFILL_PRIORITY
 from src.market_data.backfill.status_store import (
     RangeBackfillStatusStore,
     now_ms,
@@ -56,6 +57,10 @@ class RangeBackfillSupervisorConfig:
     monitor_seconds: float = 60.0
     status_path: Path = Path("data/state/range_backfill_status.json")
     lock_path: Path = Path("data/state/range_backfill.lock")
+    global_lock_path: Path = Path("data/state/raw_trade_backfill_global.lock")
+    global_status_path: Path = Path(
+        "data/state/raw_trade_backfill_global_status.json"
+    )
     low_priority: bool = True
     chunksize: int = 50_000
     raw_root: Path = Path("data/okx/raw/trades")
@@ -128,7 +133,15 @@ class RangeBackfillSupervisor:
         if self._in_restart_cooldown():
             return False
         # Respect global raw-trade lock: if MF holds it, LF must not start
-        if _global_raw_trade_lock_held_by_higher_priority():
+        if _global_raw_trade_lock_held_by_higher_priority(
+            lock_path=self.config.global_lock_path
+        ):
+            self.status_store.patch(
+                running=False,
+                phase="global_lock_not_acquired",
+                range_speed_available=False,
+                range_speed_reason="global_lock_not_acquired",
+            )
             logger.info(
                 "Range backfill skipped: global raw-trade lock held by higher-priority worker"
             )
@@ -339,6 +352,10 @@ class RangeBackfillSupervisor:
             str(self.config.checkpoint_db_path),
             "--raw-root",
             str(self.config.raw_root),
+            "--global-lock-path",
+            str(self.config.global_lock_path),
+            "--global-status-path",
+            str(self.config.global_status_path),
             "--low-priority" if self.config.low_priority else "--no-low-priority",
             "--no-once",
             "--no-save-raw-trades",
@@ -482,21 +499,23 @@ def _archive_complete_max_target_end_ms(
     return int(current_archive_start.timestamp() * 1000) - 1
 
 
-def _global_raw_trade_lock_held_by_higher_priority() -> bool:
+def _global_raw_trade_lock_held_by_higher_priority(
+    *,
+    lock_path: str | Path = "data/state/raw_trade_backfill_global.lock",
+) -> bool:
     """Check if the global raw-trade lock is held by a higher-priority worker.
 
     MF priority = 100 > LF priority = 10. If the lock exists and the holder
     has a higher priority, LF range backfill must yield.
     """
-    from pathlib import Path
     import json
 
-    lock_path = Path("data/state/raw_trade_backfill_global.lock")
-    if not lock_path.exists():
+    resolved_lock_path = Path(lock_path)
+    if not resolved_lock_path.exists():
         return False
 
     try:
-        data = json.loads(lock_path.read_text(encoding="utf-8"))
+        data = json.loads(resolved_lock_path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             return True  # malformed lock → be safe, yield
         holder_priority = int(data.get("priority", 0))
@@ -504,7 +523,3 @@ def _global_raw_trade_lock_held_by_higher_priority() -> bool:
         return holder_priority > LF_RANGE_BACKFILL_PRIORITY
     except (OSError, json.JSONDecodeError, ValueError):
         return True  # unreadable lock → be safe, yield
-
-
-# Import at module level to avoid circular imports
-LF_RANGE_BACKFILL_PRIORITY = 10

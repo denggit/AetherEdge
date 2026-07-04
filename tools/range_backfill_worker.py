@@ -15,6 +15,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.market_data.backfill.models import RangeBackfillRequest
 from src.market_data.backfill.lock import RangeBackfillLock
+from src.market_data.backfill.coordinator import (
+    LF_RANGE_BACKFILL_PRIORITY,
+    RawTradeBackfillCoordinator,
+)
 from src.market_data.backfill.service import RangeBackfillService
 from src.market_data.backfill.status_store import RangeBackfillStatusStore, now_ms
 from src.market_data.historical_trades.okx_archive import okx_raw_symbol_from_canonical
@@ -52,6 +56,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--market-db", default=_env("AETHER_MARKET_DATA_DB", "data/market_data/aether_market_data.sqlite3"))
     parser.add_argument("--checkpoint-db", default=_env("AETHER_RANGE_CHECKPOINT_DB", "data/state/range_builder_checkpoint.sqlite3"))
     parser.add_argument("--raw-root", default=_env("AETHER_RANGE_BACKFILL_RAW_ROOT", "data/okx/raw/trades"))
+    parser.add_argument(
+        "--global-lock-path",
+        default=_env(
+            "AETHER_RAW_TRADE_BACKFILL_GLOBAL_LOCK_PATH",
+            "data/state/raw_trade_backfill_global.lock",
+        ),
+    )
+    parser.add_argument(
+        "--global-status-path",
+        default=_env(
+            "AETHER_RAW_TRADE_BACKFILL_GLOBAL_STATUS_PATH",
+            "data/state/raw_trade_backfill_global_status.json",
+        ),
+    )
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--check-only", action="store_true")
@@ -160,6 +178,34 @@ def main(argv: list[str] | None = None) -> int:
     if not lock.acquire(mode=request.mode, force=request.force):
         print(f"Range backfill lock busy | path={request.lock_path}", flush=True)
         return 1
+    coordinator = RawTradeBackfillCoordinator(
+        lock_path=args.global_lock_path,
+        status_path=args.global_status_path,
+    )
+    if not coordinator.try_acquire(
+        owner="range_backfill",
+        priority=LF_RANGE_BACKFILL_PRIORITY,
+        symbol=request.symbol,
+        raw_days=request.max_days_per_cycle,
+    ):
+        holder = coordinator.current_owner() or {}
+        status_store.patch(
+            running=False,
+            phase="global_lock_not_acquired",
+            range_speed_available=False,
+            range_speed_reason="global_lock_not_acquired",
+            global_lock_owner=holder.get("owner"),
+            global_lock_pid=holder.get("pid"),
+            global_lock_priority=holder.get("priority"),
+            worker_heartbeat_ms=now_ms(),
+        )
+        lock.release()
+        print(
+            "Range backfill skipped | reason=global_lock_not_acquired "
+            f"owner={holder.get('owner')} priority={holder.get('priority')}",
+            flush=True,
+        )
+        return 0
 
     exit_code = 1
     exit_phase = "failed"
@@ -197,6 +243,7 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
             final_summary = summary
+            coordinator.heartbeat()
             if summary.status == "error":
                 exit_code = 1
                 exit_phase = "failed"
@@ -248,17 +295,20 @@ def main(argv: list[str] | None = None) -> int:
                 return exit_code
             time.sleep(max(0.0, float(args.sleep_seconds)))
     finally:
-        _write_process_status(
-            status_store,
-            request=request,
-            phase=exit_phase,
-            running=False,
-            exit_code=exit_code,
-            range_speed_reason=range_speed_reason,
-            next_retry_after_ms=next_retry_after_ms,
-            summary=final_summary,
-        )
-        lock.release()
+        try:
+            _write_process_status(
+                status_store,
+                request=request,
+                phase=exit_phase,
+                running=False,
+                exit_code=exit_code,
+                range_speed_reason=range_speed_reason,
+                next_retry_after_ms=next_retry_after_ms,
+                summary=final_summary,
+            )
+        finally:
+            coordinator.release()
+            lock.release()
 
 
 def resolve_once(args: argparse.Namespace) -> bool:

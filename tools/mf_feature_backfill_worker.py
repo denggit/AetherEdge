@@ -16,7 +16,6 @@ import logging
 import os
 import sys
 import time
-from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Sequence
@@ -51,11 +50,15 @@ from src.market_data.models import (  # noqa: E402
     TradeFootprintFeature,
 )
 from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore  # noqa: E402
-from src.market_data.trade_features.coverage import compute_backfill_target  # noqa: E402
+from src.market_data.trade_features.coverage import (  # noqa: E402
+    compute_backfill_target,
+    safe_okx_archive_end_ms,
+)
 from src.platform.data.models import MarketTrade  # noqa: E402
 from src.platform.exchanges.models import ExchangeName  # noqa: E402
 
 logger = logging.getLogger(__name__)
+_ONE_MINUTE_MS = 60_000
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -88,6 +91,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-download", action="store_true")
     parser.add_argument("--save-raw-trades", action="store_true", default=False)
     parser.add_argument("--contract-value", type=str, default="0.01")
+    parser.add_argument("--price-bucket-size", type=str, default="1")
     parser.add_argument("--large-trade-threshold", type=str, default="10000")
     return parser.parse_args(argv)
 
@@ -113,6 +117,7 @@ def run_cycle(
     save_raw_trades: bool,
     contract_value: Decimal,
     large_trade_threshold: Decimal,
+    price_bucket_size: Decimal = Decimal("1"),
 ) -> dict:
     # -------- guard --------
     if save_raw_trades:
@@ -136,24 +141,55 @@ def run_cycle(
         raw_days=max_days_per_cycle,
     )
     if not acquired:
-        return {"status": "skipped", "reason": "global_lock_not_acquired"}
+        holder = coordinator.current_owner() or {}
+        holder_priority = int(holder.get("priority", 0) or 0)
+        reason = (
+            "waiting_for_lower_priority_worker"
+            if holder_priority < MF_FEATURE_BACKFILL_PRIORITY
+            else "global_lock_not_acquired"
+        )
+        return {
+            "status": "skipped",
+            "reason": reason,
+            "global_lock_owner": holder.get("owner"),
+            "global_lock_pid": holder.get("pid"),
+            "global_lock_priority": holder_priority,
+        }
 
     try:
         # -------- gap-driven target --------
+        safe_archive_end = safe_okx_archive_end_ms()
         target = compute_backfill_target(
             symbol=symbol,
             exchange=exchange,
             store=store,
             max_minutes_per_cycle=max_minutes_per_cycle,
             direction=direction,
+            safe_archive_end_ms=safe_archive_end,
         )
 
         if target is None:
-            return {"status": "up_to_date", "reason": "no_gap_found"}
+            return {
+                "status": "up_to_date",
+                "reason": "no_gap_found",
+                "safe_archive_end_ms": safe_archive_end,
+            }
 
         start_ms = target.start_ms
-        end_ms = target.end_ms
+        requested_end_ms = target.end_ms
+        end_ms = min(requested_end_ms, safe_archive_end)
         reason = target.reason
+        current_day_gap = requested_end_ms > safe_archive_end
+        if start_ms > safe_archive_end:
+            return {
+                "status": "not_ready",
+                "reason": "current_day_archive_not_ready",
+                "target_start_ms": start_ms,
+                "requested_target_end_ms": requested_end_ms,
+                "target_end_ms": safe_archive_end,
+                "safe_archive_end_ms": safe_archive_end,
+                "current_day_gap_unrecoverable_until_archive": True,
+            }
 
         # Collect archive dates
         archive_dates = list(iter_okx_archive_dates_for_utc_range(start_ms, end_ms))
@@ -172,7 +208,10 @@ def run_cycle(
             contract_value=contract_value,
             large_trade_threshold_notional=large_trade_threshold,
         )
-        fp_builder = TradeFootprintBuilder(contract_value=contract_value)
+        fp_builder = TradeFootprintBuilder(
+            contract_value=contract_value,
+            price_bucket_size=price_bucket_size,
+        )
 
         total_trades = 0
         total_bars = 0
@@ -180,60 +219,42 @@ def run_cycle(
         downloaded = 0
         failed_downloads: list[str] = []
         missing_raw_days: list[str] = []
-        safe_end_ms: int | None = None
-
-        # Identify current-day boundary for conservative handling
-        current_okx_day = _current_okx_day_utc8()
+        processed_through_ms: int | None = None
+        cycle_truncated = False
 
         for day in archive_dates:
             elapsed = time.time() - cycle_start
             if elapsed > max_seconds_per_cycle:
                 logger.info("Cycle time limit reached")
+                cycle_truncated = True
                 break
             if total_trades >= max_trades_per_cycle:
                 logger.info("Trade limit reached")
+                cycle_truncated = True
                 break
 
-            # Current-day guard: don't pretend archive is ready
-            if str(day) >= current_okx_day.isoformat():
-                if no_download:
-                    missing_raw_days.append(day.isoformat())
-                    continue
-                # Attempt download but track failure explicitly
-                try:
-                    hf = archive.ensure_daily_file(
-                        symbol=symbol,
-                        raw_symbol=raw_symbol,
-                        day=day,
-                        allow_download=True,
-                    )
-                    if hf.downloaded:
-                        downloaded += 1
-                except Exception as exc:
-                    failed_downloads.append(day.isoformat())
-                    logger.warning("Current-day archive not available: %s (%s)", day, exc)
-                    continue
-            else:
-                try:
-                    hf = archive.ensure_daily_file(
-                        symbol=symbol,
-                        raw_symbol=raw_symbol,
-                        day=day,
-                        allow_download=not no_download,
-                    )
-                    if hf.downloaded:
-                        downloaded += 1
-                except Exception as exc:
-                    logger.warning("Failed to get archive for %s: %s", day, exc)
-                    failed_downloads.append(day.isoformat())
-                    missing_raw_days.append(day.isoformat())
-                    continue
+            try:
+                hf = archive.ensure_daily_file(
+                    symbol=symbol,
+                    raw_symbol=raw_symbol,
+                    day=day,
+                    allow_download=not no_download,
+                )
+                if hf.downloaded:
+                    downloaded += 1
+            except Exception as exc:
+                logger.warning("Failed to get archive for %s: %s", day, exc)
+                failed_downloads.append(day.isoformat())
+                missing_raw_days.append(day.isoformat())
+                continue
 
             # Process chunks
             for chunk in iter_trade_csv_chunks(hf.path, chunksize=50_000):
                 if total_trades >= max_trades_per_cycle:
+                    cycle_truncated = True
                     break
                 if (time.time() - cycle_start) > max_seconds_per_cycle:
+                    cycle_truncated = True
                     break
 
                 trades = normalize_okx_trade_chunk(
@@ -269,12 +290,27 @@ def run_cycle(
                 if chunk_sleep_seconds > 0:
                     time.sleep(chunk_sleep_seconds)
 
-            # Track safe end after processing each day
-            safe_end_ms = end_ms
+            if cycle_truncated:
+                break
 
-        # -------- Drain ONLY closed bars (never active) --------
-        remaining_bars = bar_builder.drain_closed_only()
-        remaining_fps = fp_builder.drain_closed_only()
+            # Track safe end after processing each day
+            processed_through_ms = end_ms
+            coordinator.heartbeat()
+
+        # A fully read safe archive proves the final historical minute closed.
+        # A truncated/failed cycle must never promote its active minute.
+        can_finalize_safe_history = (
+            not cycle_truncated
+            and not failed_downloads
+            and not missing_raw_days
+            and processed_through_ms == end_ms
+        )
+        if can_finalize_safe_history:
+            remaining_bars = bar_builder.drain_completed_through(end_ms)
+            remaining_fps = fp_builder.drain_completed_through(end_ms)
+        else:
+            remaining_bars = bar_builder.drain_closed_only()
+            remaining_fps = fp_builder.drain_closed_only()
 
         if remaining_bars:
             store.upsert_tradebars_many(list(remaining_bars))
@@ -289,17 +325,33 @@ def run_cycle(
 
         coordinator.heartbeat()
 
-        # Determine status
-        has_current_day_gap = _current_okx_day_utc8().isoformat() in [
-            d.isoformat() for d in archive_dates
-        ] if archive_dates else False
+        target_minutes = max(
+            1,
+            (end_ms - start_ms + 1 + _ONE_MINUTE_MS - 1)
+            // _ONE_MINUTE_MS,
+        )
+        coverage_after = store.coverage_scan(
+            symbol=symbol,
+            exchange=exchange,
+            required_minutes=target_minutes,
+            current_day_archive_ready=False,
+            reference_end_ms=end_ms,
+            safe_archive_end_ms=safe_archive_end,
+        )
 
-        if failed_downloads and has_current_day_gap:
+        # Determine status
+        if current_day_gap:
             actual_status = "partial"
             status_reason = "current_day_archive_not_ready"
         elif failed_downloads:
             actual_status = "partial"
             status_reason = "download_failures"
+        elif cycle_truncated:
+            actual_status = "partial"
+            status_reason = "cycle_limit_reached"
+        elif not coverage_after.available:
+            actual_status = "partial"
+            status_reason = "feature_coverage_incomplete"
         else:
             actual_status = "ok"
             status_reason = "cycle_complete"
@@ -315,7 +367,19 @@ def run_cycle(
             "missing_raw_days": missing_raw_days,
             "target_start_ms": start_ms,
             "target_end_ms": end_ms,
-            "safe_end_ms": safe_end_ms,
+            "requested_target_end_ms": requested_end_ms,
+            "safe_end_ms": safe_archive_end,
+            "safe_archive_end_ms": safe_archive_end,
+            "processed_through_ms": processed_through_ms,
+            "cycle_truncated": cycle_truncated,
+            "coverage_after": {
+                "complete_minutes": coverage_after.complete_minutes,
+                "missing_minutes": coverage_after.missing_minutes,
+                "degraded_minutes": coverage_after.degraded_minutes,
+                "available": coverage_after.available,
+                "reason": coverage_after.reason,
+            },
+            "current_day_gap_unrecoverable_until_archive": current_day_gap,
             "elapsed_seconds": time.time() - cycle_start,
         }
 
@@ -336,13 +400,6 @@ def _update_status(status_path: str, **kwargs: object) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, path)
-
-
-def _current_okx_day_utc8() -> date:
-    from datetime import UTC, datetime, timedelta
-    utc_now = datetime.now(UTC)
-    cst_now = utc_now + timedelta(hours=8)
-    return cst_now.date()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -387,6 +444,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             save_raw_trades=args.save_raw_trades,
             contract_value=Decimal(args.contract_value),
             large_trade_threshold=Decimal(args.large_trade_threshold),
+            price_bucket_size=Decimal(args.price_bucket_size),
         )
         _update_status(
             args.status_path,

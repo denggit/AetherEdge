@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from src.market_data.derived import TradeFootprintBuilder
+from src.market_data.derived import FixedTimeTradeBarBuilder, TradeFootprintBuilder
 from src.market_data.models import TradeFootprintFeature, TradeFeatureQuality
 from src.platform.data.models import MarketTrade, TradeSide
 from src.platform.exchanges.models import ExchangeName
@@ -132,19 +132,73 @@ def test_footprint_builder_snapshot_restore() -> None:
     assert len(closed) == 1
 
 
-# ---------------------------------------------------------------------------
-# fp_max_bucket_abs_delta_pressure placeholder
-# ---------------------------------------------------------------------------
-
-def test_fp_max_bucket_abs_delta_pressure_is_zero_in_r007() -> None:
+def test_safe_watermark_never_closes_newer_footprint_minute() -> None:
     builder = TradeFootprintBuilder()
     t0 = 1_700_000_000_000
+    t0 -= t0 % 60_000
+    builder.on_trade(_trade("1000", t0 + 1_000))
 
-    builder.on_trade(_trade("1000", t0 + 1_000, side=TradeSide.BUY))
-    closed = builder.on_trade(_trade("1001", t0 + 60_001))
+    assert builder.drain_completed_through(t0 + 59_998) == ()
+    closed = builder.drain_completed_through(t0 + 59_999)
+    assert len(closed) == 1
+    assert closed[0].quality == TradeFeatureQuality.COMPLETE.value
+
+
+# ---------------------------------------------------------------------------
+# fp_max_bucket_abs_delta_pressure
+# ---------------------------------------------------------------------------
+
+def test_price_bucket_notional_delta_and_max_pressure_are_exact() -> None:
+    builder = TradeFootprintBuilder(price_bucket_size="1")
+    t0 = 1_700_000_000_000
+
+    trades = (
+        _trade("100.2", t0 + 1_000, side=TradeSide.BUY, quantity="2"),
+        _trade("100.8", t0 + 2_000, side=TradeSide.SELL, quantity="1"),
+        _trade("101.1", t0 + 3_000, side=TradeSide.BUY, quantity="1"),
+        _trade("101.9", t0 + 4_000, side=TradeSide.SELL, quantity="3"),
+    )
+    for trade in trades:
+        builder.on_trade(trade)
+
+    snapshot = builder.snapshot_state()
+    buckets = snapshot["active"]["price_buckets"]
+    assert Decimal(buckets["100"]["buy_notional"]) == Decimal("200.4")
+    assert Decimal(buckets["100"]["sell_notional"]) == Decimal("100.8")
+    assert Decimal(buckets["101"]["buy_notional"]) == Decimal("101.1")
+    assert Decimal(buckets["101"]["sell_notional"]) == Decimal("305.7")
+
+    closed = builder.on_trade(_trade("102", t0 + 60_001))
 
     assert len(closed) == 1
-    assert closed[0].fp_max_bucket_abs_delta_pressure == Decimal("0")
+    pressure_100 = abs(Decimal("200.4") - Decimal("100.8")) / Decimal("301.2")
+    pressure_101 = abs(Decimal("101.1") - Decimal("305.7")) / Decimal("406.8")
+    assert closed[0].fp_max_bucket_abs_delta_pressure == max(
+        pressure_100, pressure_101
+    )
+    assert closed[0].context_available is True
+    assert closed[0].quality == TradeFeatureQuality.COMPLETE.value
+
+
+def test_contract_value_matches_tradebar_notional_delta() -> None:
+    footprint = TradeFootprintBuilder(
+        contract_value="0.01", price_bucket_size="1"
+    )
+    tradebar = FixedTimeTradeBarBuilder(contract_value="0.01")
+    t0 = 1_700_000_000_000
+    trades = (
+        _trade("1000", t0 + 1_000, side=TradeSide.BUY, quantity="4"),
+        _trade("1001", t0 + 2_000, side=TradeSide.SELL, quantity="2"),
+    )
+    for trade in trades:
+        footprint.on_trade(trade)
+        tradebar.on_trade(trade)
+    next_trade = _trade("1002", t0 + 60_001)
+    closed_fp = footprint.on_trade(next_trade)[0]
+    closed_bar = tradebar.on_trade(next_trade)[0]
+
+    assert closed_fp.delta_notional == closed_bar.delta_notional
+    assert closed_fp.abs_delta_notional == closed_bar.abs_delta_notional
 
 
 # ---------------------------------------------------------------------------
@@ -169,12 +223,13 @@ def test_footprint_close_pos_is_valid() -> None:
     assert f.range_pct >= Decimal("0")
 
 
-def test_footprint_context_available_is_false_in_r007() -> None:
-    """R007 cannot compute fp_max_bucket_abs_delta_pressure, so context is unavailable."""
+def test_footprint_context_unavailable_when_pressure_cannot_be_computed() -> None:
     builder = TradeFootprintBuilder()
     t0 = 1_700_000_000_000
 
-    builder.on_trade(_trade("1000", t0 + 1_000))
+    builder.on_trade(
+        _trade("1000", t0 + 1_000, side=TradeSide.UNKNOWN)
+    )
     closed = builder.on_trade(_trade("1001", t0 + 60_001))
 
     assert len(closed) == 1

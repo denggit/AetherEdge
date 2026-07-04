@@ -60,6 +60,7 @@ from src.runtime.market_features import (
     resolve_market_feature_observers,
 )
 from src.runtime.models import RuntimeHealth, RuntimeMode, RuntimePhase
+from src.runtime.mf_feature_backfill_supervisor import MfFeatureBackfillSupervisor
 from src.runtime.range_backfill_supervisor import RangeBackfillSupervisor, RangeBackfillSupervisorConfig
 from src.runtime.range_micro_repair_supervisor import (
     RangeMicroRepairSupervisor,
@@ -277,6 +278,9 @@ class LiveRuntimeRunner:
         self._range_speed_complete_history = 0
         self._range_speed_min_periods = 0
         self._range_backfill_supervisor = self.services.get("range_backfill_supervisor")
+        self._mf_feature_backfill_supervisor = self.services.get(
+            "mf_feature_backfill_supervisor"
+        )
         self._range_micro_repair_supervisor = self.services.get(
             "range_micro_repair_supervisor"
         )
@@ -710,6 +714,7 @@ class LiveRuntimeRunner:
         logger.info("Live runtime startup phase started")
         self._initialize_rangebar_trust_window()
         self._set_health(RuntimePhase.WARMING_UP, healthy=True)
+        await self._check_mf_feature_backfill_at_startup()
         await self._bootstrap_account_config_if_enabled()
         await self._run_warmup()
         loaded_range_speed_history = await self._warmup_range_speed_history()
@@ -743,6 +748,88 @@ class LiveRuntimeRunner:
         self._start_range_speed_background_services()
         self._set_health(RuntimePhase.RUNNING, healthy=True, warmup_complete=True, caught_up=True)
         logger.info("Live runtime startup phase completed")
+
+    async def _check_mf_feature_backfill_at_startup(self) -> None:
+        """Audit and optionally launch the V1 feature repair worker.
+
+        This check never gates or fails the LF startup path.
+        """
+        if str(self.app_config.strategy).strip().lower() != "eth_portfolio_v1":
+            return
+
+        enabled = self._project_env.get_bool(
+            "AETHER_MF_FEATURE_BACKFILL_ENABLED", False
+        )
+        if not enabled:
+            result: dict[str, Any] = {
+                "enabled": False,
+                "action": "none",
+                "reason": "mf_supervisor_disabled",
+                "mf_signal_ready": False,
+            }
+        else:
+            supervisor = self._mf_feature_backfill_supervisor
+            if supervisor is None:
+                supervisor = MfFeatureBackfillSupervisor(
+                    symbol=self.app_config.symbol,
+                    exchange=self.app_config.data_exchange.value,
+                    market_db=self._project_env.get(
+                        "AETHER_MARKET_DATA_DB",
+                        "data/market_data/aether_market_data.sqlite3",
+                    ),
+                    required_minutes=self._project_env.get_int(
+                        "AETHER_MF_FEATURE_BACKFILL_REQUIRED_MINUTES", 4320
+                    ),
+                    max_seconds_per_cycle=self._project_env.get_float(
+                        "AETHER_MF_FEATURE_BACKFILL_MAX_SECONDS_PER_CYCLE",
+                        60.0,
+                    ),
+                    raw_root=self._project_env.get(
+                        "AETHER_RANGE_BACKFILL_RAW_ROOT",
+                        "data/okx/raw/trades",
+                    ),
+                    contract_value=self._project_env.get(
+                        "AETHER_MF_FEATURE_CONTRACT_VALUE", "0.01"
+                    ),
+                    price_bucket_size=self._project_env.get(
+                        "AETHER_MF_FEATURE_PRICE_BUCKET_SIZE", "1"
+                    ),
+                    large_trade_threshold=self._project_env.get(
+                        "AETHER_MF_FEATURE_LARGE_TRADE_THRESHOLD", "10000"
+                    ),
+                )
+                self._mf_feature_backfill_supervisor = supervisor
+            try:
+                raw_result = await asyncio.to_thread(
+                    supervisor.check_and_launch
+                )
+                result = {
+                    "enabled": True,
+                    **dict(raw_result),
+                    "mf_signal_ready": False,
+                }
+            except Exception as exc:
+                result = {
+                    "enabled": True,
+                    "action": "none",
+                    "reason": "mf_supervisor_failed",
+                    "error": str(exc),
+                    "coverage_ready": False,
+                    "mf_signal_ready": False,
+                }
+                logger.warning(
+                    "MF feature supervisor failed; LF startup continues | error=%s",
+                    exc,
+                )
+
+        self._set_health(
+            self._health.phase,
+            metadata={
+                **dict(self._health.metadata),
+                "mf_supervisor": result,
+            },
+        )
+        logger.info("MF feature supervisor startup audit | result=%s", result)
 
     async def _bootstrap_account_config_if_enabled(self) -> None:
         if self.runtime_config.mode is not RuntimeMode.LIVE_RUNTIME:

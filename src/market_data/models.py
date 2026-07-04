@@ -356,12 +356,26 @@ class TradeFootprintFeature:
             raise ValueError("close_pos must be within [0, 1]")
         if self.range_pct < 0:
             raise ValueError("range_pct must be non-negative")
+        if (
+            self.fp_max_bucket_abs_delta_pressure < 0
+            or self.fp_max_bucket_abs_delta_pressure > 1
+        ):
+            raise ValueError(
+                "fp_max_bucket_abs_delta_pressure must be within [0, 1]"
+            )
         # Delta consistency
         if self.abs_delta_notional != abs(self.delta_notional):
             raise ValueError("abs_delta_notional must equal abs(delta_notional)")
         # Quality vs context_available invariant
         if self.context_available is False and self.quality == TradeFeatureQuality.COMPLETE.value:
             raise ValueError("quality cannot be COMPLETE when context_available=False")
+        if (
+            self.context_available
+            and self.quality == TradeFeatureQuality.MISSING_FOOTPRINT_CONTEXT.value
+        ):
+            raise ValueError(
+                "quality cannot be MISSING_FOOTPRINT_CONTEXT when context_available=True"
+            )
 
 
 @dataclass(frozen=True)

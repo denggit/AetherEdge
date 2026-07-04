@@ -132,6 +132,27 @@ class FixedTimeTradeBarBuilder:
         """Return pending closed bars without touching the active bucket."""
         return tuple(self._drain_pending())
 
+    def drain_completed_through(
+        self, watermark_ms: int
+    ) -> tuple[FixedTimeTradeBar, ...]:
+        """Close only buckets proven complete by an external safe watermark.
+
+        Unlike ``drain()``, this never closes a bucket whose close time is
+        newer than the supplied archive-completeness watermark.
+        """
+        result: list[FixedTimeTradeBar] = list(self._drain_pending())
+        if (
+            self._active is not None
+            and self._active.trade_count > 0
+            and self._active.close_time_ms <= int(watermark_ms)
+        ):
+            self._active.available_time_ms = max(
+                self._active.available_time_ms, self._active.close_time_ms
+            )
+            self._flush_closed(self._close_active_bar())
+            result.extend(self._drain_pending())
+        return tuple(result)
+
     def discard_active(self) -> None:
         """Drop the in-progress (active) bucket without writing it."""
         self._active = None
