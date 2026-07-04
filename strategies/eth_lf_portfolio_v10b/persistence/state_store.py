@@ -6,8 +6,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from strategies.eth_lf_portfolio_v8.domain.models import Side
-from strategies.eth_lf_portfolio_v8.domain.position_state import ExchangeLegState, V8PositionState
+from strategies.eth_lf_portfolio_v10b.domain.models import Side
+from strategies.eth_lf_portfolio_v10b.domain.position_state import ExchangeLegState, V8PositionState
 
 
 class JsonV8StateStore:

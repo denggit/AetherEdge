@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
 from src.platform.execution.rules import round_to_step
-from strategies.eth_lf_portfolio_v8.domain.models import Side
+from strategies.eth_lf_portfolio_v10b.domain.models import Side
 
 
 STRUCTURAL_STOP_SOURCE = "STRUCTURAL_STOP"

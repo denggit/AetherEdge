@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Mapping
 
-from strategies.eth_lf_portfolio_v8.domain.models import BarReadyContext, EngineSignal, Side
+from strategies.eth_lf_portfolio_v10b.domain.models import BarReadyContext, EngineSignal, Side
 
 
 @dataclass(frozen=True)

@@ -19,15 +19,15 @@ from src.order_management.models import ExchangeOrderResult
 from src.platform.snapshot import PlatformSnapshot
 from src.signals import SignalAction, TradeSignal
 from src.strategy import StrategyRecoveryContext
-from strategies.eth_lf_portfolio_v8.domain.models import BarReadyContext, Side, V8DecisionType, V8TradeDecision
+from strategies.eth_lf_portfolio_v10b.domain.models import BarReadyContext, Side, V8DecisionType, V8TradeDecision
 from strategies.eth_lf_portfolio_v10b.domain.position_state import V8PositionState
-from strategies.eth_lf_portfolio_v8.engines.bear_v3 import BearV3OnlyEngine
-from strategies.eth_lf_portfolio_v8.engines.bull_reclaim_v2 import BullReclaimV2Engine
-from strategies.eth_lf_portfolio_v8.engines.momentum_v3 import MomentumV3Engine
+from strategies.eth_lf_portfolio_v10b.engines.bear_v3 import BearV3OnlyEngine
+from strategies.eth_lf_portfolio_v10b.engines.bull_reclaim_v2 import BullReclaimV2Engine
+from strategies.eth_lf_portfolio_v10b.engines.momentum_v3 import MomentumV3Engine
 from strategies.eth_lf_portfolio_v10b.engines.router import MomentumEntryFilterConfig, PortfolioRouter
-from strategies.eth_lf_portfolio_v8.execution.signal_mapper import SignalMapperConfig, V8SignalMapper
-from strategies.eth_lf_portfolio_v8.execution.range_exit import RangeExitConfig, evaluate_range_exit
-from strategies.eth_lf_portfolio_v8.execution.sizing import RiskSizingConfig, V8RiskSizer
+from strategies.eth_lf_portfolio_v10b.execution.signal_mapper import SignalMapperConfig, V8SignalMapper
+from strategies.eth_lf_portfolio_v10b.execution.range_exit import RangeExitConfig, evaluate_range_exit
+from strategies.eth_lf_portfolio_v10b.execution.sizing import RiskSizingConfig, V8RiskSizer
 from strategies.eth_lf_portfolio_v10b.execution.stops import initial_stop_from_risk, is_better_stop, protected_stop, validate_exchange_stop
 from strategies.eth_lf_portfolio_v10b.execution.structural_stop import (
     STRUCTURAL_STOP_SOURCE,
@@ -37,9 +37,9 @@ from strategies.eth_lf_portfolio_v10b.execution.structural_stop import (
     evaluate_swing_structural_stop,
 )
 from strategies.eth_lf_portfolio_v10b.features.buffer import V8FeatureBuffer
-from strategies.eth_lf_portfolio_v8.features.feature_frame import parse_closed_kline, parse_range_aggregate
-from strategies.eth_lf_portfolio_v8.features.live_features import V8LiveFeatureBuilder
-from strategies.eth_lf_portfolio_v8.features.micro_context import MicroContextConfig, MicroContextEngine
+from strategies.eth_lf_portfolio_v10b.features.feature_frame import parse_closed_kline, parse_range_aggregate
+from strategies.eth_lf_portfolio_v10b.features.live_features import V8LiveFeatureBuilder
+from strategies.eth_lf_portfolio_v10b.features.micro_context import MicroContextConfig, MicroContextEngine
 from strategies.eth_lf_portfolio_v10b.features.range_speed import PastOnlyRangeSpeedTracker
 
 

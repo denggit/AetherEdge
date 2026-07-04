@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
-from strategies.eth_lf_portfolio_v8.domain.models import Side
+from strategies.eth_lf_portfolio_v10b.domain.models import Side
 
 
 def initial_stop_from_risk(*, side: Side, entry_price: Decimal, risk_per_coin: Decimal) -> Decimal:

@@ -6,7 +6,7 @@ from typing import Any, Mapping
 
 from src.platform.account.events import AccountEvent, AccountEventType
 from src.platform.exchanges.models import OrderSide, OrderStatus
-from strategies.eth_lf_portfolio_v8.domain.models import Side
+from strategies.eth_lf_portfolio_v10b.domain.models import Side
 
 
 @dataclass
