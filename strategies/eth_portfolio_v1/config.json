@@ -1,0 +1,98 @@
+{
+  "strategy_id": "eth_lf_portfolio_v10b_all_swing_structural_stop",
+  "strategy_version": "V10B",
+  "display_name": "ETH LF Portfolio V10B All-Swing Structural Stop",
+  "symbol": "ETH-USDT-PERP",
+  "data_exchange": "okx",
+  "execution_policy": {
+    "quantity_semantics": "base_asset",
+    "stop_price_source": "master",
+    "same_stop_price_as_master": true
+  },
+  "portfolio_router": {
+    "priority_mode": "reclaim_first",
+    "priority_order": ["BULL_RECLAIM_V2", "MOMENTUM_V3", "BEAR_V3_ONLY"],
+    "priorities": {
+      "BULL_RECLAIM_V2": 150,
+      "MOMENTUM_V3": 100,
+      "BEAR_V3_ONLY": 50
+    }
+  },
+  "runtime_requirements": {
+    "closed_kline": {
+      "enabled": true,
+      "interval": "4h",
+      "warmup_days": 365,
+      "close_buffer_ms": 5000,
+      "closed_bar_retry_interval_ms": 5000,
+      "closed_bar_missing_alert_after_ms": 120000,
+      "min_records": 2000
+    },
+    "trades": {
+      "enabled": true,
+      "stream_enabled": true
+    },
+    "range_bars": {
+      "enabled": true,
+      "range_pct": "0.002",
+      "aggregate_interval": "4h"
+    },
+    "order_book": {
+      "enabled": false
+    },
+    "account_state": {
+      "startup_snapshot_enabled": true,
+      "poll_enabled": true,
+      "poll_interval_seconds": 300,
+      "post_order_sync_enabled": true
+    },
+    "order_state": {
+      "post_submit_sync_enabled": true,
+      "poll_when_position_enabled": true,
+      "poll_interval_seconds": 20,
+      "sync_open_orders": true,
+      "sync_open_stop_orders": true,
+      "sync_position": true
+    }
+  },
+  "micro_context": {
+    "mode": "soft",
+    "min_range_bars": 5,
+    "contra_imbalance": "0.05",
+    "aligned_imbalance": "0.05",
+    "bad_close_pos": "0.35",
+    "good_close_pos": "0.65",
+    "contra_risk_scale": "0.50",
+    "not_aligned_risk_scale": "0.50"
+  },
+  "enable_momentum_long_not_aligned_block": true,
+  "enable_momentum_short_fast_speed_block": true,
+  "range_speed_rolling_window_bars": 1080,
+  "range_speed_min_periods": 100,
+  "range_speed_fast_quantile": 0.75,
+  "range_exit": {
+    "enabled": true,
+    "mode": "soft",
+    "min_mfe_r": "2.0",
+    "giveback_frac": "0.65",
+    "min_hold_bars": 2,
+    "contra_imbalance": "0.05",
+    "bad_close_pos": "0.35",
+    "require_reversal": true
+  },
+  "structural_stop": {
+    "enabled": true,
+    "engine_scope": "ALL",
+    "source": "swing",
+    "lookback_bars": 21,
+    "buffer_atr": 0.0,
+    "trigger_mfe_r": 0.0,
+    "min_hold_bars": 0,
+    "require_full_window": true,
+    "closed_bar_only": true,
+    "effective_from_next_bar": true
+  },
+  "risk": {
+    "global_risk_scale": "1.3"
+  }
+}
