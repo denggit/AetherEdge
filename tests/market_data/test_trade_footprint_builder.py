@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from src.market_data.derived import FixedTimeTradeBarBuilder, TradeFootprintBuilder
+from src.market_data.derived import (
+    FixedTimeTradeBarBuilder,
+    RangeFootprintBuilder,
+    TradeFootprintBuilder,
+)
 from src.market_data.models import TradeFootprintFeature, TradeFeatureQuality
 from src.platform.data.models import MarketTrade, TradeSide
 from src.platform.exchanges.models import ExchangeName
@@ -236,3 +240,91 @@ def test_footprint_context_unavailable_when_pressure_cannot_be_computed() -> Non
     assert closed[0].context_available is False
     assert closed[0].quality == TradeFeatureQuality.MISSING_FOOTPRINT_CONTEXT.value
     assert closed[0].fp_max_bucket_abs_delta_pressure == Decimal("0")
+
+
+# CoinBacktest portfolio selection source:
+# D:\Code_Project\CoinBacktest\backtest\portfolio\eth_portfolio_V1_lf_v10b_low_sweep_mf_backtest.py
+# CoinBacktest calculation-chain source:
+# D:\Code_Project\CoinBacktest\research\low_sweep_a_upgrade_research.py
+# attach_footprint_context + OKXRangeFootprintLoader defaults:
+# range_pct=0.0020, price_step=1.0, closed end_ts backward-asof signal_time.
+# fp_max_bucket_abs_delta_pressure maps to the identically named
+# RangeFootprintFeature field; closed end_ts maps to available_time_ms.
+def test_range_footprint_builder_matches_coinbacktest_bucket_pressure_formula() -> None:
+    builder = RangeFootprintBuilder(
+        range_pct="0.002",
+        price_step="1",
+        contract_value="0.1",
+    )
+    t0 = 1_700_000_000_000
+    trades = (
+        _trade("1000.2", t0 + 1_000, side=TradeSide.BUY, quantity="2"),
+        _trade("1000.8", t0 + 2_000, side=TradeSide.SELL, quantity="1"),
+        _trade("1001.1", t0 + 3_000, side=TradeSide.BUY, quantity="1"),
+        _trade("1002.3", t0 + 4_000, side=TradeSide.SELL, quantity="3"),
+    )
+    closed = ()
+    for trade in trades:
+        closed = builder.on_trade(trade)
+
+    assert len(closed) == 1
+    feature = closed[0]
+    bucket_1000 = (
+        Decimal("1000.2") * Decimal("2")
+        - Decimal("1000.8")
+    ) / (
+        Decimal("1000.2") * Decimal("2")
+        + Decimal("1000.8")
+    )
+    assert feature.fp_low_bucket_delta_pressure == bucket_1000
+    assert feature.fp_high_bucket_delta_pressure == Decimal("-1")
+    assert feature.fp_max_bucket_abs_delta_pressure == Decimal("1")
+    expected_total_delta = (
+        Decimal("1000.2") * Decimal("2")
+        - Decimal("1000.8")
+        + Decimal("1001.1")
+        - Decimal("1002.3") * Decimal("3")
+    )
+    expected_total = (
+        Decimal("1000.2") * Decimal("2")
+        + Decimal("1000.8")
+        + Decimal("1001.1")
+        + Decimal("1002.3") * Decimal("3")
+    )
+    assert feature.fp_delta_pressure == expected_total_delta / expected_total
+
+
+def test_range_footprint_available_time_is_not_before_range_close() -> None:
+    builder = RangeFootprintBuilder()
+    t0 = 1_700_000_000_000
+    builder.on_trade(_trade("1000", t0 + 1_000))
+    feature = builder.on_trade(_trade("1002", t0 + 2_000))[0]
+
+    assert feature.available_time_ms == feature.range_end_ms
+    assert feature.available_time_ms >= feature.range_end_ms
+
+
+def test_range_footprint_not_complete_when_active_range_incomplete() -> None:
+    builder = RangeFootprintBuilder()
+    t0 = 1_700_000_000_000
+    assert builder.on_trade(_trade("1000", t0 + 1_000)) == ()
+    assert builder.on_trade(_trade("1001", t0 + 2_000)) == ()
+    assert builder.has_active_range is True
+
+    builder.discard_active()
+    assert builder.has_active_range is False
+    assert builder.stats["features_closed"] == 0
+
+
+def test_range_footprint_context_available_only_when_pressure_computed() -> None:
+    builder = RangeFootprintBuilder()
+    t0 = 1_700_000_000_000
+    builder.on_trade(
+        _trade("1000", t0 + 1_000, side=TradeSide.UNKNOWN)
+    )
+    feature = builder.on_trade(
+        _trade("1002", t0 + 2_000, side=TradeSide.UNKNOWN)
+    )[0]
+
+    assert feature.context_available is False
+    assert feature.quality == TradeFeatureQuality.MISSING_FOOTPRINT_CONTEXT.value

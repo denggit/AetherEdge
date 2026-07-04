@@ -4,7 +4,11 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
-from src.market_data.models import FixedTimeTradeBar, TradeFootprintFeature
+from src.market_data.models import (
+    FixedTimeTradeBar,
+    RangeFootprintFeature,
+    TradeFootprintFeature,
+)
 from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
 from src.market_data.trade_features.coverage import (
     compute_backfill_target,
@@ -70,6 +74,48 @@ def _write_pair(store: SqliteTradeFeatureStore, open_time_ms: int, *,
     store.upsert_footprints_many([_make_fp(open_time_ms, quality=fp_quality, context_available=fp_context)])
 
 
+def _write_range_ready(
+    store: SqliteTradeFeatureStore,
+    available_time_ms: int,
+    *,
+    start_ms: int | None = None,
+) -> None:
+    coverage_start = _base(0) if start_ms is None else start_ms
+    available_times = [coverage_start]
+    if available_time_ms != coverage_start:
+        available_times.append(available_time_ms)
+    store.upsert_range_footprints_many(
+        [
+            RangeFootprintFeature(
+                exchange="okx",
+                symbol="ETH-USDT-PERP",
+                range_pct=Decimal("0.002"),
+                price_step=Decimal("1"),
+                range_bar_id=index,
+                range_start_ms=current_ms - 1_000,
+                range_end_ms=current_ms,
+                available_time_ms=current_ms,
+                fp_max_bucket_abs_delta_pressure=Decimal("0.8"),
+                fp_low_bucket_delta_pressure=Decimal("-0.2"),
+                fp_high_bucket_delta_pressure=Decimal("0.8"),
+                fp_delta_pressure=Decimal("0.1"),
+                bucket_count=3,
+                trade_count=9,
+            )
+            for index, current_ms in enumerate(available_times, start=1)
+        ]
+    )
+    store.mark_range_footprint_coverage(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        range_pct=Decimal("0.002"),
+        price_step=Decimal("1"),
+        start_ms=coverage_start,
+        end_ms=available_time_ms,
+        complete=True,
+    )
+
+
 def test_mf_feature_coverage_scan_no_data(tmp_path: Path) -> None:
     store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
     coverage = mf_feature_coverage_scan(
@@ -88,6 +134,7 @@ def test_mf_feature_coverage_scan_complete(tmp_path: Path) -> None:
     store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
     for i in range(5):
         _write_pair(store, _base(i))
+    _write_range_ready(store, _base(4) + _MINUTE - 1)
 
     coverage = mf_feature_coverage_scan(
         symbol="ETH-USDT-PERP",
@@ -121,6 +168,7 @@ def test_resolve_mf_readiness_always_signal_false(tmp_path: Path) -> None:
     store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
     for i in range(100):
         _write_pair(store, _base(i))
+    _write_range_ready(store, _base(99) + _MINUTE - 1)
 
     readiness = resolve_mf_readiness(
         symbol="ETH-USDT-PERP",
@@ -131,6 +179,8 @@ def test_resolve_mf_readiness_always_signal_false(tmp_path: Path) -> None:
     )
     assert readiness.mf_signal_ready is False
     assert readiness.coverage_ready is True
+    assert readiness.mf_signal_feature_ready is True
+    assert readiness.range_footprint_ready is True
 
 
 def test_resolve_mf_readiness_degraded_footprint(tmp_path: Path) -> None:
@@ -158,6 +208,8 @@ def test_audit_has_required_fields(tmp_path: Path) -> None:
     )
     audit = readiness.audit()
     for key in (
+        "tradebar_ready", "fixed_time_footprint_ready",
+        "range_footprint_ready", "mf_signal_feature_ready",
         "price_ready", "orderflow_ready", "footprint_ready",
         "coverage_ready", "mf_signal_ready", "coverage",
         "worker_running", "waiting_for_global_lock",
@@ -189,6 +241,7 @@ def test_compute_backfill_target_returns_none_when_complete(tmp_path: Path) -> N
     store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
     for i in range(5):
         _write_pair(store, _base(i))
+    _write_range_ready(store, _base(4) + _MINUTE - 1)
 
     target = compute_backfill_target(
         symbol="ETH-USDT-PERP", exchange="okx", store=store,
@@ -197,6 +250,139 @@ def test_compute_backfill_target_returns_none_when_complete(tmp_path: Path) -> N
         safe_archive_end_ms=_base(4) + _MINUTE - 1,
     )
     assert target is None
+
+
+def test_coverage_fixed_footprint_does_not_satisfy_range_footprint_ready(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
+    for i in range(3):
+        _write_pair(store, _base(i))
+
+    readiness = resolve_mf_readiness(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        store=store,
+        required_minutes=3,
+        reference_end_ms=_base(2) + _MINUTE - 1,
+    )
+
+    assert readiness.tradebar_ready is True
+    assert readiness.fixed_time_footprint_ready is True
+    assert readiness.range_footprint_ready is False
+    assert readiness.mf_signal_feature_ready is False
+
+
+def test_coverage_range_footprint_missing_blocks_mf_signal_feature_ready(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
+    for i in range(2):
+        _write_pair(store, _base(i))
+
+    coverage = mf_feature_coverage_scan(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        store=store,
+        required_minutes=2,
+        reference_end_ms=_base(1) + _MINUTE - 1,
+    )
+
+    assert coverage.available is False
+    assert coverage.extra["missing_range_footprint_count"] > 0
+    assert coverage.extra["range_footprint_ready"] is False
+
+
+def test_range_context_closed_after_window_start_cannot_seed_earlier_signals(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
+    for i in range(2):
+        _write_pair(store, _base(i))
+    _write_range_ready(
+        store,
+        _base(1) + _MINUTE - 1,
+        start_ms=_base(1) + _MINUTE - 1,
+    )
+    # Replace the helper's marker with coverage for the full two-minute
+    # window while leaving its first context unavailable until the end.
+    store.mark_range_footprint_coverage(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        range_pct=Decimal("0.002"),
+        price_step=Decimal("1"),
+        start_ms=_base(0),
+        end_ms=_base(1) + _MINUTE - 1,
+        complete=True,
+    )
+
+    readiness = resolve_mf_readiness(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        store=store,
+        required_minutes=2,
+        reference_end_ms=_base(1) + _MINUTE - 1,
+    )
+
+    assert readiness.range_footprint_ready is False
+    assert readiness.mf_signal_feature_ready is False
+    assert (
+        readiness.coverage.extra[
+            "range_footprint_context_seed_available_time_ms"
+        ]
+        is None
+    )
+
+
+def test_compute_backfill_target_recomputes_degraded_range_footprint(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
+    for i in range(2):
+        _write_pair(store, _base(i))
+    store.upsert_range_footprints_many(
+        [
+            RangeFootprintFeature(
+                exchange="okx",
+                symbol="ETH-USDT-PERP",
+                range_pct=Decimal("0.002"),
+                price_step=Decimal("1"),
+                range_bar_id=7,
+                range_start_ms=_base(0),
+                range_end_ms=_base(1) + _MINUTE - 1,
+                available_time_ms=_base(1) + _MINUTE - 1,
+                fp_max_bucket_abs_delta_pressure=Decimal("0"),
+                fp_low_bucket_delta_pressure=Decimal("0"),
+                fp_high_bucket_delta_pressure=Decimal("0"),
+                fp_delta_pressure=Decimal("0"),
+                bucket_count=0,
+                trade_count=2,
+                context_available=False,
+                quality="MISSING_FOOTPRINT_CONTEXT",
+            )
+        ]
+    )
+    store.mark_range_footprint_coverage(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        range_pct=Decimal("0.002"),
+        price_step=Decimal("1"),
+        start_ms=_base(0),
+        end_ms=_base(1) + _MINUTE - 1,
+        complete=True,
+    )
+
+    target = compute_backfill_target(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        store=store,
+        required_minutes=2,
+        max_minutes_per_cycle=2,
+        safe_archive_end_ms=_base(1) + _MINUTE - 1,
+    )
+
+    assert target is not None
+    assert target.reason == "degraded_range_footprint_recompute"
 
 
 def test_compute_backfill_target_finds_gap(tmp_path: Path) -> None:

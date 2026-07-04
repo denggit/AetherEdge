@@ -714,7 +714,6 @@ class LiveRuntimeRunner:
         logger.info("Live runtime startup phase started")
         self._initialize_rangebar_trust_window()
         self._set_health(RuntimePhase.WARMING_UP, healthy=True)
-        await self._check_mf_feature_backfill_at_startup()
         await self._bootstrap_account_config_if_enabled()
         await self._run_warmup()
         loaded_range_speed_history = await self._warmup_range_speed_history()
@@ -728,6 +727,7 @@ class LiveRuntimeRunner:
                 self._range_speed_min_periods,
                 self._range_speed_min_periods - loaded_range_speed_history,
             )
+        await self._check_mf_feature_backfill_at_startup()
         self._set_health(RuntimePhase.CATCHING_UP, healthy=True, warmup_complete=True)
         snapshots = await self._run_recovery()
         # ── State convergence: reconcile exchange truth against local state ──
@@ -793,6 +793,15 @@ class LiveRuntimeRunner:
                     ),
                     price_bucket_size=self._project_env.get(
                         "AETHER_MF_FEATURE_PRICE_BUCKET_SIZE", "1"
+                    ),
+                    range_footprint_range_pct=self._project_env.get(
+                        "AETHER_MF_RANGE_FOOTPRINT_RANGE_PCT", "0.002"
+                    ),
+                    range_footprint_price_step=self._project_env.get(
+                        "AETHER_MF_RANGE_FOOTPRINT_PRICE_STEP", "1"
+                    ),
+                    range_footprint_warmup_days=self._project_env.get_int(
+                        "AETHER_MF_RANGE_FOOTPRINT_WARMUP_DAYS", 1
                     ),
                     large_trade_threshold=self._project_env.get(
                         "AETHER_MF_FEATURE_LARGE_TRADE_THRESHOLD", "10000"

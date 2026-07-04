@@ -34,6 +34,7 @@ from src.market_data.backfill.coordinator import (  # noqa: E402
 from src.market_data.backfill.status_store import now_ms  # noqa: E402
 from src.market_data.derived import (  # noqa: E402
     FixedTimeTradeBarBuilder,
+    RangeFootprintBuilder,
     TradeFootprintBuilder,
 )
 from src.market_data.historical_trades.importer import (  # noqa: E402
@@ -47,11 +48,13 @@ from src.market_data.historical_trades.okx_archive import (  # noqa: E402
 )
 from src.market_data.models import (  # noqa: E402
     FixedTimeTradeBar,
+    RangeFootprintFeature,
     TradeFootprintFeature,
 )
 from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore  # noqa: E402
 from src.market_data.trade_features.coverage import (  # noqa: E402
     compute_backfill_target,
+    resolve_mf_readiness,
     safe_okx_archive_end_ms,
 )
 from src.platform.data.models import MarketTrade  # noqa: E402
@@ -92,6 +95,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--save-raw-trades", action="store_true", default=False)
     parser.add_argument("--contract-value", type=str, default="0.01")
     parser.add_argument("--price-bucket-size", type=str, default="1")
+    parser.add_argument("--range-footprint-range-pct", type=str, default="0.002")
+    parser.add_argument("--range-footprint-price-step", type=str, default="1")
+    parser.add_argument("--range-footprint-warmup-days", type=int, default=1)
     parser.add_argument("--large-trade-threshold", type=str, default="10000")
     return parser.parse_args(argv)
 
@@ -118,6 +124,9 @@ def run_cycle(
     contract_value: Decimal,
     large_trade_threshold: Decimal,
     price_bucket_size: Decimal = Decimal("1"),
+    range_footprint_range_pct: Decimal = Decimal("0.002"),
+    range_footprint_price_step: Decimal = Decimal("1"),
+    range_footprint_warmup_days: int = 1,
 ) -> dict:
     # -------- guard --------
     if save_raw_trades:
@@ -166,6 +175,8 @@ def run_cycle(
             max_minutes_per_cycle=max_minutes_per_cycle,
             direction=direction,
             safe_archive_end_ms=safe_archive_end,
+            range_pct=str(range_footprint_range_pct),
+            price_step=str(range_footprint_price_step),
         )
 
         if target is None:
@@ -191,8 +202,13 @@ def run_cycle(
                 "current_day_gap_unrecoverable_until_archive": True,
             }
 
-        # Collect archive dates
-        archive_dates = list(iter_okx_archive_dates_for_utc_range(start_ms, end_ms))
+        # CoinBacktest's resumed range-footprint prebuild replays one prior day
+        # so cross-day active range state is reconstructed before target rows.
+        warmup_ms = max(0, int(range_footprint_warmup_days)) * 86_400_000
+        effective_start_ms = max(0, start_ms - warmup_ms)
+        archive_dates = list(
+            iter_okx_archive_dates_for_utc_range(effective_start_ms, end_ms)
+        )
         if not archive_dates:
             return {"status": "no_archive_dates", "target_start_ms": start_ms,
                     "target_end_ms": end_ms, "reason": reason}
@@ -212,10 +228,25 @@ def run_cycle(
             contract_value=contract_value,
             price_bucket_size=price_bucket_size,
         )
+        range_fp_builder = RangeFootprintBuilder(
+            range_pct=range_footprint_range_pct,
+            price_step=range_footprint_price_step,
+            contract_value=contract_value,
+        )
+        store.delete_range_footprint_window(
+            symbol=symbol,
+            exchange=exchange,
+            range_pct=range_footprint_range_pct,
+            price_step=range_footprint_price_step,
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
 
         total_trades = 0
         total_bars = 0
         total_footprints = 0
+        total_range_footprints = 0
+        latest_range_seed: RangeFootprintFeature | None = None
         downloaded = 0
         failed_downloads: list[str] = []
         missing_raw_days: list[str] = []
@@ -262,22 +293,41 @@ def run_cycle(
                     symbol=symbol,
                     raw_symbol=raw_symbol,
                     exchange=exchange,
-                    min_valid_trade_time_ms=start_ms,
+                    min_valid_trade_time_ms=effective_start_ms,
                     max_valid_trade_time_ms=end_ms,
                 )
                 total_trades += len(trades)
 
                 batch_bars: list[FixedTimeTradeBar] = []
                 batch_fps: list[TradeFootprintFeature] = []
+                batch_range_fps: list[RangeFootprintFeature] = []
                 for trade in trades:
-                    # Feed EVERY trade to BOTH builders independently
+                    # Feed every trade to all independent derived builders.
                     closed_bars = bar_builder.on_trade(trade)
                     for bar in closed_bars:
-                        batch_bars.append(bar)
+                        if start_ms <= bar.close_time_ms <= end_ms:
+                            batch_bars.append(bar)
 
                     closed_fps = fp_builder.on_trade(trade)
                     for fp in closed_fps:
-                        batch_fps.append(fp)
+                        if start_ms <= fp.close_time_ms <= end_ms:
+                            batch_fps.append(fp)
+
+                    closed_range_fps = range_fp_builder.on_trade(trade)
+                    for range_fp in closed_range_fps:
+                        if range_fp.available_time_ms < start_ms:
+                            if (
+                                latest_range_seed is None
+                                or range_fp.available_time_ms
+                                > latest_range_seed.available_time_ms
+                            ):
+                                latest_range_seed = range_fp
+                        elif (
+                            start_ms
+                            <= range_fp.available_time_ms
+                            <= end_ms
+                        ):
+                            batch_range_fps.append(range_fp)
 
                 # Batch-write
                 if batch_bars:
@@ -286,6 +336,9 @@ def run_cycle(
                 if batch_fps:
                     store.upsert_footprints_many(batch_fps)
                     total_footprints += len(batch_fps)
+                if batch_range_fps:
+                    store.upsert_range_footprints_many(batch_range_fps)
+                    total_range_footprints += len(batch_range_fps)
 
                 if chunk_sleep_seconds > 0:
                     time.sleep(chunk_sleep_seconds)
@@ -313,15 +366,29 @@ def run_cycle(
             remaining_fps = fp_builder.drain_closed_only()
 
         if remaining_bars:
-            store.upsert_tradebars_many(list(remaining_bars))
-            total_bars += len(remaining_bars)
+            target_bars = [
+                row
+                for row in remaining_bars
+                if start_ms <= row.close_time_ms <= end_ms
+            ]
+            store.upsert_tradebars_many(target_bars)
+            total_bars += len(target_bars)
         if remaining_fps:
-            store.upsert_footprints_many(list(remaining_fps))
-            total_footprints += len(remaining_fps)
+            target_fps = [
+                row
+                for row in remaining_fps
+                if start_ms <= row.close_time_ms <= end_ms
+            ]
+            store.upsert_footprints_many(target_fps)
+            total_footprints += len(target_fps)
+        if latest_range_seed is not None:
+            store.upsert_range_footprints_many([latest_range_seed])
+            total_range_footprints += 1
 
         # Discard active to prevent accidental writes
         bar_builder.discard_active()
         fp_builder.discard_active()
+        range_fp_builder.discard_active()
 
         coordinator.heartbeat()
 
@@ -330,14 +397,44 @@ def run_cycle(
             (end_ms - start_ms + 1 + _ONE_MINUTE_MS - 1)
             // _ONE_MINUTE_MS,
         )
-        coverage_after = store.coverage_scan(
+        if can_finalize_safe_history:
+            store.mark_range_footprint_coverage(
+                symbol=symbol,
+                exchange=exchange,
+                range_pct=range_footprint_range_pct,
+                price_step=range_footprint_price_step,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                complete=True,
+            )
+        readiness_after = resolve_mf_readiness(
             symbol=symbol,
             exchange=exchange,
+            store=store,
             required_minutes=target_minutes,
-            current_day_archive_ready=False,
             reference_end_ms=end_ms,
-            safe_archive_end_ms=safe_archive_end,
+            range_pct=str(range_footprint_range_pct),
+            price_step=str(range_footprint_price_step),
         )
+        coverage_after = readiness_after.coverage
+        if coverage_after is None:
+            raise RuntimeError("feature coverage missing after worker cycle")
+        range_coverage_after = {
+            key: value
+            for key, value in dict(coverage_after.extra or {}).items()
+            if key
+            in {
+                "range_footprint_ready",
+                "range_footprint_complete_count",
+                "missing_range_footprint_count",
+                "degraded_range_footprint_count",
+                "latest_range_footprint_available_time_ms",
+                "range_footprint_context_seed_available_time_ms",
+                "range_footprint_coverage_marker_present",
+                "range_pct",
+                "price_step",
+            }
+        }
 
         # Determine status
         if current_day_gap:
@@ -362,6 +459,9 @@ def run_cycle(
             "total_trades": total_trades,
             "total_bars_written": total_bars,
             "total_footprints_written": total_footprints,
+            "tradebars_written": total_bars,
+            "fixed_footprints_written": total_footprints,
+            "range_footprints_written": total_range_footprints,
             "downloaded_files": downloaded,
             "failed_downloads": failed_downloads,
             "missing_raw_days": missing_raw_days,
@@ -379,6 +479,8 @@ def run_cycle(
                 "available": coverage_after.available,
                 "reason": coverage_after.reason,
             },
+            "range_footprint_coverage_after": range_coverage_after,
+            "mf_signal_feature_ready": readiness_after.mf_signal_feature_ready,
             "current_day_gap_unrecoverable_until_archive": current_day_gap,
             "elapsed_seconds": time.time() - cycle_start,
         }
@@ -445,6 +547,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             contract_value=Decimal(args.contract_value),
             large_trade_threshold=Decimal(args.large_trade_threshold),
             price_bucket_size=Decimal(args.price_bucket_size),
+            range_footprint_range_pct=Decimal(
+                args.range_footprint_range_pct
+            ),
+            range_footprint_price_step=Decimal(
+                args.range_footprint_price_step
+            ),
+            range_footprint_warmup_days=args.range_footprint_warmup_days,
         )
         _update_status(
             args.status_path,

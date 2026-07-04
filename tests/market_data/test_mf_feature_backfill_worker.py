@@ -68,16 +68,18 @@ class _Archive:
         return SimpleNamespace(path=Path("unused.zip"), downloaded=False)
 
 
-def test_empty_store_cycle_writes_first_closed_tradebar_and_footprint(
+def test_worker_empty_store_writes_tradebar_and_range_footprint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     safe_end = safe_okx_archive_end_ms()
     start = safe_end - 2 * _MINUTE + 1
     trades = [
+        _trade("990", start - _MINUTE, TradeSide.BUY),
+        _trade("992", start - 30_000, TradeSide.SELL),
         _trade("1000.2", start + 1_000, TradeSide.BUY),
         _trade("1000.8", start + 2_000, TradeSide.SELL),
         _trade("1001.2", start + _MINUTE + 1_000, TradeSide.BUY),
-        _trade("1001.8", start + _MINUTE + 2_000, TradeSide.SELL),
+        _trade("1002.3", start + _MINUTE + 2_000, TradeSide.SELL),
     ]
     monkeypatch.setattr(worker, "OkxHistoricalTradeArchive", _Archive)
     monkeypatch.setattr(
@@ -94,6 +96,8 @@ def test_empty_store_cycle_writes_first_closed_tradebar_and_footprint(
     assert result["target_end_ms"] <= result["safe_archive_end_ms"]
     assert result["total_bars_written"] == 2
     assert result["total_footprints_written"] == 2
+    assert result["range_footprints_written"] == 2
+    assert result["mf_signal_feature_ready"] is True
     store = SqliteTradeFeatureStore(path=tmp_path / "market.sqlite3")
     bars = store.load_range_tradebars(
         symbol="ETH-USDT-PERP",
@@ -108,6 +112,20 @@ def test_empty_store_cycle_writes_first_closed_tradebar_and_footprint(
     assert len(bars) == len(footprints) == 2
     assert all(item.context_available for item in footprints)
     assert all(item.quality == "COMPLETE" for item in footprints)
+    range_footprints = store.load_range_footprint_features(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        time_range=TimeRange(start, safe_end),
+    )
+    assert len(range_footprints) == 1
+    assert range_footprints[0].available_time_ms <= safe_end
+    assert range_footprints[0].context_available is True
+    assert (
+        result["range_footprint_coverage_after"][
+            "range_footprint_context_seed_available_time_ms"
+        ]
+        < start
+    )
     assert result["coverage_after"]["available"] is True
 
 
@@ -139,6 +157,49 @@ def test_worker_clamps_requested_current_day_target_and_reports_partial(
     assert result["reason"] == "current_day_archive_not_ready"
     assert result["target_end_ms"] == safe_end
     assert result["current_day_gap_unrecoverable_until_archive"] is True
+
+
+def test_worker_does_not_write_active_range_footprint_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    safe_end = safe_okx_archive_end_ms()
+    start = safe_end - 2 * _MINUTE + 1
+    trades = [
+        _trade("1000.2", start + 1_000, TradeSide.BUY),
+        _trade("1000.8", start + 2_000, TradeSide.SELL),
+        _trade("1001.2", start + _MINUTE + 1_000, TradeSide.BUY),
+        _trade("1001.8", start + _MINUTE + 2_000, TradeSide.SELL),
+    ]
+    monkeypatch.setattr(worker, "OkxHistoricalTradeArchive", _Archive)
+    monkeypatch.setattr(
+        worker,
+        "iter_okx_archive_dates_for_utc_range",
+        lambda *_: iter((date(2026, 7, 3),)),
+    )
+    monkeypatch.setattr(
+        worker,
+        "iter_trade_csv_chunks",
+        lambda *_args, **_kwargs: iter((object(),)),
+    )
+    monkeypatch.setattr(
+        worker, "normalize_okx_trade_chunk", lambda *_args, **_kwargs: trades
+    )
+
+    result = worker.run_cycle(**_kwargs(tmp_path))
+
+    assert result["status"] == "partial"
+    assert result["reason"] == "feature_coverage_incomplete"
+    assert result["range_footprints_written"] == 0
+    assert result["mf_signal_feature_ready"] is False
+    store = SqliteTradeFeatureStore(path=tmp_path / "market.sqlite3")
+    assert (
+        store.load_range_footprint_features(
+            symbol="ETH-USDT-PERP",
+            exchange="okx",
+            time_range=TimeRange(start, safe_end),
+        )
+        == []
+    )
 
 
 def test_live_worker_rejects_save_raw_trades(tmp_path: Path) -> None:

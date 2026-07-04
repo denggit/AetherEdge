@@ -51,8 +51,8 @@ class TradeFootprintBuilder:
         / (buy_notional + sell_notional)
 
     The feature value is the maximum pressure across all populated price
-    buckets in the minute. This is the CoinBacktest range-footprint formula,
-    applied to a fixed-time 1m aggregate.
+    buckets in the minute. This fixed-time diagnostic is not range-bar
+    context and must not satisfy range-footprint readiness.
     """
 
     _MAX_PENDING_CLOSED = 8

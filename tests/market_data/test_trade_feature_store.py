@@ -5,6 +5,7 @@ from pathlib import Path
 
 from src.market_data.models import (
     FixedTimeTradeBar,
+    RangeFootprintFeature,
     TimeRange,
     TradeFootprintFeature,
 )
@@ -96,6 +97,35 @@ def _make_fp(
         range_pct=Decimal("0.01"),
         return_pct=Decimal("0.002"),
         fp_max_bucket_abs_delta_pressure=Decimal("0"),
+        context_available=context_available,
+        quality=quality,
+    )
+
+
+def _make_range_fp(
+    *,
+    available_time_ms: int,
+    range_bar_id: int = 1,
+    quality: str = "COMPLETE",
+    context_available: bool = True,
+) -> RangeFootprintFeature:
+    return RangeFootprintFeature(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct=Decimal("0.002"),
+        price_step=Decimal("1"),
+        range_bar_id=range_bar_id,
+        range_start_ms=available_time_ms - 1_000,
+        range_end_ms=available_time_ms,
+        available_time_ms=available_time_ms,
+        fp_max_bucket_abs_delta_pressure=(
+            Decimal("0.8") if context_available else Decimal("0")
+        ),
+        fp_low_bucket_delta_pressure=Decimal("-0.2"),
+        fp_high_bucket_delta_pressure=Decimal("0.8"),
+        fp_delta_pressure=Decimal("0.1"),
+        bucket_count=3,
+        trade_count=8,
         context_available=context_available,
         quality=quality,
     )
@@ -258,6 +288,24 @@ def test_coverage_scan_available_when_all_present(tmp_path: Path) -> None:
 
     for i in range(5):
         _write_pair(store, _base(i))
+    store.upsert_range_footprints_many(
+        [
+            _make_range_fp(available_time_ms=_base(0), range_bar_id=1),
+            _make_range_fp(
+                available_time_ms=_base(4) + _MINUTE - 1,
+                range_bar_id=2,
+            ),
+        ]
+    )
+    store.mark_range_footprint_coverage(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        range_pct=Decimal("0.002"),
+        price_step=Decimal("1"),
+        start_ms=_base(0),
+        end_ms=_base(4) + _MINUTE - 1,
+        complete=True,
+    )
 
     coverage = store.coverage_scan(
         symbol="ETH-USDT-PERP",
@@ -268,6 +316,74 @@ def test_coverage_scan_available_when_all_present(tmp_path: Path) -> None:
     )
     assert coverage.available is True
     assert coverage.missing_minutes == 0
+
+
+def test_store_upsert_and_load_range_footprint_features(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
+    feature = _make_range_fp(
+        available_time_ms=_base(1) + _MINUTE - 1,
+        range_bar_id=42,
+    )
+
+    assert store.upsert_range_footprints_many([feature]) == 1
+    loaded = store.load_range_footprint_features(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        time_range=TimeRange(_base(0), _base(2) + _MINUTE - 1),
+    )
+
+    assert loaded == [feature]
+    assert (
+        store.latest_any_range_footprint_available_time_ms(
+            symbol="ETH-USDT-PERP", exchange="okx"
+        )
+        == feature.available_time_ms
+    )
+
+
+def test_coverage_degraded_range_footprint_is_not_ready(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
+    for i in range(2):
+        _write_pair(store, _base(i))
+    store.upsert_range_footprints_many(
+        [
+            _make_range_fp(
+                available_time_ms=_base(0),
+                range_bar_id=1,
+            ),
+            _make_range_fp(
+                available_time_ms=_base(1) + _MINUTE - 1,
+                range_bar_id=2,
+                quality="MISSING_FOOTPRINT_CONTEXT",
+                context_available=False,
+            )
+        ]
+    )
+    store.mark_range_footprint_coverage(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        range_pct=Decimal("0.002"),
+        price_step=Decimal("1"),
+        start_ms=_base(0),
+        end_ms=_base(1) + _MINUTE - 1,
+        complete=True,
+    )
+
+    coverage = store.coverage_scan(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        required_minutes=2,
+        reference_end_ms=_base(1) + _MINUTE - 1,
+        safe_archive_end_ms=_base(1) + _MINUTE - 1,
+    )
+
+    assert coverage.available is False
+    assert coverage.extra["range_footprint_ready"] is False
+    assert coverage.extra["degraded_range_footprint_count"] == 1
 
 
 def test_coverage_scan_detects_degraded_minutes(tmp_path: Path) -> None:

@@ -20,6 +20,10 @@ _OKX_ARCHIVE_TIMEZONE = timezone(timedelta(hours=8))
 class MfFeatureReadiness:
     """Aggregated readiness status for the trade-derived feature pipeline."""
 
+    tradebar_ready: bool = False
+    fixed_time_footprint_ready: bool = False
+    range_footprint_ready: bool = False
+    mf_signal_feature_ready: bool = False
     price_ready: bool = False
     orderflow_ready: bool = False
     footprint_ready: bool = False
@@ -34,6 +38,10 @@ class MfFeatureReadiness:
 
     def audit(self) -> Mapping[str, Any]:
         return {
+            "tradebar_ready": self.tradebar_ready,
+            "fixed_time_footprint_ready": self.fixed_time_footprint_ready,
+            "range_footprint_ready": self.range_footprint_ready,
+            "mf_signal_feature_ready": self.mf_signal_feature_ready,
             "price_ready": self.price_ready,
             "orderflow_ready": self.orderflow_ready,
             "footprint_ready": self.footprint_ready,
@@ -74,8 +82,10 @@ def mf_feature_coverage_scan(
     global_lock_path: str | None = None,
     reference_end_ms: int | None = None,
     now_ms: int | None = None,
+    range_pct: str = "0.002",
+    price_step: str = "1",
 ) -> TradeDerivedFeatureCoverage:
-    """Scan both 1m tradebar and footprint coverage at a safe archive edge."""
+    """Scan 1m and range-footprint coverage at a safe archive edge."""
     safe_end = safe_okx_archive_end_ms(now_ms)
     extra: dict[str, Any] = {
         "current_day_archive_ready": False,
@@ -93,6 +103,8 @@ def mf_feature_coverage_scan(
         current_day_archive_ready=False,
         reference_end_ms=reference_end_ms,
         safe_archive_end_ms=safe_end,
+        range_pct=range_pct,
+        price_step=price_step,
         extra=extra,
     )
 
@@ -107,6 +119,8 @@ def resolve_mf_readiness(
     global_lock_path: str | None = None,
     reference_end_ms: int | None = None,
     now_ms: int | None = None,
+    range_pct: str = "0.002",
+    price_step: str = "1",
 ) -> MfFeatureReadiness:
     """Resolve independent price, order-flow, and footprint readiness gates."""
     coverage = mf_feature_coverage_scan(
@@ -118,26 +132,38 @@ def resolve_mf_readiness(
         global_lock_path=global_lock_path,
         reference_end_ms=reference_end_ms,
         now_ms=now_ms,
+        range_pct=range_pct,
+        price_step=price_step,
     )
     extra = dict(coverage.extra or {})
     required = coverage.required_minutes
-    price_ready = (
+    tradebar_ready = (
         int(extra.get("tradebar_complete_minutes", 0)) == required
         and int(extra.get("missing_tradebar", required)) == 0
         and int(extra.get("degraded_tradebar", required)) == 0
     )
-    orderflow_ready = price_ready
-    footprint_ready = (
+    orderflow_ready = tradebar_ready
+    fixed_time_footprint_ready = (
         int(extra.get("footprint_complete_minutes", 0)) == required
         and int(extra.get("missing_footprint", required)) == 0
         and int(extra.get("degraded_footprint", required)) == 0
     )
-    coverage_ready = price_ready and orderflow_ready and footprint_ready
+    range_footprint_ready = bool(extra.get("range_footprint_ready", False))
+    mf_signal_feature_ready = tradebar_ready and range_footprint_ready
+    coverage_ready = (
+        tradebar_ready
+        and fixed_time_footprint_ready
+        and range_footprint_ready
+    )
 
     return MfFeatureReadiness(
-        price_ready=price_ready,
+        tradebar_ready=tradebar_ready,
+        fixed_time_footprint_ready=fixed_time_footprint_ready,
+        range_footprint_ready=range_footprint_ready,
+        mf_signal_feature_ready=mf_signal_feature_ready,
+        price_ready=tradebar_ready,
         orderflow_ready=orderflow_ready,
-        footprint_ready=footprint_ready,
+        footprint_ready=fixed_time_footprint_ready,
         coverage_ready=coverage_ready,
         mf_signal_ready=False,
         coverage=coverage,
@@ -164,6 +190,8 @@ def compute_backfill_target(
     direction: str = "recent-to-oldest",
     safe_archive_end_ms: int | None = None,
     now_ms: int | None = None,
+    range_pct: str = "0.002",
+    price_step: str = "1",
 ) -> TradeFeatureBackfillTarget | None:
     """Return the next recoverable safe-archive feature gap.
 
@@ -249,6 +277,8 @@ def compute_backfill_target(
         current_day_archive_ready=False,
         reference_end_ms=safe_end,
         safe_archive_end_ms=safe_end,
+        range_pct=range_pct,
+        price_step=price_step,
     )
     if coverage.available:
         return None
@@ -258,7 +288,22 @@ def compute_backfill_target(
     if incomplete is None:
         incomplete = coverage.first_missing_range
     if incomplete is None:
-        return None
+        range_start = safe_end - required * _ONE_MINUTE_MS + 1
+        range_reason = (
+            "degraded_range_footprint_recompute"
+            if int(extra.get("degraded_range_footprint_count", 0)) > 0
+            else "missing_range_footprint"
+        )
+        start_ms, end_ms = _bounded_window(
+            (range_start, safe_end),
+            max_minutes=max_minutes,
+            direction=direction,
+        )
+        return TradeFeatureBackfillTarget(
+            start_ms=start_ms,
+            end_ms=end_ms,
+            reason=range_reason,
+        )
     start_ms, end_ms = (int(incomplete[0]), int(incomplete[1]))
     return TradeFeatureBackfillTarget(
         start_ms=start_ms,

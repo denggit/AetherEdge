@@ -9,6 +9,9 @@ from src.market_data.events import MarketFeatureEvent, MarketFeatureEventType
 from src.market_data.models import FixedTimeTradeBar, TradeFootprintFeature
 from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
 from src.market_data.trade_features.coverage import resolve_mf_readiness
+from strategies.eth_portfolio_v1.domain.mf_live_policy import (
+    R007_MF_EXIT_VARIANT,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +192,10 @@ class MfDataReadiness:
             worker_status_path=self._worker_status_path,
             global_lock_path=self._global_lock_path,
         )
-        return dict(result.audit())
+        return {
+            **dict(result.audit()),
+            "exit_variant": R007_MF_EXIT_VARIANT,
+        }
 
     @property
     def mf_signal_ready(self) -> bool:

@@ -379,6 +379,69 @@ class TradeFootprintFeature:
 
 
 @dataclass(frozen=True)
+class RangeFootprintFeature:
+    """Price-bucket order flow for one closed trade-derived range bar."""
+
+    exchange: str
+    symbol: str
+    range_pct: Decimal
+    price_step: Decimal
+    range_bar_id: int
+    range_start_ms: int
+    range_end_ms: int
+    available_time_ms: int
+    fp_max_bucket_abs_delta_pressure: Decimal
+    fp_low_bucket_delta_pressure: Decimal
+    fp_high_bucket_delta_pressure: Decimal
+    fp_delta_pressure: Decimal
+    bucket_count: int = 0
+    trade_count: int = 0
+    context_available: bool = True
+    quality: str = TradeFeatureQuality.COMPLETE.value
+    source: str = "trade_derived_range_footprint"
+
+    def __post_init__(self) -> None:
+        if not self.exchange:
+            raise ValueError("exchange is required")
+        if not self.symbol:
+            raise ValueError("symbol is required")
+        if self.range_pct <= 0:
+            raise ValueError("range_pct must be positive")
+        if self.price_step <= 0:
+            raise ValueError("price_step must be positive")
+        if self.range_bar_id < 0:
+            raise ValueError("range_bar_id must be non-negative")
+        if min(self.range_start_ms, self.range_end_ms, self.available_time_ms) < 0:
+            raise ValueError("range footprint time fields must be non-negative")
+        if self.range_end_ms < self.range_start_ms:
+            raise ValueError("range_end_ms must be >= range_start_ms")
+        if self.available_time_ms < self.range_end_ms:
+            raise ValueError("available_time_ms must be >= range_end_ms")
+        if self.bucket_count < 0 or self.trade_count < 0:
+            raise ValueError("bucket_count and trade_count must be non-negative")
+        if not Decimal("0") <= self.fp_max_bucket_abs_delta_pressure <= Decimal("1"):
+            raise ValueError(
+                "fp_max_bucket_abs_delta_pressure must be within [0, 1]"
+            )
+        for name, value in (
+            ("fp_low_bucket_delta_pressure", self.fp_low_bucket_delta_pressure),
+            ("fp_high_bucket_delta_pressure", self.fp_high_bucket_delta_pressure),
+            ("fp_delta_pressure", self.fp_delta_pressure),
+        ):
+            if not Decimal("-1") <= value <= Decimal("1"):
+                raise ValueError(f"{name} must be within [-1, 1]")
+        if not self.context_available and self.quality == TradeFeatureQuality.COMPLETE.value:
+            raise ValueError("quality cannot be COMPLETE when context_available=False")
+        if (
+            self.context_available
+            and self.quality == TradeFeatureQuality.MISSING_FOOTPRINT_CONTEXT.value
+        ):
+            raise ValueError(
+                "quality cannot be MISSING_FOOTPRINT_CONTEXT when context_available=True"
+            )
+
+
+@dataclass(frozen=True)
 class TradeFeatureBackfillTarget:
     """Gap-driven backfill target computed by the coverage scanner."""
 

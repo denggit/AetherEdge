@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from decimal import Decimal
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 from src.app import AppConfig, AppContext, AsyncAlertDispatcher, NoopAlertSink
 from src.platform import ExchangeName
@@ -102,18 +102,64 @@ def _project_env(**values: str) -> ProjectEnvConfig:
 
 
 class _FakeMfSupervisor:
-    def __init__(self, *, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        error: Exception | None = None,
+        events: list[str] | None = None,
+    ) -> None:
         self.calls = 0
         self.error = error
+        self.events = events
 
     def check_and_launch(self):
         self.calls += 1
+        if self.events is not None:
+            self.events.append("mf_supervisor")
         if self.error is not None:
             raise self.error
         return {"action": "launched", "reason": "coverage_gap"}
 
 
-def test_v10b_startup_does_not_enable_mf_supervisor_by_default() -> None:
+def _stub_non_mf_startup_work(
+    runner: LiveRuntimeRunner,
+    monkeypatch,
+    *,
+    events: list[str] | None = None,
+) -> None:
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    async def _warmup():
+        if events is not None:
+            events.append("warmup")
+
+    async def _warmup_range_speed():
+        if events is not None:
+            events.append("range_speed_warmup")
+        return 0
+
+    async def _recovery():
+        return (object(),)
+
+    monkeypatch.setattr(runner, "_initialize_rangebar_trust_window", lambda: None)
+    monkeypatch.setattr(runner, "_bootstrap_account_config_if_enabled", _noop)
+    monkeypatch.setattr(runner, "_run_warmup", _warmup)
+    monkeypatch.setattr(runner, "_warmup_range_speed_history", _warmup_range_speed)
+    monkeypatch.setattr(runner, "_run_recovery", _recovery)
+    monkeypatch.setattr(runner, "_run_reconciliation", _noop)
+    monkeypatch.setattr(runner, "_call_on_start", _noop)
+    monkeypatch.setattr(runner, "_evaluate_startup_catchup_once", _noop)
+    monkeypatch.setattr(
+        runner, "_finish_range_speed_warmup_after_catchup", _noop
+    )
+    monkeypatch.setattr(
+        runner, "_start_range_speed_background_services", lambda: None
+    )
+    runner._heartbeat_service = SimpleNamespace(start=lambda **_kwargs: None)
+
+
+def test_v10b_startup_does_not_touch_mf_supervisor(monkeypatch) -> None:
     config = _app_config_for_strategy("eth_lf_portfolio_v10b")
     supervisor = _FakeMfSupervisor()
     runner = LiveRuntimeRunner(
@@ -125,16 +171,21 @@ def test_v10b_startup_does_not_enable_mf_supervisor_by_default() -> None:
             "mf_feature_backfill_supervisor": supervisor,
         },
     )
+    _stub_non_mf_startup_work(runner, monkeypatch)
 
-    asyncio.run(runner._check_mf_feature_backfill_at_startup())
+    asyncio.run(runner._startup())
 
     assert supervisor.calls == 0
     assert "mf_supervisor" not in runner._health.metadata
+    assert runner._health.phase is RuntimePhase.RUNNING
 
 
-def test_portfolio_v1_enabled_startup_calls_mf_supervisor() -> None:
+def test_portfolio_v1_startup_calls_mf_feature_supervisor_when_enabled(
+    monkeypatch,
+) -> None:
     config = _app_config_for_strategy("eth_portfolio_v1")
-    supervisor = _FakeMfSupervisor()
+    events: list[str] = []
+    supervisor = _FakeMfSupervisor(events=events)
     runner = LiveRuntimeRunner(
         app_config=config,
         app_context=_context(),
@@ -146,15 +197,20 @@ def test_portfolio_v1_enabled_startup_calls_mf_supervisor() -> None:
             "mf_feature_backfill_supervisor": supervisor,
         },
     )
+    _stub_non_mf_startup_work(runner, monkeypatch, events=events)
 
-    asyncio.run(runner._check_mf_feature_backfill_at_startup())
+    asyncio.run(runner._startup())
 
     assert supervisor.calls == 1
+    assert events == ["warmup", "range_speed_warmup", "mf_supervisor"]
     assert runner._health.metadata["mf_supervisor"]["action"] == "launched"
     assert runner._health.metadata["mf_supervisor"]["mf_signal_ready"] is False
+    assert runner._health.phase is RuntimePhase.RUNNING
 
 
-def test_portfolio_v1_disabled_startup_audits_disabled_reason() -> None:
+def test_portfolio_v1_startup_marks_mf_supervisor_disabled_when_disabled(
+    monkeypatch,
+) -> None:
     config = _app_config_for_strategy("eth_portfolio_v1")
     supervisor = _FakeMfSupervisor()
     runner = LiveRuntimeRunner(
@@ -166,17 +222,19 @@ def test_portfolio_v1_disabled_startup_audits_disabled_reason() -> None:
             "mf_feature_backfill_supervisor": supervisor,
         },
     )
+    _stub_non_mf_startup_work(runner, monkeypatch)
 
-    asyncio.run(runner._check_mf_feature_backfill_at_startup())
+    asyncio.run(runner._startup())
 
     assert supervisor.calls == 0
     assert (
         runner._health.metadata["mf_supervisor"]["reason"]
         == "mf_supervisor_disabled"
     )
+    assert runner._health.phase is RuntimePhase.RUNNING
 
 
-def test_portfolio_v1_supervisor_failure_does_not_abort_startup() -> None:
+def test_mf_supervisor_exception_does_not_fail_startup(monkeypatch) -> None:
     config = _app_config_for_strategy("eth_portfolio_v1")
     supervisor = _FakeMfSupervisor(error=RuntimeError("boom"))
     runner = LiveRuntimeRunner(
@@ -190,13 +248,16 @@ def test_portfolio_v1_supervisor_failure_does_not_abort_startup() -> None:
             "mf_feature_backfill_supervisor": supervisor,
         },
     )
+    _stub_non_mf_startup_work(runner, monkeypatch)
 
-    asyncio.run(runner._check_mf_feature_backfill_at_startup())
+    asyncio.run(runner._startup())
 
     audit = runner._health.metadata["mf_supervisor"]
     assert supervisor.calls == 1
     assert audit["reason"] == "mf_supervisor_failed"
     assert audit["coverage_ready"] is False
+    assert audit["mf_signal_ready"] is False
+    assert runner._health.phase is RuntimePhase.RUNNING
 
 
 def test_live_runtime_runner_exposes_health_without_replacing_app_runner_path():

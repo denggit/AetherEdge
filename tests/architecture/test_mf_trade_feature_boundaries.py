@@ -11,6 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 PUBLIC_MF_SOURCES = (
     PROJECT_ROOT / "src" / "market_data" / "derived" / "fixed_time_trade_bar_builder.py",
     PROJECT_ROOT / "src" / "market_data" / "derived" / "trade_footprint_builder.py",
+    PROJECT_ROOT / "src" / "market_data" / "derived" / "range_footprint_builder.py",
     PROJECT_ROOT / "src" / "market_data" / "storage" / "trade_feature_store.py",
     PROJECT_ROOT / "src" / "market_data" / "trade_features" / "coverage.py",
     PROJECT_ROOT / "src" / "market_data" / "backfill" / "coordinator.py",
@@ -84,6 +85,7 @@ def test_bar_builder_has_no_runtime_or_strategy_imports() -> None:
     for builder_path in (
         PROJECT_ROOT / "src" / "market_data" / "derived" / "fixed_time_trade_bar_builder.py",
         PROJECT_ROOT / "src" / "market_data" / "derived" / "trade_footprint_builder.py",
+        PROJECT_ROOT / "src" / "market_data" / "derived" / "range_footprint_builder.py",
     ):
         imports = _imports(builder_path)
         assert not any(m.startswith("src.runtime") for m in imports), \
@@ -203,3 +205,19 @@ def test_trade_footprint_feature_has_required_fields() -> None:
     }
     missing = required - fields
     assert not missing, f"TradeFootprintFeature missing fields: {missing}"
+
+
+def test_range_footprint_feature_has_required_fields() -> None:
+    from src.market_data.models import RangeFootprintFeature
+    import dataclasses
+
+    fields = {f.name for f in dataclasses.fields(RangeFootprintFeature)}
+    required = {
+        "exchange", "symbol", "range_pct", "price_step", "range_bar_id",
+        "range_start_ms", "range_end_ms", "available_time_ms",
+        "fp_max_bucket_abs_delta_pressure",
+        "fp_low_bucket_delta_pressure", "fp_high_bucket_delta_pressure",
+        "fp_delta_pressure", "context_available", "quality", "source",
+    }
+    missing = required - fields
+    assert not missing, f"RangeFootprintFeature missing fields: {missing}"

@@ -5,7 +5,7 @@ import time
 from decimal import Decimal
 from pathlib import Path
 
-from src.market_data.models import FixedTimeTradeBar
+from src.market_data.models import FixedTimeTradeBar, RangeFootprintFeature
 from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
 from src.market_data.trade_features.coverage import safe_okx_archive_end_ms
 from src.runtime.mf_feature_backfill_supervisor import MfFeatureBackfillSupervisor
@@ -66,6 +66,43 @@ def _write_pair(store: SqliteTradeFeatureStore, open_time_ms: int) -> None:
     store.upsert_footprints_many([_make_fp(open_time_ms)])
 
 
+def _write_range_footprint(
+    store: SqliteTradeFeatureStore,
+    *,
+    start_time_ms: int,
+    end_time_ms: int,
+) -> None:
+    store.upsert_range_footprints_many(
+        [
+            RangeFootprintFeature(
+                exchange="okx",
+                symbol="ETH-USDT-PERP",
+                range_pct=Decimal("0.002"),
+                price_step=Decimal("1"),
+                range_bar_id=1,
+                range_start_ms=max(0, start_time_ms - 1_000),
+                range_end_ms=start_time_ms,
+                available_time_ms=start_time_ms,
+                fp_max_bucket_abs_delta_pressure=Decimal("0.5"),
+                fp_low_bucket_delta_pressure=Decimal("-0.25"),
+                fp_high_bucket_delta_pressure=Decimal("0.5"),
+                fp_delta_pressure=Decimal("0.1"),
+                bucket_count=2,
+                trade_count=4,
+            )
+        ]
+    )
+    store.mark_range_footprint_coverage(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        range_pct=Decimal("0.002"),
+        price_step=Decimal("1"),
+        start_ms=start_time_ms,
+        end_ms=end_time_ms,
+        complete=True,
+    )
+
+
 def test_supervisor_scan_coverage_returns_dict(tmp_path: Path) -> None:
     db_path = tmp_path / "test.sqlite3"
     status_path = tmp_path / "status.json"
@@ -109,6 +146,11 @@ def test_supervisor_check_and_launch_when_coverage_complete(tmp_path: Path) -> N
     base = safe_okx_archive_end_ms() - 10 * _MINUTE + 1
     for i in range(10):
         _write_pair(store, base + i * 60_000)
+    _write_range_footprint(
+        store,
+        start_time_ms=base,
+        end_time_ms=base + 10 * _MINUTE - 1,
+    )
 
     supervisor = MfFeatureBackfillSupervisor(
         symbol="ETH-USDT-PERP",

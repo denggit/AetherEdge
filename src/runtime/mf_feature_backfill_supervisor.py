@@ -33,7 +33,7 @@ class _SupervisorState:
 
 
 class MfFeatureBackfillSupervisor:
-    """Supervisor that ensures 1m trade-derived features are backfilled.
+    """Supervisor that ensures MF trade-derived features are backfilled.
 
     Scans feature coverage on startup and periodically. When gaps are found
     and no worker is already running, launches the backfill worker as a
@@ -62,6 +62,9 @@ class MfFeatureBackfillSupervisor:
         raw_root: str = "data/okx/raw/trades",
         contract_value: str = "0.01",
         price_bucket_size: str = "1",
+        range_footprint_range_pct: str = "0.002",
+        range_footprint_price_step: str = "1",
+        range_footprint_warmup_days: int = 1,
         large_trade_threshold: str = "10000",
     ) -> None:
         self.symbol = symbol
@@ -81,6 +84,11 @@ class MfFeatureBackfillSupervisor:
         self.raw_root = raw_root
         self.contract_value = contract_value
         self.price_bucket_size = price_bucket_size
+        self.range_footprint_range_pct = range_footprint_range_pct
+        self.range_footprint_price_step = range_footprint_price_step
+        self.range_footprint_warmup_days = max(
+            0, int(range_footprint_warmup_days)
+        )
         self.large_trade_threshold = large_trade_threshold
 
         self._state = _SupervisorState()
@@ -105,6 +113,8 @@ class MfFeatureBackfillSupervisor:
             required_minutes=self.required_minutes,
             worker_status_path=str(self.status_path),
             global_lock_path=str(self.global_lock_path),
+            range_pct=self.range_footprint_range_pct,
+            price_step=self.range_footprint_price_step,
         )
         return dict(readiness.audit())
 
@@ -186,6 +196,12 @@ class MfFeatureBackfillSupervisor:
             "--max-seconds-per-cycle", str(self.max_seconds_per_cycle),
             "--contract-value", str(self.contract_value),
             "--price-bucket-size", str(self.price_bucket_size),
+            "--range-footprint-range-pct",
+            str(self.range_footprint_range_pct),
+            "--range-footprint-price-step",
+            str(self.range_footprint_price_step),
+            "--range-footprint-warmup-days",
+            str(self.range_footprint_warmup_days),
             "--large-trade-threshold", str(self.large_trade_threshold),
             "--log-file", str(self.worker_log_path),
         ]
