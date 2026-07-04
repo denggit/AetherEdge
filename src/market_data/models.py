@@ -254,6 +254,38 @@ class FixedTimeTradeBar:
             raise ValueError("close_time_ms must be >= open_time_ms")
         if self.trade_count < 0:
             raise ValueError("trade_count must be non-negative")
+        # OHLCV validation
+        if self.open <= 0 or self.high <= 0 or self.low <= 0 or self.close <= 0:
+            raise ValueError("OHLC must be positive")
+        if self.high < self.low:
+            raise ValueError("high must be >= low")
+        if self.open < self.low or self.open > self.high:
+            raise ValueError("open must be within [low, high]")
+        if self.close < self.low or self.close > self.high:
+            raise ValueError("close must be within [low, high]")
+        # Volume / notional
+        if self.volume < 0:
+            raise ValueError("volume must be non-negative")
+        if self.buy_volume < 0 or self.sell_volume < 0:
+            raise ValueError("buy/sell volume must be non-negative")
+        if self.buy_notional < 0 or self.sell_notional < 0:
+            raise ValueError("buy/sell notional must be non-negative")
+        if self.large_buy_notional < 0 or self.large_sell_notional < 0:
+            raise ValueError("large notional must be non-negative")
+        if self.large_trade_count < 0:
+            raise ValueError("large_trade_count must be non-negative")
+        if self.large_trade_share < 0 or self.large_trade_share > 1:
+            raise ValueError("large_trade_share must be within [0, 1]")
+        # Delta consistency (allow small float tolerance for Decimal)
+        _delta_vol = self.buy_volume - self.sell_volume
+        _delta_not = self.buy_notional - self.sell_notional
+        _abs_delta = abs(_delta_not)
+        if self.delta_volume != _delta_vol:
+            raise ValueError(f"delta_volume {self.delta_volume} != buy_vol - sell_vol {_delta_vol}")
+        if self.delta_notional != _delta_not:
+            raise ValueError(f"delta_notional {self.delta_notional} != buy_not - sell_not {_delta_not}")
+        if self.abs_delta_notional != _abs_delta:
+            raise ValueError(f"abs_delta_notional {self.abs_delta_notional} != abs(delta_notional) {_abs_delta}")
 
     @property
     def notional(self) -> Decimal:
@@ -317,6 +349,35 @@ class TradeFootprintFeature:
             raise ValueError("available_time_ms must be >= close_time_ms")
         if self.close_time_ms < self.open_time_ms:
             raise ValueError("close_time_ms must be >= open_time_ms")
+        # Range checks
+        if self.taker_buy_ratio < 0 or self.taker_buy_ratio > 1:
+            raise ValueError("taker_buy_ratio must be within [0, 1]")
+        if self.close_pos < 0 or self.close_pos > 1:
+            raise ValueError("close_pos must be within [0, 1]")
+        if self.range_pct < 0:
+            raise ValueError("range_pct must be non-negative")
+        # Delta consistency
+        if self.abs_delta_notional != abs(self.delta_notional):
+            raise ValueError("abs_delta_notional must equal abs(delta_notional)")
+        # Quality vs context_available invariant
+        if self.context_available is False and self.quality == TradeFeatureQuality.COMPLETE.value:
+            raise ValueError("quality cannot be COMPLETE when context_available=False")
+
+
+@dataclass(frozen=True)
+class TradeFeatureBackfillTarget:
+    """Gap-driven backfill target computed by the coverage scanner."""
+
+    start_ms: int
+    end_ms: int
+    reason: str = "missing"
+    archive_dates: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.start_ms < 0 or self.end_ms < 0:
+            raise ValueError("target timestamps must be non-negative")
+        if self.end_ms < self.start_ms:
+            raise ValueError("end_ms must be >= start_ms")
 
 
 @dataclass(frozen=True)

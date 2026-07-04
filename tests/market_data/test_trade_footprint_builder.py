@@ -155,13 +155,13 @@ def test_footprint_close_pos_is_valid() -> None:
     builder = TradeFootprintBuilder()
     t0 = 1_700_000_000_000
 
-    # With bar context
-    builder.on_trade(_trade("1000", t0 + 1_000), trade_bar_open=Decimal("1000"),
-                     trade_bar_high=Decimal("1020"), trade_bar_low=Decimal("990"),
-                     trade_bar_close=Decimal("1015"))
-    closed = builder.on_trade(_trade("1010", t0 + 60_001), trade_bar_open=Decimal("1000"),
-                              trade_bar_high=Decimal("1020"), trade_bar_low=Decimal("990"),
-                              trade_bar_close=Decimal("1015"))
+    # The footprint builder now tracks OHLCV internally from trades
+    builder.on_trade(_trade("1000", t0 + 1_000))
+    builder.on_trade(_trade("1020", t0 + 2_000))
+    builder.on_trade(_trade("990", t0 + 3_000))
+    builder.on_trade(_trade("1015", t0 + 4_000))
+
+    closed = builder.on_trade(_trade("1010", t0 + 60_001))
 
     assert len(closed) == 1
     f = closed[0]
@@ -169,7 +169,8 @@ def test_footprint_close_pos_is_valid() -> None:
     assert f.range_pct >= Decimal("0")
 
 
-def test_footprint_context_available_is_true_for_normal_data() -> None:
+def test_footprint_context_available_is_false_in_r007() -> None:
+    """R007 cannot compute fp_max_bucket_abs_delta_pressure, so context is unavailable."""
     builder = TradeFootprintBuilder()
     t0 = 1_700_000_000_000
 
@@ -177,5 +178,6 @@ def test_footprint_context_available_is_true_for_normal_data() -> None:
     closed = builder.on_trade(_trade("1001", t0 + 60_001))
 
     assert len(closed) == 1
-    assert closed[0].context_available is True
-    assert closed[0].quality == TradeFeatureQuality.COMPLETE.value
+    assert closed[0].context_available is False
+    assert closed[0].quality == TradeFeatureQuality.MISSING_FOOTPRINT_CONTEXT.value
+    assert closed[0].fp_max_bucket_abs_delta_pressure == Decimal("0")

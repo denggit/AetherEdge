@@ -1,8 +1,8 @@
 """MF feature backfill worker tool.
 
-Reads raw trades from OKX daily zip archives, normalizes trades, feeds them
-into FixedTimeTradeBarBuilder + TradeFootprintBuilder, and writes closed 1m
-features to SQLite.
+Reads raw trades from OKX daily zip archives, normalizes trades, feeds EVERY
+trade into FixedTimeTradeBarBuilder AND TradeFootprintBuilder independently,
+and writes both closed 1m tradebars and footprints to SQLite.
 
 Usage:
   python tools/mf_feature_backfill_worker.py --once --symbol ETH-USDT-PERP
@@ -16,15 +16,13 @@ import logging
 import os
 import sys
 import time
-from datetime import UTC, date, datetime, timedelta
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Sequence
 
 # ---------------------------------------------------------------------------
-# Repo-root bootstrap: ensure `src` is on sys.path when the tool is invoked
-# directly (e.g. ``python tools/mf_feature_backfill_worker.py``) or via a
-# supervisor subprocess.
+# Repo-root bootstrap
 # ---------------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -34,6 +32,7 @@ from src.market_data.backfill.coordinator import (  # noqa: E402
     MF_FEATURE_BACKFILL_PRIORITY,
     RawTradeBackfillCoordinator,
 )
+from src.market_data.backfill.status_store import now_ms  # noqa: E402
 from src.market_data.derived import (  # noqa: E402
     FixedTimeTradeBarBuilder,
     TradeFootprintBuilder,
@@ -47,9 +46,12 @@ from src.market_data.historical_trades.okx_archive import (  # noqa: E402
     iter_okx_archive_dates_for_utc_range,
     okx_raw_symbol_from_canonical,
 )
-from src.market_data.models import FixedTimeTradeBar  # noqa: E402
+from src.market_data.models import (  # noqa: E402
+    FixedTimeTradeBar,
+    TradeFootprintFeature,
+)
 from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore  # noqa: E402
-from src.market_data.backfill.status_store import now_ms  # noqa: E402
+from src.market_data.trade_features.coverage import compute_backfill_target  # noqa: E402
 from src.platform.data.models import MarketTrade  # noqa: E402
 from src.platform.exchanges.models import ExchangeName  # noqa: E402
 
@@ -60,17 +62,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MF 1m trade-derived feature backfill worker")
     # Mode
     parser.add_argument("--once", action="store_true", help="Run one cycle and exit")
-    parser.add_argument("--mode", choices=("live", "prebuild"), default="prebuild",
-                        help="Backfill mode (live/prebuild)")
+    parser.add_argument("--mode", choices=("live", "prebuild"), default="prebuild")
     parser.add_argument("--direction", choices=("recent-to-oldest", "oldest-to-recent"),
-                        default="recent-to-oldest", help="Direction to process")
+                        default="recent-to-oldest")
     # Limits
     parser.add_argument("--max-minutes-per-cycle", type=int, default=1440)
     parser.add_argument("--max-days-per-cycle", type=int, default=1)
     parser.add_argument("--max-trades-per-cycle", type=int, default=500_000)
     parser.add_argument("--max-seconds-per-cycle", type=float, default=60.0)
     parser.add_argument("--chunk-sleep-seconds", type=float, default=0.0)
-    # Symbol / exchange
+    # Symbol
     parser.add_argument("--symbol", default="ETH-USDT-PERP")
     parser.add_argument("--exchange", default="okx")
     # Paths
@@ -78,12 +79,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--market-db", default="data/market_data/aether_market_data.sqlite3")
     parser.add_argument("--status-path", default="data/state/mf_feature_backfill_status.json")
     parser.add_argument("--lock-path", default="data/state/mf_feature_backfill.lock")
+    parser.add_argument("--global-lock-path",
+                        default="data/state/raw_trade_backfill_global.lock")
+    parser.add_argument("--global-status-path",
+                        default="data/state/raw_trade_backfill_global_status.json")
     parser.add_argument("--log-file", default=None)
     # Flags
     parser.add_argument("--no-download", action="store_true")
-    parser.add_argument("--low-priority", action="store_true")
-    parser.add_argument("--save-raw-trades", action="store_true", default=False,
-                        help="(Forbidden in live mode; must be False for MF)")
+    parser.add_argument("--save-raw-trades", action="store_true", default=False)
     parser.add_argument("--contract-value", type=str, default="0.01")
     parser.add_argument("--large-trade-threshold", type=str, default="10000")
     return parser.parse_args(argv)
@@ -97,6 +100,8 @@ def run_cycle(
     raw_root: str,
     status_path: str,
     lock_path: str,
+    global_lock_path: str,
+    global_status_path: str,
     mode: str,
     direction: str,
     max_minutes_per_cycle: int,
@@ -109,23 +114,23 @@ def run_cycle(
     contract_value: Decimal,
     large_trade_threshold: Decimal,
 ) -> dict:
-    # -------- guard: no raw-trade persistence --------
+    # -------- guard --------
     if save_raw_trades:
         if mode == "live":
             raise ValueError("--save-raw-trades is forbidden in live mode")
-        logger.warning("save_raw_trades=True is NOT recommended for MF feature backfill")
+        logger.warning("save_raw_trades=True is NOT recommended")
 
     cycle_start = time.time()
     store = SqliteTradeFeatureStore(path=market_db)
     raw_symbol = okx_raw_symbol_from_canonical(symbol)
 
-    # -------- global coordinator --------
+    # -------- global raw-trade coordinator --------
     coordinator = RawTradeBackfillCoordinator(
-        lock_path=lock_path,
-        status_path=status_path,
+        lock_path=global_lock_path,
+        status_path=global_status_path,
     )
     acquired = coordinator.try_acquire(
-        owner=f"mf_feature_backfill:{symbol}",
+        owner="mf_feature_backfill",
         priority=MF_FEATURE_BACKFILL_PRIORITY,
         symbol=symbol,
         raw_days=max_days_per_cycle,
@@ -134,24 +139,27 @@ def run_cycle(
         return {"status": "skipped", "reason": "global_lock_not_acquired"}
 
     try:
-        # -------- determine range --------
-        latest = store.latest_complete_close_time_ms(symbol=symbol, exchange=exchange)
-        end_ms = int(time.time() * 1000)
+        # -------- gap-driven target --------
+        target = compute_backfill_target(
+            symbol=symbol,
+            exchange=exchange,
+            store=store,
+            max_minutes_per_cycle=max_minutes_per_cycle,
+            direction=direction,
+        )
 
-        if latest is not None and direction == "recent-to-oldest":
-            start_ms = latest - (max_minutes_per_cycle * 60_000)
-        elif latest is None:
-            start_ms = end_ms - (max_days_per_cycle * 24 * 60 * 60_000)
-        else:
-            start_ms = latest + 60_000
+        if target is None:
+            return {"status": "up_to_date", "reason": "no_gap_found"}
 
-        if end_ms <= start_ms:
-            return {"status": "up_to_date", "latest_complete_close_time_ms": latest}
+        start_ms = target.start_ms
+        end_ms = target.end_ms
+        reason = target.reason
 
-        # -------- collect archive dates --------
+        # Collect archive dates
         archive_dates = list(iter_okx_archive_dates_for_utc_range(start_ms, end_ms))
         if not archive_dates:
-            return {"status": "no_archive_dates"}
+            return {"status": "no_archive_dates", "target_start_ms": start_ms,
+                    "target_end_ms": end_ms, "reason": reason}
 
         archive = OkxHistoricalTradeArchive(
             root=Path(raw_root),
@@ -159,43 +167,75 @@ def run_cycle(
             retries=3,
         )
 
-        # -------- builders --------
+        # -------- builders with same contract_value --------
         bar_builder = FixedTimeTradeBarBuilder(
             contract_value=contract_value,
             large_trade_threshold_notional=large_trade_threshold,
         )
-        fp_builder = TradeFootprintBuilder()
+        fp_builder = TradeFootprintBuilder(contract_value=contract_value)
 
         total_trades = 0
         total_bars = 0
+        total_footprints = 0
         downloaded = 0
         failed_downloads: list[str] = []
+        missing_raw_days: list[str] = []
+        safe_end_ms: int | None = None
+
+        # Identify current-day boundary for conservative handling
+        current_okx_day = _current_okx_day_utc8()
 
         for day in archive_dates:
-            if cycle_start > 0 and (time.time() - cycle_start) > max_seconds_per_cycle:
-                logger.info("Cycle time limit reached after %s seconds", max_seconds_per_cycle)
+            elapsed = time.time() - cycle_start
+            if elapsed > max_seconds_per_cycle:
+                logger.info("Cycle time limit reached")
                 break
             if total_trades >= max_trades_per_cycle:
-                logger.info("Trade limit reached: %s", max_trades_per_cycle)
+                logger.info("Trade limit reached")
                 break
 
-            try:
-                hf = archive.ensure_daily_file(
-                    symbol=symbol,
-                    raw_symbol=raw_symbol,
-                    day=day,
-                    allow_download=not no_download,
-                )
-                if hf.downloaded:
-                    downloaded += 1
-            except Exception as exc:
-                logger.warning("Failed to get archive for %s: %s", day, exc)
-                failed_downloads.append(day.isoformat())
-                continue
+            # Current-day guard: don't pretend archive is ready
+            if str(day) >= current_okx_day.isoformat():
+                if no_download:
+                    missing_raw_days.append(day.isoformat())
+                    continue
+                # Attempt download but track failure explicitly
+                try:
+                    hf = archive.ensure_daily_file(
+                        symbol=symbol,
+                        raw_symbol=raw_symbol,
+                        day=day,
+                        allow_download=True,
+                    )
+                    if hf.downloaded:
+                        downloaded += 1
+                except Exception as exc:
+                    failed_downloads.append(day.isoformat())
+                    logger.warning("Current-day archive not available: %s (%s)", day, exc)
+                    continue
+            else:
+                try:
+                    hf = archive.ensure_daily_file(
+                        symbol=symbol,
+                        raw_symbol=raw_symbol,
+                        day=day,
+                        allow_download=not no_download,
+                    )
+                    if hf.downloaded:
+                        downloaded += 1
+                except Exception as exc:
+                    logger.warning("Failed to get archive for %s: %s", day, exc)
+                    failed_downloads.append(day.isoformat())
+                    missing_raw_days.append(day.isoformat())
+                    continue
 
+            # Process chunks
             for chunk in iter_trade_csv_chunks(hf.path, chunksize=50_000):
                 if total_trades >= max_trades_per_cycle:
                     break
+                if (time.time() - cycle_start) > max_seconds_per_cycle:
+                    break
+
                 trades = normalize_okx_trade_chunk(
                     chunk,
                     symbol=symbol,
@@ -206,46 +246,76 @@ def run_cycle(
                 )
                 total_trades += len(trades)
 
-                batch_closed: list[FixedTimeTradeBar] = []
+                batch_bars: list[FixedTimeTradeBar] = []
+                batch_fps: list[TradeFootprintFeature] = []
                 for trade in trades:
-                    # Feed both builders
+                    # Feed EVERY trade to BOTH builders independently
                     closed_bars = bar_builder.on_trade(trade)
-                    if closed_bars:
-                        batch_closed.extend(closed_bars)
-
-                    # Feed footprint builder with bar context
                     for bar in closed_bars:
-                        fp_builder.on_trade(
-                            trade,
-                            trade_bar_open=bar.open,
-                            trade_bar_high=bar.high,
-                            trade_bar_low=bar.low,
-                            trade_bar_close=bar.close,
-                        )
+                        batch_bars.append(bar)
 
-                # Batch-write closed bars
-                if batch_closed:
-                    store.upsert_many(batch_closed)
-                    total_bars += len(batch_closed)
+                    closed_fps = fp_builder.on_trade(trade)
+                    for fp in closed_fps:
+                        batch_fps.append(fp)
+
+                # Batch-write
+                if batch_bars:
+                    store.upsert_tradebars_many(batch_bars)
+                    total_bars += len(batch_bars)
+                if batch_fps:
+                    store.upsert_footprints_many(batch_fps)
+                    total_footprints += len(batch_fps)
 
                 if chunk_sleep_seconds > 0:
                     time.sleep(chunk_sleep_seconds)
 
-        # Drain remaining
-        remaining_bars = bar_builder.drain()
-        if remaining_bars:
-            store.upsert_many(list(remaining_bars))
-            total_bars += len(remaining_bars)
+            # Track safe end after processing each day
+            safe_end_ms = end_ms
 
-        # Update heartbeat
+        # -------- Drain ONLY closed bars (never active) --------
+        remaining_bars = bar_builder.drain_closed_only()
+        remaining_fps = fp_builder.drain_closed_only()
+
+        if remaining_bars:
+            store.upsert_tradebars_many(list(remaining_bars))
+            total_bars += len(remaining_bars)
+        if remaining_fps:
+            store.upsert_footprints_many(list(remaining_fps))
+            total_footprints += len(remaining_fps)
+
+        # Discard active to prevent accidental writes
+        bar_builder.discard_active()
+        fp_builder.discard_active()
+
         coordinator.heartbeat()
 
+        # Determine status
+        has_current_day_gap = _current_okx_day_utc8().isoformat() in [
+            d.isoformat() for d in archive_dates
+        ] if archive_dates else False
+
+        if failed_downloads and has_current_day_gap:
+            actual_status = "partial"
+            status_reason = "current_day_archive_not_ready"
+        elif failed_downloads:
+            actual_status = "partial"
+            status_reason = "download_failures"
+        else:
+            actual_status = "ok"
+            status_reason = "cycle_complete"
+
         return {
-            "status": "ok",
+            "status": actual_status,
+            "reason": status_reason,
             "total_trades": total_trades,
             "total_bars_written": total_bars,
+            "total_footprints_written": total_footprints,
             "downloaded_files": downloaded,
             "failed_downloads": failed_downloads,
+            "missing_raw_days": missing_raw_days,
+            "target_start_ms": start_ms,
+            "target_end_ms": end_ms,
+            "safe_end_ms": safe_end_ms,
             "elapsed_seconds": time.time() - cycle_start,
         }
 
@@ -253,10 +323,10 @@ def run_cycle(
         coordinator.release()
 
 
-def _update_status(status_path: str, **kwargs) -> None:
+def _update_status(status_path: str, **kwargs: object) -> None:
     path = Path(status_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
+    payload: dict[str, object] = {
         "version": 1,
         "pid": os.getpid(),
         "worker_heartbeat_ms": now_ms(),
@@ -266,6 +336,13 @@ def _update_status(status_path: str, **kwargs) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp, path)
+
+
+def _current_okx_day_utc8() -> date:
+    from datetime import UTC, datetime, timedelta
+    utc_now = datetime.now(UTC)
+    cst_now = utc_now + timedelta(hours=8)
+    return cst_now.date()
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -297,6 +374,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             raw_root=args.raw_root,
             status_path=args.status_path,
             lock_path=args.lock_path,
+            global_lock_path=args.global_lock_path,
+            global_status_path=args.global_status_path,
             mode=args.mode,
             direction=args.direction,
             max_minutes_per_cycle=args.max_minutes_per_cycle,

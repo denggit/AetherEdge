@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Mapping
 
-from src.market_data.models import TradeDerivedFeatureCoverage
+from src.market_data.models import (
+    TradeDerivedFeatureCoverage,
+    TradeFeatureBackfillTarget,
+)
 from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
+
+_ONE_MINUTE_MS = 60_000
 
 
 @dataclass(frozen=True)
@@ -27,7 +32,7 @@ class MfFeatureReadiness:
     current_day_archive_not_ready: bool = False
 
     def audit(self) -> Mapping[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "price_ready": self.price_ready,
             "orderflow_ready": self.orderflow_ready,
             "footprint_ready": self.footprint_ready,
@@ -39,7 +44,12 @@ class MfFeatureReadiness:
             "degraded_footprint": self.degraded_footprint,
             "current_day_archive_not_ready": self.current_day_archive_not_ready,
         }
+        return result
 
+
+# ---------------------------------------------------------------------------
+# Coverage scan
+# ---------------------------------------------------------------------------
 
 def mf_feature_coverage_scan(
     *,
@@ -52,9 +62,10 @@ def mf_feature_coverage_scan(
 ) -> TradeDerivedFeatureCoverage:
     """Scan 1m trade-derived feature coverage from SQLite.
 
-    Does NOT scan raw zip archives. Only reads the feature store.
+    Checks BOTH tradebar_1m_features AND trade_footprint_1m_features.
+    Uses conservative current-day archive readiness.
     """
-    current_day_ready = _current_day_archive_ready()
+    current_day_ready = _resolve_current_day_archive_ready(symbol=symbol)
     extra: dict[str, Any] = {"current_day_archive_ready": current_day_ready}
 
     if worker_status_path:
@@ -107,30 +118,92 @@ def resolve_mf_readiness(
         orderflow_ready=orderflow_ready,
         footprint_ready=footprint_ready,
         coverage_ready=coverage_ready,
-        mf_signal_ready=False,  # R007: NEVER True
+        mf_signal_ready=False,
         coverage=coverage,
         worker_running=worker_running,
         waiting_for_global_lock=waiting_for_global_lock,
         degraded_footprint=degraded_fp,
         current_day_archive_not_ready=not (
-            coverage.extra.get("current_day_archive_ready", True)
-            if coverage.extra
-            else True
+            (coverage.extra or {}).get("current_day_archive_ready", False)
         ),
     )
 
 
-def _current_day_archive_ready() -> bool:
-    """Check if today's UTC+8 daily archive is likely available.
+# ---------------------------------------------------------------------------
+# Gap-driven backfill target
+# ---------------------------------------------------------------------------
 
-    The daily archive for day D usually becomes available on D+1.
+def compute_backfill_target(
+    *,
+    symbol: str,
+    exchange: str,
+    store: SqliteTradeFeatureStore,
+    required_minutes: int = 4320,
+    max_minutes_per_cycle: int = 1440,
+    direction: str = "recent-to-oldest",
+) -> TradeFeatureBackfillTarget | None:
+    """Compute the next backfill target from coverage gaps.
+
+    Priority: always fill the latest gap first (live/crash recovery).
+    If no gaps, returns None.
     """
+    # Quick scan at a larger window to find all gaps
+    coverage = store.coverage_scan(
+        symbol=symbol,
+        exchange=exchange,
+        required_minutes=max(required_minutes, max_minutes_per_cycle),
+        current_day_archive_ready=_resolve_current_day_archive_ready(symbol=symbol),
+    )
+
+    if coverage.available and coverage.first_missing_range is None:
+        return None
+
+    # Use first_missing_range from coverage as the primary target
+    if coverage.first_missing_range is not None:
+        start_ms, end_ms = coverage.first_missing_range
+        return TradeFeatureBackfillTarget(
+            start_ms=start_ms,
+            end_ms=min(end_ms, start_ms + max_minutes_per_cycle * _ONE_MINUTE_MS - 1),
+            reason="gap_from_coverage_scan",
+        )
+
+    if coverage.latest_complete_close_time_ms is not None:
+        # Gap after latest complete: [latest+1min .. now]
+        gap_start = coverage.latest_complete_close_time_ms + 1
+        gap_end = int(time.time() * 1000)
+        if gap_end > gap_start:
+            return TradeFeatureBackfillTarget(
+                start_ms=gap_start,
+                end_ms=min(gap_end, gap_start + max_minutes_per_cycle * _ONE_MINUTE_MS - 1),
+                reason="gap_after_latest_complete",
+            )
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Current-day archive (conservative)
+# ---------------------------------------------------------------------------
+
+def _resolve_current_day_archive_ready(*, symbol: str) -> bool:
+    """Conservative check: is the OKX daily archive for the *current* day available?
+
+    The OKX daily archive for UTC+8 day D typically becomes available on D+1
+    after ~01:00 CST. Before that, HTTP requests to the archive URL return 404.
+
+    This implementation is conservative:
+    - If the current UTC+8 hour is < 1, archive is NOT ready.
+    - Even at >= 1 CST, we never assume a file exists without successfully
+      downloading or finding a local copy. The caller (worker) is responsible
+      for confirming download success and reporting `failed_downloads`.
+    """
+    _ = symbol  # reserved for future per-symbol logic
     now_utc = datetime.now(UTC)
     now_cst = now_utc + timedelta(hours=8)
     current_hour_cst = now_cst.hour
-    # Archives for the current day are typically not available until
-    # well into the next day. We use a conservative threshold.
-    return current_hour_cst >= 1  # After 01:00 CST
+    # Archives are never available before 01:00 CST on D+1.
+    # Even after 01:00 they may be delayed; callers must verify.
+    return current_hour_cst >= 1
 
 
 def _check_worker_running(status_path: str | None) -> bool:
@@ -145,7 +218,7 @@ def _check_worker_running(status_path: str | None) -> bool:
             return False
         heartbeat = data.get("worker_heartbeat_ms", 0)
         age_ms = int(time.time() * 1000) - int(heartbeat)
-        return age_ms < 180_000  # stale after 3 min
+        return age_ms < 180_000
     except (OSError, json.JSONDecodeError, ValueError):
         return False
 

@@ -43,6 +43,28 @@ def _make_bar(open_time_ms: int, close_time_ms: int | None = None) -> FixedTimeT
     )
 
 
+def _make_fp(open_time_ms: int, close_time_ms: int | None = None, *,
+             quality: str = "COMPLETE", context_available: bool = True) -> "TradeFootprintFeature":
+    from src.market_data.models import TradeFootprintFeature as TFF
+    if close_time_ms is None:
+        close_time_ms = open_time_ms + _MINUTE - 1
+    delta = Decimal("2000")
+    return TFF(
+        exchange="okx", symbol="ETH-USDT-PERP", timeframe="1m",
+        open_time_ms=open_time_ms, close_time_ms=close_time_ms, available_time_ms=close_time_ms,
+        delta_notional=delta, abs_delta_notional=abs(delta),
+        taker_buy_ratio=Decimal("0.6"), close_pos=Decimal("0.5"),
+        range_pct=Decimal("0.01"), return_pct=Decimal("0.002"),
+        fp_max_bucket_abs_delta_pressure=Decimal("0"),
+        context_available=context_available, quality=quality,
+    )
+
+
+def _write_pair(store: SqliteTradeFeatureStore, open_time_ms: int) -> None:
+    store.upsert_tradebars_many([_make_bar(open_time_ms)])
+    store.upsert_footprints_many([_make_fp(open_time_ms)])
+
+
 def test_supervisor_scan_coverage_returns_dict(tmp_path: Path) -> None:
     db_path = tmp_path / "test.sqlite3"
     status_path = tmp_path / "status.json"
@@ -53,10 +75,8 @@ def test_supervisor_scan_coverage_returns_dict(tmp_path: Path) -> None:
 
     store = SqliteTradeFeatureStore(path=db_path)
     base = _now_aligned() - 3600_000
-    store.upsert_many([
-        _make_bar(base + i * 60_000)
-        for i in range(5)
-    ])
+    for i in range(5):
+        _write_pair(store, base + i * 60_000)
 
     supervisor = MfFeatureBackfillSupervisor(
         symbol="ETH-USDT-PERP",
@@ -86,10 +106,8 @@ def test_supervisor_check_and_launch_when_coverage_complete(tmp_path: Path) -> N
 
     store = SqliteTradeFeatureStore(path=db_path)
     base = _now_aligned() - 3600_000
-    store.upsert_many([
-        _make_bar(base + i * 60_000)
-        for i in range(10)
-    ])
+    for i in range(10):
+        _write_pair(store, base + i * 60_000)
 
     supervisor = MfFeatureBackfillSupervisor(
         symbol="ETH-USDT-PERP",

@@ -112,7 +112,11 @@ class FixedTimeTradeBarBuilder:
         return ()
 
     def drain(self) -> tuple[FixedTimeTradeBar, ...]:
-        """Force-close active bar and return any pending closed bars."""
+        """Force-close active bar and return any pending closed bars.
+
+        Prefer drain_closed_only() in backfill/historical tools — this
+        method may mark an incomplete active bucket as COMPLETE.
+        """
         result: list[FixedTimeTradeBar] = list(self._drain_pending())
         if self._active is not None and self._active.trade_count > 0:
             # Force available_time_ms to at least close_time_ms
@@ -123,6 +127,14 @@ class FixedTimeTradeBarBuilder:
             self._flush_closed(closed)
             result.extend(self._drain_pending())
         return tuple(result)
+
+    def drain_closed_only(self) -> tuple[FixedTimeTradeBar, ...]:
+        """Return pending closed bars without touching the active bucket."""
+        return tuple(self._drain_pending())
+
+    def discard_active(self) -> None:
+        """Drop the in-progress (active) bucket without writing it."""
+        self._active = None
 
     def snapshot_active(self) -> FixedTimeTradeBar | None:
         """Snapshot the current active bar without closing it."""

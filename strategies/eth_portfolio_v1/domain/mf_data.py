@@ -5,18 +5,22 @@ from collections import deque
 from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
-from src.market_data.models import FixedTimeTradeBar
+from src.market_data.events import MarketFeatureEvent, MarketFeatureEventType
+from src.market_data.models import FixedTimeTradeBar, TradeFootprintFeature
 from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
 from src.market_data.trade_features.coverage import resolve_mf_readiness
 
+
+# ---------------------------------------------------------------------------
+# Bounded buffer
+# ---------------------------------------------------------------------------
 
 class MfDataBuffer:
     """Bounded in-memory buffer for MF trade-derived 1m features.
 
     Decision buffer (default 3 days = 4320 minutes) holds complete
     FixedTimeTradeBar objects. Long-history rolling scalars (e.g.
-    large_trade_share) are tracked separately as lightweight values
-    to avoid keeping full bar objects for 90 days.
+    large_trade_share) are tracked separately as lightweight values.
 
     Constraints:
     - Never loads raw trades
@@ -31,8 +35,8 @@ class MfDataBuffer:
         symbol: str,
         exchange: str = "okx",
         store_path: str = "data/market_data/aether_market_data.sqlite3",
-        decision_buffer_minutes: int = 4320,  # 3 days
-        decision_buffer_max_minutes: int = 10080,  # 7 days
+        decision_buffer_minutes: int = 4320,
+        decision_buffer_max_minutes: int = 10080,
         large_share_quantile_window_days: int = 90,
     ) -> None:
         if decision_buffer_minutes > decision_buffer_max_minutes:
@@ -45,10 +49,7 @@ class MfDataBuffer:
         self._decision_default_minutes = max(1, int(decision_buffer_minutes))
         self._large_share_window_days = max(1, int(large_share_quantile_window_days))
 
-        # Bounded deque for decision buffer
         self._bars: deque[FixedTimeTradeBar] = deque(maxlen=self._decision_maxlen)
-
-        # Rolling scalars: only keep lightweight values
         self._large_trade_shares: deque[float] = deque(
             maxlen=self._large_share_window_days * 1440
         )
@@ -61,22 +62,20 @@ class MfDataBuffer:
     # ------------------------------------------------------------------
 
     def load_initial(self) -> int:
-        """Load recent bars from SQLite into the bounded buffer."""
-        bars = self._store.load_recent(
+        bars = self._store.load_recent_tradebars(
             symbol=self.symbol,
             exchange=self.exchange,
             limit=self._decision_default_minutes,
         )
         for bar in bars:
             self._bars.append(bar)
-            if float(bar.large_trade_share) > 0:
-                self._large_trade_shares.append(float(bar.large_trade_share))
-
+            share_val = float(bar.large_trade_share)
+            if share_val > 0:
+                self._large_trade_shares.append(share_val)
         self._loaded_initial = True
         return len(bars)
 
-    def append(self, bar: FixedTimeTradeBar) -> None:
-        """Append a new closed 1m bar to the buffer."""
+    def append_tradebar(self, bar: FixedTimeTradeBar) -> None:
         self._bars.append(bar)
         share_val = float(bar.large_trade_share)
         if share_val > 0:
@@ -84,14 +83,13 @@ class MfDataBuffer:
 
     def append_many(self, bars: Sequence[FixedTimeTradeBar]) -> None:
         for bar in bars:
-            self.append(bar)
+            self.append_tradebar(bar)
 
     # ------------------------------------------------------------------
     # Read
     # ------------------------------------------------------------------
 
     def recent_bars(self, n_minutes: int | None = None) -> tuple[FixedTimeTradeBar, ...]:
-        """Return the most recent N bars from the buffer."""
         if n_minutes is None:
             n_minutes = self._decision_default_minutes
         n = min(max(1, int(n_minutes)), len(self._bars))
@@ -111,7 +109,6 @@ class MfDataBuffer:
     # ------------------------------------------------------------------
 
     def large_trade_share_median(self) -> float:
-        """Median large_trade_share over rolling window."""
         if not self._large_trade_shares:
             return 0.0
         sorted_shares = sorted(self._large_trade_shares)
@@ -121,7 +118,6 @@ class MfDataBuffer:
         return sorted_shares[n // 2]
 
     def large_trade_share_quantile(self, q: float = 0.75) -> float:
-        """Quantile of large_trade_share over rolling window."""
         if not self._large_trade_shares:
             return 0.0
         sorted_shares = sorted(self._large_trade_shares)
@@ -133,7 +129,6 @@ class MfDataBuffer:
     # ------------------------------------------------------------------
 
     def audit(self) -> Mapping[str, Any]:
-        """JSON-safe audit of buffer state."""
         self._last_audit_ms = int(time.time() * 1000)
         latest = None
         if self._bars:
@@ -155,15 +150,17 @@ class MfDataBuffer:
         }
 
     def last_audit(self) -> Mapping[str, Any]:
-        """Return the most recent audit result."""
         return self.audit()
 
+
+# ---------------------------------------------------------------------------
+# Readiness gate
+# ---------------------------------------------------------------------------
 
 class MfDataReadiness:
     """Readiness gate for MF trade-derived feature pipeline.
 
-    In R007, mf_signal_ready is ALWAYS False. This gate provides
-    detailed readiness info for monitoring and audit purposes.
+    In R007, mf_signal_ready is ALWAYS False.
     """
 
     def __init__(
@@ -184,7 +181,6 @@ class MfDataReadiness:
         self._global_lock_path = global_lock_path
 
     def readiness(self) -> Mapping[str, Any]:
-        """Return full MF readiness including detailed coverage info."""
         result = resolve_mf_readiness(
             symbol=self.symbol,
             exchange=self.exchange,
@@ -201,15 +197,29 @@ class MfDataReadiness:
         return False
 
 
-class MfFeatureObserver:
-    """MF observer placeholder that always returns empty signals.
+# ---------------------------------------------------------------------------
+# Feature observer — receives features, buffers them, returns 0 signals
+# ---------------------------------------------------------------------------
 
-    In R007, this observer exists only to establish the interface boundary.
-    It never generates TradeSignals.
+class MfFeatureObserver:
+    """MF observer that receives trade-derived features but always returns 0 signals.
+
+    In R007 this observer:
+    - Receives FIXED_TIME_TRADE_BAR events and buffers them
+    - Receives TRADE_FOOTPRINT_FEATURE events and tracks them via audit
+    - Always returns empty tuple — never generates TradeSignal
     """
 
+    def __init__(self, buffer: MfDataBuffer | None = None) -> None:
+        self._buffer = buffer
+        self._last_tradebar_ms: int = 0
+        self._last_footprint_ms: int = 0
+        self._tradebar_count: int = 0
+        self._footprint_count: int = 0
+
     def on_market_feature(self, event: Any) -> tuple[Any, ...]:
-        """Returns empty tuple — no MF signals in R007."""
+        """Process market feature events, buffer data, return empty signals."""
+        self._handle_event(event)
         return ()
 
     def on_kline(self, *args: Any, **kwargs: Any) -> tuple:
@@ -217,3 +227,74 @@ class MfFeatureObserver:
 
     def on_trade(self, *args: Any, **kwargs: Any) -> tuple:
         return ()
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _handle_event(self, event: Any) -> None:
+        """Internal dispatch: try to buffer trade-derived features."""
+        event_type = getattr(event, "event_type", None)
+        if event_type is None:
+            return
+
+        type_val = event_type.value if hasattr(event_type, "value") else str(event_type)
+        if type_val == MarketFeatureEventType.FIXED_TIME_TRADE_BAR.value:
+            self._tradebar_count += 1
+            self._last_tradebar_ms = getattr(event, "event_time_ms", 0)
+            if self._buffer is not None:
+                try:
+                    bar = self._event_to_tradebar(event)
+                    if bar is not None:
+                        self._buffer.append_tradebar(bar)
+                except Exception:
+                    pass
+        elif type_val == MarketFeatureEventType.TRADE_FOOTPRINT_FEATURE.value:
+            self._footprint_count += 1
+            self._last_footprint_ms = getattr(event, "event_time_ms", 0)
+
+    @staticmethod
+    def _event_to_tradebar(event: Any) -> FixedTimeTradeBar | None:
+        """Convert a FIXED_TIME_TRADE_BAR event to FixedTimeTradeBar."""
+        data = getattr(event, "data", {})
+        if not data:
+            return None
+        try:
+            return FixedTimeTradeBar(
+                exchange=str(getattr(event, "exchange", "")),
+                symbol=str(getattr(event, "symbol", "")),
+                timeframe=str(getattr(event, "timeframe", "1m")),
+                open_time_ms=int(data.get("open_time_ms", 0)),
+                close_time_ms=int(data.get("close_time_ms", 0)),
+                available_time_ms=data.get("available_time_ms", data.get("close_time_ms", 0)),
+                open=Decimal(str(data.get("open", "0"))),
+                high=Decimal(str(data.get("high", "0"))),
+                low=Decimal(str(data.get("low", "0"))),
+                close=Decimal(str(data.get("close", "0"))),
+                volume=Decimal(str(data.get("volume", "0"))),
+                buy_volume=Decimal(str(data.get("buy_volume", "0"))),
+                sell_volume=Decimal(str(data.get("sell_volume", "0"))),
+                buy_notional=Decimal(str(data.get("buy_notional", "0"))),
+                sell_notional=Decimal(str(data.get("sell_notional", "0"))),
+                delta_volume=Decimal(str(data.get("delta_volume", "0"))),
+                delta_notional=Decimal(str(data.get("delta_notional", "0"))),
+                abs_delta_notional=Decimal(str(data.get("abs_delta_notional", "0"))),
+                trade_count=int(data.get("trade_count", 0)),
+                large_buy_notional=Decimal(str(data.get("large_buy_notional", "0"))),
+                large_sell_notional=Decimal(str(data.get("large_sell_notional", "0"))),
+                large_trade_count=int(data.get("large_trade_count", 0)),
+                large_trade_share=Decimal(str(data.get("large_trade_share", "0"))),
+                quality=str(data.get("quality", "COMPLETE")),
+                source=str(data.get("source", "trade_derived")),
+            )
+        except Exception:
+            return None
+
+    def audit(self) -> Mapping[str, Any]:
+        return {
+            "tradebar_count": self._tradebar_count,
+            "footprint_count": self._footprint_count,
+            "last_tradebar_ms": self._last_tradebar_ms,
+            "last_footprint_ms": self._last_footprint_ms,
+            "buffer": self._buffer.last_audit() if self._buffer else None,
+        }

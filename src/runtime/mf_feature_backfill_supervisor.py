@@ -178,6 +178,8 @@ class MfFeatureBackfillSupervisor:
             "--market-db", self.market_db,
             "--status-path", str(self.status_path),
             "--lock-path", str(self.lock_path),
+            "--global-lock-path", str(self.global_lock_path),
+            "--global-status-path", str(self.global_status_path),
             "--raw-root", self.raw_root,
             "--max-seconds-per-cycle", str(self.max_seconds_per_cycle),
             "--contract-value", str(self.contract_value),

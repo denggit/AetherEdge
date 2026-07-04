@@ -6,6 +6,7 @@ from pathlib import Path
 from src.market_data.models import (
     FixedTimeTradeBar,
     TimeRange,
+    TradeFootprintFeature,
 )
 from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
 
@@ -63,6 +64,48 @@ def _make_bar(
         trade_count=trade_count,
         quality=quality,
     )
+
+
+def _make_fp(
+    *,
+    exchange: str = "okx",
+    symbol: str = "ETH-USDT-PERP",
+    open_time_ms: int,
+    close_time_ms: int | None = None,
+    available_time_ms: int | None = None,
+    delta_notional: str = "2000",
+    quality: str = "COMPLETE",
+    context_available: bool = True,
+) -> TradeFootprintFeature:
+    if close_time_ms is None:
+        close_time_ms = open_time_ms + _MINUTE - 1
+    if available_time_ms is None:
+        available_time_ms = close_time_ms
+    delta = Decimal(delta_notional)
+    return TradeFootprintFeature(
+        exchange=exchange,
+        symbol=symbol,
+        timeframe="1m",
+        open_time_ms=open_time_ms,
+        close_time_ms=close_time_ms,
+        available_time_ms=available_time_ms,
+        delta_notional=delta,
+        abs_delta_notional=abs(delta),
+        taker_buy_ratio=Decimal("0.6"),
+        close_pos=Decimal("0.5"),
+        range_pct=Decimal("0.01"),
+        return_pct=Decimal("0.002"),
+        fp_max_bucket_abs_delta_pressure=Decimal("0"),
+        context_available=context_available,
+        quality=quality,
+    )
+
+
+def _write_pair(store: SqliteTradeFeatureStore, open_time_ms: int, *, tb_quality: str = "COMPLETE", fp_quality: str = "COMPLETE", fp_context: bool = True) -> None:
+    bar = _make_bar(open_time_ms=open_time_ms, quality=tb_quality)
+    fp = _make_fp(open_time_ms=open_time_ms, quality=fp_quality, context_available=fp_context)
+    store.upsert_tradebars_many([bar])
+    store.upsert_footprints_many([fp])
 
 
 # ---------------------------------------------------------------------------
@@ -157,10 +200,9 @@ def test_latest_complete_close_time_ms(tmp_path: Path) -> None:
 
     assert store.latest_complete_close_time_ms(symbol="ETH-USDT-PERP", exchange="okx") is None
 
-    store.upsert_many([
-        _make_bar(open_time_ms=_base(0)),
-        _make_bar(open_time_ms=_base(2)),
-    ])
+    # Need BOTH tradebar + footprint for latest to be found
+    _write_pair(store, _base(0))
+    _write_pair(store, _base(2))
     latest = store.latest_complete_close_time_ms(symbol="ETH-USDT-PERP", exchange="okx")
     assert latest is not None
     assert latest >= _base(2)
@@ -173,11 +215,8 @@ def test_latest_complete_close_time_ms(tmp_path: Path) -> None:
 def test_coverage_scan_detects_missing_minutes(tmp_path: Path) -> None:
     store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
 
-    store.upsert_many([
-        _make_bar(open_time_ms=_base(0)),
-        _make_bar(open_time_ms=_base(1)),
-        _make_bar(open_time_ms=_base(2)),
-    ])
+    for i in (0, 1, 2):
+        _write_pair(store, _base(i))
 
     coverage = store.coverage_scan(
         symbol="ETH-USDT-PERP",
@@ -192,7 +231,8 @@ def test_coverage_scan_detects_missing_minutes(tmp_path: Path) -> None:
 def test_coverage_scan_available_when_all_present(tmp_path: Path) -> None:
     store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
 
-    store.upsert_many([_make_bar(open_time_ms=_base(i)) for i in range(5)])
+    for i in range(5):
+        _write_pair(store, _base(i))
 
     coverage = store.coverage_scan(
         symbol="ETH-USDT-PERP",
@@ -206,10 +246,8 @@ def test_coverage_scan_available_when_all_present(tmp_path: Path) -> None:
 def test_coverage_scan_detects_degraded_minutes(tmp_path: Path) -> None:
     store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
 
-    store.upsert_many([
-        _make_bar(open_time_ms=_base(0), quality="DEGRADED_LOW_TRADE_COUNT"),
-        _make_bar(open_time_ms=_base(1)),
-    ])
+    _write_pair(store, _base(0), tb_quality="DEGRADED_LOW_TRADE_COUNT", fp_quality="DEGRADED_LOW_TRADE_COUNT")
+    _write_pair(store, _base(1))
 
     coverage = store.coverage_scan(
         symbol="ETH-USDT-PERP",

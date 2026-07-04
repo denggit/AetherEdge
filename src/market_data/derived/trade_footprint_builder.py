@@ -7,6 +7,8 @@ from typing import Any, Mapping
 from src.market_data.models import TradeFootprintFeature, TradeFeatureQuality
 from src.platform.data.models import MarketTrade, TradeSide
 
+_ONE_MINUTE_MS = 60_000
+
 
 @dataclass
 class _FootprintAccum:
@@ -23,41 +25,42 @@ class _FootprintAccum:
     trade_count: int = 0
     available_time_ms: int = 0
     context_available: bool = True
+    fp_max_bucket_abs_delta_pressure: Decimal = Decimal("0")
 
 
 class TradeFootprintBuilder:
     """Streaming trade footprint feature builder.
 
-    Consumes normalized MarketTrade flows and produces TradeFootprintFeature
-    for closed 1m buckets. Footprint features are derived from the same trade
-    stream as FixedTimeTradeBar — never from OHLCV.
+    Consumes EVERY normalized MarketTrade independently and produces
+    TradeFootprintFeature for closed 1m buckets. Maintains its own OHLCV
+    state so it does not depend on FixedTimeTradeBarBuilder context.
 
-    For now ``fp_max_bucket_abs_delta_pressure`` is not computed (requires
-    sub-bucket context). When unavailable the field stays 0 and quality is
-    marked MISSING_FOOTPRINT_CONTEXT.
+    ``fp_max_bucket_abs_delta_pressure`` requires sub-bucket context; in
+    R007 it is always 0. The quality flag will be MISSING_FOOTPRINT_CONTEXT
+    when context is unavailable.
     """
 
     _MAX_PENDING_CLOSED = 8
 
-    def __init__(self) -> None:
+    def __init__(self, *, contract_value: Decimal | str | float = Decimal("1")) -> None:
+        self.contract_value = Decimal(str(contract_value))
+        if self.contract_value <= 0:
+            raise ValueError("contract_value must be positive")
+
         self._active: _FootprintAccum | None = None
         self._pending_closed: list[TradeFootprintFeature] = []
         self._stats = _FootprintStats()
 
     # ------------------------------------------------------------------
-    # Core feed
+    # Core feed — EVERY trade must enter here
     # ------------------------------------------------------------------
 
-    def on_trade(
-        self,
-        trade: MarketTrade,
-        *,
-        trade_bar_open: Decimal = Decimal("0"),
-        trade_bar_high: Decimal = Decimal("0"),
-        trade_bar_low: Decimal = Decimal("0"),
-        trade_bar_close: Decimal = Decimal("0"),
-    ) -> tuple[TradeFootprintFeature, ...]:
-        """Feed a normalized trade with its parent 1m bar context."""
+    def on_trade(self, trade: MarketTrade) -> tuple[TradeFootprintFeature, ...]:
+        """Feed a normalized trade; returns newly-closed footprint features.
+
+        This method must be called for every single trade so that all
+        order-flow data is correctly accumulated.
+        """
         time_ms = _trade_time_ms(trade)
         if time_ms is None or time_ms <= 0:
             self._stats.invalid += 1
@@ -67,8 +70,13 @@ class TradeFootprintBuilder:
             return ()
 
         bucket_start = _bucket_start_ms(time_ms)
-        exchange = trade.exchange.value if hasattr(trade.exchange, "value") else str(trade.exchange)
+        exchange = (
+            trade.exchange.value
+            if hasattr(trade.exchange, "value")
+            else str(trade.exchange)
+        )
 
+        # --- bucket transition: close old, start new ---
         if self._active is not None and bucket_start > self._active.open_time_ms:
             self._active.available_time_ms = max(self._active.available_time_ms, time_ms)
             closed = self._close()
@@ -78,37 +86,43 @@ class TradeFootprintBuilder:
                 symbol=trade.symbol,
                 exchange=exchange,
                 bucket_start=bucket_start,
-                trade=trade,
             )
             self._add_trade(self._active, trade, time_ms)
             return result
 
+        # --- first-ever trade ---
         if self._active is None:
             self._active = self._new_accum(
                 symbol=trade.symbol,
                 exchange=exchange,
                 bucket_start=bucket_start,
-                trade=trade,
             )
             self._add_trade(self._active, trade, time_ms)
             return ()
 
+        # --- out-of-order ---
         if bucket_start < self._active.open_time_ms:
             self._stats.out_of_order += 1
             return ()
 
-        # Update running OHLCV from trade-bar context
-        if trade_bar_open > 0:
-            if self._active.trade_count == 0:
-                self._active.open = trade_bar_open
-            self._active.high = trade_bar_high if trade_bar_high > 0 else self._active.high
-            self._active.low = trade_bar_low if trade_bar_low > 0 else self._active.low
-            self._active.close = trade_bar_close if trade_bar_close > 0 else self._active.close
-
+        # --- same bucket ---
         self._add_trade(self._active, trade, time_ms)
         return ()
 
+    # ------------------------------------------------------------------
+    # Safe drain — never writes active/incomplete buckets
+    # ------------------------------------------------------------------
+
+    def drain_closed_only(self) -> tuple[TradeFootprintFeature, ...]:
+        """Return pending closed features WITHOUT closing the active bucket."""
+        return tuple(self._drain())
+
+    def discard_active(self) -> None:
+        """Drop the in-progress (active) bucket without writing it."""
+        self._active = None
+
     def drain(self) -> tuple[TradeFootprintFeature, ...]:
+        """Force-close active. Prefer drain_closed_only() in backfill tools."""
         result: list[TradeFootprintFeature] = list(self._drain())
         if self._active is not None and self._active.trade_count > 0:
             self._active.available_time_ms = max(
@@ -141,13 +155,14 @@ class TradeFootprintBuilder:
                 "available_time_ms": self._active.available_time_ms,
                 "context_available": self._active.context_available,
             }
-        return {"version": 1, "active": active}
+        return {"version": 2, "contract_value": str(self.contract_value), "active": active}
 
     @classmethod
     def restore_state(cls, state: Mapping[str, Any]) -> "TradeFootprintBuilder":
-        if int(state.get("version", 0)) != 1:
+        if int(state.get("version", 0)) not in (1, 2):
             raise ValueError("unsupported footprint builder checkpoint version")
-        builder = cls()
+        cv = state.get("contract_value", "1")
+        builder = cls(contract_value=Decimal(str(cv)))
         raw = state.get("active")
         if raw is not None:
             if not isinstance(raw, Mapping):
@@ -181,16 +196,30 @@ class TradeFootprintBuilder:
     # Internal
     # ------------------------------------------------------------------
 
-    def _new_accum(self, *, symbol: str, exchange: str, bucket_start: int, trade: MarketTrade) -> _FootprintAccum:
+    def _new_accum(self, *, symbol: str, exchange: str, bucket_start: int) -> _FootprintAccum:
         return _FootprintAccum(
             symbol=symbol,
             exchange=exchange,
             open_time_ms=bucket_start,
-            close_time_ms=bucket_start + 60_000 - 1,
+            close_time_ms=bucket_start + _ONE_MINUTE_MS - 1,
         )
 
     def _add_trade(self, accum: _FootprintAccum, trade: MarketTrade, time_ms: int) -> None:
-        notional = trade.price * trade.quantity
+        price = trade.price
+        quantity = trade.quantity
+        notional = price * quantity * self.contract_value
+
+        # Internal OHLCV tracking from trades
+        if accum.trade_count == 0:
+            accum.open = price
+            accum.high = price
+            accum.low = price
+            accum.close = price
+        else:
+            accum.high = max(accum.high, price)
+            accum.low = min(accum.low, price)
+            accum.close = price
+
         if trade.side is TradeSide.BUY:
             accum.buy_notional += notional
         elif trade.side is TradeSide.SELL:
@@ -204,11 +233,14 @@ class TradeFootprintBuilder:
     def _feature_from_accum(self, accum: _FootprintAccum) -> TradeFootprintFeature:
         delta = accum.buy_notional - accum.sell_notional
         total = accum.buy_notional + accum.sell_notional
-        taker_buy_ratio = (accum.buy_notional / total) if total > 0 else Decimal("0")
+
+        taker_buy_ratio = Decimal("0")
+        if total > 0:
+            taker_buy_ratio = accum.buy_notional / total
 
         span = accum.high - accum.low
         close_pos = Decimal("0.5")
-        if span > 0:
+        if span > 0 and accum.open > 0 and accum.close > 0:
             close_pos = (accum.close - accum.low) / span
 
         range_pct = Decimal("0")
@@ -219,12 +251,10 @@ class TradeFootprintBuilder:
         if accum.open > 0:
             return_pct = accum.close / accum.open - Decimal("1")
 
-        # fp_max_bucket_abs_delta_pressure is not computed in R007
-        quality = TradeFeatureQuality.COMPLETE.value
-        context_available = True
-        if not accum.context_available:
-            quality = TradeFeatureQuality.MISSING_FOOTPRINT_CONTEXT.value
-            context_available = False
+        # fp_max_bucket_abs_delta_pressure: R007 cannot compute this
+        # because sub-bucket context is unavailable → mark degraded
+        fp_quality = TradeFeatureQuality.MISSING_FOOTPRINT_CONTEXT.value
+        fp_context_available = False
 
         return TradeFootprintFeature(
             exchange=accum.exchange,
@@ -240,8 +270,8 @@ class TradeFootprintBuilder:
             range_pct=range_pct,
             return_pct=return_pct,
             fp_max_bucket_abs_delta_pressure=Decimal("0"),
-            context_available=context_available,
-            quality=quality,
+            context_available=fp_context_available,
+            quality=fp_quality,
             source="trade_derived",
         )
 
@@ -270,4 +300,4 @@ def _trade_time_ms(trade: MarketTrade) -> int | None:
 
 
 def _bucket_start_ms(time_ms: int) -> int:
-    return (time_ms // 60_000) * 60_000
+    return (time_ms // _ONE_MINUTE_MS) * _ONE_MINUTE_MS

@@ -77,7 +77,7 @@ def test_buffer_maxlen_enforced(tmp_path: Path) -> None:
     )
     base = int(time.time() * 1000)
     for i in range(10):
-        buffer.append(_make_bar(base + i * 60_000, base + (i + 1) * 60_000 - 1))
+        buffer.append_tradebar(_make_bar(base + i * 60_000, base + (i + 1) * 60_000 - 1))
 
     assert buffer.bar_count <= 5
 
@@ -92,7 +92,7 @@ def test_buffer_large_trade_share_scalars(tmp_path: Path) -> None:
     base = int(time.time() * 1000)
     for i in range(10):
         share = str(0.01 * (i + 1))
-        buffer.append(_make_bar(base + i * 60_000, base + (i + 1) * 60_000 - 1, large_share=share))
+        buffer.append_tradebar(_make_bar(base + i * 60_000, base + (i + 1) * 60_000 - 1, large_share=share))
 
     median = buffer.large_trade_share_median()
     assert median > 0
@@ -107,7 +107,7 @@ def test_buffer_audit_is_json_safe(tmp_path: Path) -> None:
         store_path=str(tmp_path / "test.sqlite3"),
     )
     base = int(time.time() * 1000)
-    buffer.append(_make_bar(base, base + 60_000 - 1))
+    buffer.append_tradebar(_make_bar(base, base + 60_000 - 1))
 
     audit = buffer.last_audit()
     json.dumps(audit)
@@ -125,7 +125,7 @@ def test_buffer_recent_bars_returns_subset(tmp_path: Path) -> None:
     )
     base = int(time.time() * 1000)
     for i in range(50):
-        buffer.append(_make_bar(base + i * 60_000, base + (i + 1) * 60_000 - 1))
+        buffer.append_tradebar(_make_bar(base + i * 60_000, base + (i + 1) * 60_000 - 1))
 
     recent = buffer.recent_bars(10)
     assert len(recent) == 10
