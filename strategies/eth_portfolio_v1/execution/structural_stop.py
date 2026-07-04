@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
 from src.platform.execution.rules import round_to_step
-from strategies.eth_lf_portfolio_v10b.domain.models import Side
+from strategies.eth_portfolio_v1.domain.models import Side
 
 
 STRUCTURAL_STOP_SOURCE = "STRUCTURAL_STOP"
@@ -128,7 +128,7 @@ def evaluate_swing_structural_stop(
     config: StructuralStopConfig,
     current_bar_exit: bool = False,
     precondition_reject_reason: str | None = None,
-    strategy: str = "eth_lf_portfolio_v10b",
+    strategy: str = "eth_portfolio_v1",
 ) -> StructuralStopDecision:
     """Evaluate the completed bar, producing a stop that is active only later.
 

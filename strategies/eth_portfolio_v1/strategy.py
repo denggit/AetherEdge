@@ -19,28 +19,28 @@ from src.order_management.models import ExchangeOrderResult
 from src.platform.snapshot import PlatformSnapshot
 from src.signals import SignalAction, TradeSignal
 from src.strategy import StrategyRecoveryContext
-from strategies.eth_lf_portfolio_v10b.domain.models import BarReadyContext, Side, V8DecisionType, V8TradeDecision
-from strategies.eth_lf_portfolio_v10b.domain.position_state import V8PositionState
-from strategies.eth_lf_portfolio_v10b.engines.bear_v3 import BearV3OnlyEngine
-from strategies.eth_lf_portfolio_v10b.engines.bull_reclaim_v2 import BullReclaimV2Engine
-from strategies.eth_lf_portfolio_v10b.engines.momentum_v3 import MomentumV3Engine
-from strategies.eth_lf_portfolio_v10b.engines.router import MomentumEntryFilterConfig, PortfolioRouter
-from strategies.eth_lf_portfolio_v10b.execution.signal_mapper import SignalMapperConfig, V8SignalMapper
-from strategies.eth_lf_portfolio_v10b.execution.range_exit import RangeExitConfig, evaluate_range_exit
-from strategies.eth_lf_portfolio_v10b.execution.sizing import RiskSizingConfig, V8RiskSizer
-from strategies.eth_lf_portfolio_v10b.execution.stops import initial_stop_from_risk, is_better_stop, protected_stop, validate_exchange_stop
-from strategies.eth_lf_portfolio_v10b.execution.structural_stop import (
+from strategies.eth_portfolio_v1.domain.models import BarReadyContext, Side, V8DecisionType, V8TradeDecision
+from strategies.eth_portfolio_v1.domain.position_state import V8PositionState
+from strategies.eth_portfolio_v1.engines.bear_v3 import BearV3OnlyEngine
+from strategies.eth_portfolio_v1.engines.bull_reclaim_v2 import BullReclaimV2Engine
+from strategies.eth_portfolio_v1.engines.momentum_v3 import MomentumV3Engine
+from strategies.eth_portfolio_v1.engines.router import MomentumEntryFilterConfig, PortfolioRouter
+from strategies.eth_portfolio_v1.execution.signal_mapper import SignalMapperConfig, V8SignalMapper
+from strategies.eth_portfolio_v1.execution.range_exit import RangeExitConfig, evaluate_range_exit
+from strategies.eth_portfolio_v1.execution.sizing import RiskSizingConfig, V8RiskSizer
+from strategies.eth_portfolio_v1.execution.stops import initial_stop_from_risk, is_better_stop, protected_stop, validate_exchange_stop
+from strategies.eth_portfolio_v1.execution.structural_stop import (
     STRUCTURAL_STOP_SOURCE,
     STRUCTURAL_STOP_VARIANT,
     StructuralStopConfig,
     StructuralStopDecision,
     evaluate_swing_structural_stop,
 )
-from strategies.eth_lf_portfolio_v10b.features.buffer import V8FeatureBuffer
-from strategies.eth_lf_portfolio_v10b.features.feature_frame import parse_closed_kline, parse_range_aggregate
-from strategies.eth_lf_portfolio_v10b.features.live_features import V8LiveFeatureBuilder
-from strategies.eth_lf_portfolio_v10b.features.micro_context import MicroContextConfig, MicroContextEngine
-from strategies.eth_lf_portfolio_v10b.features.range_speed import PastOnlyRangeSpeedTracker
+from strategies.eth_portfolio_v1.features.buffer import V8FeatureBuffer
+from strategies.eth_portfolio_v1.features.feature_frame import parse_closed_kline, parse_range_aggregate
+from strategies.eth_portfolio_v1.features.live_features import V8LiveFeatureBuilder
+from strategies.eth_portfolio_v1.features.micro_context import MicroContextConfig, MicroContextEngine
+from strategies.eth_portfolio_v1.features.range_speed import PastOnlyRangeSpeedTracker
 
 
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
@@ -68,9 +68,9 @@ class V10BConfig:
         micro = data.get("micro_context", {})
         range_exit = RangeExitConfig.from_mapping(data.get("range_exit", {}))
         return cls(
-            strategy_id=str(data.get("strategy_id", "eth_lf_portfolio_v10b_all_swing_structural_stop")),
-            strategy_version=str(data.get("strategy_version", "V10B")),
-            display_name=str(data.get("display_name", "ETH LF Portfolio V10B All-Swing Structural Stop")),
+            strategy_id=str(data.get("strategy_id", "eth_portfolio_v1")),
+            strategy_version=str(data.get("strategy_version", "V1")),
+            display_name=str(data.get("display_name", "ETH Portfolio V1")),
             symbol=str(data.get("symbol", "ETH-USDT-PERP")),
             data_exchange=str(data.get("data_exchange", "okx")).strip().lower(),
             runtime_requirements=data.get("runtime_requirements", {}),

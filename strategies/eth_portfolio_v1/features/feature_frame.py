@@ -4,7 +4,7 @@ from decimal import Decimal
 from typing import Any, Mapping
 
 from src.market_data.events import MarketFeatureEvent, MarketFeatureEventType
-from strategies.eth_lf_portfolio_v10b.domain.models import ClosedKlineContext, RangeAggregateContext
+from strategies.eth_portfolio_v1.domain.models import ClosedKlineContext, RangeAggregateContext
 
 
 def parse_closed_kline(event: MarketFeatureEvent) -> ClosedKlineContext:

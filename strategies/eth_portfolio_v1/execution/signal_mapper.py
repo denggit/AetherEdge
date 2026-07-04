@@ -5,12 +5,12 @@ from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
 from src.signals import SignalAction, SignalOrderType, TradeSignal
-from strategies.eth_lf_portfolio_v10b.domain.models import Side, V8DecisionType, V8TradeDecision
+from strategies.eth_portfolio_v1.domain.models import Side, V8DecisionType, V8TradeDecision
 
 
 @dataclass(frozen=True)
 class SignalMapperConfig:
-    strategy_id: str = "eth_lf_portfolio_v8"
+    strategy_id: str = "eth_portfolio_v1"
     target_exchanges: tuple[str, ...] = ()
     extra_metadata: Mapping[str, Any] = field(default_factory=dict)
 

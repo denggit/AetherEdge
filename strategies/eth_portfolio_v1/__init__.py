@@ -1,3 +1,3 @@
-from strategies.eth_lf_portfolio_v10b.strategy import Strategy
+from strategies.eth_portfolio_v1.strategy import Strategy
 
 __all__ = ["Strategy"]

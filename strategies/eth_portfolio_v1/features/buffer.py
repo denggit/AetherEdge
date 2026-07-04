@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from strategies.eth_lf_portfolio_v10b.domain.models import ClosedKlineContext, RangeAggregateContext
+from strategies.eth_portfolio_v1.domain.models import ClosedKlineContext, RangeAggregateContext
 
 
 @dataclass

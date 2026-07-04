@@ -1,51 +1,42 @@
-# ETH LF Portfolio V10B AetherEdge Plugin
+# ETH Portfolio V1 AetherEdge Plugin
 
-V10B keeps the V10A portfolio, entry filters, routing, sizing, add-on, and
-range-exit behavior unchanged and adds one all-engine swing structural stop:
+ETH Portfolio V1 is an independent, LF-only scaffold forked from
+`eth_lf_portfolio_v10b`. Its current behavior is intended to remain equivalent
+to the V10B LF portfolio: the alpha rules, router, sizing, range exit,
+structural stop, and risk scaling are unchanged.
 
-```text
-struct_stop_all_swing_n21_buf0p0_trig0p0_h0
-```
-
-Plugin path:
+Plugin path and identity:
 
 ```text
-strategies.eth_lf_portfolio_v10b:Strategy
+strategies.eth_portfolio_v1:Strategy
+strategy_id: eth_portfolio_v1
+strategy_version: V1
 ```
 
-Strategy identity:
+## Current scope
 
-```text
-strategy_id: eth_lf_portfolio_v10b_all_swing_structural_stop
-strategy_version: V10B
-```
+- V1 currently contains only the V10B-equivalent LF sleeve.
+- Low Sweep MF is not connected or implemented in this plugin.
+- The plugin owns its copied domain, engine, execution, feature, and
+  persistence modules and does not import another concrete strategy plugin.
 
-## Structural stop
+## Future direction
 
-On every completed 4H strategy bar, after all current-bar exit decisions:
+V1 will later add independent LF and MF sleeves. That future live strategy must
+run in hedge mode. LF and MF stops must use sleeve-scoped quantities and
+`reduce_only`; stop handling must never use a global
+`cancel_all_stop_orders`.
 
-- long uses the lowest low of the latest 21 completed 4H bars;
-- short uses the highest high of the latest 21 completed 4H bars;
-- no candidate exists before a full 21-bar window;
-- the candidate must tighten the confirmed stop and beat the V10A stop;
-- the candidate must remain on the protective side of the completed close;
-- rounding is followed by the same direction and close checks;
-- an accepted stop affects only subsequent bars and order-management rounds.
-
-The canonical candidate is calculated from OKX master strategy state. The
-standard stop-sync signal carries that one canonical price to the open master
-and follower legs; Binance does not calculate a separate structural level.
-
-If structural evaluation, rounding, or validation fails, the strategy keeps or
-updates the existing V10A stop. It never cancels the V10A stop merely because
-the V10B candidate failed.
+These future requirements are documented only. This scaffold does not add
+Low Sweep, dual-sleeve behavior, scoped-stop changes, or automatic hedge-mode
+switching.
 
 ## Runtime boundary
 
 The plugin consumes normalized closed-kline/range feature events and emits
-standard `TradeSignal` stop-sync intents. It does not call exchange adapters.
-Startup hydration uses the existing 365-day/2000-record closed-kline warmup,
-which is more than the 21 bars required for the structural window.
+standard `TradeSignal` intents. It does not call exchange adapters. Runtime
+requirements and all behavior parameters other than plugin identity remain
+aligned with V10B.
 
 ## Start
 
@@ -53,6 +44,6 @@ From PowerShell at the repository root:
 
 ```powershell
 $env:PYTHONPATH="."
-$env:AETHER_STRATEGY="strategies.eth_lf_portfolio_v10b:Strategy"
+$env:AETHER_STRATEGY="strategies.eth_portfolio_v1:Strategy"
 python scripts/run_live.py
 ```

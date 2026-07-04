@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
-from strategies.eth_lf_portfolio_v10b.domain.models import MicroDecision, RangeAggregateContext, Side
+from strategies.eth_portfolio_v1.domain.models import MicroDecision, RangeAggregateContext, Side
 
 
 @dataclass(frozen=True)

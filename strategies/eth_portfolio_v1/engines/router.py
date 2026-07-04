@@ -4,8 +4,8 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Iterable, Mapping, Protocol
 
-from strategies.eth_lf_portfolio_v10b.domain.models import BarReadyContext, EngineSignal, RoutedSignal, Side
-from strategies.eth_lf_portfolio_v10b.features.range_speed import RangeSpeedEvaluation
+from strategies.eth_portfolio_v1.domain.models import BarReadyContext, EngineSignal, RoutedSignal, Side
+from strategies.eth_portfolio_v1.features.range_speed import RangeSpeedEvaluation
 
 
 class V8Engine(Protocol):
