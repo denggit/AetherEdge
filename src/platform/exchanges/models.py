@@ -305,9 +305,13 @@ class CancelStopOrderRequest:
     symbol: str
     stop_order_id: str | None = None
     client_order_id: str | None = None
+    metadata: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        if not self.stop_order_id and not self.client_order_id:
+        if not any(
+            value is not None and bool(str(value).strip())
+            for value in (self.stop_order_id, self.client_order_id)
+        ):
             raise ValueError("stop_order_id or client_order_id is required")
 
 

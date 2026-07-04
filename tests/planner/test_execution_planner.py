@@ -68,6 +68,56 @@ def test_planner_maps_cancel_all_without_execution_side_effect():
     assert plan.items[0].stop_market_request is None
 
 
+def test_planner_maps_scoped_stop_cancel_and_preserves_metadata():
+    metadata = {
+        "strategy_id": "eth_portfolio_v1",
+        "sleeve_id": "lf",
+        "position_id": "position-1",
+        "stop_order_id": "stop-123",
+        "stop_client_order_id": "metadata-client-id",
+        "target_exchanges": ["okx"],
+    }
+    plan = ExecutionPlanner().plan(
+        TradeSignal(
+            symbol="ETH-USDT-PERP",
+            action=SignalAction.CANCEL_STOP_ORDER,
+            client_order_id="signal-client-id",
+            metadata=metadata,
+        )
+    )
+
+    item = plan.items[0]
+    assert item.action is PlannedExecutionAction.CANCEL_STOP_ORDER
+    assert item.order_request is None
+    assert item.stop_market_request is None
+    assert item.cancel_stop_request is not None
+    assert item.cancel_stop_request.symbol == "ETH-USDT-PERP"
+    assert item.cancel_stop_request.client_order_id == "signal-client-id"
+    assert item.cancel_stop_request.stop_order_id == "stop-123"
+    assert item.cancel_stop_request.metadata is metadata
+
+
+def test_planner_uses_metadata_stop_client_order_id_as_fallback():
+    plan = ExecutionPlanner().plan(
+        TradeSignal(
+            symbol="ETH-USDT-PERP",
+            action=SignalAction.CANCEL_STOP_ORDER,
+            client_order_id="   ",
+            metadata={
+                "stop_client_order_id": "metadata-client-id",
+                "strategy_id": "eth_portfolio_v1",
+                "sleeve_id": "mf",
+                "position_id": "position-2",
+            },
+        )
+    )
+
+    request = plan.items[0].cancel_stop_request
+    assert request is not None
+    assert request.client_order_id == "metadata-client-id"
+    assert request.stop_order_id is None
+
+
 def test_plan_many_keeps_signal_order():
     planner = ExecutionPlanner()
     plan = planner.plan_many(

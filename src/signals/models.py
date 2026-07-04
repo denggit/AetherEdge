@@ -18,6 +18,7 @@ class SignalAction(str, Enum):
     PLACE_STOP_LOSS_SHORT = "place_stop_loss_short"
     CANCEL_ALL_ORDERS = "cancel_all_orders"
     CANCEL_ALL_STOP_ORDERS = "cancel_all_stop_orders"
+    CANCEL_STOP_ORDER = "cancel_stop_order"
 
 
 class SignalOrderType(str, Enum):
@@ -47,6 +48,21 @@ class TradeSignal:
     def __post_init__(self) -> None:
         if not self.symbol:
             raise ValueError("symbol is required")
+        if self.action is SignalAction.CANCEL_STOP_ORDER:
+            metadata = self.metadata or {}
+            if not any(
+                _non_empty_identifier(value)
+                for value in (
+                    self.client_order_id,
+                    metadata.get("stop_order_id"),
+                    metadata.get("stop_client_order_id"),
+                )
+            ):
+                raise ValueError(
+                    "client_order_id, metadata['stop_order_id'], or "
+                    "metadata['stop_client_order_id'] is required for scoped stop cancel"
+                )
+            return
         if self.action in {SignalAction.CANCEL_ALL_ORDERS, SignalAction.CANCEL_ALL_STOP_ORDERS}:
             return
         if self.action in {SignalAction.PLACE_STOP_LOSS_LONG, SignalAction.PLACE_STOP_LOSS_SHORT}:
@@ -65,3 +81,7 @@ class SignalBatch:
     @classmethod
     def from_iterable(cls, signals) -> "SignalBatch":
         return cls(tuple(signals))
+
+
+def _non_empty_identifier(value: Any) -> bool:
+    return value is not None and bool(str(value).strip())

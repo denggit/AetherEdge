@@ -4,10 +4,11 @@ from decimal import Decimal
 
 from src.order_management.quantity import NativeQuantityConverter
 from src.order_management.safety import RecoveryExitOrderValidator
+from src.order_management.stops import ScopedStopReplaceService, StopScope
 from src.platform import ExchangeName
 from src.platform.exchanges.models import PositionMode, PositionSide
 from src.platform.markets import get_market_profile
-from src.signals import SignalAction
+from src.signals import SignalAction, TradeSignal
 from strategies.eth_lf_portfolio_v8.domain.models import Side
 from strategies.eth_lf_portfolio_v8.strategy import Strategy
 
@@ -98,6 +99,63 @@ def test_stop_replace_never_places_new_then_cancel_all_without_targeted_cancel()
             assert signal.metadata.get("stop_replace_mode") != "place_new_then_cancel_all"
         if seen_place:
             assert signal.action is not SignalAction.CANCEL_ALL_STOP_ORDERS
+
+
+def test_scoped_stop_replace_builds_cancel_for_exact_scope() -> None:
+    scope = _scoped_stop()
+
+    signal = ScopedStopReplaceService().build_cancel_signal(scope)
+
+    assert signal.action is SignalAction.CANCEL_STOP_ORDER
+    assert signal.symbol == scope.symbol
+    assert signal.client_order_id == "lf-old-stop-client"
+    assert signal.metadata["stop_order_id"] == "lf-old-stop-order"
+    assert signal.metadata["stop_client_order_id"] == "lf-old-stop-client"
+    assert signal.metadata["strategy_id"] == "eth_portfolio_v1"
+    assert signal.metadata["sleeve_id"] == "lf"
+    assert signal.metadata["position_id"] == "lf-position-1"
+    assert signal.metadata["position_side"] == "long"
+    assert signal.metadata["target_exchanges"] == ["okx"]
+
+
+def test_scoped_replace_stages_new_stop_before_scoped_old_stop_cancel() -> None:
+    scope = _scoped_stop()
+    new_stop = TradeSignal(
+        symbol=scope.symbol,
+        action=SignalAction.PLACE_STOP_LOSS_LONG,
+        quantity=Decimal("0.25"),
+        trigger_price=Decimal("2450"),
+        client_order_id="lf-new-stop-client",
+        metadata={
+            "strategy_id": scope.strategy_id,
+            "sleeve_id": scope.sleeve_id,
+            "position_id": scope.position_id,
+        },
+    )
+
+    signals = ScopedStopReplaceService().build_replace_signals(scope, new_stop)
+
+    # R001 only stages the two boundaries. R002 must verify the first stop at
+    # the venue before it dispatches the second signal.
+    assert signals[0] is new_stop
+    assert signals[0].action is SignalAction.PLACE_STOP_LOSS_LONG
+    assert signals[0].metadata["sleeve_id"] == "lf"
+    assert signals[1].action is SignalAction.CANCEL_STOP_ORDER
+    assert signals[1].metadata["sleeve_id"] == "lf"
+    assert all(signal.action is not SignalAction.CANCEL_ALL_STOP_ORDERS for signal in signals)
+
+
+def _scoped_stop() -> StopScope:
+    return StopScope(
+        strategy_id="eth_portfolio_v1",
+        sleeve_id="lf",
+        position_id="lf-position-1",
+        symbol="ETH-USDT-PERP",
+        position_side=PositionSide.LONG,
+        target_exchanges=(ExchangeName.OKX,),
+        stop_client_order_id="lf-old-stop-client",
+        stop_order_id="lf-old-stop-order",
+    )
 
 
 def _short_strategy() -> Strategy:

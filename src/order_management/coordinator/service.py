@@ -15,7 +15,7 @@ from src.order_management.safety import ExitSafetyError, ExitSafetyGuard, is_exi
 from src.order_management.sync import OrderStatusSynchronizer, extract_avg_fill_price, extract_fee
 from src.planner import ExecutionPlanner, PlannedExecution, PlannedExecutionAction
 from src.platform.execution import ExecutionClient
-from src.platform.exchanges.models import ExchangeName, Order, OrderRequest, OrderStatus, PositionMode, PositionSide, StopMarketOrderRequest
+from src.platform.exchanges.models import CancelStopOrderRequest, ExchangeName, Order, OrderRequest, OrderStatus, PositionMode, PositionSide, StopMarketOrderRequest
 from src.signals.models import SignalAction
 from src.utils.log import get_logger
 
@@ -448,6 +448,7 @@ class MultiExchangeOrderCoordinator:
             # They must not require a master client in the filtered target set.
             return True
         if intent.signal.action in {
+            SignalAction.CANCEL_STOP_ORDER,
             SignalAction.CANCEL_ALL_STOP_ORDERS,
             SignalAction.PLACE_STOP_LOSS_LONG,
             SignalAction.PLACE_STOP_LOSS_SHORT,
@@ -466,7 +467,12 @@ class MultiExchangeOrderCoordinator:
     ) -> list[ExchangeOrderResult]:
         results: list[ExchangeOrderResult] = []
         for sequence, item in enumerate(items):
-            client_order_id = self.client_order_id_factory.create(strategy_id=intent.strategy_id, signal=item.signal, exchange=client.exchange, sequence=sequence)
+            client_order_id = self._execution_client_order_id(
+                client=client,
+                intent=intent,
+                item=item,
+                sequence=sequence,
+            )
             last_error: Exception | None = None
             for attempt in range(max_attempts):
                 try:
@@ -537,10 +543,30 @@ class MultiExchangeOrderCoordinator:
                 )
         return results
 
-    async def _execute_item(self, client: ExecutionClient, item: PlannedExecution, *, intent: OrderIntent, client_order_id: str) -> Order:
+    def _execution_client_order_id(
+        self,
+        *,
+        client: ExecutionClient,
+        intent: OrderIntent,
+        item: PlannedExecution,
+        sequence: int,
+    ) -> str | None:
+        if item.action is PlannedExecutionAction.CANCEL_STOP_ORDER:
+            request = item.cancel_stop_request
+            return None if request is None else request.client_order_id
+        return self.client_order_id_factory.create(
+            strategy_id=intent.strategy_id,
+            signal=item.signal,
+            exchange=client.exchange,
+            sequence=sequence,
+        )
+
+    async def _execute_item(self, client: ExecutionClient, item: PlannedExecution, *, intent: OrderIntent, client_order_id: str | None) -> Order:
         if item.action is PlannedExecutionAction.PLACE_ORDER:
             if item.order_request is None:
                 raise ValueError("order_request is required")
+            if client_order_id is None:
+                raise ValueError("client_order_id is required")
             request = await self._normalize_order_for_client(
                 client,
                 item.signal.action,
@@ -551,6 +577,8 @@ class MultiExchangeOrderCoordinator:
         if item.action is PlannedExecutionAction.PLACE_STOP_MARKET_ORDER:
             if item.stop_market_request is None:
                 raise ValueError("stop_market_request is required")
+            if client_order_id is None:
+                raise ValueError("client_order_id is required")
             request = await self._normalize_stop_for_client(
                 client,
                 item.signal.action,
@@ -559,11 +587,20 @@ class MultiExchangeOrderCoordinator:
             request = self._convert_stop_for_client(client, request)
             return await client.place_stop_market_order(_with_stop_client_id(request, client_order_id))
         if item.action is PlannedExecutionAction.CANCEL_ALL_ORDERS:
+            if client_order_id is None:
+                raise ValueError("client_order_id is required")
             orders = await client.cancel_all_orders()
             return orders[0] if orders else _synthetic_order(client, client_order_id)
         if item.action is PlannedExecutionAction.CANCEL_ALL_STOP_ORDERS:
+            if client_order_id is None:
+                raise ValueError("client_order_id is required")
             orders = await client.cancel_all_stop_orders()
             return orders[0] if orders else _synthetic_order(client, client_order_id)
+        if item.action is PlannedExecutionAction.CANCEL_STOP_ORDER:
+            if item.cancel_stop_request is None:
+                raise ValueError("cancel_stop_request is required")
+            order = await client.cancel_stop_order(item.cancel_stop_request)
+            return _with_scoped_cancel_audit(order, item.cancel_stop_request)
         raise ValueError(f"unsupported planned action: {item.action}")
 
     def _with_execution_metadata(self, intent: OrderIntent, *, clients: Sequence[ExecutionClient], items: Sequence[PlannedExecution]) -> OrderIntent:
@@ -865,6 +902,17 @@ def _synthetic_order(client: ExecutionClient, client_order_id: str) -> Order:
     from src.platform.exchanges.models import OrderStatus
 
     return Order(exchange=client.exchange, symbol=client.symbol, raw_symbol=client.symbol, order_id=None, client_order_id=client_order_id, status=OrderStatus.CANCELED)
+
+
+def _with_scoped_cancel_audit(order: Order, request: CancelStopOrderRequest) -> Order:
+    return replace(
+        order,
+        raw={
+            **dict(order.raw),
+            "execution_action": PlannedExecutionAction.CANCEL_STOP_ORDER.value,
+            "cancel_stop_metadata": dict(request.metadata or {}),
+        },
+    )
 
 
 def _final_status(results: Sequence[ExchangeOrderResult]) -> OrderIntentStatus:

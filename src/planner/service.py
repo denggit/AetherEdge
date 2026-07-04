@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Iterable
 
 from src.planner.models import ExecutionPlan, PlannedExecution, PlannedExecutionAction
-from src.platform.exchanges.models import OrderRequest, OrderSide, OrderType, StopMarketOrderRequest
+from src.platform.exchanges.models import CancelStopOrderRequest, OrderRequest, OrderSide, OrderType, StopMarketOrderRequest
 from src.signals.models import SignalAction, SignalOrderType, TradeSignal
 
 
@@ -23,6 +23,24 @@ class ExecutionPlanner:
             return ExecutionPlan.single(PlannedExecution(action=PlannedExecutionAction.CANCEL_ALL_ORDERS, signal=signal))
         if signal.action is SignalAction.CANCEL_ALL_STOP_ORDERS:
             return ExecutionPlan.single(PlannedExecution(action=PlannedExecutionAction.CANCEL_ALL_STOP_ORDERS, signal=signal))
+        if signal.action is SignalAction.CANCEL_STOP_ORDER:
+            metadata = signal.metadata or {}
+            request = CancelStopOrderRequest(
+                symbol=signal.symbol,
+                client_order_id=(
+                    _identifier_or_none(signal.client_order_id)
+                    or _identifier_or_none(metadata.get("stop_client_order_id"))
+                ),
+                stop_order_id=_identifier_or_none(metadata.get("stop_order_id")),
+                metadata=signal.metadata,
+            )
+            return ExecutionPlan.single(
+                PlannedExecution(
+                    action=PlannedExecutionAction.CANCEL_STOP_ORDER,
+                    signal=signal,
+                    cancel_stop_request=request,
+                )
+            )
         if signal.action in {SignalAction.PLACE_STOP_LOSS_LONG, SignalAction.PLACE_STOP_LOSS_SHORT}:
             request = StopMarketOrderRequest(
                 symbol=signal.symbol,
@@ -102,3 +120,9 @@ def _order_type(order_type: SignalOrderType) -> OrderType:
     if order_type is SignalOrderType.LIMIT:
         return OrderType.LIMIT
     raise SignalPlanningError(f"unsupported order type: {order_type.value}")
+
+
+def _identifier_or_none(value) -> str | None:
+    if value is None or not str(value).strip():
+        return None
+    return str(value)
