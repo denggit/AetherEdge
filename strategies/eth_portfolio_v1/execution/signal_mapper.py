@@ -6,13 +6,16 @@ from typing import Any, Mapping, Sequence
 
 from src.signals import SignalAction, SignalOrderType, TradeSignal
 from strategies.eth_portfolio_v1.domain.models import Side, V8DecisionType, V8TradeDecision
+from strategies.eth_portfolio_v1.domain.sleeves import SleeveId
 
 
 @dataclass(frozen=True)
 class SignalMapperConfig:
     strategy_id: str = "eth_portfolio_v1"
     target_exchanges: tuple[str, ...] = ()
-    extra_metadata: Mapping[str, Any] = field(default_factory=dict)
+    extra_metadata: Mapping[str, Any] = field(
+        default_factory=lambda: {"sleeve_id": SleeveId.LF.value}
+    )
 
 
 class V8SignalMapper:

@@ -1,9 +1,10 @@
 # ETH Portfolio V1 AetherEdge Plugin
 
-ETH Portfolio V1 is an independent, LF-only scaffold forked from
-`eth_lf_portfolio_v10b`. Its current behavior is intended to remain equivalent
-to the V10B LF portfolio: the alpha rules, router, sizing, range exit,
-structural stop, and risk scaling are unchanged.
+ETH Portfolio V1 is an independent portfolio strategy plugin. It is no longer
+modeled as a long-term single-LF strategy, although its only active sleeve in
+R005 is still the existing LF implementation. The LF alpha rules, router,
+sizing, range exit, structural stop, risk scaling, and execution behavior
+remain equivalent to the pre-R005 V1 baseline.
 
 Plugin path and identity:
 
@@ -15,11 +16,26 @@ strategy_version: V1
 
 ## Current scope
 
-- V1 currently contains only the V10B-equivalent LF sleeve.
-- Low Sweep MF is not connected or implemented in this plugin.
+- The LF sleeve is active and owns the existing position and signal behavior.
+- The MF sleeve is a disabled state placeholder. It receives no market events,
+  emits no signals, places no orders, and contributes no active position.
+- Low Sweep signal/data migration is not part of R005; it remains reserved for
+  R007/R008.
 - The plugin owns its copied domain, engine, execution, feature, and
   persistence modules and does not import another concrete strategy plugin.
 - V1 regular stop replacement never uses global `cancel_all_stop_orders`.
+
+## Logical position provider
+
+`Strategy.position_snapshots()` is the standard V1 provider used to expose
+logical positions to the generic runtime. In R005 it returns active logical
+positions only: an active LF position is adapted from the existing LF state,
+while flat LF and disabled MF sleeves return no snapshot.
+
+The LF adapter preserves the existing `position_id` exactly and maps the
+existing base-asset `qty`, average entry, confirmed stop, side, engine, entry
+time, and active exchanges into `StrategyPositionSnapshot`. This provider does
+not change stop ownership, recovery scope, or scoped stop replacement.
 
 ## Scoped stop replacement
 
@@ -43,15 +59,13 @@ cleanup as required. Before live rollout, order events and recovery data must
 reliably populate old stop exchange/client IDs; otherwise obsolete stops cannot
 be cleaned up automatically.
 
-## Future direction
+## Sleeve direction
 
-V1 will later add independent LF and MF sleeves. That future live strategy must
-run in hedge mode. LF and MF stops must use their own sleeve quantities and
-`reduce_only`. This scoped boundary is required so one sleeve cannot remove the
-other sleeve's protective stop.
-
-Low Sweep, dual-sleeve behavior, and automatic hedge-mode switching are not
-part of the current scaffold.
+V1 now owns explicit LF and MF state boundaries. LF signals carry
+`strategy_id=eth_portfolio_v1` and `sleeve_id=lf`; position-scoped signals keep
+their existing `position_id`. MF remains disabled and inert until a later
+milestone migrates its signal and data behavior. Automatic hedge-mode
+switching is also outside R005.
 
 ## Runtime boundary
 

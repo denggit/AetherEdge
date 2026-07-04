@@ -12,6 +12,17 @@ FORBIDDEN_PLUGIN_IMPORTS = (
     "strategies.eth_lf_portfolio_v8",
     "strategies.eth_lf_portfolio_v10b",
 )
+SLEEVE_BOUNDARY_FILES = (
+    PLUGIN_ROOT / "domain" / "position_snapshots.py",
+    PLUGIN_ROOT / "domain" / "sleeves.py",
+)
+FORBIDDEN_SLEEVE_IMPORTS = (
+    "src.platform.exchanges.okx",
+    "src.platform.exchanges.binance",
+    "src.platform.account.websocket.okx",
+    "src.platform.account.websocket.binance",
+    "src.runtime.runner",
+)
 
 
 def _python_files() -> tuple[Path, ...]:
@@ -59,3 +70,14 @@ def test_v1_config_has_independent_identity() -> None:
     assert config["strategy_id"] == "eth_portfolio_v1"
     assert config["strategy_version"] == "V1"
     assert config["display_name"] == "ETH Portfolio V1"
+
+
+def test_v1_sleeve_boundaries_do_not_import_runtime_or_raw_exchange_adapters() -> None:
+    for path in SLEEVE_BOUNDARY_FILES:
+        source = path.read_text(encoding="utf-8")
+        for forbidden in FORBIDDEN_SLEEVE_IMPORTS:
+            assert forbidden not in source, (
+                f"{path.relative_to(PROJECT_ROOT)} imports forbidden boundary "
+                f"dependency {forbidden}"
+            )
+        assert "CoinBacktest" not in source

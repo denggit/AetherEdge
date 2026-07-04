@@ -54,3 +54,4 @@ def test_v1_signal_mapper_default_identity() -> None:
     signal_mapper = importlib.import_module(f"{V1_PREFIX}.execution.signal_mapper")
 
     assert signal_mapper.SignalMapperConfig().strategy_id == "eth_portfolio_v1"
+    assert signal_mapper.SignalMapperConfig().extra_metadata["sleeve_id"] == "lf"
