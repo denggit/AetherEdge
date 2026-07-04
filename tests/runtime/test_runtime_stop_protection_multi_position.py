@@ -268,6 +268,65 @@ def test_exchange_long_and_short_positions_match_requested_side() -> None:
     ) == (exchange_positions[0],)
 
 
+def test_okx_style_positive_short_quantity_does_not_match_long_scope() -> None:
+    long_position = _strategy_position("long-sleeve", StrategyPositionSide.LONG)
+    exchange_positions = (
+        _exchange_position(PositionSide.LONG, "2.82"),
+        _exchange_position(PositionSide.SHORT, "2.82"),
+    )
+
+    assert _exchange_positions_matching_strategy_position(
+        exchange_positions,
+        long_position,
+    ) == (exchange_positions[0],)
+
+
+def test_okx_style_positive_short_quantity_matches_short_scope() -> None:
+    short_position = _strategy_position(
+        "short-sleeve",
+        StrategyPositionSide.SHORT,
+    )
+    exchange_positions = (
+        _exchange_position(PositionSide.LONG, "2.82"),
+        _exchange_position(PositionSide.SHORT, "2.82"),
+    )
+
+    assert _exchange_positions_matching_strategy_position(
+        exchange_positions,
+        short_position,
+    ) == (exchange_positions[1],)
+
+
+def test_explicit_short_side_takes_priority_over_positive_quantity() -> None:
+    long_position = _strategy_position("long-sleeve", StrategyPositionSide.LONG)
+    explicit_short = _exchange_position(PositionSide.SHORT, "1.0")
+
+    assert _exchange_positions_matching_strategy_position(
+        (explicit_short,),
+        long_position,
+    ) == ()
+
+
+def test_both_exchange_side_falls_back_to_quantity_sign() -> None:
+    long_position = _strategy_position("long-sleeve", StrategyPositionSide.LONG)
+    short_position = _strategy_position(
+        "short-sleeve",
+        StrategyPositionSide.SHORT,
+    )
+    positive_both = _exchange_position(PositionSide.BOTH, "1.0")
+    negative_both = _exchange_position(PositionSide.BOTH, "-1.0")
+    exchange_positions = (positive_both, negative_both)
+
+    assert _exchange_positions_matching_strategy_position(
+        exchange_positions,
+        long_position,
+    ) == (positive_both,)
+    assert _exchange_positions_matching_strategy_position(
+        exchange_positions,
+        short_position,
+    ) == (negative_both,)
+
+
 def test_ambiguous_same_side_exchange_positions_fail_closed() -> None:
     strategy_position = _strategy_position(
         "long-sleeve",

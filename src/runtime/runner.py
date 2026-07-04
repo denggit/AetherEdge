@@ -4003,13 +4003,13 @@ def _exchange_positions_matching_strategy_position(
         return tuple(
             position
             for position in candidates
-            if position.quantity > 0 or position.side is PositionSide.LONG
+            if _exchange_position_matches_long(position)
         )
     if strategy_position.side is StrategyPositionSide.SHORT:
         return tuple(
             position
             for position in candidates
-            if position.quantity < 0 or position.side is PositionSide.SHORT
+            if _exchange_position_matches_short(position)
         )
     if strategy_position.side in {
         StrategyPositionSide.BOTH,
@@ -4017,6 +4017,22 @@ def _exchange_positions_matching_strategy_position(
     }:
         return candidates
     return ()
+
+
+def _exchange_position_matches_long(position: Position) -> bool:
+    if position.side is PositionSide.LONG:
+        return True
+    if position.side is PositionSide.SHORT:
+        return False
+    return position.quantity > 0
+
+
+def _exchange_position_matches_short(position: Position) -> bool:
+    if position.side is PositionSide.SHORT:
+        return True
+    if position.side is PositionSide.LONG:
+        return False
+    return position.quantity < 0
 
 
 def _position_side_for_strategy_position(
