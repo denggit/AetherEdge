@@ -19,17 +19,37 @@ strategy_version: V1
 - Low Sweep MF is not connected or implemented in this plugin.
 - The plugin owns its copied domain, engine, execution, feature, and
   persistence modules and does not import another concrete strategy plugin.
+- V1 regular stop replacement never uses global `cancel_all_stop_orders`.
+
+## Scoped stop replacement
+
+V1 stop replacement is staged, not an atomic batch:
+
+1. Place the new LF-quantity, `reduce_only` stop.
+2. Verify that the new stop exists at the target exchange.
+3. Dispatch a scoped cancel for the old LF stop using its existing exchange
+   order ID and/or client order ID.
+
+The signal list preserves this order for runtimes that execute signals
+sequentially. It must not be interpreted as an atomic venue operation. Both
+stages retain `target_exchanges`, and the old-stop cancel includes the V1
+strategy, LF sleeve, position, side, symbol, and old stop identifiers.
+
+If an old stop identifier is unavailable, V1 places the new protective stop
+but does not fall back to a global cancel. The new-stop metadata marks manual
+cleanup as required. Before live rollout, order events and recovery data must
+reliably populate old stop exchange/client IDs; otherwise obsolete stops cannot
+be cleaned up automatically.
 
 ## Future direction
 
 V1 will later add independent LF and MF sleeves. That future live strategy must
-run in hedge mode. LF and MF stops must use sleeve-scoped quantities and
-`reduce_only`; stop handling must never use a global
-`cancel_all_stop_orders`.
+run in hedge mode. LF and MF stops must use their own sleeve quantities and
+`reduce_only`. This scoped boundary is required so one sleeve cannot remove the
+other sleeve's protective stop.
 
-These future requirements are documented only. This scaffold does not add
-Low Sweep, dual-sleeve behavior, scoped-stop changes, or automatic hedge-mode
-switching.
+Low Sweep, dual-sleeve behavior, and automatic hedge-mode switching are not
+part of the current scaffold.
 
 ## Runtime boundary
 

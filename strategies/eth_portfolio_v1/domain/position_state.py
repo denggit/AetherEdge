@@ -281,6 +281,24 @@ class V8PositionState:
         self.legs[exchange] = leg
         return leg
 
+    def record_stop_order(
+        self,
+        *,
+        exchange: str,
+        stop_order_id: str | None,
+        stop_client_order_id: str | None,
+        stop_price: Decimal | None,
+    ) -> ExchangeLegState:
+        """Replace the venue identifiers for this leg's confirmed stop."""
+
+        leg = self.legs.get(exchange, ExchangeLegState(exchange=exchange))
+        leg.stop_order_id = stop_order_id
+        leg.stop_client_order_id = stop_client_order_id
+        if stop_price is not None:
+            leg.stop_price = stop_price
+        self.legs[exchange] = leg
+        return leg
+
     def apply_account_event(self, event: AccountEvent, *, master_exchange: str | None = None) -> None:
         """Update exchange-leg state from a generic private account event.
 

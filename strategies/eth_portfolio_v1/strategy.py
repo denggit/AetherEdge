@@ -27,6 +27,11 @@ from strategies.eth_portfolio_v1.engines.momentum_v3 import MomentumV3Engine
 from strategies.eth_portfolio_v1.engines.router import MomentumEntryFilterConfig, PortfolioRouter
 from strategies.eth_portfolio_v1.execution.signal_mapper import SignalMapperConfig, V8SignalMapper
 from strategies.eth_portfolio_v1.execution.range_exit import RangeExitConfig, evaluate_range_exit
+from strategies.eth_portfolio_v1.execution.scoped_stop_replace import (
+    StopIdentifier,
+    build_scoped_cancel_signals,
+    build_scoped_replace_signals,
+)
 from strategies.eth_portfolio_v1.execution.sizing import RiskSizingConfig, V8RiskSizer
 from strategies.eth_portfolio_v1.execution.stops import initial_stop_from_risk, is_better_stop, protected_stop, validate_exchange_stop
 from strategies.eth_portfolio_v1.execution.structural_stop import (
@@ -331,8 +336,6 @@ class Strategy:
     ) -> Sequence[TradeSignal]:
         if signal.action in {SignalAction.PLACE_STOP_LOSS_LONG, SignalAction.PLACE_STOP_LOSS_SHORT}:
             return self._handle_stop_order_results(signal=signal, results=results, event_time_ms=event_time_ms)
-        if signal.action is SignalAction.CANCEL_ALL_STOP_ORDERS:
-            return []
         if signal.action not in {SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT, SignalAction.CLOSE_LONG, SignalAction.CLOSE_SHORT}:
             return []
 
@@ -441,6 +444,12 @@ class Strategy:
             if stop_price is not None:
                 self.position.confirm_pending_stop_replace(stop_price=stop_price)
             for result in successful:
+                self.position.record_stop_order(
+                    exchange=result.exchange.value,
+                    stop_order_id=result.order_id,
+                    stop_client_order_id=result.client_order_id,
+                    stop_price=stop_price,
+                )
                 self._reconcile_master_position_from_exchange_result(
                     result=result,
                     event_time_ms=event_time_ms,
@@ -2029,6 +2038,15 @@ class Strategy:
                     reason=reason,
                     bar_close_time_ms=None,
                     metadata_overrides=repair_metadata,
+                    old_stop_identifiers={
+                        exchange: [
+                            StopIdentifier(
+                                stop_order_id=order.order_id,
+                                stop_client_order_id=order.client_order_id,
+                            )
+                            for order in validation.bot_owned_orders
+                        ]
+                    },
                 )
             )
             cancel_count = len(validation.bot_owned_orders)
@@ -2122,12 +2140,24 @@ class Strategy:
             len(bot_owned_stops),
             len(bot_owned_stops),
         )
-        return [
-            self._cancel_stop_signal(
-                target_exchanges=[exchange],
-                reason="RECOVERY_FOLLOWER_MISSING_CANCEL_STOP",
-            )
-        ]
+        cancel_signals, _missing_targets = build_scoped_cancel_signals(
+            strategy_id=self.config.strategy_id,
+            position_id=position_id,
+            symbol=self.config.symbol,
+            position_side=None,
+            target_exchanges=[exchange],
+            stop_identifiers={
+                exchange: [
+                    StopIdentifier(
+                        stop_order_id=order.order_id,
+                        stop_client_order_id=order.client_order_id,
+                    )
+                    for order in bot_owned_stops
+                ]
+            },
+            replace_reason="RECOVERY_FOLLOWER_MISSING_CANCEL_STOP",
+        )
+        return cancel_signals
 
     def _follower_topup_signal(self, *, exchange: str, side: Side, quantity: Decimal, plan: Mapping[str, Any]) -> TradeSignal:
         return TradeSignal(
@@ -2154,6 +2184,7 @@ class Strategy:
         exchange_quantities: Mapping[str, Decimal] | None = None,
         reference_price: Decimal | None = None,
         metadata_overrides: Mapping[str, Any] | None = None,
+        old_stop_identifiers: Mapping[str, Sequence[StopIdentifier]] | None = None,
     ) -> list[TradeSignal]:
         if not self._stop_is_exchange_valid(
             stop_price=stop_price,
@@ -2162,30 +2193,40 @@ class Strategy:
             bar_close_time_ms=bar_close_time_ms,
         ):
             return []
-        return [
-            self._cancel_stop_signal(target_exchanges=target_exchanges, reason=f"{reason}_CANCEL_OLD"),
-            *self._place_stop_signals(
-                target_exchanges=target_exchanges,
-                quantity=quantity,
-                stop_price=stop_price,
-                reason=reason,
-                bar_close_time_ms=bar_close_time_ms,
-                exchange_quantities=exchange_quantities,
-                reference_price=reference_price,
-                metadata_overrides=metadata_overrides,
-            ),
-        ]
-
-    def _cancel_stop_signal(self, *, target_exchanges: list[str], reason: str) -> TradeSignal:
-        return TradeSignal(
-            symbol=self.config.symbol,
-            action=SignalAction.CANCEL_ALL_STOP_ORDERS,
+        new_stop_signals = self._place_stop_signals(
+            target_exchanges=target_exchanges,
+            quantity=quantity,
+            stop_price=stop_price,
             reason=reason,
-            metadata={
-                "target_exchanges": target_exchanges,
-                "execution_purpose": "stop_sync",
-                "position_id": self.position.position_id,
-            },
+            bar_close_time_ms=bar_close_time_ms,
+            exchange_quantities=exchange_quantities,
+            reference_price=reference_price,
+            metadata_overrides=metadata_overrides,
+        )
+        if not new_stop_signals:
+            return []
+        identifiers = old_stop_identifiers or {
+            exchange: [
+                StopIdentifier(
+                    stop_order_id=leg.stop_order_id,
+                    stop_client_order_id=leg.stop_client_order_id,
+                )
+            ]
+            for exchange in target_exchanges
+            if (leg := self.position.legs.get(exchange)) is not None
+        }
+        # These are orchestration stages, not an atomic batch: submit the new
+        # stop first, verify that it exists, then dispatch exact old-stop
+        # cancels. Sequential runtimes must preserve this list order.
+        return build_scoped_replace_signals(
+            strategy_id=self.config.strategy_id,
+            position_id=self.position.position_id,
+            symbol=self.config.symbol,
+            position_side=_position_side_for_strategy_side(self.position.side),
+            target_exchanges=target_exchanges,
+            old_stop_identifiers=identifiers,
+            new_stop_signal=new_stop_signals[0],
+            replace_reason=reason,
         )
 
     def _place_stop_signals(
@@ -2222,10 +2263,11 @@ class Strategy:
                     "target_exchanges": target_exchanges,
                     "stop_price_source": "master_canonical",
                     "execution_purpose": "stop_sync",
-                    "replace_mode": "cancel_then_place_validated",
+                    "sleeve_id": "lf",
+                    "replace_mode": "staged_place_verify_scoped_cancel",
                     "stop_replace_atomic_supported": False,
-                    "stop_replace_mode": "cancel_then_place_validated",
-                    "stop_replace_non_atomic_reason": "no_targeted_stop_cancel_capability",
+                    "stop_replace_mode": "staged_place_verify_scoped_cancel",
+                    "stop_replace_non_atomic_reason": "verify_new_stop_before_scoped_cancel",
                     "desired_stop_price": str(stop_price),
                     "confirmed_stop_price": None if self.position.stop_price is None else str(self.position.stop_price),
                     "position_id": self.position.position_id,
