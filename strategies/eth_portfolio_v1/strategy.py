@@ -19,11 +19,17 @@ from src.order_management.models import ExchangeOrderResult
 from src.platform.snapshot import PlatformSnapshot
 from src.signals import SignalAction, TradeSignal
 from src.strategy import StrategyRecoveryContext
-from src.strategy.positions import StrategyPositionSnapshot, StrategyPositionSide, StrategyPositionStatus
+from src.strategy.positions import StrategyPositionSnapshot
 from strategies.eth_portfolio_v1.domain.models import BarReadyContext, Side, V8DecisionType, V8TradeDecision
 from strategies.eth_portfolio_v1.domain.position_snapshots import LfSleeveSnapshotAdapter
 from strategies.eth_portfolio_v1.domain.position_state import V8PositionState
-from strategies.eth_portfolio_v1.domain.sleeves import LfSleeveState, MfSleeveState, PortfolioSleeves, SleeveId
+from strategies.eth_portfolio_v1.domain.sleeve_registry import SleeveRegistry
+from strategies.eth_portfolio_v1.domain.sleeves import (
+    DisabledSleeve,
+    LF_SLEEVE_ID,
+    LfSleeveState,
+    MF_RESERVED_SLEEVE_ID,
+)
 from strategies.eth_portfolio_v1.engines.bear_v3 import BearV3OnlyEngine
 from strategies.eth_portfolio_v1.engines.bull_reclaim_v2 import BullReclaimV2Engine
 from strategies.eth_portfolio_v1.engines.momentum_v3 import MomentumV3Engine
@@ -167,13 +173,15 @@ class Strategy:
         self.range_speed_history_warmup_count = 0
         self.feature_builder = V8LiveFeatureBuilder()
         self.position = V8PositionState()
-        self.lf_sleeve = LfSleeveState(position=self.position)
-        self.mf_sleeve = MfSleeveState()
-        self.sleeves = PortfolioSleeves(lf=self.lf_sleeve, mf=self.mf_sleeve)
-        self._lf_snapshot_adapter = LfSleeveSnapshotAdapter(
-            strategy_id=self.config.strategy_id,
-            symbol=self.config.symbol,
+        self.lf_sleeve = LfSleeveState(
+            position=self.position,
+            snapshot_adapter=LfSleeveSnapshotAdapter(
+                strategy_id=self.config.strategy_id,
+                symbol=self.config.symbol,
+            ),
         )
+        self.mf_sleeve = DisabledSleeve(MF_RESERVED_SLEEVE_ID)
+        self.sleeves = SleeveRegistry((self.lf_sleeve, self.mf_sleeve))
         self.router = PortfolioRouter(
             engines=(BullReclaimV2Engine(), MomentumV3Engine(), BearV3OnlyEngine()),
             entry_filter_config=self.config.entry_filters,
@@ -267,17 +275,7 @@ class Strategy:
     def position_snapshots(self) -> tuple[StrategyPositionSnapshot, ...]:
         """Expose active V1 logical positions through the generic provider."""
 
-        lf_snapshot = self._lf_snapshot_adapter.build_active(self.lf_sleeve.position)
-        if (
-            lf_snapshot is None
-            or lf_snapshot.status is not StrategyPositionStatus.ACTIVE
-            or lf_snapshot.side not in {
-                StrategyPositionSide.LONG,
-                StrategyPositionSide.SHORT,
-            }
-        ):
-            return ()
-        return (lf_snapshot,)
+        return self.sleeves.position_snapshots()
 
     async def on_start(self, snapshot: PlatformSnapshot) -> Sequence[TradeSignal]:
         self.started = True
@@ -1649,7 +1647,7 @@ class Strategy:
                     quantity=self.pending_entry.quantity,
                     metadata={
                         "strategy_id": self.config.strategy_id,
-                        "sleeve_id": SleeveId.LF.value,
+                        "sleeve_id": LF_SLEEVE_ID,
                         "position_id": self.pending_entry.position_id,
                     },
                 ),
@@ -1989,7 +1987,7 @@ class Strategy:
                         reason="RECOVERY_MASTER_CLOSED_CLOSE_FOLLOWER",
                         metadata={
                             "strategy_id": self.config.strategy_id,
-                            "sleeve_id": SleeveId.LF.value,
+                            "sleeve_id": LF_SLEEVE_ID,
                             "target_exchanges": [exchange],
                             "reduce_only": True,
                             "execution_purpose": "follower_close_after_master_close",
@@ -2215,7 +2213,7 @@ class Strategy:
             reason="RECOVERY_FOLLOWER_TOPUP",
             metadata={
                 "strategy_id": self.config.strategy_id,
-                "sleeve_id": SleeveId.LF.value,
+                "sleeve_id": LF_SLEEVE_ID,
                 "target_exchanges": [exchange],
                 "execution_purpose": "follower_recovery_topup",
                 "position_id": plan.get("position_id"),
@@ -2409,7 +2407,7 @@ class Strategy:
                     reason="MASTER_CLOSE_FILLED_CLOSE_FOLLOWER",
                     metadata={
                         "strategy_id": self.config.strategy_id,
-                        "sleeve_id": SleeveId.LF.value,
+                        "sleeve_id": LF_SLEEVE_ID,
                         "target_exchanges": [exchange],
                         "reduce_only": True,
                         "execution_purpose": "follower_close_after_master_close",

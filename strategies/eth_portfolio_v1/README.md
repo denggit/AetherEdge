@@ -16,26 +16,27 @@ strategy_version: V1
 
 ## Current scope
 
-- The LF sleeve is active and owns the existing position and signal behavior.
-- The MF sleeve is a disabled state placeholder. It receives no market events,
-  emits no signals, places no orders, and contributes no active position.
-- Low Sweep signal/data migration is not part of R005; it remains reserved for
-  R007/R008.
+- V1 composes its sleeves through a plugin-private `SleeveRegistry`.
+- The registry currently contains the active `lf` sleeve followed by an inert
+  `DisabledSleeve("mf")` placeholder.
+- Low Sweep signal/data migration is not part of R005-fix; it remains reserved
+  for R007/R008.
 - The plugin owns its copied domain, engine, execution, feature, and
   persistence modules and does not import another concrete strategy plugin.
 - V1 regular stop replacement never uses global `cancel_all_stop_orders`.
 
 ## Logical position provider
 
-`Strategy.position_snapshots()` is the standard V1 provider used to expose
-logical positions to the generic runtime. In R005 it returns active logical
-positions only: an active LF position is adapted from the existing LF state,
-while flat LF and disabled MF sleeves return no snapshot.
+`Strategy.position_snapshots()` delegates to the sleeve registry, which
+aggregates snapshots from enabled sleeves in registration order. In R005-fix
+it returns active logical positions only: the LF sleeve adapts its existing
+position state, while flat LF and disabled MF sleeves return no snapshot.
 
-The LF adapter preserves the existing `position_id` exactly and maps the
-existing base-asset `qty`, average entry, confirmed stop, side, engine, entry
-time, and active exchanges into `StrategyPositionSnapshot`. This provider does
-not change stop ownership, recovery scope, or scoped stop replacement.
+The LF sleeve composes its existing snapshot adapter. The adapter preserves the
+existing `position_id` exactly and maps base-asset `qty`, average entry,
+confirmed stop, side, engine, entry time, and active exchanges into
+`StrategyPositionSnapshot`. This provider does not change stop ownership,
+recovery scope, or scoped stop replacement.
 
 ## Scoped stop replacement
 
@@ -61,11 +62,14 @@ be cleaned up automatically.
 
 ## Sleeve direction
 
-V1 now owns explicit LF and MF state boundaries. LF signals carry
-`strategy_id=eth_portfolio_v1` and `sleeve_id=lf`; position-scoped signals keep
-their existing `position_id`. MF remains disabled and inert until a later
+The registry depends only on the plugin-private `PortfolioSleeve` protocol and
+unique string IDs; it has no fixed LF/MF field set. Future sleeves such as
+`mf_low_sweep` or `hf_range` can be registered without changing the public
+`src` architecture. LF signals continue to carry
+`strategy_id=eth_portfolio_v1` and `sleeve_id=lf`, and position-scoped signals
+keep their existing `position_id`. MF remains disabled and inert until a later
 milestone migrates its signal and data behavior. Automatic hedge-mode
-switching is also outside R005.
+switching is also outside R005-fix.
 
 ## Runtime boundary
 

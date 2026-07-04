@@ -4,7 +4,11 @@ from decimal import Decimal
 
 from src.signals import SignalAction
 from strategies.eth_portfolio_v1.domain.models import Side, V8DecisionType, V8TradeDecision
-from strategies.eth_portfolio_v1.domain.sleeves import SleeveId
+from strategies.eth_portfolio_v1.domain.sleeves import (
+    DisabledSleeve,
+    LF_SLEEVE_ID,
+    MF_RESERVED_SLEEVE_ID,
+)
 from strategies.eth_portfolio_v1.strategy import Strategy
 
 
@@ -12,8 +16,10 @@ def test_mf_placeholder_has_no_market_event_or_signal_surface() -> None:
     strategy = Strategy()
     mf = strategy.mf_sleeve
 
+    assert isinstance(mf, DisabledSleeve)
     assert mf.enabled is False
-    assert mf.sleeve_id is SleeveId.MF
+    assert mf.sleeve_id == MF_RESERVED_SLEEVE_ID
+    assert mf.position_snapshots() == ()
     assert not hasattr(mf, "on_kline")
     assert not hasattr(mf, "on_trade")
     assert not hasattr(mf, "signals")
@@ -38,7 +44,7 @@ def test_lf_entry_signal_metadata_contains_v1_sleeve_scope() -> None:
     assert signal.action is SignalAction.OPEN_LONG
     assert signal.quantity == Decimal("0.20")
     assert signal.metadata["strategy_id"] == "eth_portfolio_v1"
-    assert signal.metadata["sleeve_id"] == SleeveId.LF.value
+    assert signal.metadata["sleeve_id"] == LF_SLEEVE_ID
     assert signal.metadata["position_id"] == "existing-lf-position-id"
     assert signal.metadata["existing_key"] == "preserved"
 
@@ -67,5 +73,5 @@ def test_lf_scoped_stop_signal_keeps_position_scope_and_sleeve_metadata() -> Non
     assert signal.quantity == Decimal("0.30")
     assert signal.trigger_price == Decimal("2550")
     assert signal.metadata["strategy_id"] == "eth_portfolio_v1"
-    assert signal.metadata["sleeve_id"] == SleeveId.LF.value
+    assert signal.metadata["sleeve_id"] == LF_SLEEVE_ID
     assert signal.metadata["position_id"] == "existing-lf-short-position"

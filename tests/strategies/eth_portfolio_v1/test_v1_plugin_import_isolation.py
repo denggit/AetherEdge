@@ -14,6 +14,7 @@ FORBIDDEN_PLUGIN_IMPORTS = (
 )
 SLEEVE_BOUNDARY_FILES = (
     PLUGIN_ROOT / "domain" / "position_snapshots.py",
+    PLUGIN_ROOT / "domain" / "sleeve_registry.py",
     PLUGIN_ROOT / "domain" / "sleeves.py",
 )
 FORBIDDEN_SLEEVE_IMPORTS = (

@@ -10,7 +10,7 @@ from src.strategy.positions import (
 )
 from strategies.eth_portfolio_v1.domain.models import Side
 from strategies.eth_portfolio_v1.domain.position_state import V8PositionState
-from strategies.eth_portfolio_v1.domain.sleeves import SleeveId
+from strategies.eth_portfolio_v1.domain.sleeves import LF_SLEEVE_ID
 
 
 @dataclass(frozen=True)
@@ -39,7 +39,7 @@ class LfSleeveSnapshotAdapter:
 
         return StrategyPositionSnapshot(
             strategy_id=self.strategy_id,
-            sleeve_id=SleeveId.LF.value,
+            sleeve_id=LF_SLEEVE_ID,
             position_id=position.position_id,
             symbol=self.symbol,
             side=side,
