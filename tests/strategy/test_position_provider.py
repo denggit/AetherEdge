@@ -45,6 +45,30 @@ def test_strategy_id_and_symbol_must_be_non_empty(field: str, value: str) -> Non
         _snapshot(**kwargs)
 
 
+def test_side_must_be_strategy_position_side() -> None:
+    with pytest.raises(ValueError, match="side"):
+        StrategyPositionSnapshot(
+            strategy_id="test-strategy",
+            position_id="position-1",
+            symbol="ETH-USDT-PERP",
+            side="long",  # type: ignore[arg-type]
+            status=StrategyPositionStatus.ACTIVE,
+            base_quantity=Decimal("1"),
+        )
+
+
+def test_status_must_be_strategy_position_status() -> None:
+    with pytest.raises(ValueError, match="status"):
+        StrategyPositionSnapshot(
+            strategy_id="test-strategy",
+            position_id="position-1",
+            symbol="ETH-USDT-PERP",
+            side=StrategyPositionSide.LONG,
+            status="active",  # type: ignore[arg-type]
+            base_quantity=Decimal("1"),
+        )
+
+
 def test_active_position_rejects_negative_quantity() -> None:
     with pytest.raises(ValueError, match="base_quantity"):
         _snapshot(base_quantity=Decimal("-0.1"))

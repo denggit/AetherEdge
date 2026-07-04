@@ -44,6 +44,10 @@ class StrategyPositionSnapshot:
             raise ValueError("strategy_id must be non-empty")
         if not isinstance(self.symbol, str) or not self.symbol.strip():
             raise ValueError("symbol must be non-empty")
+        if not isinstance(self.side, StrategyPositionSide):
+            raise ValueError("side must be StrategyPositionSide")
+        if not isinstance(self.status, StrategyPositionStatus):
+            raise ValueError("status must be StrategyPositionStatus")
         if self.status == StrategyPositionStatus.ACTIVE:
             if not isinstance(self.position_id, str) or not self.position_id.strip():
                 raise ValueError("active position must have a non-empty position_id")
