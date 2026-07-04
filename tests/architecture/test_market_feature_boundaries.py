@@ -1,0 +1,85 @@
+from __future__ import annotations
+
+import ast
+import re
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+STRATEGY_PORT = PROJECT_ROOT / "src" / "strategy" / "market_features.py"
+RUNTIME_DISPATCHER = PROJECT_ROOT / "src" / "runtime" / "market_features.py"
+NEW_SOURCE_FILES = (STRATEGY_PORT, RUNTIME_DISPATCHER)
+
+
+def _imports(path: Path) -> tuple[str, ...]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    modules = [
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    ]
+    modules.extend(
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module is not None
+    )
+    return tuple(modules)
+
+
+def test_strategy_observer_port_has_only_allowed_dependencies() -> None:
+    imports = _imports(STRATEGY_PORT)
+
+    assert not any(module.startswith("src.runtime") for module in imports)
+    assert not any(module.startswith("src.order_management") for module in imports)
+    assert not any(module.startswith("src.platform.exchanges.okx") for module in imports)
+    assert not any(module.startswith("src.platform.exchanges.binance") for module in imports)
+    assert not any(module.startswith("strategies") for module in imports)
+
+
+def test_runtime_dispatcher_has_no_concrete_or_execution_dependencies() -> None:
+    imports = _imports(RUNTIME_DISPATCHER)
+
+    assert not any(module.startswith("strategies") for module in imports)
+    assert not any(module.startswith("src.order_management") for module in imports)
+    assert not any(module.startswith("src.platform.exchanges.okx") for module in imports)
+    assert not any(module.startswith("src.platform.exchanges.binance") for module in imports)
+
+
+def test_new_public_boundary_sources_have_no_strategy_specific_vocabulary() -> None:
+    forbidden = re.compile(
+        r"eth_portfolio_v1|eth_lf_portfolio_v8|eth_lf_portfolio_v10b|"
+        r"low_sweep|\blf\b|\bmf\b|\bhf\b|iceberg",
+        re.IGNORECASE,
+    )
+
+    for path in NEW_SOURCE_FILES:
+        assert forbidden.search(path.read_text(encoding="utf-8")) is None
+
+
+def test_runtime_has_only_one_direct_market_feature_dispatch_module() -> None:
+    runtime_root = PROJECT_ROOT / "src" / "runtime"
+    violations: list[str] = []
+
+    for path in sorted(runtime_root.rglob("*.py")):
+        if path == RUNTIME_DISPATCHER:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            direct_attribute = (
+                isinstance(node, ast.Attribute)
+                and node.attr == "on_market_feature"
+            )
+            dynamic_lookup = (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value == "on_market_feature"
+            )
+            if direct_attribute or dynamic_lookup:
+                violations.append(str(path.relative_to(PROJECT_ROOT)))
+                break
+
+    assert violations == []

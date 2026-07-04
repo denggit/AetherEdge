@@ -55,6 +55,10 @@ from src.runtime.account_sync import AccountStateSyncService, OrderStateSyncServ
 from src.runtime.config import LiveRuntimeConfig, live_runtime_config_from_app
 from src.runtime.features import closed_kline_feature, range_aggregate_feature, range_aggregate_unavailable_feature, range_bar_closed_feature
 from src.runtime.heartbeat import RuntimeHeartbeatService
+from src.runtime.market_features import (
+    dispatch_market_feature_event,
+    resolve_market_feature_observers,
+)
 from src.runtime.models import RuntimeHealth, RuntimeMode, RuntimePhase
 from src.runtime.range_backfill_supervisor import RangeBackfillSupervisor, RangeBackfillSupervisorConfig
 from src.runtime.range_micro_repair_supervisor import (
@@ -370,11 +374,8 @@ class LiveRuntimeRunner:
             open_ms = event.data.get("open_time_ms") if isinstance(event.data, dict) else None
             if isinstance(open_ms, int):
                 hb.note_closed_bar(open_ms)
-        handler = getattr(self.context.strategy, "on_market_feature", None)
-        if not callable(handler):
-            return
-        signals = await handler(event)
-        await self._execute_signals(signals or (), source=event.type_value, event_time_ms=event.event_time_ms, metadata={"feature_type": event.type_value})
+        signals = await dispatch_market_feature_event(self.context.strategy, event)
+        await self._execute_signals(signals, source=event.type_value, event_time_ms=event.event_time_ms, metadata={"feature_type": event.type_value})
 
     async def process_account_event(self, event: AccountEvent) -> None:
         await self._process_account_event(event)
@@ -1195,8 +1196,7 @@ class LiveRuntimeRunner:
                         )
 
     async def _hydrate_strategy_closed_klines(self, repository, *, time_range: TimeRange) -> None:
-        handler = getattr(self.context.strategy, "on_market_feature", None)
-        if not callable(handler):
+        if not resolve_market_feature_observers(self.context.strategy):
             return
         rows = repository.load(symbol=self.app_config.symbol, interval=self._closed_bar_interval, time_range=time_range)
         for row in rows:
@@ -1642,14 +1642,11 @@ class LiveRuntimeRunner:
         The caller is responsible for filtering, price-guard checks, and
         eventual execution.
         """
-        handler = getattr(self.context.strategy, "on_market_feature", None)
-        if not callable(handler):
-            return []
         signals: list[TradeSignal] = []
         for event in events:
-            result = await handler(event)
-            if result:
-                signals.extend(result)
+            signals.extend(
+                await dispatch_market_feature_event(self.context.strategy, event)
+            )
         return signals
 
     def _capture_startup_preview_state(self) -> StartupPreviewState:

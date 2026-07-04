@@ -23,13 +23,29 @@ class MarketFeatureEvent:
     timeframe: str | None
     event_time_ms: int
     data: Mapping[str, Any] = field(default_factory=dict)
+    available_time_ms: int | None = None
 
     def __post_init__(self) -> None:
         if not self.symbol:
             raise ValueError("symbol is required")
         if self.event_time_ms < 0:
             raise ValueError("event_time_ms must be non-negative")
+        if self.available_time_ms is not None:
+            if self.available_time_ms < 0:
+                raise ValueError("available_time_ms must be non-negative")
+            if self.available_time_ms < self.event_time_ms:
+                raise ValueError(
+                    "available_time_ms must be greater than or equal to event_time_ms"
+                )
 
     @property
     def type_value(self) -> str:
         return self.event_type.value if isinstance(self.event_type, MarketFeatureEventType) else str(self.event_type)
+
+    @property
+    def effective_available_time_ms(self) -> int:
+        return (
+            self.event_time_ms
+            if self.available_time_ms is None
+            else self.available_time_ms
+        )
