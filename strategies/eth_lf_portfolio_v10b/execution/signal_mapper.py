@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
 from src.signals import SignalAction, SignalOrderType, TradeSignal
-from strategies.eth_lf_portfolio_v10b.domain.models import Side, V8DecisionType, V8TradeDecision
+from strategies.eth_lf_portfolio_v8.domain.models import Side, V8DecisionType, V8TradeDecision
 
 
 @dataclass(frozen=True)

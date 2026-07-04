@@ -5,8 +5,8 @@ from typing import Any, Mapping
 
 import pandas as pd
 
-from strategies.eth_lf_portfolio_v10b.domain.models import ClosedKlineContext
-from strategies.eth_lf_portfolio_v10b.features.indicators import adx, atr, ema, resample_ohlcv, rsi
+from strategies.eth_lf_portfolio_v8.domain.models import ClosedKlineContext
+from strategies.eth_lf_portfolio_v8.features.indicators import adx, atr, ema, resample_ohlcv, rsi
 
 
 @dataclass(frozen=True)

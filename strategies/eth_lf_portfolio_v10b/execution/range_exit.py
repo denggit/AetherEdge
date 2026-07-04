@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Mapping
 
-from strategies.eth_lf_portfolio_v10b.domain.models import Side
+from strategies.eth_lf_portfolio_v8.domain.models import Side
 
 
 RANGE_EXIT_REASON = "RANGE_EXIT_NEXT_OPEN"
