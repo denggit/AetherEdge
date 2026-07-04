@@ -71,6 +71,44 @@ def test_runtime_has_no_loaded_first_active_strategy_helpers() -> None:
     assert violations == []
 
 
+def test_generic_stop_protection_paths_do_not_use_single_active_helpers() -> None:
+    runner_path = RUNTIME_ROOT / "runner.py"
+    tree = ast.parse(runner_path.read_text(encoding="utf-8"))
+    generic_paths = {
+        "_validate_recovery_protection_postcondition",
+        "_validate_post_execution_stop_protection",
+        "_verify_stop_order_results",
+    }
+    violations: list[str] = []
+    matching_helper_calls: set[str] = set()
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if node.name not in generic_paths:
+            continue
+        loaded_names = {
+            child.id
+            for child in ast.walk(node)
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+        }
+        loaded_names.update(
+            child.attr
+            for child in ast.walk(node)
+            if isinstance(child, ast.Attribute) and isinstance(child.ctx, ast.Load)
+        )
+        if {
+            "single_active_or_none_for_legacy",
+            "_single_active_exchange_position_or_none_for_legacy",
+        } & loaded_names:
+            violations.append(node.name)
+        if "_exchange_positions_matching_strategy_position" in loaded_names:
+            matching_helper_calls.add(node.name)
+
+    assert violations == []
+    assert matching_helper_calls == generic_paths
+
+
 def test_position_foundation_has_no_exchange_endpoint_fragments() -> None:
     source = _combined_source().lower()
     forbidden_fragments = (

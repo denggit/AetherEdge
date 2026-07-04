@@ -1293,29 +1293,10 @@ class LiveRuntimeRunner:
             return
 
         position_index = self._strategy_position_index()
-        if len(position_index.active) > 1:
-            raise LiveRuntimeError(
-                "legacy recovery protection validation requires a single logical position; "
-                f"active_strategy_positions={len(position_index.active)}"
-            )
-        strategy_position = position_index.single_active_or_none_for_legacy()
-        strategy_id = (
-            strategy_position.strategy_id
-            if strategy_position is not None
-            else self.app_config.strategy
-        )
-        position_id = (
-            strategy_position.position_id
-            if strategy_position is not None
-            else None
-        )
-        canonical_stop_price = (
-            strategy_position.stop_price
-            if strategy_position is not None
-            else None
-        )
+        active_strategy_positions = position_index.active
+        if not active_strategy_positions:
+            return
 
-        market_profile = get_market_profile(self.app_config.symbol)
         converter = NativeQuantityConverter()
         validator = RecoveryExitOrderValidator(quantity_converter=converter)
 
@@ -1334,40 +1315,61 @@ class LiveRuntimeRunner:
 
         master_exchange_str = self.app_config.data_exchange.value
 
-        for snapshot in report.snapshots:
-            exchange_name = snapshot.balance.exchange
-            exchange_str = exchange_name.value if hasattr(exchange_name, "value") else str(exchange_name)
+        for strategy_position in active_strategy_positions:
+            market_profile = get_market_profile(strategy_position.symbol)
+            relevant_exchanges = {
+                master_exchange_str,
+                *_strategy_position_active_exchanges(strategy_position),
+            }
+            for snapshot in report.snapshots:
+                exchange_name = snapshot.balance.exchange
+                exchange_str = (
+                    exchange_name.value
+                    if hasattr(exchange_name, "value")
+                    else str(exchange_name)
+                )
+                if exchange_str not in relevant_exchanges:
+                    continue
 
-            # Determine whether this exchange holds a position we must protect.
-            active_pos = _single_active_exchange_position_or_none_for_legacy(
-                getattr(snapshot, "positions", ()) or ()
-            )
-            if active_pos is None:
-                continue
+                matching_positions = _exchange_positions_matching_strategy_position(
+                    getattr(snapshot, "positions", ()) or (),
+                    strategy_position,
+                )
+                if len(matching_positions) > 1:
+                    _raise_ambiguous_exchange_positions(
+                        context="recovery protection postcondition failed",
+                        strategy_position=strategy_position,
+                        exchange=exchange_str,
+                        ambiguous_count=len(matching_positions),
+                    )
+                if not matching_positions:
+                    continue
 
-            # Only protect master + open legs. Follower-only positions where master
-            # is already closed are handled by reconciliation, not by stop sync.
-            is_master = exchange_str == master_exchange_str
-            is_open_leg = (
-                strategy_position is not None
-                and exchange_str in _strategy_position_active_exchanges(strategy_position)
-            )
-            if not is_master and not is_open_leg:
-                continue
+                active_pos = matching_positions[0]
+                canonical_stop_price = strategy_position.stop_price
+                expected_native_quantity = _strategy_position_native_quantity(
+                    strategy_position=strategy_position,
+                    active_pos=active_pos,
+                    exchange=exchange_name,
+                    market_profile=market_profile,
+                    converter=converter,
+                    logical_position_count=len(active_strategy_positions),
+                )
+                position_side = _position_side_for_strategy_position(
+                    strategy_position,
+                    active_pos,
+                )
 
-            # ── Check 1: existing bot-owned valid stop ──────────────────
-            if canonical_stop_price is not None:
-                pos_side = _position_side_from_quantity(active_pos.quantity)
-                if pos_side is not None:
+                if canonical_stop_price is not None and position_side is not None:
                     try:
                         validation = validator.validate_stop_orders(
                             exchange=exchange_name,
-                            symbol=self.app_config.symbol,
-                            strategy_id=strategy_id,
-                            position_id=position_id,
-                            position_side=pos_side,
+                            symbol=strategy_position.symbol,
+                            strategy_id=strategy_position.strategy_id,
+                            position_id=strategy_position.position_id,
+                            position_side=position_side,
                             position_mode=snapshot.position_mode,
-                            current_position_native_quantity=abs(active_pos.quantity),
+                            current_position_native_quantity=expected_native_quantity,
                             canonical_stop_price=canonical_stop_price,
                             open_stop_orders=getattr(snapshot, "open_stop_orders", ()) or (),
                             open_orders=getattr(snapshot, "open_orders", ()) or (),
@@ -1378,30 +1380,29 @@ class LiveRuntimeRunner:
                     except Exception:
                         pass
 
-            # ── Check 2: recovery generated PLACE_STOP_LOSS for this exchange ──
-            if _place_stop_scope_covers(
-                place_stop_scopes,
-                exchange=exchange_str,
-                position_id=position_id,
-                logical_position_count=len(position_index.active),
-            ):
-                continue
+                if _place_stop_scope_covers(
+                    place_stop_scopes,
+                    exchange=exchange_str,
+                    position_id=strategy_position.position_id,
+                    logical_position_count=len(active_strategy_positions),
+                ):
+                    continue
 
-            # ── Postcondition FAILED ─────────────────────────────────────
-            open_stop_orders = getattr(snapshot, "open_stop_orders", ()) or ()
-            raise LiveRuntimeError(
-                "recovery protection postcondition failed: "
-                "active position without bot-owned valid stop or recovery stop signal | "
-                f"exchange={exchange_str} "
-                f"symbol={snapshot.symbol} "
-                f"position_side={_position_side_label(active_pos)} "
-                f"position_qty={active_pos.quantity} "
-                f"open_stop_orders={len(open_stop_orders)} "
-                f"bot_owned_valid_stop=false "
-                f"place_stop_signal=false "
-                f"canonical_stop_price={canonical_stop_price} "
-                f"strategy_recovery_blocking_manual_required=false"
-            )
+                open_stop_orders = getattr(snapshot, "open_stop_orders", ()) or ()
+                raise LiveRuntimeError(
+                    "recovery protection postcondition failed: "
+                    "active position without bot-owned valid stop or recovery stop signal | "
+                    f"strategy_position_id={strategy_position.position_id} "
+                    f"exchange={exchange_str} "
+                    f"symbol={strategy_position.symbol} "
+                    f"position_side={strategy_position.side.value} "
+                    f"position_qty={active_pos.quantity} "
+                    f"open_stop_orders={len(open_stop_orders)} "
+                    f"bot_owned_valid_stop=false "
+                    f"place_stop_signal=false "
+                    f"canonical_stop_price={canonical_stop_price} "
+                    f"strategy_recovery_blocking_manual_required=false"
+                )
 
     async def _validate_post_execution_stop_protection(self) -> None:
         """After executing PLACE_STOP_LOSS signals, verify the stop orders
@@ -1412,25 +1413,10 @@ class LiveRuntimeRunner:
         MUST satisfy ``should_keep_existing_stop`` — a valid, bot-owned
         protective stop must be live on the exchange right now.
         """
-        position_index = self._strategy_position_index()
-        if len(position_index.active) > 1:
-            raise LiveRuntimeError(
-                "legacy post-execution stop validation requires a single logical position; "
-                f"active_strategy_positions={len(position_index.active)}"
-            )
-        strategy_position = position_index.single_active_or_none_for_legacy()
-        if strategy_position is None:
+        active_strategy_positions = self._strategy_position_index().active
+        if not active_strategy_positions:
             return
 
-        strategy_id = strategy_position.strategy_id
-        position_id = strategy_position.position_id
-        canonical_stop_price = strategy_position.stop_price
-        if canonical_stop_price is None:
-            raise LiveRuntimeError(
-                "post-execution stop validation failed: no canonical stop price available"
-            )
-
-        market_profile = get_market_profile(self.app_config.symbol)
         converter = NativeQuantityConverter()
         validator = RecoveryExitOrderValidator(quantity_converter=converter)
 
@@ -1440,77 +1426,124 @@ class LiveRuntimeRunner:
         acct_by_exchange = {c.exchange: c for c in account_clients}
 
         master_exchange_str = self.app_config.data_exchange.value
-        active_exchanges = _strategy_position_active_exchanges(strategy_position)
+        exchange_state: dict[
+            ExchangeName,
+            tuple[Sequence[Position], Sequence[Order], PositionMode],
+        ] = {}
 
-        for exchange in self.app_config.exchanges:
-            exchange_str = exchange.value
-            if exchange_str != master_exchange_str and exchange_str not in active_exchanges:
-                continue
-
-            exec_client = exec_by_exchange.get(exchange)
-            acct_client = acct_by_exchange.get(exchange)
-            if exec_client is None or acct_client is None:
-                continue
-
-            # ── Fetch fresh exchange state ─────────────────────────────
-            try:
-                positions = await acct_client.fetch_positions()
-                open_stop_orders = await exec_client.fetch_open_stop_orders()
-            except Exception as exc:
+        for strategy_position in active_strategy_positions:
+            canonical_stop_price = strategy_position.stop_price
+            if canonical_stop_price is None:
                 raise LiveRuntimeError(
-                    "post-execution stop validation failed: cannot fetch exchange state | "
-                    f"exchange={exchange_str} error={exc}"
-                ) from exc
-
-            active_pos = _single_active_exchange_position_or_none_for_legacy(positions or ())
-            if active_pos is None:
-                continue
-
-            pos_side = _position_side_from_quantity(active_pos.quantity)
-            if pos_side is None:
-                continue
-
-            try:
-                mode = await acct_client.fetch_position_mode()
-            except Exception:
-                mode = PositionMode.ONE_WAY
-
-            # ── Re-validate against live exchange state ────────────────
-            validation = validator.validate_stop_orders(
-                exchange=exchange,
-                symbol=self.app_config.symbol,
-                strategy_id=strategy_id,
-                position_id=position_id,
-                position_side=pos_side,
-                position_mode=mode,
-                current_position_native_quantity=abs(active_pos.quantity),
-                canonical_stop_price=canonical_stop_price,
-                open_stop_orders=open_stop_orders or (),
-                open_orders=(),
-                market_profile=market_profile,
-            )
-
-            if not validation.should_keep_existing_stop:
-                raise LiveRuntimeError(
-                    "post-execution stop validation failed: "
-                    "active position still without bot-owned valid stop "
-                    "after recovery stop placement | "
-                    f"exchange={exchange_str} "
-                    f"symbol={self.app_config.symbol} "
-                    f"position_qty={active_pos.quantity} "
-                    f"canonical_stop_price={canonical_stop_price} "
-                    f"valid_bot_stops={len(validation.valid_bot_owned_orders)} "
-                    f"invalid_bot_stops={len(validation.invalid_bot_owned_orders)} "
-                    f"unknown_stops={len(validation.unknown_exit_orders)} "
-                    f"primary_reason={validation.primary_invalid_reason}"
+                    "post-execution stop validation failed: no canonical stop price available | "
+                    f"strategy_position_id={strategy_position.position_id}"
                 )
 
-            logger.info(
-                "Post-execution stop protection validated | exchange=%s "
-                "valid_bot_stops=%s",
-                exchange_str,
-                len(validation.valid_bot_owned_orders),
-            )
+            market_profile = get_market_profile(strategy_position.symbol)
+            relevant_exchanges = {
+                master_exchange_str,
+                *_strategy_position_active_exchanges(strategy_position),
+            }
+            for exchange in self.app_config.exchanges:
+                exchange_str = exchange.value
+                if exchange_str not in relevant_exchanges:
+                    continue
+
+                exec_client = exec_by_exchange.get(exchange)
+                acct_client = acct_by_exchange.get(exchange)
+                if exec_client is None or acct_client is None:
+                    continue
+
+                if exchange not in exchange_state:
+                    try:
+                        positions = tuple(await acct_client.fetch_positions() or ())
+                        open_stop_orders = tuple(
+                            await exec_client.fetch_open_stop_orders() or ()
+                        )
+                    except Exception as exc:
+                        raise LiveRuntimeError(
+                            "post-execution stop validation failed: cannot fetch exchange state | "
+                            f"exchange={exchange_str} error={exc}"
+                        ) from exc
+                    try:
+                        mode = await acct_client.fetch_position_mode()
+                    except Exception:
+                        mode = PositionMode.ONE_WAY
+                    exchange_state[exchange] = (positions, open_stop_orders, mode)
+
+                positions, open_stop_orders, mode = exchange_state[exchange]
+                matching_positions = _exchange_positions_matching_strategy_position(
+                    positions,
+                    strategy_position,
+                )
+                if len(matching_positions) > 1:
+                    _raise_ambiguous_exchange_positions(
+                        context="post-execution stop validation failed",
+                        strategy_position=strategy_position,
+                        exchange=exchange_str,
+                        ambiguous_count=len(matching_positions),
+                    )
+                if not matching_positions:
+                    continue
+
+                active_pos = matching_positions[0]
+                position_side = _position_side_for_strategy_position(
+                    strategy_position,
+                    active_pos,
+                )
+                if position_side is None:
+                    raise LiveRuntimeError(
+                        "post-execution stop validation failed: unresolved position side | "
+                        f"strategy_position_id={strategy_position.position_id} "
+                        f"symbol={strategy_position.symbol} exchange={exchange_str}"
+                    )
+                expected_native_quantity = _strategy_position_native_quantity(
+                    strategy_position=strategy_position,
+                    active_pos=active_pos,
+                    exchange=exchange,
+                    market_profile=market_profile,
+                    converter=converter,
+                    logical_position_count=len(active_strategy_positions),
+                )
+
+                validation = validator.validate_stop_orders(
+                    exchange=exchange,
+                    symbol=strategy_position.symbol,
+                    strategy_id=strategy_position.strategy_id,
+                    position_id=strategy_position.position_id,
+                    position_side=position_side,
+                    position_mode=mode,
+                    current_position_native_quantity=expected_native_quantity,
+                    canonical_stop_price=canonical_stop_price,
+                    open_stop_orders=open_stop_orders,
+                    open_orders=(),
+                    market_profile=market_profile,
+                )
+
+                if not validation.should_keep_existing_stop:
+                    raise LiveRuntimeError(
+                        "post-execution stop validation failed: "
+                        "active position still without bot-owned valid stop "
+                        "after recovery stop placement | "
+                        f"strategy_position_id={strategy_position.position_id} "
+                        f"exchange={exchange_str} "
+                        f"symbol={strategy_position.symbol} "
+                        f"position_side={strategy_position.side.value} "
+                        f"position_qty={active_pos.quantity} "
+                        f"canonical_stop_price={canonical_stop_price} "
+                        f"valid_bot_stops={len(validation.valid_bot_owned_orders)} "
+                        f"invalid_bot_stops={len(validation.invalid_bot_owned_orders)} "
+                        f"unknown_stops={len(validation.unknown_exit_orders)} "
+                        f"primary_reason={validation.primary_invalid_reason}"
+                    )
+
+                logger.info(
+                    "Post-execution stop protection validated | "
+                    "position_id=%s exchange=%s valid_bot_stops=%s",
+                    strategy_position.position_id,
+                    exchange_str,
+                    len(validation.valid_bot_owned_orders),
+                )
 
     async def _call_on_start(self, snapshot: PlatformSnapshot) -> None:
         on_start = getattr(self.context.strategy, "on_start", None)
@@ -2826,7 +2859,7 @@ class LiveRuntimeRunner:
         account_by_exchange = {client.exchange: client for client in self._get_account_clients()}
         strategy_id = strategy_position.strategy_id
         position_id = strategy_position.position_id
-        market_profile = get_market_profile(self.app_config.symbol)
+        market_profile = get_market_profile(strategy_position.symbol)
         converter = NativeQuantityConverter()
         validator = RecoveryExitOrderValidator(quantity_converter=converter)
 
@@ -2902,8 +2935,27 @@ class LiveRuntimeRunner:
                     )
                     break
 
-                active_pos = _single_active_exchange_position_or_none_for_legacy(positions or ())
-                if active_pos is None:
+                matching_positions = _exchange_positions_matching_strategy_position(
+                    positions or (),
+                    strategy_position,
+                )
+                if len(matching_positions) > 1:
+                    verified.append(
+                        self._stop_post_check_failed_result(
+                            result,
+                            reason="ambiguous_exchange_position_scope",
+                            metadata={
+                                "post_check": "stop_order_exchange_verification",
+                                "strategy_position_id": strategy_position.position_id,
+                                "symbol": strategy_position.symbol,
+                                "side": strategy_position.side.value,
+                                "exchange": exchange.value,
+                                "ambiguous_count": len(matching_positions),
+                            },
+                        )
+                    )
+                    break
+                if not matching_positions:
                     if attempt < attempts:
                         logger.warning(
                             "Stop post-check missing exchange position; retrying | "
@@ -2927,8 +2979,20 @@ class LiveRuntimeRunner:
                     )
                     break
 
-                position_side = _position_side_from_quantity(active_pos.quantity)
-                native_qty = abs(active_pos.quantity)
+                active_pos = matching_positions[0]
+                position_side = _position_side_for_strategy_position(
+                    strategy_position,
+                    active_pos,
+                )
+                native_qty = _strategy_position_native_quantity(
+                    strategy_position=strategy_position,
+                    active_pos=active_pos,
+                    exchange=exchange,
+                    market_profile=market_profile,
+                    converter=converter,
+                    logical_position_count=len(position_index.active),
+                    scoped_base_quantity=signal.quantity,
+                )
 
                 if position_side is None or native_qty <= 0:
                     verified.append(result)
@@ -2941,7 +3005,7 @@ class LiveRuntimeRunner:
 
                 validation = validator.validate_stop_orders(
                     exchange=exchange,
-                    symbol=self.app_config.symbol,
+                    symbol=strategy_position.symbol,
                     strategy_id=strategy_id,
                     position_id=position_id,
                     position_side=position_side,
@@ -2956,7 +3020,7 @@ class LiveRuntimeRunner:
                     exchange_position_metadata = _exchange_position_metadata(
                         active_pos=active_pos,
                         exchange=exchange,
-                        symbol=self.app_config.symbol,
+                        symbol=strategy_position.symbol,
                         market_profile=market_profile,
                         converter=converter,
                     )
@@ -3918,6 +3982,120 @@ def _single_active_exchange_position_or_none_for_legacy(
 # Backward-compatible import for pre-R004 tests. Runtime paths use the
 # explicitly named helper above, which rejects ambiguous multi-position input.
 _first_active_position = _single_active_exchange_position_or_none_for_legacy
+
+
+def _active_exchange_positions(
+    positions: Sequence[Position],
+) -> tuple[Position, ...]:
+    return tuple(position for position in positions if position.quantity != 0)
+
+
+def _exchange_positions_matching_strategy_position(
+    positions: Sequence[Position],
+    strategy_position: StrategyPositionSnapshot,
+) -> tuple[Position, ...]:
+    candidates = tuple(
+        position
+        for position in _active_exchange_positions(positions)
+        if position.symbol == strategy_position.symbol
+    )
+    if strategy_position.side is StrategyPositionSide.LONG:
+        return tuple(
+            position
+            for position in candidates
+            if position.quantity > 0 or position.side is PositionSide.LONG
+        )
+    if strategy_position.side is StrategyPositionSide.SHORT:
+        return tuple(
+            position
+            for position in candidates
+            if position.quantity < 0 or position.side is PositionSide.SHORT
+        )
+    if strategy_position.side in {
+        StrategyPositionSide.BOTH,
+        StrategyPositionSide.UNKNOWN,
+    }:
+        return candidates
+    return ()
+
+
+def _position_side_for_strategy_position(
+    strategy_position: StrategyPositionSnapshot,
+    exchange_position: Position,
+) -> PositionSide | None:
+    if strategy_position.side is StrategyPositionSide.LONG:
+        return PositionSide.LONG
+    if strategy_position.side is StrategyPositionSide.SHORT:
+        return PositionSide.SHORT
+    side = _position_side_from_quantity(exchange_position.quantity)
+    if side is not None:
+        return side
+    if exchange_position.side in {PositionSide.LONG, PositionSide.SHORT}:
+        return exchange_position.side
+    return None
+
+
+def _strategy_position_native_quantity(
+    *,
+    strategy_position: StrategyPositionSnapshot,
+    active_pos: Position,
+    exchange: ExchangeName,
+    market_profile,
+    converter: NativeQuantityConverter,
+    logical_position_count: int,
+    scoped_base_quantity: Decimal | None = None,
+) -> Decimal:
+    if scoped_base_quantity is not None and scoped_base_quantity > 0:
+        try:
+            return converter.convert_quantity(
+                exchange=exchange,
+                symbol=strategy_position.symbol,
+                base_quantity=scoped_base_quantity,
+                market_profile=market_profile,
+            ).native_quantity
+        except Exception as exc:
+            raise LiveRuntimeError(
+                "stop protection validation failed: strategy quantity conversion failed | "
+                f"strategy_position_id={strategy_position.position_id} "
+                f"symbol={strategy_position.symbol} exchange={exchange.value} error={exc}"
+            ) from exc
+    if logical_position_count <= 1:
+        return abs(active_pos.quantity)
+    if strategy_position.base_quantity > 0:
+        try:
+            return converter.convert_quantity(
+                exchange=exchange,
+                symbol=strategy_position.symbol,
+                base_quantity=strategy_position.base_quantity,
+                market_profile=market_profile,
+            ).native_quantity
+        except Exception as exc:
+            raise LiveRuntimeError(
+                "stop protection validation failed: strategy quantity conversion failed | "
+                f"strategy_position_id={strategy_position.position_id} "
+                f"symbol={strategy_position.symbol} exchange={exchange.value} error={exc}"
+            ) from exc
+    raise LiveRuntimeError(
+        "stop protection validation failed: missing scoped strategy quantity | "
+        f"strategy_position_id={strategy_position.position_id} "
+        f"symbol={strategy_position.symbol} side={strategy_position.side.value} "
+        f"exchange={exchange.value} active_strategy_positions={logical_position_count}"
+    )
+
+
+def _raise_ambiguous_exchange_positions(
+    *,
+    context: str,
+    strategy_position: StrategyPositionSnapshot,
+    exchange: str,
+    ambiguous_count: int,
+) -> None:
+    raise LiveRuntimeError(
+        f"{context}: ambiguous exchange positions | "
+        f"strategy_position_id={strategy_position.position_id} "
+        f"symbol={strategy_position.symbol} side={strategy_position.side.value} "
+        f"exchange={exchange} ambiguous_count={ambiguous_count}"
+    )
 
 
 def _strategy_position_for_stop_signal(
