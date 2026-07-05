@@ -3,8 +3,13 @@ from __future__ import annotations
 import json
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 
+from tools import mf_feature_backfill_worker as worker
+from src.market_data.trade_features import (
+    backfill_supervisor as supervisor_module,
+)
 from src.market_data.trade_features.backfill_supervisor import (
     TradeFeatureBackfillConfig,
     TradeFeatureBackfillSupervisor,
@@ -106,3 +111,37 @@ def test_scan_coverage_returns_detached_mapping(tmp_path) -> None:
     result["coverage_ready"] = True
 
     assert source["coverage_ready"] is False
+
+
+def test_worker_command_required_minutes_is_parser_compatible(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config = replace(
+        _config(tmp_path),
+        required_minutes=172800,
+    )
+    supervisor = TradeFeatureBackfillSupervisor(
+        config=config,
+        coverage_reader=lambda: {"coverage_ready": False},
+    )
+    captured = {}
+
+    def capture_popen(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(
+        supervisor_module.subprocess,
+        "Popen",
+        capture_popen,
+    )
+
+    assert supervisor._launch_worker() is True
+    command = captured["command"]
+    assert "--required-minutes" in command
+
+    parsed = worker.parse_args(command[2:])
+
+    assert parsed.required_minutes == 172800

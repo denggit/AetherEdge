@@ -60,6 +60,49 @@ def _kwargs(tmp_path: Path) -> dict:
     }
 
 
+def test_parser_required_minutes_defaults_to_4320() -> None:
+    assert worker.parse_args([]).required_minutes == 4320
+
+
+def test_parser_accepts_required_minutes_override() -> None:
+    args = worker.parse_args(
+        ["--required-minutes", "172800"]
+    )
+
+    assert args.required_minutes == 172800
+
+
+def test_main_passes_required_minutes_to_run_cycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+
+    def capture_cycle(**kwargs):
+        captured.update(kwargs)
+        return {"status": "up_to_date", "reason": "no_gap_found"}
+
+    monkeypatch.setattr(worker, "run_cycle", capture_cycle)
+    monkeypatch.setattr(
+        worker,
+        "_update_status",
+        lambda *args, **kwargs: None,
+    )
+
+    result = worker.main(
+        [
+            "--once",
+            "--required-minutes",
+            "172800",
+            "--status-path",
+            str(tmp_path / "status.json"),
+        ]
+    )
+
+    assert result == 0
+    assert captured["required_minutes"] == 172800
+
+
 class _Archive:
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs
