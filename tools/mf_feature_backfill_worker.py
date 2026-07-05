@@ -100,7 +100,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--range-footprint-price-step", type=str, default="1")
     parser.add_argument("--range-footprint-warmup-days", type=int, default=1)
     parser.add_argument("--large-trade-threshold", type=str, default="10000")
-    parser.add_argument("--required-minutes", type=int, default=4320)
     return parser.parse_args(argv)
 
 
