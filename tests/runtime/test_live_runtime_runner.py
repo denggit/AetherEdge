@@ -34,6 +34,11 @@ class FakeStrategy:
         return []
 
 
+class FakeTradeFeatureStrategy(FakeStrategy):
+    def trade_feature_readiness(self):
+        return {}
+
+
 class FakeData:
     exchange = ExchangeName.OKX
     symbol = "ETH-USDT-PERP"
@@ -81,12 +86,16 @@ def _app_config_for_strategy(strategy: str) -> AppConfig:
     )
 
 
-def _context() -> AppContext:
+def _context(*, trade_features: bool = False) -> AppContext:
     return AppContext(
         data=FakeData(),
         execution=FakeExecution(),
         state_store=FakeStateStore(),
-        strategy=FakeStrategy(),
+        strategy=(
+            FakeTradeFeatureStrategy()
+            if trade_features
+            else FakeStrategy()
+        ),
         planner=ExecutionPlanner(),
         alerts=AsyncAlertDispatcher(NoopAlertSink()),
     )
@@ -145,7 +154,7 @@ def _stub_non_mf_startup_work(
     monkeypatch.setattr(runner, "_initialize_rangebar_trust_window", lambda: None)
     monkeypatch.setattr(runner, "_bootstrap_account_config_if_enabled", _noop)
     monkeypatch.setattr(
-        runner, "_check_portfolio_v1_hedge_mode", _noop
+        runner, "_check_strategy_position_mode_requirements", _noop
     )
     monkeypatch.setattr(runner, "_run_warmup", _warmup)
     monkeypatch.setattr(runner, "_warmup_range_speed_history", _warmup_range_speed)
@@ -191,7 +200,7 @@ def test_portfolio_v1_startup_calls_mf_feature_supervisor_when_enabled(
     supervisor = _FakeMfSupervisor(events=events)
     runner = LiveRuntimeRunner(
         app_config=config,
-        app_context=_context(),
+        app_context=_context(trade_features=True),
         runtime_config=LiveRuntimeConfig(app=config, mode=RuntimeMode.LIVE_RUNTIME),
         services={
             "project_env_config": _project_env(
@@ -231,7 +240,7 @@ def test_portfolio_v1_supervisor_coverage_emits_readiness_event(
     config = _app_config_for_strategy("eth_portfolio_v1")
     runner = LiveRuntimeRunner(
         app_config=config,
-        app_context=_context(),
+        app_context=_context(trade_features=True),
         runtime_config=LiveRuntimeConfig(
             app=config, mode=RuntimeMode.LIVE_RUNTIME
         ),
@@ -268,7 +277,7 @@ def test_portfolio_v1_startup_marks_mf_supervisor_disabled_when_disabled(
     supervisor = _FakeMfSupervisor()
     runner = LiveRuntimeRunner(
         app_config=config,
-        app_context=_context(),
+        app_context=_context(trade_features=True),
         runtime_config=LiveRuntimeConfig(app=config, mode=RuntimeMode.LIVE_RUNTIME),
         services={
             "project_env_config": _project_env(),
@@ -292,7 +301,7 @@ def test_mf_supervisor_exception_does_not_fail_startup(monkeypatch) -> None:
     supervisor = _FakeMfSupervisor(error=RuntimeError("boom"))
     runner = LiveRuntimeRunner(
         app_config=config,
-        app_context=_context(),
+        app_context=_context(trade_features=True),
         runtime_config=LiveRuntimeConfig(app=config, mode=RuntimeMode.LIVE_RUNTIME),
         services={
             "project_env_config": _project_env(

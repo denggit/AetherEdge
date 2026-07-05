@@ -33,7 +33,7 @@ from src.platform import (
 )
 from src.runtime import RuntimeMode
 from src.runtime.config import LiveRuntimeConfig
-from src.runtime.portfolio_v1_live_gate import (
+from strategies.eth_portfolio_v1.preflight.live_gate import (
     EXIT_FAIL_CONFIG,
     EXIT_FAIL_MARKET_DATA,
     EXIT_FAIL_RECOVERY,
@@ -41,7 +41,7 @@ from src.runtime.portfolio_v1_live_gate import (
     PortfolioV1LiveGate,
     PortfolioV1LiveGateReport,
 )
-from src.runtime.portfolio_v1_readiness import (
+from strategies.eth_portfolio_v1.preflight.readiness import (
     PortfolioV1ReadinessResult,
 )
 

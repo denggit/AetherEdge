@@ -7,11 +7,13 @@ from src.platform.account.ports import AccountClient
 from src.platform.exchanges.models import ExchangeName, PositionMode
 
 
-PORTFOLIO_V1_STRATEGY_ID = "eth_portfolio_v1"
-_PORTFOLIO_V1_PLUGIN_PATH = "strategies.eth_portfolio_v1:strategy"
-_PORTFOLIO_V1_MODULE_PATH = (
-    "strategies.eth_portfolio_v1.strategy:strategy"
-)
+@dataclass(frozen=True)
+class PositionModeRequirement:
+    """A strategy-declared, exchange-scoped startup requirement."""
+
+    required_mode: PositionMode
+    exchanges: tuple[ExchangeName, ...]
+    source: str
 
 
 @dataclass(frozen=True)
@@ -24,25 +26,46 @@ class PositionModeStatus:
     error: str | None = None
     raw: Mapping[str, Any] = field(default_factory=dict)
 
-    def audit(self) -> dict[str, Any]:
+    def audit(
+        self,
+        required_mode: PositionMode = PositionMode.HEDGE,
+    ) -> dict[str, Any]:
         return {
             "exchange": self.exchange.value,
             "symbol": self.symbol,
-            "required_mode": PositionMode.HEDGE.value,
+            "required_mode": required_mode.value,
             "actual_mode": self.mode,
+            "position_mode_ok": self.mode == required_mode.value,
+            # Kept as a data-level compatibility field for existing reports.
             "hedge_mode_ok": self.hedge_mode,
             "source": self.source,
             "error": self.error,
         }
 
 
-def portfolio_v1_requires_hedge_mode(strategy: object) -> bool:
-    normalized = str(strategy or "").strip().lower()
-    return normalized in {
-        PORTFOLIO_V1_STRATEGY_ID,
-        _PORTFOLIO_V1_PLUGIN_PATH,
-        _PORTFOLIO_V1_MODULE_PATH,
-    }
+def resolve_position_mode_requirements(
+    strategy: object,
+) -> tuple[PositionModeRequirement, ...]:
+    """Resolve optional startup requirements without knowing the plugin."""
+
+    provider = getattr(strategy, "runtime_startup_requirements", None)
+    if not callable(provider):
+        return ()
+    values = provider()
+    if values is None:
+        return ()
+    resolved = tuple(values)
+    invalid = tuple(
+        type(value).__name__
+        for value in resolved
+        if not isinstance(value, PositionModeRequirement)
+    )
+    if invalid:
+        raise TypeError(
+            "invalid position mode requirement types: "
+            f"{invalid}"
+        )
+    return resolved
 
 
 def position_mode_status(
@@ -166,9 +189,9 @@ def _normalized_mode(value: object) -> str:
 
 
 __all__ = [
-    "PORTFOLIO_V1_STRATEGY_ID",
+    "PositionModeRequirement",
     "PositionModeStatus",
     "fetch_position_mode_statuses",
-    "portfolio_v1_requires_hedge_mode",
     "position_mode_status",
+    "resolve_position_mode_requirements",
 ]

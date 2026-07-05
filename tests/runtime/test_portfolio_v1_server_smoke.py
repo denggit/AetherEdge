@@ -8,7 +8,7 @@ from src.runtime.no_mutation import (
     MutationAttemptError,
     NoMutationExecutionClient,
 )
-from src.runtime.portfolio_v1_live_gate import (
+from strategies.eth_portfolio_v1.preflight.live_gate import (
     EXIT_FAIL_CONFIG,
     EXIT_FAIL_MARKET_DATA,
     EXIT_FAIL_MUTATION_ATTEMPT,
@@ -17,7 +17,7 @@ from src.runtime.portfolio_v1_live_gate import (
     PortfolioV1LiveGateReport,
     write_live_gate_report,
 )
-from tools.live_server_smoke import PortfolioV1ServerSmoke
+from src.runtime.live_smoke import FiniteLiveSmokeRunner
 
 
 class _Gate:
@@ -53,7 +53,7 @@ def _report(*, exit_code: int, verdict: str) -> PortfolioV1LiveGateReport:
 @pytest.mark.asyncio
 async def test_all_smoke_gates_pass_returns_zero() -> None:
     gate = _Gate(_report(exit_code=EXIT_PASS, verdict="pass"))
-    smoke = PortfolioV1ServerSmoke(gate)
+    smoke = FiniteLiveSmokeRunner(gate)
 
     result = await smoke.run()
 
@@ -77,7 +77,7 @@ async def test_failed_smoke_gate_is_nonzero(
     exit_code: int,
     verdict: str,
 ) -> None:
-    smoke = PortfolioV1ServerSmoke(
+    smoke = FiniteLiveSmokeRunner(
         _Gate(_report(exit_code=exit_code, verdict=verdict))
     )
 
@@ -108,7 +108,7 @@ async def test_mutation_attempt_in_smoke_wrapper_fails(
 
 @pytest.mark.asyncio
 async def test_smoke_does_not_start_long_running_producers() -> None:
-    smoke = PortfolioV1ServerSmoke(
+    smoke = FiniteLiveSmokeRunner(
         _Gate(_report(exit_code=EXIT_PASS, verdict="pass"))
     )
 

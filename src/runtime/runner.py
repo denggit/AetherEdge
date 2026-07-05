@@ -73,9 +73,9 @@ from src.runtime.features import (
     trade_footprint_feature,
 )
 from src.runtime.heartbeat import RuntimeHeartbeatService
-from src.runtime.hedge_mode_gate import (
+from src.runtime.position_mode_gate import (
     fetch_position_mode_statuses,
-    portfolio_v1_requires_hedge_mode,
+    resolve_position_mode_requirements,
 )
 from src.runtime.market_features import (
     dispatch_market_feature_event,
@@ -166,7 +166,7 @@ FATAL_STARTUP_ERROR_MARKERS = (
     "startup reconciliation missing exchange snapshots",
     "startup reconciliation failed",
     "runtime recovery failed",
-    "portfolio v1 requires hedge mode",
+    "strategy position mode requirement failed",
 )
 
 
@@ -758,7 +758,7 @@ class LiveRuntimeRunner:
         self._initialize_rangebar_trust_window()
         self._set_health(RuntimePhase.WARMING_UP, healthy=True)
         await self._bootstrap_account_config_if_enabled()
-        await self._check_portfolio_v1_hedge_mode()
+        await self._check_strategy_position_mode_requirements()
         await self._run_warmup()
         loaded_range_speed_history = await self._warmup_range_speed_history()
         if (
@@ -794,11 +794,17 @@ class LiveRuntimeRunner:
         logger.info("Live runtime startup phase completed")
 
     async def _check_mf_feature_backfill_at_startup(self) -> None:
-        """Audit and optionally launch the V1 feature repair worker.
+        """Audit and optionally launch a strategy feature repair worker.
 
         This check never gates or fails the LF startup path.
         """
-        if str(self.app_config.strategy).strip().lower() != "eth_portfolio_v1":
+        if not callable(
+            getattr(
+                self.context.strategy,
+                "trade_feature_readiness",
+                None,
+            )
+        ):
             return
 
         enabled = self._project_env.get_bool(
@@ -893,67 +899,108 @@ class LiveRuntimeRunner:
         )
         logger.info("MF feature supervisor startup audit | result=%s", result)
 
-    async def _check_portfolio_v1_hedge_mode(self) -> None:
-        if not portfolio_v1_requires_hedge_mode(
-            self.app_config.strategy
-        ):
+    async def _check_strategy_position_mode_requirements(
+        self,
+    ) -> None:
+        try:
+            requirements = resolve_position_mode_requirements(
+                self.context.strategy
+            )
+        except Exception as exc:
+            raise LiveRuntimeError(
+                "strategy position mode requirement failed | "
+                f"invalid_requirement={type(exc).__name__}: {exc}"
+            ) from exc
+        if not requirements:
             return
 
-        statuses = await fetch_position_mode_statuses(
-            exchanges=self.app_config.exchanges,
-            symbol=self.app_config.symbol,
-            account_clients=self._get_account_clients(),
-            source="startup_hard_gate",
+        strategy_id = str(
+            getattr(
+                getattr(self.context.strategy, "config", None),
+                "strategy_id",
+                self.app_config.strategy,
+            )
         )
-        audit = {
-            "strategy": "eth_portfolio_v1",
+        audit: dict[str, Any] = {
+            "strategy": strategy_id,
             "symbol": self.app_config.symbol,
-            "required_mode": PositionMode.HEDGE.value,
-            "ok": all(status.hedge_mode for status in statuses),
-            "exchanges": [status.audit() for status in statuses],
+            "ok": True,
+            "requirements": [],
             "source": "startup_hard_gate",
         }
+        failures: list[str] = []
+        for requirement in requirements:
+            statuses = await fetch_position_mode_statuses(
+                exchanges=requirement.exchanges,
+                symbol=self.app_config.symbol,
+                account_clients=self._get_account_clients(),
+                source="startup_hard_gate",
+            )
+            requirement_ok = bool(statuses) and all(
+                status.mode == requirement.required_mode.value
+                for status in statuses
+            )
+            requirement_audit = {
+                "required_mode": requirement.required_mode.value,
+                "requirement_source": requirement.source,
+                "ok": requirement_ok,
+                "exchanges": [
+                    status.audit(requirement.required_mode)
+                    for status in statuses
+                ],
+            }
+            audit["requirements"].append(requirement_audit)
+            audit["ok"] = bool(audit["ok"]) and requirement_ok
+            if not statuses:
+                failures.append(
+                    "position_mode_requirement_has_no_exchanges"
+                )
+
+            for status in statuses:
+                status_ok = (
+                    status.mode == requirement.required_mode.value
+                )
+                log_args = (
+                    strategy_id,
+                    status.exchange.value,
+                    status.symbol,
+                    requirement.required_mode.value,
+                    status.mode,
+                    status.error,
+                )
+                if status_ok:
+                    logger.info(
+                        "Strategy position mode validated | "
+                        "strategy=%s exchange=%s symbol=%s "
+                        "required_mode=%s actual_mode=%s "
+                        "source=startup_hard_gate error=%s",
+                        *log_args,
+                    )
+                    continue
+                logger.error(
+                    "Strategy position mode validation failed | "
+                    "strategy=%s exchange=%s symbol=%s "
+                    "required_mode=%s actual_mode=%s "
+                    "source=startup_hard_gate error=%s",
+                    *log_args,
+                )
+                failures.append(
+                    f"{status.exchange.value}={status.mode}"
+                )
+
         self._set_health(
             self._health.phase,
             metadata={
                 **dict(self._health.metadata),
-                "portfolio_v1_hedge_mode": audit,
+                "position_mode_requirements": audit,
             },
         )
 
-        failed = []
-        for status in statuses:
-            if status.hedge_mode:
-                logger.info(
-                    "Portfolio V1 hedge mode validated | "
-                    "strategy=eth_portfolio_v1 exchange=%s symbol=%s "
-                    "required_mode=hedge actual_mode=%s "
-                    "source=startup_hard_gate",
-                    status.exchange.value,
-                    status.symbol,
-                    status.mode,
-                )
-                continue
-            failed.append(status)
-            logger.error(
-                "Portfolio V1 hedge mode validation failed | "
-                "strategy=eth_portfolio_v1 exchange=%s symbol=%s "
-                "required_mode=hedge actual_mode=%s "
-                "source=startup_hard_gate error=%s",
-                status.exchange.value,
-                status.symbol,
-                status.mode,
-                status.error,
-            )
-
-        if failed:
-            detail = ", ".join(
-                f"{status.exchange.value}={status.mode}"
-                for status in failed
-            )
+        if failures:
             raise LiveRuntimeError(
-                "portfolio v1 requires hedge mode on every target "
-                f"exchange | symbol={self.app_config.symbol} | {detail}"
+                "strategy position mode requirement failed | "
+                f"strategy={strategy_id} symbol={self.app_config.symbol} "
+                f"issues={failures}"
             )
 
     async def _publish_mf_readiness(
@@ -2443,16 +2490,12 @@ class LiveRuntimeRunner:
         # Heartbeat periodic task
         tasks.append(asyncio.create_task(self._heartbeat_service.run_periodic(self._stop_event)))
         if (
-            str(self.app_config.strategy).strip().lower()
-            == "eth_portfolio_v1"
-            and (
-                self._mf_feature_backfill_supervisor is not None
-                or callable(
-                    getattr(
-                        self.context.strategy,
-                        "trade_feature_readiness",
-                        None,
-                    )
+            self._mf_feature_backfill_supervisor is not None
+            or callable(
+                getattr(
+                    self.context.strategy,
+                    "trade_feature_readiness",
+                    None,
                 )
             )
         ):

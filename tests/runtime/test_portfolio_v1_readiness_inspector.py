@@ -18,7 +18,7 @@ from src.market_data.storage.trade_feature_store import (
 )
 from src.platform import ExchangeName
 from src.platform.data.models import MarketDataSource, MarketKline
-from src.runtime.portfolio_v1_readiness import (
+from strategies.eth_portfolio_v1.preflight.readiness import (
     PortfolioV1ReadinessInspector,
 )
 

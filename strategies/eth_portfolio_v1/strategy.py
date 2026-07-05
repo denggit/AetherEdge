@@ -19,10 +19,19 @@ from src.order_management.safety import (
 )
 from src.platform.account.events import AccountEvent, AccountEventType
 from src.platform.data.models import MarketKline, MarketOrderBook, MarketTicker, MarketTrade
-from src.platform.exchanges.models import Order, OrderSide, OrderStatus, Position, PositionSide
+from src.platform.exchanges.models import (
+    ExchangeName,
+    Order,
+    OrderSide,
+    OrderStatus,
+    Position,
+    PositionMode,
+    PositionSide,
+)
 from src.platform.markets import get_market_profile
 from src.order_management.models import ExchangeOrderResult
 from src.platform.snapshot import PlatformSnapshot
+from src.runtime.position_mode_gate import PositionModeRequirement
 from src.signals import SignalAction, TradeSignal
 from src.strategy import StrategyRecoveryContext
 from src.strategy.positions import StrategyPositionSnapshot
@@ -337,6 +346,45 @@ class Strategy:
 
     def runtime_requirements(self) -> Mapping[str, Any]:
         return dict(self.config.runtime_requirements)
+
+    def runtime_startup_requirements(
+        self,
+    ) -> tuple[PositionModeRequirement, ...]:
+        """Declare strategy-owned account mode safety requirements."""
+
+        return (
+            PositionModeRequirement(
+                required_mode=PositionMode.HEDGE,
+                exchanges=(
+                    ExchangeName.OKX,
+                    ExchangeName.BINANCE,
+                ),
+                source=self.config.strategy_id,
+            ),
+        )
+
+    def live_smoke_provider(
+        self,
+        **kwargs: Any,
+    ) -> object:
+        """Create the strategy-owned direct-live readiness provider."""
+
+        from strategies.eth_portfolio_v1.preflight.provider import (
+            PortfolioV1LiveSmokeProvider,
+        )
+
+        return PortfolioV1LiveSmokeProvider(
+            strategy=self,
+            **kwargs,
+        )
+
+    def live_preflight_provider(
+        self,
+        **kwargs: Any,
+    ) -> object:
+        """Use the same hard gates for preflight and finite smoke."""
+
+        return self.live_smoke_provider(**kwargs)
 
     def market_feature_observers(self) -> tuple[object, ...]:
         """Keep LF and MF behind the normalized observer boundary."""

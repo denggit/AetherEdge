@@ -25,7 +25,7 @@ from src.runtime.no_mutation import (
     MutationAttemptError,
     NoMutationExecutionClient,
 )
-from src.runtime.portfolio_v1_readiness import (
+from strategies.eth_portfolio_v1.preflight.readiness import (
     PortfolioV1ReadinessInspector,
 )
 from strategies.eth_portfolio_v1.domain.recovery import (

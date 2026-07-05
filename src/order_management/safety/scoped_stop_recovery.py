@@ -27,7 +27,7 @@ def order_matches_position_scope(
 ) -> bool:
     """Return whether an order is provably owned by one logical position.
 
-    Strategy ownership alone is deliberately insufficient: Portfolio V1 can
+    Strategy ownership alone is deliberately insufficient: a multi-sleeve strategy can
     hold multiple sleeves under the same strategy, so recovery must have an
     exact position reference from the plan, raw exchange payload, or order ID.
     """

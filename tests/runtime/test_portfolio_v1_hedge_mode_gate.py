@@ -18,6 +18,7 @@ from src.platform.config import ProjectEnvConfig
 from src.platform.exchanges.models import ExchangeName, PositionMode
 from src.planner import ExecutionPlanner
 from src.runtime import LiveRuntimeConfig, RuntimeMode
+from src.runtime.position_mode_gate import PositionModeRequirement
 from src.runtime.runner import (
     LiveRuntimeError,
     LiveRuntimeRunner,
@@ -26,6 +27,29 @@ from src.runtime.runner import (
 
 
 class _Strategy:
+    def __init__(
+        self,
+        *,
+        require_hedge: bool,
+        strategy_id: str,
+    ) -> None:
+        self.require_hedge = require_hedge
+        self.config = SimpleNamespace(strategy_id=strategy_id)
+
+    def runtime_startup_requirements(self):
+        if not self.require_hedge:
+            return ()
+        return (
+            PositionModeRequirement(
+                required_mode=PositionMode.HEDGE,
+                exchanges=(
+                    ExchangeName.OKX,
+                    ExchangeName.BINANCE,
+                ),
+                source=self.config.strategy_id,
+            ),
+        )
+
     async def on_start(self, snapshot):
         return ()
 
@@ -89,7 +113,13 @@ def _runner(
             symbol=app.symbol,
         ),
         state_store=SimpleNamespace(),
-        strategy=_Strategy(),
+        strategy=_Strategy(
+            require_hedge=app.strategy in {
+                "eth_portfolio_v1",
+                "strategies.eth_portfolio_v1:Strategy",
+            },
+            strategy_id=app.strategy,
+        ),
         planner=ExecutionPlanner(),
         alerts=AsyncAlertDispatcher(NoopAlertSink()),
     )
@@ -132,12 +162,16 @@ def test_portfolio_v1_both_exchanges_hedge_passes() -> None:
         ),
         accounts=_accounts(),
     )
-    asyncio.run(runner._check_portfolio_v1_hedge_mode())
-    audit = runner._health.metadata["portfolio_v1_hedge_mode"]
+    asyncio.run(
+        runner._check_strategy_position_mode_requirements()
+    )
+    audit = runner._health.metadata[
+        "position_mode_requirements"
+    ]
     assert audit["ok"] is True
     assert {
         item["exchange"]: item["actual_mode"]
-        for item in audit["exchanges"]
+        for item in audit["requirements"][0]["exchanges"]
     } == {"okx": "hedge", "binance": "hedge"}
 
 
@@ -157,13 +191,18 @@ def test_portfolio_v1_one_way_is_hard_failure(
         app=_app(), accounts=_accounts(okx=okx, binance=binance)
     )
     with pytest.raises(
-        LiveRuntimeError, match="portfolio v1 requires hedge mode"
+        LiveRuntimeError,
+        match="strategy position mode requirement failed",
     ):
-        asyncio.run(runner._check_portfolio_v1_hedge_mode())
-    audit = runner._health.metadata["portfolio_v1_hedge_mode"]
+        asyncio.run(
+            runner._check_strategy_position_mode_requirements()
+        )
+    audit = runner._health.metadata[
+        "position_mode_requirements"
+    ]
     failed = next(
         item
-        for item in audit["exchanges"]
+        for item in audit["requirements"][0]["exchanges"]
         if item["exchange"] == failed_exchange
     )
     assert failed["hedge_mode_ok"] is False
@@ -175,12 +214,14 @@ def test_portfolio_v1_unknown_mode_is_hard_failure() -> None:
         app=_app(), accounts=_accounts(binance=object())
     )
     with pytest.raises(LiveRuntimeError, match="binance=unknown"):
-        asyncio.run(runner._check_portfolio_v1_hedge_mode())
+        asyncio.run(
+            runner._check_strategy_position_mode_requirements()
+        )
 
 
 def test_portfolio_v1_hedge_mode_failure_is_fatal_startup_error() -> None:
     error = LiveRuntimeError(
-        "portfolio v1 requires hedge mode on every target exchange"
+        "strategy position mode requirement failed"
     )
 
     assert _is_fatal_startup_error(error) is True
@@ -195,20 +236,25 @@ def test_v10b_is_not_subject_to_portfolio_gate() -> None:
         app=_app(strategy="eth_lf_portfolio_v10b"),
         accounts=accounts,
     )
-    asyncio.run(runner._check_portfolio_v1_hedge_mode())
-    assert "portfolio_v1_hedge_mode" not in runner._health.metadata
+    asyncio.run(
+        runner._check_strategy_position_mode_requirements()
+    )
+    assert (
+        "position_mode_requirements"
+        not in runner._health.metadata
+    )
 
 
 def test_gate_is_ordered_before_recovery_on_start_and_producers() -> None:
     startup = inspect.getsource(LiveRuntimeRunner._startup)
     run = inspect.getsource(LiveRuntimeRunner.run)
     assert startup.index("_bootstrap_account_config_if_enabled") < (
-        startup.index("_check_portfolio_v1_hedge_mode")
+        startup.index("_check_strategy_position_mode_requirements")
     )
-    assert startup.index("_check_portfolio_v1_hedge_mode") < (
+    assert startup.index("_check_strategy_position_mode_requirements") < (
         startup.index("_run_recovery")
     )
-    assert startup.index("_check_portfolio_v1_hedge_mode") < (
+    assert startup.index("_check_strategy_position_mode_requirements") < (
         startup.index("_call_on_start")
     )
     assert run.index("await self._startup()") < run.index(
@@ -302,7 +348,9 @@ def test_failure_log_contains_required_audit_fields(caplog) -> None:
     with caplog.at_level(logging.ERROR), pytest.raises(
         LiveRuntimeError
     ):
-        asyncio.run(runner._check_portfolio_v1_hedge_mode())
+        asyncio.run(
+            runner._check_strategy_position_mode_requirements()
+        )
     message = "\n".join(record.message for record in caplog.records)
     assert "strategy=eth_portfolio_v1" in message
     assert "exchange=binance" in message

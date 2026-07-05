@@ -50,16 +50,14 @@ from src.platform.exchanges.models import ExchangeConfig
 from src.platform.execution.factory import create_execution_client
 from src.platform.snapshot import PlatformSnapshot, fetch_platform_snapshot
 from src.runtime import RuntimeMode, runtime_mode_from_env
-from src.runtime.hedge_mode_gate import (
-    portfolio_v1_requires_hedge_mode,
-    position_mode_status,
+from src.runtime.live_smoke import (
+    BootstrapFailureReport,
+    strategy_plugin_path,
+    write_live_smoke_report,
 )
 from src.runtime.tasks.scheduler import closed_bar_open_time_ms
 from src.strategy import load_strategy
 from src.utils.log import get_logger
-from strategies.eth_portfolio_v1.domain.recovery import (
-    audit_portfolio_v1_plans,
-)
 
 logger = get_logger(__name__)
 
@@ -85,7 +83,6 @@ class PreflightReport:
     runtime_mode: str | None = None
     checks: list[CheckResult] = field(default_factory=list)
     reconciliation: LiveStateReconciliationReport | None = None
-    portfolio_v1_recovery_audit: dict[str, Any] | None = None
     verdict: str = "pass"
 
     @property
@@ -137,10 +134,6 @@ class PreflightReport:
                 "exchange_open_stops": self.reconciliation.exchange_open_stops,
                 "issues": self.reconciliation.issues,
             }
-        if self.portfolio_v1_recovery_audit is not None:
-            payload["portfolio_v1_recovery_audit"] = (
-                self.portfolio_v1_recovery_audit
-            )
         return json.dumps(payload, indent=2, ensure_ascii=False, default=str)
 
 
@@ -155,12 +148,7 @@ async def main() -> int:
             env_file=args.env_file,
         )
         if args.strategy:
-            strategy_path = (
-                "strategies.eth_portfolio_v1:Strategy"
-                if args.strategy
-                in {"eth_portfolio_v1", "strategies.eth_portfolio_v1"}
-                else args.strategy
-            )
+            strategy_path = strategy_plugin_path(args.strategy)
             app_config = replace(app_config, strategy=strategy_path)
     except Exception as exc:
         report.add("load_app_config", "fail", error=str(exc))
@@ -171,12 +159,20 @@ async def main() -> int:
     report.symbol = app_config.symbol
     report.strategy = app_config.strategy
 
-    if portfolio_v1_requires_hedge_mode(app_config.strategy):
-        from src.runtime.portfolio_v1_live_gate import (
-            EXIT_FAIL_CONFIG as V1_EXIT_FAIL_CONFIG,
-            PortfolioV1LiveGateReport,
-            write_live_gate_report,
-        )
+    try:
+        strategy = load_strategy(app_config.strategy)
+    except Exception as exc:
+        report.add("load_strategy", "fail", error=str(exc))
+        report.verdict = "fail_config"
+        _maybe_write_report(args.report, report)
+        return EXIT_FAIL_CONFIG
+
+    provider_factory = getattr(
+        strategy,
+        "live_preflight_provider",
+        None,
+    )
+    if callable(provider_factory):
         from tools.live_server_smoke import run_server_smoke
 
         forbidden_flags = [
@@ -189,35 +185,22 @@ async def main() -> int:
             if active
         ]
         if forbidden_flags:
-            final_report = PortfolioV1LiveGateReport(
-                symbol=app_config.symbol,
-                runtime_mode=runtime_mode_from_env(
-                    defaults_path=args.defaults,
-                    env_file=args.env_file,
-                ).value,
-                exchanges=[
-                    exchange.value for exchange in app_config.exchanges
-                ],
-                ok=False,
+            final_report = BootstrapFailureReport(
                 verdict="fail_config",
-                exit_code=V1_EXIT_FAIL_CONFIG,
+                exit_code=1,
                 issues=[
                     "direct_live_preflight_disallows:"
                     + ",".join(forbidden_flags)
                 ],
-            )
-            final_report.add(
-                "direct_live_cli_flags",
-                ok=False,
-                error=final_report.issues[0],
             )
         else:
             final_report = await run_server_smoke(
                 defaults_path=args.defaults,
                 env_file=args.env_file,
                 strategy_name=args.strategy or app_config.strategy,
+                provider_hook="live_preflight_provider",
             )
-        write_live_gate_report(args.report, final_report)
+        write_live_smoke_report(args.report, final_report)
         return int(final_report.exit_code)
 
     runtime_mode = runtime_mode_from_env()
@@ -236,14 +219,6 @@ async def main() -> int:
     report.add("runtime_mode_check", "ok", detail={"mode": runtime_mode.value})
 
     # ── 3. Strategy identity check ──
-    try:
-        strategy = load_strategy(app_config.strategy)
-    except Exception as exc:
-        report.add("load_strategy", "fail", error=str(exc))
-        report.verdict = "fail_config"
-        _maybe_write_report(args.report, report)
-        return EXIT_FAIL_CONFIG
-
     strategy_id = getattr(getattr(strategy, "config", None), "strategy_id", None)
     if not strategy_id:
         report.add("strategy_identity", "fail", error="Strategy has no strategy_id")
@@ -282,27 +257,8 @@ async def main() -> int:
         report.add("exchange_snapshots", "warn", detail={"skipped": True})
 
     # ── 6. Check local PositionPlan store for stale state ──
-    if not _check_portfolio_v1_hedge_mode(
-        report,
-        strategy_id=strategy_id,
-        app_config=app_config,
-        snapshots=snapshots,
-    ):
-        _maybe_write_report(args.report, report)
-        return EXIT_FAIL_CONFIG
-
     plan_store = SqlitePositionPlanStore(str(plan_db))
     journal = SqliteOrderJournalStore(str(journal_db))
-
-    if not _check_portfolio_v1_recovery_audit(
-        report,
-        strategy_id=strategy_id,
-        app_config=app_config,
-        plan_store=plan_store,
-        snapshots=snapshots,
-    ):
-        _maybe_write_report(args.report, report)
-        return EXIT_FAIL_CONFIG
 
     await _check_stale_state(
         report,
@@ -385,151 +341,6 @@ async def _fetch_snapshots(
             report.verdict = "fail_config"
             return None
     return tuple(snapshots)
-
-
-def _check_portfolio_v1_hedge_mode(
-    report: PreflightReport,
-    *,
-    strategy_id: object,
-    app_config: AppConfig,
-    snapshots: tuple[PlatformSnapshot, ...],
-) -> bool:
-    if not (
-        portfolio_v1_requires_hedge_mode(strategy_id)
-        or portfolio_v1_requires_hedge_mode(app_config.strategy)
-    ):
-        return True
-
-    snapshots_by_exchange = {
-        snapshot.balance.exchange: snapshot for snapshot in snapshots
-    }
-    statuses = []
-    for exchange in app_config.exchanges:
-        snapshot = snapshots_by_exchange.get(exchange)
-        status = position_mode_status(
-            exchange=exchange,
-            symbol=app_config.symbol,
-            value=(
-                None if snapshot is None else snapshot.position_mode
-            ),
-            source="preflight_hard_gate",
-            error=(
-                "snapshot_missing"
-                if snapshot is None
-                else None
-            ),
-        )
-        statuses.append(status)
-        detail = status.audit()
-        if status.hedge_mode:
-            logger.info(
-                "[preflight] hedge_mode ok exchange=%s mode=%s",
-                exchange.value,
-                status.mode,
-            )
-            report.add(
-                f"portfolio_v1_hedge_mode_{exchange.value}",
-                "ok",
-                detail=detail,
-            )
-        else:
-            logger.error(
-                "[preflight] hedge_mode failed exchange=%s "
-                "required=hedge actual=%s",
-                exchange.value,
-                status.mode,
-            )
-            report.add(
-                f"portfolio_v1_hedge_mode_{exchange.value}",
-                "fail",
-                detail=detail,
-                error=(
-                    "portfolio v1 requires hedge mode; "
-                    f"actual_mode={status.mode}"
-                ),
-            )
-
-    ok = bool(statuses) and all(
-        status.hedge_mode for status in statuses
-    )
-    report.add(
-        "portfolio_v1_hedge_mode",
-        "ok" if ok else "fail",
-        detail={
-            "strategy": "eth_portfolio_v1",
-            "symbol": app_config.symbol,
-            "required_mode": "hedge",
-            "hedge_mode_ok": ok,
-            "source": "preflight_hard_gate",
-            "exchanges": [status.audit() for status in statuses],
-        },
-        error=None if ok else "hedge mode hard gate failed",
-    )
-    if not ok:
-        report.verdict = "fail_config"
-    return ok
-
-
-def _check_portfolio_v1_recovery_audit(
-    report: PreflightReport,
-    *,
-    strategy_id: object,
-    app_config: AppConfig,
-    plan_store: SqlitePositionPlanStore,
-    snapshots: tuple[PlatformSnapshot, ...] = (),
-) -> bool:
-    if not (
-        portfolio_v1_requires_hedge_mode(strategy_id)
-        or portfolio_v1_requires_hedge_mode(app_config.strategy)
-    ):
-        return True
-
-    audit = audit_portfolio_v1_plans(
-        tuple(plan_store.serialize_active_positions())
-    )
-    active_plan_count = int(audit["plans"]["active_count"])
-    active_exchange_positions = sum(
-        1
-        for snapshot in snapshots
-        for position in snapshot.positions
-        if position.quantity != 0
-    )
-    if snapshots and active_plan_count and not active_exchange_positions:
-        audit["issues"].append("local_active_plans_exchange_flat")
-    elif snapshots and not active_plan_count and active_exchange_positions:
-        audit["issues"].append("exchange_position_without_local_plan")
-    if audit["issues"]:
-        audit["recovery_ok"] = False
-        audit["manual_required"] = True
-        audit["startup_blocked"] = True
-        audit["hard_fail"] = any(
-            str(issue).startswith(
-                (
-                    "exchange_",
-                    "local_active_plans_exchange_flat",
-                )
-            )
-            for issue in audit["issues"]
-        )
-    audit["exchange_snapshot_summary"] = {
-        "snapshot_count": len(snapshots),
-        "active_position_count": active_exchange_positions,
-    }
-    report.portfolio_v1_recovery_audit = audit
-    ok = bool(audit["recovery_ok"])
-    report.add(
-        "portfolio_v1_recovery_audit",
-        "ok" if ok else "fail",
-        detail=audit,
-        error=(
-            None
-            if ok
-            else "Portfolio V1 recovery metadata requires manual review"
-        ),
-    )
-    if not ok:
-        report.verdict = "fail_config"
-    return ok
 
 
 async def _check_stale_state(
