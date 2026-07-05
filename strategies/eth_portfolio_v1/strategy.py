@@ -20,6 +20,10 @@ from src.platform.snapshot import PlatformSnapshot
 from src.signals import SignalAction, TradeSignal
 from src.strategy import StrategyRecoveryContext
 from src.strategy.positions import StrategyPositionSnapshot
+from strategies.eth_portfolio_v1.diagnostics.lf_engine_diag import (
+    build_lf_engine_diag,
+    format_lf_engine_diag,
+)
 from strategies.eth_portfolio_v1.domain.models import BarReadyContext, Side, V8DecisionType, V8TradeDecision
 from strategies.eth_portfolio_v1.domain.position_snapshots import LfSleeveSnapshotAdapter
 from strategies.eth_portfolio_v1.domain.position_state import V8PositionState
@@ -852,6 +856,7 @@ class Strategy:
             range_available = True
             range_status = "ok"
 
+        engine_diag = build_lf_engine_diag(context.engine_features)
         return {
             "strategy_id": self.config.strategy_id,
             "strategy_version": self.config.strategy_version,
@@ -887,6 +892,8 @@ class Strategy:
             "momentum_signal": _engine_signal(context.engine_features.get("momentum")),
             "bear_signal": _engine_signal(context.engine_features.get("bear")),
             "bull_signal": _engine_signal(context.engine_features.get("bull")),
+            "engine_diag": engine_diag,
+            "engine_diag_text": format_lf_engine_diag(engine_diag),
             "momentum_selected": selected_engine == "MOMENTUM_V3",
             "bear_only": selected_engine == "BEAR_V3_ONLY",
             "bull_reclaim": selected_engine == "BULL_RECLAIM_V2",

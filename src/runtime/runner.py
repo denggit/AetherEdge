@@ -441,6 +441,16 @@ class LiveRuntimeRunner:
             closed_kline.close,
             self._closed_bar_buffer_ms,
         )
+        engine_diag_text = audit.get("engine_diag_text")
+        if isinstance(engine_diag_text, str) and engine_diag_text.strip():
+            logger.info(
+                "4H engine diagnostics | symbol=%s interval=%s open_time_ms=%s close_time_ms=%s\n%s",
+                self.app_config.symbol,
+                self._closed_bar_interval,
+                audit.get("bar_open_time_ms"),
+                audit.get("bar_close_time_ms"),
+                engine_diag_text,
+            )
 
     async def poll_closed_bar_once(self, *, now_ms: int | None = None) -> list[MarketFeatureEvent]:
         now = int(time.time() * 1000) if now_ms is None else now_ms
