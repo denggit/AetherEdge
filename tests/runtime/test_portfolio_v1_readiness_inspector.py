@@ -1,0 +1,306 @@
+from __future__ import annotations
+
+import sqlite3
+from decimal import Decimal
+
+from src.market_data.models import (
+    FixedTimeTradeBar,
+    RangeBar,
+    RangeBarAggregate,
+    RangeCoverageStatus,
+    RangeFootprintFeature,
+    TradeFootprintFeature,
+)
+from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
+from src.market_data.storage import SqliteKlineStore, SqliteRangeBarStore
+from src.market_data.storage.trade_feature_store import (
+    SqliteTradeFeatureStore,
+)
+from src.platform import ExchangeName
+from src.platform.data.models import MarketDataSource, MarketKline
+from src.runtime.portfolio_v1_readiness import (
+    PortfolioV1ReadinessInspector,
+)
+
+
+SYMBOL = "ETH-USDT-PERP"
+NOW_MS = 1_800_000_000_000
+MINUTE_MS = 60_000
+FOUR_HOURS_MS = 4 * 60 * MINUTE_MS
+
+
+def _seed_ready_stores(
+    tmp_path,
+    *,
+    degraded_range_footprint: bool = False,
+) -> tuple[str, str]:
+    market_path = str(tmp_path / "market.sqlite3")
+    checkpoint_path = str(tmp_path / "checkpoint.sqlite3")
+    latest_close = NOW_MS - MINUTE_MS
+
+    kline_store = SqliteKlineStore(market_path)
+    klines = []
+    for index in range(2):
+        close_ms = latest_close - (1 - index) * FOUR_HOURS_MS
+        klines.append(
+            MarketKline(
+                exchange=ExchangeName.OKX,
+                symbol=SYMBOL,
+                raw_symbol="ETH-USDT-SWAP",
+                interval="4h",
+                open_time_ms=close_ms - FOUR_HOURS_MS + 1,
+                close_time_ms=close_ms,
+                open=Decimal("2000"),
+                high=Decimal("2010"),
+                low=Decimal("1990"),
+                close=Decimal("2005"),
+                volume=Decimal("100"),
+                source=MarketDataSource.REST,
+            )
+        )
+    kline_store.save(klines)
+
+    range_store = SqliteRangeBarStore(market_path)
+    range_store.save(
+        (
+            RangeBar(
+                symbol=SYMBOL,
+                range_pct=Decimal("0.002"),
+                bar_id=1_800_000_000_001,
+                start_time_ms=latest_close - MINUTE_MS,
+                end_time_ms=latest_close,
+                open=Decimal("2000"),
+                high=Decimal("2010"),
+                low=Decimal("1990"),
+                close=Decimal("2005"),
+                volume=Decimal("10"),
+                buy_notional=Decimal("110"),
+                sell_notional=Decimal("90"),
+                trade_count=10,
+            ),
+        )
+    )
+
+    checkpoint = SqliteRangeCheckpointStore(checkpoint_path)
+    for index in range(2):
+        end_ms = latest_close - (1 - index) * FOUR_HOURS_MS
+        checkpoint.save_completed_aggregate(
+            exchange="okx",
+            aggregate=RangeBarAggregate(
+                symbol=SYMBOL,
+                range_pct=Decimal("0.002"),
+                bucket_start_ms=end_ms - FOUR_HOURS_MS + 1,
+                bucket_end_ms=end_ms,
+                bar_count=10,
+                first_open=Decimal("2000"),
+                last_close=Decimal("2005"),
+                high=Decimal("2010"),
+                low=Decimal("1990"),
+                buy_notional_sum=Decimal("110"),
+                sell_notional_sum=Decimal("90"),
+                delta_notional_sum=Decimal("20"),
+                notional_sum=Decimal("200"),
+            ),
+            coverage_status=RangeCoverageStatus.COMPLETE.value,
+            completed_at_ms=end_ms,
+        )
+
+    feature_store = SqliteTradeFeatureStore(market_path)
+    latest_open = ((NOW_MS - 2 * MINUTE_MS) // MINUTE_MS) * MINUTE_MS
+    bars = []
+    footprints = []
+    for index in range(4):
+        open_ms = latest_open - (3 - index) * MINUTE_MS
+        close_ms = open_ms + MINUTE_MS - 1
+        bars.append(
+            FixedTimeTradeBar(
+                exchange="okx",
+                symbol=SYMBOL,
+                open_time_ms=open_ms,
+                close_time_ms=close_ms,
+                available_time_ms=close_ms,
+                open=Decimal("2000"),
+                high=Decimal("2001"),
+                low=Decimal("1999"),
+                close=Decimal("2000"),
+                volume=Decimal("2"),
+                buy_volume=Decimal("1"),
+                sell_volume=Decimal("1"),
+                buy_notional=Decimal("100"),
+                sell_notional=Decimal("100"),
+                delta_volume=Decimal("0"),
+                delta_notional=Decimal("0"),
+                abs_delta_notional=Decimal("0"),
+                trade_count=10,
+                large_trade_share=Decimal("0.2"),
+            )
+        )
+        footprints.append(
+            TradeFootprintFeature(
+                exchange="okx",
+                symbol=SYMBOL,
+                open_time_ms=open_ms,
+                close_time_ms=close_ms,
+                available_time_ms=close_ms,
+                delta_notional=Decimal("0"),
+                abs_delta_notional=Decimal("0"),
+                taker_buy_ratio=Decimal("0.5"),
+                close_pos=Decimal("0.5"),
+                range_pct=Decimal("0.001"),
+                return_pct=Decimal("0"),
+                fp_max_bucket_abs_delta_pressure=Decimal("0.7"),
+            )
+        )
+    feature_store.upsert_tradebars_many(bars)
+    feature_store.upsert_footprints_many(footprints)
+    coverage_start = bars[-3].open_time_ms
+    coverage_end = bars[-1].close_time_ms
+    range_available = coverage_start - MINUTE_MS
+    feature_store.upsert_range_footprints_many(
+        (
+            RangeFootprintFeature(
+                exchange="okx",
+                symbol=SYMBOL,
+                range_pct=Decimal("0.002"),
+                price_step=Decimal("1"),
+                range_bar_id=1,
+                range_start_ms=range_available - MINUTE_MS,
+                range_end_ms=range_available,
+                available_time_ms=range_available,
+                fp_max_bucket_abs_delta_pressure=Decimal("0.8"),
+                fp_low_bucket_delta_pressure=Decimal("-0.2"),
+                fp_high_bucket_delta_pressure=Decimal("0.3"),
+                fp_delta_pressure=Decimal("0.1"),
+                bucket_count=5,
+                trade_count=20,
+                quality=(
+                    "DEGRADED_LOW_TRADE_COUNT"
+                    if degraded_range_footprint
+                    else "COMPLETE"
+                ),
+            ),
+        )
+    )
+    feature_store.mark_range_footprint_coverage(
+        symbol=SYMBOL,
+        exchange="okx",
+        range_pct="0.002",
+        price_step="1",
+        start_ms=coverage_start,
+        end_ms=coverage_end,
+        complete=True,
+    )
+    return market_path, checkpoint_path
+
+
+def _inspect(
+    market_path: str,
+    checkpoint_path: str,
+    *,
+    now_ms: int = NOW_MS,
+    large_share_min_samples: int = 2,
+):
+    return PortfolioV1ReadinessInspector(
+        symbol=SYMBOL,
+        market_data_db_path=market_path,
+        range_checkpoint_db_path=checkpoint_path,
+        lf_min_records=2,
+        range_speed_min_periods=2,
+        mf_required_minutes=3,
+        large_share_min_samples=large_share_min_samples,
+        now_ms=now_ms,
+    ).inspect()
+
+
+def test_lf_closed_kline_enough_warmup_is_ready(tmp_path) -> None:
+    market, checkpoint = _seed_ready_stores(tmp_path)
+
+    result = _inspect(market, checkpoint)
+
+    assert result.lf["closed_kline_count"] == 2
+    assert result.lf["ok"] is True
+
+
+def test_lf_closed_kline_stale_fails(tmp_path) -> None:
+    market, checkpoint = _seed_ready_stores(tmp_path)
+
+    result = _inspect(
+        market,
+        checkpoint,
+        now_ms=NOW_MS + 2 * FOUR_HOURS_MS,
+    )
+
+    assert "lf_closed_kline_stale" in result.issues
+
+
+def test_range_aggregate_complete_is_ready(tmp_path) -> None:
+    market, checkpoint = _seed_ready_stores(tmp_path)
+
+    result = _inspect(market, checkpoint)
+
+    assert result.lf["latest_range_aggregate_status"] == "COMPLETE"
+    assert result.lf["range_aggregate_causal_ok"] is True
+
+
+def test_range_aggregate_missing_fails(tmp_path) -> None:
+    market, checkpoint = _seed_ready_stores(tmp_path)
+    with sqlite3.connect(checkpoint) as conn:
+        conn.execute("DELETE FROM completed_range_aggregates")
+
+    result = _inspect(market, checkpoint)
+
+    assert "lf_range_aggregate_missing" in result.issues
+
+
+def test_mf_tradebar_and_range_footprint_are_ready(tmp_path) -> None:
+    market, checkpoint = _seed_ready_stores(tmp_path)
+
+    result = _inspect(market, checkpoint)
+
+    assert result.mf["tradebar_ready"] is True
+    assert result.mf["range_footprint_ready"] is True
+    assert result.mf["ok"] is True
+
+
+def test_mf_missing_large_share_samples_fails(tmp_path) -> None:
+    market, checkpoint = _seed_ready_stores(tmp_path)
+
+    result = _inspect(
+        market,
+        checkpoint,
+        large_share_min_samples=10,
+    )
+
+    assert "mf_large_share_samples_insufficient" in result.issues
+
+
+def test_available_time_after_decision_boundary_fails(tmp_path) -> None:
+    market, checkpoint = _seed_ready_stores(tmp_path)
+    with sqlite3.connect(market) as conn:
+        conn.execute(
+            """
+            UPDATE trade_footprint_1m_features
+            SET available_time_ms=?
+            WHERE open_time_ms=(
+                SELECT MAX(open_time_ms)
+                FROM trade_footprint_1m_features
+            )
+            """,
+            (NOW_MS + MINUTE_MS,),
+        )
+
+    result = _inspect(market, checkpoint)
+
+    assert "mf_fixed_time_footprint_future_available" in result.issues
+    assert result.causal["ok"] is False
+
+
+def test_degraded_range_footprint_fails(tmp_path) -> None:
+    market, checkpoint = _seed_ready_stores(
+        tmp_path,
+        degraded_range_footprint=True,
+    )
+
+    result = _inspect(market, checkpoint)
+
+    assert "mf_range_footprint_degraded" in result.issues

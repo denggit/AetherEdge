@@ -23,7 +23,7 @@ import json
 import os
 import sys
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -150,10 +150,18 @@ async def main() -> int:
 
     # ── 1. Load config ──
     try:
-        app_config = AppConfig.from_defaults(
+        app_config = AppConfig.from_env(
             defaults_path=args.defaults,
             env_file=args.env_file,
         )
+        if args.strategy:
+            strategy_path = (
+                "strategies.eth_portfolio_v1:Strategy"
+                if args.strategy
+                in {"eth_portfolio_v1", "strategies.eth_portfolio_v1"}
+                else args.strategy
+            )
+            app_config = replace(app_config, strategy=strategy_path)
     except Exception as exc:
         report.add("load_app_config", "fail", error=str(exc))
         report.verdict = "fail_config"
@@ -162,6 +170,56 @@ async def main() -> int:
 
     report.symbol = app_config.symbol
     report.strategy = app_config.strategy
+
+    if portfolio_v1_requires_hedge_mode(app_config.strategy):
+        from src.runtime.portfolio_v1_live_gate import (
+            EXIT_FAIL_CONFIG as V1_EXIT_FAIL_CONFIG,
+            PortfolioV1LiveGateReport,
+            write_live_gate_report,
+        )
+        from tools.live_server_smoke import run_server_smoke
+
+        forbidden_flags = [
+            name
+            for name, active in (
+                ("--skip-api", args.skip_api),
+                ("--skip-kline", args.skip_kline),
+                ("--apply-reconcile", args.apply_reconcile),
+            )
+            if active
+        ]
+        if forbidden_flags:
+            final_report = PortfolioV1LiveGateReport(
+                symbol=app_config.symbol,
+                runtime_mode=runtime_mode_from_env(
+                    defaults_path=args.defaults,
+                    env_file=args.env_file,
+                ).value,
+                exchanges=[
+                    exchange.value for exchange in app_config.exchanges
+                ],
+                ok=False,
+                verdict="fail_config",
+                exit_code=V1_EXIT_FAIL_CONFIG,
+                issues=[
+                    "direct_live_preflight_disallows:"
+                    + ",".join(forbidden_flags)
+                ],
+            )
+            final_report.add(
+                "direct_live_cli_flags",
+                ok=False,
+                error=final_report.issues[0],
+            )
+        else:
+            final_report = await run_server_smoke(
+                defaults_path=args.defaults,
+                env_file=args.env_file,
+                strategy_name=args.strategy or app_config.strategy,
+            )
+        write_live_gate_report(args.report, final_report)
+        return int(final_report.exit_code)
+
     runtime_mode = runtime_mode_from_env()
     report.runtime_mode = runtime_mode.value
 
@@ -699,6 +757,11 @@ def parse_args() -> argparse.Namespace:
   1 = FAIL_NEEDS_RECONCILE (run with --apply-reconcile to fix)
   2 = FAIL_UNRESOLVED_FOLLOWER_POSITION
   3 = FAIL_CONFIG""",
+    )
+    parser.add_argument(
+        "--strategy",
+        default=None,
+        help="Strategy alias or module:attribute path",
     )
     parser.add_argument(
         "--defaults",
