@@ -13,6 +13,10 @@ from src.order_management.safety.recovery_exit_validator import (
     RecoveryExitValidationResult,
     is_bot_owned_order,
 )
+from src.order_management.safety.scoped_stop_recovery import (
+    filter_orders_for_position_scope,
+    order_matches_position_scope,
+)
 
 __all__ = [
     "ExchangeExitNormalization",
@@ -25,5 +29,7 @@ __all__ = [
     "RecoveryExitOrderCheck",
     "RecoveryExitOrderValidator",
     "RecoveryExitValidationResult",
+    "filter_orders_for_position_scope",
     "is_bot_owned_order",
+    "order_matches_position_scope",
 ]

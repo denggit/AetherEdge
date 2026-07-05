@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from decimal import Decimal
-from typing import Sequence
+from enum import Enum
+from typing import Any, Mapping, Sequence
 
 from src.order_management.idempotency.client_order_id import DeterministicClientOrderIdFactory
 from src.order_management.models import ExchangeOrderResult, OrderIntent, OrderIntentStatus, OrderJournalEvent
@@ -159,6 +160,10 @@ class MultiExchangeOrderCoordinator:
         stop_price = _optional_decimal(signal.metadata.get("estimated_initial_stop") if signal.metadata else None)
         if existing is None:
             master_target_qty = _signal_exchange_quantity(signal, master_exchange, fallback=Decimal("0")) if master_exchange in intent.target_exchanges else Decimal("0")
+            plan_metadata = _position_plan_metadata(
+                signal.metadata,
+                intent_id=intent.intent_id,
+            )
             self.position_plan_store.upsert_position(
                 PositionPlan(
                     position_id=position_id,
@@ -170,7 +175,7 @@ class MultiExchangeOrderCoordinator:
                     master_exchange=master_exchange,
                     master_target_qty_base=master_target_qty,
                     master_filled_qty_base=Decimal("0"),
-                    metadata={"intent_id": intent.intent_id},
+                    metadata=plan_metadata,
                 )
             )
             for exchange in intent.target_exchanges:
@@ -217,7 +222,23 @@ class MultiExchangeOrderCoordinator:
                 if exchange is master_exchange:
                     plan = self.position_plan_store.get_position(position_id)
                     if plan is not None:
-                        self.position_plan_store.upsert_position(replace(plan, master_filled_qty_base=plan.master_filled_qty_base + filled))
+                        metadata = dict(plan.metadata)
+                        if (
+                            result.avg_fill_price is not None
+                            and result.avg_fill_price > 0
+                        ):
+                            metadata["average_entry_price"] = str(
+                                result.avg_fill_price
+                            )
+                        self.position_plan_store.upsert_position(
+                            replace(
+                                plan,
+                                master_filled_qty_base=(
+                                    plan.master_filled_qty_base + filled
+                                ),
+                                metadata=metadata,
+                            )
+                        )
             elif purpose == "follower_recovery_topup":
                 self.position_plan_store.update_leg_sync_status(position_id=position_id, exchange=exchange, sync_status=LegSyncStatus.TOPUP_FAILED)
             elif master_entry_ok and exchange is not master_exchange:
@@ -325,6 +346,22 @@ class MultiExchangeOrderCoordinator:
                                 "ok": master_result.ok if master_result is not None else False,
                                 "error": master_result.error if master_result is not None else "missing result",
                             },
+                        )
+                    )
+                if (
+                    signal.metadata
+                    and signal.metadata.get("sleeve_id") == "mf"
+                ):
+                    metadata = {
+                        **dict(existing.metadata),
+                        "pending_close_unconfirmed": True,
+                        "pending_close_intent_id": intent.intent_id,
+                    }
+                    self.position_plan_store.upsert_position(
+                        replace(
+                            existing,
+                            status=PositionPlanStatus.MANUAL_REQUIRED,
+                            metadata=_json_safe_value(metadata),
                         )
                     )
                 return
@@ -930,6 +967,50 @@ def _optional_decimal(value) -> Decimal | None:
     if value in (None, ""):
         return None
     return Decimal(str(value))
+
+
+def _position_plan_metadata(
+    signal_metadata: Mapping[str, Any] | None,
+    *,
+    intent_id: str,
+) -> dict[str, Any]:
+    safe_signal = _json_safe_value(dict(signal_metadata or {}))
+    metadata: dict[str, Any] = {
+        "intent_id": intent_id,
+        "signal_metadata": safe_signal,
+    }
+    for key in (
+        "sleeve_id",
+        "position_id",
+        "engine",
+        "entry_execution_time_ms",
+        "entry_tradebar_open_time_ms",
+        "signal_time_ms",
+        "time48_holding_minutes",
+        "exit_variant",
+        "quantity_scope",
+        "protective_stop_required",
+    ):
+        if key in safe_signal:
+            metadata[key] = safe_signal[key]
+    return metadata
+
+
+def _json_safe_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, Enum):
+        return _json_safe_value(value.value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_safe_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_json_safe_value(item) for item in value]
+    return str(value)
 
 
 def _result_is_filled(result: ExchangeOrderResult) -> bool:

@@ -233,9 +233,6 @@ class LiveStateReconciliationService:
             report.active_position_after = False
             return report
 
-        # Determine master exchange from the first plan
-        master_exchange = active_plans[0].master_exchange
-
         all_flat = _all_exchanges_flat(snapshots_by_exchange)
 
         for plan in active_plans:
@@ -249,7 +246,7 @@ class LiveStateReconciliationService:
                 legs=legs,
                 snapshots_by_exchange=snapshots_by_exchange,
                 all_flat=all_flat,
-                master_exchange=master_exchange,
+                master_exchange=plan.master_exchange,
                 report=report,
             )
 

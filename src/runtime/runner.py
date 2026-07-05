@@ -42,7 +42,10 @@ from src.order_management.position_plan.models import LegRole
 from src.order_management.models import ExchangeOrderResult, OrderIntentStatus
 from src.order_management.quantity import NativeQuantityConverter
 from src.order_management.reconciliation.service import LiveStateReconciliationService
-from src.order_management.safety import RecoveryExitOrderValidator
+from src.order_management.safety import (
+    RecoveryExitOrderValidator,
+    filter_orders_for_position_scope,
+)
 from src.platform import create_account_client, create_execution_client
 from src.platform.account.events import AccountEvent
 from src.platform.account.ports import AccountClient
@@ -162,6 +165,7 @@ FATAL_STARTUP_ERROR_MARKERS = (
     "startup snapshot is required before live trading",
     "startup reconciliation missing exchange snapshots",
     "runtime recovery failed",
+    "portfolio v1 requires hedge mode",
 )
 
 
@@ -1576,6 +1580,10 @@ class LiveRuntimeRunner:
         master_exchange_str = self.app_config.data_exchange.value
 
         for strategy_position in active_strategy_positions:
+            if not _strategy_position_requires_protective_stop(
+                strategy_position
+            ):
+                continue
             market_profile = get_market_profile(strategy_position.symbol)
             relevant_exchanges = {
                 master_exchange_str,
@@ -1622,6 +1630,17 @@ class LiveRuntimeRunner:
 
                 if canonical_stop_price is not None and position_side is not None:
                     try:
+                        open_stop_orders = (
+                            getattr(snapshot, "open_stop_orders", ()) or ()
+                        )
+                        if len(active_strategy_positions) > 1:
+                            open_stop_orders = filter_orders_for_position_scope(
+                                open_stop_orders,
+                                position_id=strategy_position.position_id,
+                                known_order_ids=_strategy_position_stop_order_ids(
+                                    strategy_position
+                                ),
+                            )
                         validation = validator.validate_stop_orders(
                             exchange=exchange_name,
                             symbol=strategy_position.symbol,
@@ -1631,7 +1650,7 @@ class LiveRuntimeRunner:
                             position_mode=snapshot.position_mode,
                             current_position_native_quantity=expected_native_quantity,
                             canonical_stop_price=canonical_stop_price,
-                            open_stop_orders=getattr(snapshot, "open_stop_orders", ()) or (),
+                            open_stop_orders=open_stop_orders,
                             open_orders=getattr(snapshot, "open_orders", ()) or (),
                             market_profile=market_profile,
                         )
@@ -1692,6 +1711,10 @@ class LiveRuntimeRunner:
         ] = {}
 
         for strategy_position in active_strategy_positions:
+            if not _strategy_position_requires_protective_stop(
+                strategy_position
+            ):
+                continue
             canonical_stop_price = strategy_position.stop_price
             if canonical_stop_price is None:
                 raise LiveRuntimeError(
@@ -1775,7 +1798,17 @@ class LiveRuntimeRunner:
                     position_mode=mode,
                     current_position_native_quantity=expected_native_quantity,
                     canonical_stop_price=canonical_stop_price,
-                    open_stop_orders=open_stop_orders,
+                    open_stop_orders=(
+                        filter_orders_for_position_scope(
+                            open_stop_orders,
+                            position_id=strategy_position.position_id,
+                            known_order_ids=_strategy_position_stop_order_ids(
+                                strategy_position
+                            ),
+                        )
+                        if len(active_strategy_positions) > 1
+                        else open_stop_orders
+                    ),
                     open_orders=(),
                     market_profile=market_profile,
                 )
@@ -4598,6 +4631,35 @@ def _strategy_position_active_exchanges(
         normalized
         for item in values
         if (normalized := str(item).strip().lower())
+    )
+
+
+def _strategy_position_requires_protective_stop(
+    snapshot: StrategyPositionSnapshot,
+) -> bool:
+    value = snapshot.metadata.get("protective_stop_required", True)
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"false", "0", "no", "n", ""}:
+        return False
+    return True
+
+
+def _strategy_position_stop_order_ids(
+    snapshot: StrategyPositionSnapshot,
+) -> tuple[str, ...]:
+    raw = snapshot.metadata.get("stop_order_ids", ())
+    if isinstance(raw, str):
+        values = (raw,)
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        values = raw
+    else:
+        values = ()
+    return tuple(
+        normalized
+        for value in values
+        if (normalized := str(value or "").strip())
     )
 
 

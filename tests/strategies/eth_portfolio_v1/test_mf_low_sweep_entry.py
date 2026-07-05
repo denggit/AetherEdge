@@ -114,10 +114,16 @@ def test_entry_signal_has_independent_mf_scope(tmp_path) -> None:
     )
     assert signal.metadata["position_id"] == sleeve.position_id
     assert signal.metadata["entry_mode"] == "next_open"
+    causal = signal.metadata["audit"]
+    assert signal.metadata["entry_tradebar_open_time_ms"] == causal[
+        "entry_tradebar_open_time_ms"
+    ]
+    assert signal.metadata["time48_holding_minutes"] == 48
+    assert signal.metadata["quantity_scope"] == "mf_sleeve_quantity"
+    assert signal.metadata["protective_stop_required"] is False
     assert signal.metadata["sizing_input"]["position_fraction"] == "0.10"
     assert signal.metadata["sizing_input"]["equity"] == "1000"
     assert signal.quantity == Decimal("100") / Decimal("90")
-    causal = signal.metadata["audit"]
     assert (
         signal.metadata["entry_execution_time_ms"]
         > causal["used_tradebar_close_time_ms"]

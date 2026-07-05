@@ -10,6 +10,7 @@ from src.strategy.positions import (
     StrategyPositionStatus,
 )
 from strategies.eth_portfolio_v1.domain.mf_signal import MF_ENGINE_NAME
+from strategies.eth_portfolio_v1.domain.recovery import merged_plan_metadata
 from strategies.eth_portfolio_v1.domain.sleeves import MF_RESERVED_SLEEVE_ID
 
 
@@ -100,6 +101,7 @@ class MfSleeveState:
 
     def restore_from_plan(self, payload: Mapping[str, Any]) -> bool:
         position = dict(payload.get("position", {}))
+        metadata = merged_plan_metadata(payload)
         position_id = str(position.get("position_id") or "")
         if not position_id:
             return False
@@ -112,12 +114,29 @@ class MfSleeveState:
         )
         if quantity <= 0:
             return False
+        average_entry_price = _positive_decimal(
+            metadata.get("average_entry_price")
+        )
+        signal_time_ms = _positive_int(metadata.get("signal_time_ms"))
+        execution_time_ms = _positive_int(
+            metadata.get("entry_execution_time_ms")
+        )
+        tradebar_open_time_ms = _positive_int(
+            metadata.get("entry_tradebar_open_time_ms")
+        )
+        if (
+            average_entry_price is None
+            or signal_time_ms is None
+            or execution_time_ms is None
+            or tradebar_open_time_ms is None
+        ):
+            return False
         self.position_id = position_id
         self.quantity = quantity
-        self.average_entry_price = None
-        self.entry_signal_time_ms = int(position.get("created_time_ms") or 0)
-        self.entry_execution_time_ms = int(position.get("created_time_ms") or 0)
-        self.entry_tradebar_open_time_ms = None
+        self.average_entry_price = average_entry_price
+        self.entry_signal_time_ms = signal_time_ms
+        self.entry_execution_time_ms = execution_time_ms
+        self.entry_tradebar_open_time_ms = tradebar_open_time_ms
         self.pending_open = False
         self.pending_close = False
         return True
@@ -157,9 +176,29 @@ class MfSleeveState:
                     "exit_variant": "time48",
                     "stop_scope": self.position_id,
                     "protective_stop_required": False,
+                    "entry_execution_time_ms": self.entry_execution_time_ms,
+                    "entry_tradebar_open_time_ms": (
+                        self.entry_tradebar_open_time_ms
+                    ),
                 },
             ),
         )
+
+
+def _positive_decimal(value: object) -> Decimal | None:
+    try:
+        parsed = Decimal(str(value))
+    except Exception:
+        return None
+    return parsed if parsed.is_finite() and parsed > 0 else None
+
+
+def _positive_int(value: object) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 __all__ = ["MfSleeveState"]

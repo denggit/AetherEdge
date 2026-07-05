@@ -18,7 +18,11 @@ from src.platform.config import ProjectEnvConfig
 from src.platform.exchanges.models import ExchangeName, PositionMode
 from src.planner import ExecutionPlanner
 from src.runtime import LiveRuntimeConfig, RuntimeMode
-from src.runtime.runner import LiveRuntimeError, LiveRuntimeRunner
+from src.runtime.runner import (
+    LiveRuntimeError,
+    LiveRuntimeRunner,
+    _is_fatal_startup_error,
+)
 
 
 class _Strategy:
@@ -172,6 +176,14 @@ def test_portfolio_v1_unknown_mode_is_hard_failure() -> None:
     )
     with pytest.raises(LiveRuntimeError, match="binance=unknown"):
         asyncio.run(runner._check_portfolio_v1_hedge_mode())
+
+
+def test_portfolio_v1_hedge_mode_failure_is_fatal_startup_error() -> None:
+    error = LiveRuntimeError(
+        "portfolio v1 requires hedge mode on every target exchange"
+    )
+
+    assert _is_fatal_startup_error(error) is True
 
 
 def test_v10b_is_not_subject_to_portfolio_gate() -> None:

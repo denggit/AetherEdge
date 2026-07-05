@@ -120,7 +120,13 @@ class MfSignalMapper:
             "signal_time_ms": decision.signal_time_ms,
             "decision_time_ms": decision.decision_time_ms,
             "entry_execution_time_ms": decision.entry_execution_time_ms,
+            "entry_tradebar_open_time_ms": decision.audit.get(
+                "entry_tradebar_open_time_ms"
+            ),
+            "time48_holding_minutes": self.config.holding_minutes,
+            "quantity_scope": "mf_sleeve_quantity",
             "stop_scope": decision.position_id,
+            "protective_stop_required": False,
             "audit": _json_safe_mapping(decision.audit),
         }
         if self.target_exchanges:

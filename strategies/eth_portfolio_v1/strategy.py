@@ -10,7 +10,13 @@ from typing import Any, Mapping, Sequence
 
 from src.market_data.events import MarketFeatureEvent, MarketFeatureEventType
 from src.order_management.quantity import NativeQuantityConverter
-from src.order_management.safety import RecoveryExitOrderValidator, RecoveryExitValidationResult, is_bot_owned_order
+from src.order_management.safety import (
+    RecoveryExitOrderValidator,
+    RecoveryExitValidationResult,
+    filter_orders_for_position_scope,
+    is_bot_owned_order,
+    order_matches_position_scope,
+)
 from src.platform.account.events import AccountEvent, AccountEventType
 from src.platform.data.models import MarketKline, MarketOrderBook, MarketTicker, MarketTrade
 from src.platform.exchanges.models import Order, OrderSide, OrderStatus, Position, PositionSide
@@ -33,6 +39,11 @@ from strategies.eth_portfolio_v1.domain.mf_signal import (
     MfLowSweepConfig,
 )
 from strategies.eth_portfolio_v1.domain.mf_sleeve import MfSleeveState
+from strategies.eth_portfolio_v1.domain.recovery import (
+    audit_portfolio_v1_plans,
+    merged_plan_metadata,
+    plan_sleeve_id,
+)
 from strategies.eth_portfolio_v1.domain.models import BarReadyContext, Side, V8DecisionType, V8TradeDecision
 from strategies.eth_portfolio_v1.domain.position_snapshots import LfSleeveSnapshotAdapter
 from strategies.eth_portfolio_v1.domain.position_state import V8PositionState
@@ -256,6 +267,7 @@ class Strategy:
         self.bar_ready_events: list[BarReadyContext] = []
         self.last_decision_audit: dict[str, Any] | None = None
         self.recovery_alerts: list[str] = []
+        self.last_recovery_audit: dict[str, Any] | None = None
         self.stop_safety_alerts: list[str] = []
         self.last_stop_reject_reason: str | None = None
         self.last_stop_reject_metadata: dict[str, Any] | None = None
@@ -396,10 +408,22 @@ class Strategy:
 
     async def recover(self, context: StrategyRecoveryContext) -> Sequence[TradeSignal]:
         self.recovered = True
+        self.recovery_manual_required = False
+        self.recovery_blocking_manual_required = False
+        self.recovery_alerts.clear()
         for snapshot in context.snapshots:
             self._refresh_account_equity(snapshot)
         plans = tuple(context.metadata.get("active_position_plans", ()) if context.metadata else ())
-        return self._recover_position_from_plans(snapshots=context.snapshots, plans=plans)
+        prior_strategy_positions = tuple(
+            context.metadata.get("active_strategy_positions", ())
+            if context.metadata
+            else ()
+        )
+        return self._recover_position_from_plans(
+            snapshots=context.snapshots,
+            plans=plans,
+            prior_strategy_positions=prior_strategy_positions,
+        )
 
     async def on_account_snapshot(self, snapshot: PlatformSnapshot) -> None:
         self._refresh_account_equity(snapshot)
@@ -1907,21 +1931,535 @@ class Strategy:
             reference_price=event.price,
         )
 
-    def _recover_position_from_plans(self, *, snapshots: Sequence[PlatformSnapshot], plans: Sequence[Mapping[str, Any]]) -> list[TradeSignal]:
+    def _recover_position_from_plans(
+        self,
+        *,
+        snapshots: Sequence[PlatformSnapshot],
+        plans: Sequence[Mapping[str, Any]],
+        prior_strategy_positions: Sequence[StrategyPositionSnapshot] = (),
+    ) -> list[TradeSignal]:
+        audit = audit_portfolio_v1_plans(plans)
+        self.last_recovery_audit = audit
+        plan_position_ids = {
+            str(dict(payload.get("position", {})).get("position_id") or "")
+            for payload in plans
+        }
+        prior_position_ids = {
+            str(snapshot.position_id)
+            for snapshot in prior_strategy_positions
+            if snapshot.status.value in {"active", "closing"}
+        }
+        if prior_position_ids and prior_position_ids != plan_position_ids:
+            self._block_portfolio_recovery(
+                audit=audit,
+                issues=(
+                    "strategy_snapshot_plan_mismatch:"
+                    f"plans={sorted(plan_position_ids)}:"
+                    f"snapshots={sorted(prior_position_ids)}",
+                ),
+            )
+            return []
+        if audit["issues"]:
+            self._block_portfolio_recovery(
+                audit=audit,
+                issues=tuple(str(issue) for issue in audit["issues"]),
+            )
+            return []
+
         snapshot_by_exchange = {snapshot.balance.exchange.value: snapshot for snapshot in snapshots}
         master_snapshot = snapshot_by_exchange.get(self.config.data_exchange)
         if master_snapshot is None:
+            self._block_portfolio_recovery(
+                audit=audit,
+                issues=("master_exchange_snapshot_missing",),
+            )
             return []
-        active_master = _first_active_position(master_snapshot.positions)
-        active_plan = _first_active_plan(plans)
-        if active_master is not None and active_plan is not None:
-            return self._recover_active_master_with_plan(master=active_master, master_snapshot=master_snapshot, snapshots=snapshot_by_exchange, plan_payload=active_plan)
-        if active_master is not None:
-            self._recover_active_master_without_plan(active_master)
+
+        lf_plans = tuple(
+            plan
+            for plan in plans
+            if plan_sleeve_id(plan) == LF_SLEEVE_ID
+        )
+        mf_plans = tuple(
+            plan
+            for plan in plans
+            if plan_sleeve_id(plan) == MF_RESERVED_SLEEVE_ID
+        )
+        active_master_positions = tuple(
+            position
+            for position in master_snapshot.positions
+            if position.quantity != 0
+        )
+
+        # Keep the established LF state hydration and stop-repair path. The
+        # multi-sleeve path below is activated only when an MF plan exists.
+        if not mf_plans:
+            _lf_coverage_issues, lf_exchange_audit = (
+                self._validate_multi_sleeve_exchange_coverage(
+                    snapshots=snapshot_by_exchange,
+                    plans=plans,
+                )
+            )
+            audit["exchange"] = lf_exchange_audit
+            active_plan = lf_plans[0] if lf_plans else None
+            active_master: Position | None = None
+            if active_plan is not None:
+                plan = dict(active_plan.get("position", {}))
+                plan_side = _side_from_plan(plan.get("side"))
+                matching = tuple(
+                    position
+                    for position in active_master_positions
+                    if _side_from_position(position) is plan_side
+                )
+                if len(matching) == 1 and len(active_master_positions) == 1:
+                    active_master = matching[0]
+                elif active_master_positions:
+                    self._block_portfolio_recovery(
+                        audit=audit,
+                        issues=("master_position_set_ambiguous_or_side_mismatch",),
+                    )
+                    return []
+            if active_master is not None and active_plan is not None:
+                quantity_issue = self._lf_master_quantity_issue(
+                    master=active_master,
+                    plan_payload=active_plan,
+                )
+                if quantity_issue is not None:
+                    self._block_portfolio_recovery(
+                        audit=audit,
+                        issues=(quantity_issue,),
+                    )
+                    return []
+                signals = self._recover_active_master_with_plan(
+                    master=active_master,
+                    master_snapshot=master_snapshot,
+                    snapshots=snapshot_by_exchange,
+                    plan_payload=active_plan,
+                )
+                self._complete_portfolio_recovery_audit(audit)
+                return signals
+            if active_master_positions:
+                self._block_portfolio_recovery(
+                    audit=audit,
+                    issues=("exchange_position_without_local_plan",),
+                )
+                return []
+            if active_plan is not None:
+                self._block_portfolio_recovery(
+                    audit=audit,
+                    issues=("local_active_plan_without_master_position",),
+                )
+                return []
+            self._complete_portfolio_recovery_audit(audit)
             return []
-        if active_plan is not None:
-            return self._recover_master_closed_with_active_plan(snapshots=snapshot_by_exchange, plan_payload=active_plan)
-        return []
+
+        coverage_issues, exchange_audit = (
+            self._validate_multi_sleeve_exchange_coverage(
+                snapshots=snapshot_by_exchange,
+                plans=plans,
+            )
+        )
+        audit["exchange"] = exchange_audit
+        stop_scope_issues = self._validate_multi_sleeve_stop_scopes(
+            snapshots=snapshot_by_exchange,
+            plans=plans,
+        )
+        if coverage_issues or stop_scope_issues:
+            self._block_portfolio_recovery(
+                audit=audit,
+                issues=(*coverage_issues, *stop_scope_issues),
+            )
+            return []
+
+        signals: list[TradeSignal] = []
+        if lf_plans:
+            signals.extend(
+                self._recover_scoped_lf_plan(
+                    snapshots=snapshot_by_exchange,
+                    plan_payload=lf_plans[0],
+                    audit=audit,
+                )
+            )
+        if not self.mf_sleeve.restore_from_plan(mf_plans[0]):
+            self._block_portfolio_recovery(
+                audit=audit,
+                issues=("mf_restore_failed_after_validation",),
+            )
+            return []
+        audit["mf"]["stop_validated"] = True
+        audit["mf"]["sleeve_state"] = self.mf_sleeve.state_label
+        self._complete_portfolio_recovery_audit(audit)
+        return signals
+
+    def _lf_master_quantity_issue(
+        self,
+        *,
+        master: Position,
+        plan_payload: Mapping[str, Any],
+    ) -> str | None:
+        plan = dict(plan_payload.get("position", {}))
+        expected = _dec_or_none(
+            plan.get("master_filled_qty_base")
+            or plan.get("master_target_qty_base")
+        )
+        if expected is None or expected <= 0:
+            return "lf_master_plan_quantity_missing"
+        actual = NativeQuantityConverter().native_to_base_quantity(
+            exchange=master.exchange,
+            symbol=self.config.symbol,
+            native_quantity=abs(master.quantity),
+            market_profile=get_market_profile(self.config.symbol),
+        )
+        tolerance = expected * Decimal("0.05")
+        if abs(actual - expected) > tolerance:
+            return (
+                "lf_master_aggregate_qty_mismatch:"
+                f"expected={expected}:actual={actual}"
+            )
+        return None
+
+    def _validate_multi_sleeve_exchange_coverage(
+        self,
+        *,
+        snapshots: Mapping[str, PlatformSnapshot],
+        plans: Sequence[Mapping[str, Any]],
+    ) -> tuple[tuple[str, ...], dict[str, Any]]:
+        expected: dict[tuple[str, Side], Decimal] = {}
+        for payload in plans:
+            position = dict(payload.get("position", {}))
+            side = _side_from_plan(position.get("side"))
+            if side is Side.FLAT:
+                continue
+            for raw_leg in payload.get("legs", ()):
+                leg = dict(raw_leg)
+                exchange = str(leg.get("exchange") or "").strip().lower()
+                quantity = _dec_or_none(
+                    leg.get("filled_qty_base")
+                    or leg.get("target_qty_base")
+                )
+                if exchange and quantity is not None and quantity > 0:
+                    key = (exchange, side)
+                    expected[key] = expected.get(key, Decimal("0")) + quantity
+
+        issues: list[str] = []
+        exchange_audit: dict[str, Any] = {}
+        market_profile = get_market_profile(self.config.symbol)
+        for exchange, snapshot in snapshots.items():
+            long_base, _long_native, short_base, _short_native = (
+                _side_quantities_with_native(
+                    snapshot.positions,
+                    Side.LONG,
+                    market_profile=market_profile,
+                )
+            )
+            actual = {
+                Side.LONG: long_base,
+                Side.SHORT: short_base,
+            }
+            exchange_audit[exchange] = {
+                "long_qty": str(long_base),
+                "short_qty": str(short_base),
+                "aggregate_side": (
+                    "both"
+                    if long_base > 0 and short_base > 0
+                    else "long"
+                    if long_base > 0
+                    else "short"
+                    if short_base > 0
+                    else "flat"
+                ),
+                "aggregate_qty": str(long_base + short_base),
+                "expected_long_qty": str(
+                    expected.get((exchange, Side.LONG), Decimal("0"))
+                ),
+                "expected_short_qty": str(
+                    expected.get((exchange, Side.SHORT), Decimal("0"))
+                ),
+            }
+            for side in (Side.LONG, Side.SHORT):
+                expected_qty = expected.get((exchange, side), Decimal("0"))
+                actual_qty = actual[side]
+                tolerance = expected_qty * Decimal("0.05")
+                if expected_qty <= 0 < actual_qty:
+                    issues.append(
+                        f"exchange_position_without_local_plan:{exchange}:{_side_label(side)}"
+                    )
+                elif expected_qty > 0 and abs(actual_qty - expected_qty) > tolerance:
+                    issues.append(
+                        "exchange_aggregate_qty_mismatch:"
+                        f"{exchange}:{_side_label(side)}:"
+                        f"expected={expected_qty}:actual={actual_qty}"
+                    )
+
+        for exchange, side in expected:
+            if exchange not in snapshots:
+                issues.append(f"exchange_snapshot_missing:{exchange}")
+        return tuple(dict.fromkeys(issues)), exchange_audit
+
+    def _validate_multi_sleeve_stop_scopes(
+        self,
+        *,
+        snapshots: Mapping[str, PlatformSnapshot],
+        plans: Sequence[Mapping[str, Any]],
+    ) -> tuple[str, ...]:
+        scopes: list[tuple[str, str, str, tuple[str | None, ...]]] = []
+        for payload in plans:
+            position = dict(payload.get("position", {}))
+            position_id = str(position.get("position_id") or "")
+            sleeve_id = str(plan_sleeve_id(payload) or "")
+            for raw_leg in payload.get("legs", ()):
+                leg = dict(raw_leg)
+                scopes.append(
+                    (
+                        str(leg.get("exchange") or "").strip().lower(),
+                        sleeve_id,
+                        position_id,
+                        (
+                            leg.get("stop_order_id"),
+                            leg.get("stop_client_order_id"),
+                        ),
+                    )
+                )
+
+        issues: list[str] = []
+        for exchange, snapshot in snapshots.items():
+            for order in snapshot.open_stop_orders:
+                matches = [
+                    (sleeve_id, position_id)
+                    for (
+                        scope_exchange,
+                        sleeve_id,
+                        position_id,
+                        known_ids,
+                    ) in scopes
+                    if scope_exchange == exchange
+                    and order_matches_position_scope(
+                        order,
+                        position_id=position_id,
+                        known_order_ids=known_ids,
+                    )
+                ]
+                if not matches:
+                    issues.append(
+                        f"unknown_stop_scope:{exchange}:"
+                        f"{order.order_id or order.client_order_id or 'unknown'}"
+                    )
+                elif len(matches) > 1:
+                    issues.append(
+                        f"ambiguous_stop_scope:{exchange}:"
+                        f"{order.order_id or order.client_order_id or 'unknown'}"
+                    )
+                elif matches[0][0] == MF_RESERVED_SLEEVE_ID:
+                    issues.append(
+                        f"unexpected_mf_stop:{exchange}:{matches[0][1]}"
+                    )
+        return tuple(dict.fromkeys(issues))
+
+    def _recover_scoped_lf_plan(
+        self,
+        *,
+        snapshots: Mapping[str, PlatformSnapshot],
+        plan_payload: Mapping[str, Any],
+        audit: dict[str, Any],
+    ) -> list[TradeSignal]:
+        plan = dict(plan_payload.get("position", {}))
+        legs = [dict(item) for item in plan_payload.get("legs", ())]
+        side = _side_from_plan(plan.get("side"))
+        stop_price = _dec_or_none(plan.get("canonical_stop_price"))
+        if side is Side.FLAT or stop_price is None:
+            self._block_portfolio_recovery(
+                audit=audit,
+                issues=("lf_plan_missing_side_or_stop",),
+            )
+            return []
+        master_snapshot = snapshots[self.config.data_exchange]
+        master = next(
+            (
+                position
+                for position in master_snapshot.positions
+                if position.quantity != 0
+                and _side_from_position(position) is side
+            ),
+            None,
+        )
+        if master is None:
+            self._block_portfolio_recovery(
+                audit=audit,
+                issues=("lf_master_position_missing",),
+            )
+            return []
+
+        metadata = merged_plan_metadata(plan_payload)
+        master_qty = _dec_or_none(
+            plan.get("master_filled_qty_base")
+            or plan.get("master_target_qty_base")
+        )
+        entry_price = (
+            _dec_or_none(metadata.get("average_entry_price"))
+            or master.entry_price
+        )
+        if master_qty is None or master_qty <= 0 or entry_price is None:
+            self._block_portfolio_recovery(
+                audit=audit,
+                issues=("lf_plan_quantity_or_entry_missing",),
+            )
+            return []
+
+        self.position.open_master(
+            side=side,
+            entry_time_ms=int(plan.get("created_time_ms") or 0),
+            avg_entry=entry_price,
+            qty=master_qty,
+            stop_price=stop_price,
+            entry_engine=str(plan.get("entry_engine") or "unknown"),
+            position_id=str(plan.get("position_id") or ""),
+        )
+        converter = NativeQuantityConverter()
+        validator = RecoveryExitOrderValidator(quantity_converter=converter)
+        market_profile = get_market_profile(self.config.symbol)
+        signals: list[TradeSignal] = []
+        all_stops_valid = True
+        for leg in legs:
+            exchange = str(leg.get("exchange") or "").strip().lower()
+            snapshot = snapshots.get(exchange)
+            quantity = _dec_or_none(
+                leg.get("filled_qty_base") or leg.get("target_qty_base")
+            )
+            if not exchange or snapshot is None or quantity is None or quantity <= 0:
+                continue
+            native_qty = converter.convert_quantity(
+                exchange=snapshot.balance.exchange,
+                symbol=self.config.symbol,
+                base_quantity=quantity,
+                market_profile=market_profile,
+            ).native_quantity
+            leg_state = self.position.mark_leg_open(
+                exchange=exchange,
+                avg_fill_price=entry_price,
+                base_qty=quantity,
+                native_qty=native_qty,
+                order_id=leg.get("entry_order_id"),
+                client_order_id=leg.get("entry_client_order_id"),
+                sync_status="recovered_scoped",
+            )
+            leg_state.stop_order_id = leg.get("stop_order_id")
+            leg_state.stop_client_order_id = leg.get("stop_client_order_id")
+            leg_state.stop_price = _dec_or_none(leg.get("stop_price")) or stop_price
+            scoped_stops = filter_orders_for_position_scope(
+                snapshot.open_stop_orders,
+                position_id=str(plan.get("position_id") or ""),
+                known_order_ids=(
+                    leg.get("stop_order_id"),
+                    leg.get("stop_client_order_id"),
+                ),
+            )
+            validation = validator.validate_stop_orders(
+                exchange=snapshot.balance.exchange,
+                symbol=self.config.symbol,
+                strategy_id=self.config.strategy_id,
+                position_id=self.position.position_id,
+                position_side=_position_side_for_strategy_side(side),
+                position_mode=snapshot.position_mode,
+                current_position_native_quantity=native_qty,
+                canonical_stop_price=stop_price,
+                open_stop_orders=scoped_stops,
+                open_orders=(),
+                market_profile=market_profile,
+            )
+            all_stops_valid = (
+                all_stops_valid and validation.should_keep_existing_stop
+            )
+            signals.extend(
+                self._signals_from_recovery_exit_validation(
+                    validation=validation,
+                    exchange=exchange,
+                    quantity=quantity,
+                    stop_price=stop_price,
+                    reason="RECOVERY_SCOPED_LF_STOP_SYNC",
+                )
+            )
+        audit["lf"]["stop_validated"] = all_stops_valid
+        audit["lf"]["stop_repair_scheduled"] = bool(signals)
+        return signals
+
+    def _block_portfolio_recovery(
+        self,
+        *,
+        audit: dict[str, Any],
+        issues: Sequence[str],
+    ) -> None:
+        merged_issues = list(
+            dict.fromkeys(
+                [
+                    *(str(item) for item in audit.get("issues", ())),
+                    *(str(item) for item in issues),
+                ]
+            )
+        )
+        audit["issues"] = merged_issues
+        audit["recovery_ok"] = False
+        audit["manual_required"] = True
+        audit["startup_blocked"] = True
+        audit["hard_fail"] = any(
+            issue.startswith(
+                (
+                    "exchange_",
+                    "local_active_plan_without_",
+                    "master_",
+                    "lf_master_",
+                    "unexpected_mf_stop",
+                    "unknown_stop_scope",
+                    "ambiguous_stop_scope",
+                )
+            )
+            for issue in merged_issues
+        )
+        self.last_recovery_audit = audit
+        self.recovery_manual_required = True
+        self.recovery_blocking_manual_required = True
+        for issue in merged_issues:
+            alert = f"portfolio_v1_recovery_manual_required:{issue}"
+            if alert not in self.recovery_alerts:
+                self.recovery_alerts.append(alert)
+        logger.critical(
+            "Portfolio V1 recovery audit | %s",
+            json.dumps(audit, sort_keys=True, default=str),
+        )
+
+    def _complete_portfolio_recovery_audit(
+        self,
+        audit: dict[str, Any],
+    ) -> None:
+        audit["recovery_ok"] = not self.recovery_blocking_manual_required
+        audit["manual_required"] = self.recovery_blocking_manual_required
+        audit["startup_blocked"] = self.recovery_blocking_manual_required
+        audit["active_position_ids"] = [
+            snapshot.position_id for snapshot in self.position_snapshots()
+        ]
+        audit["strategy_snapshots"] = [
+            {
+                "position_id": snapshot.position_id,
+                "sleeve_id": snapshot.sleeve_id,
+                "side": snapshot.side.value,
+                "quantity": str(snapshot.base_quantity),
+                "entry_price": (
+                    None
+                    if snapshot.average_entry_price is None
+                    else str(snapshot.average_entry_price)
+                ),
+                "stop_price": (
+                    None
+                    if snapshot.stop_price is None
+                    else str(snapshot.stop_price)
+                ),
+            }
+            for snapshot in self.position_snapshots()
+        ]
+        self.last_recovery_audit = audit
+        logger.info(
+            "Portfolio V1 recovery audit | %s",
+            json.dumps(audit, sort_keys=True, default=str),
+        )
 
     def _recover_active_master_with_plan(self, *, master: Position, master_snapshot: PlatformSnapshot, snapshots: Mapping[str, PlatformSnapshot], plan_payload: Mapping[str, Any]) -> list[TradeSignal]:
         plan = dict(plan_payload.get("position", {}))
@@ -2879,21 +3417,6 @@ def _target_exchanges(signal: TradeSignal) -> tuple[str, ...]:
         except TypeError:
             items = (raw,)
     return tuple(str(item.value if hasattr(item, "value") else item).strip().lower() for item in items if str(item).strip())
-
-
-def _first_active_position(positions: Sequence[Position]) -> Position | None:
-    for position in positions:
-        if position.quantity != 0:
-            return position
-    return None
-
-
-def _first_active_plan(plans: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
-    for item in plans:
-        plan = item.get("position", {}) if isinstance(item, Mapping) else {}
-        if str(plan.get("status", "")).lower() == "active":
-            return item
-    return plans[0] if plans else None
 
 
 def _side_from_plan(value: Any) -> Side:

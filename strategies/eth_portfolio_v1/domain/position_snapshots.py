@@ -51,6 +51,17 @@ class LfSleeveSnapshotAdapter:
             entry_time_ms=position.entry_time_ms,
             metadata={
                 "active_exchanges": sorted(position.open_legs),
+                "protective_stop_required": True,
+                "stop_scope": position.position_id,
+                "stop_order_ids": [
+                    value
+                    for leg in position.legs.values()
+                    for value in (
+                        leg.stop_order_id,
+                        leg.stop_client_order_id,
+                    )
+                    if value
+                ],
             },
         )
 
