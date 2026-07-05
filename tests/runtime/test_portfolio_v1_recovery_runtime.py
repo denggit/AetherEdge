@@ -19,8 +19,16 @@ from src.platform import (
     PositionSide,
 )
 from src.platform.snapshot import PlatformSnapshot
+from src.order_management.reconciliation.models import (
+    LiveStateReconciliationReport,
+    ReconciliationVerdict,
+)
 from src.runtime.recovery.models import RecoveryReport
-from src.runtime.runner import LiveRuntimeError, LiveRuntimeRunner
+from src.runtime.runner import (
+    LiveRuntimeError,
+    LiveRuntimeRunner,
+    _is_fatal_startup_error,
+)
 from src.strategy.positions import (
     StrategyPositionSide,
     StrategyPositionSnapshot,
@@ -199,3 +207,83 @@ async def test_manual_required_blocks_startup_before_signal_execution() -> None:
         match="runtime recovery blocking manual required",
     ):
         await runner._run_recovery()
+
+
+def _reconciliation_report(
+    *,
+    ok: bool,
+    verdict: ReconciliationVerdict,
+) -> LiveStateReconciliationReport:
+    return LiveStateReconciliationReport(
+        checked_at_ms=1,
+        exchanges=("okx",),
+        symbol=SYMBOL,
+        ok=ok,
+        verdict=verdict,
+        issues=[] if ok else ["unsafe-startup-state"],
+        stale_plans_closed=(
+            1
+            if verdict is ReconciliationVerdict.PASS_WITH_CLEANUP
+            else 0
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "verdict",
+    (
+        ReconciliationVerdict.FAIL_UNRESOLVED_FOLLOWER_POSITION,
+        ReconciliationVerdict.FAIL_CONFIG,
+        ReconciliationVerdict.FAIL_NEEDS_RECONCILE,
+    ),
+)
+@pytest.mark.asyncio
+async def test_startup_reconciliation_not_ok_is_fatal_hard_fail(
+    verdict: ReconciliationVerdict,
+    caplog,
+) -> None:
+    report = _reconciliation_report(ok=False, verdict=verdict)
+
+    class _ReconciliationService:
+        async def reconcile_and_apply(self, snapshots):
+            return report
+
+    runner = _runner(_Strategy(()))
+    runner._get_reconciliation_service = lambda: _ReconciliationService()
+
+    with caplog.at_level("ERROR"), pytest.raises(
+        LiveRuntimeError,
+        match=f"startup reconciliation failed: verdict={verdict.value}",
+    ) as exc_info:
+        await runner._run_reconciliation(
+            (_snapshot(with_lf_stop=False),)
+        )
+
+    assert verdict.value in caplog.text
+    assert "unsafe-startup-state" in caplog.text
+    assert _is_fatal_startup_error(exc_info.value) is True
+
+
+@pytest.mark.parametrize(
+    "verdict",
+    (
+        ReconciliationVerdict.PASS,
+        ReconciliationVerdict.PASS_WITH_CLEANUP,
+    ),
+)
+@pytest.mark.asyncio
+async def test_startup_reconciliation_ok_verdicts_continue(
+    verdict: ReconciliationVerdict,
+) -> None:
+    report = _reconciliation_report(ok=True, verdict=verdict)
+
+    class _ReconciliationService:
+        async def reconcile_and_apply(self, snapshots):
+            return report
+
+    runner = _runner(_Strategy(()))
+    runner._get_reconciliation_service = lambda: _ReconciliationService()
+
+    await runner._run_reconciliation(
+        (_snapshot(with_lf_stop=False),)
+    )

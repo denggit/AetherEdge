@@ -190,16 +190,27 @@ def _snapshot(
     )
 
 
-def _recover(strategy: Strategy, plans: list[dict], *, quantity: str) -> list:
+def _recover(
+    strategy: Strategy,
+    plans: list[dict],
+    *,
+    quantity: str,
+    okx_quantity: str | None = None,
+    binance_quantity: str | None = None,
+) -> list:
     lf_plan = next(
         (plan for plan in plans if plan["position"]["metadata"]["sleeve_id"] == "lf"),
         None,
     )
     snapshots = (
-        _snapshot(ExchangeName.OKX, base_quantity=quantity, lf_plan=lf_plan),
+        _snapshot(
+            ExchangeName.OKX,
+            base_quantity=okx_quantity or quantity,
+            lf_plan=lf_plan,
+        ),
         _snapshot(
             ExchangeName.BINANCE,
-            base_quantity=quantity,
+            base_quantity=binance_quantity or quantity,
             lf_plan=lf_plan,
         ),
     )
@@ -225,6 +236,69 @@ def test_lf_only_active_plan_restores_lf_only() -> None:
     assert strategy.position.in_pos is True
     assert strategy.position.position_id == "v9e-lf-recovery"
     assert strategy.mf_sleeve.active is False
+    assert strategy.recovery_blocking_manual_required is False
+    assert strategy.last_recovery_audit["recovery_ok"] is True
+
+
+def test_no_local_plan_with_follower_position_is_hard_block() -> None:
+    strategy = Strategy()
+
+    _recover(
+        strategy,
+        [],
+        quantity="0",
+        okx_quantity="0",
+        binance_quantity="0.4",
+    )
+
+    assert strategy.recovery_blocking_manual_required is True
+    assert any(
+        issue.startswith(
+            "exchange_position_without_local_plan:binance:long"
+        )
+        for issue in strategy.last_recovery_audit["issues"]
+    )
+    assert strategy.last_recovery_audit["exchange"]["binance"][
+        "aggregate_qty"
+    ] == "0.4"
+
+
+def test_lf_only_plan_with_unexpected_follower_extra_position_blocks() -> None:
+    strategy = Strategy()
+    lf = _plan("lf", quantity="0.6")
+
+    _recover(
+        strategy,
+        [lf],
+        quantity="0.6",
+        binance_quantity="0.8",
+    )
+
+    assert strategy.recovery_blocking_manual_required is True
+    assert any(
+        issue.startswith(
+            "exchange_aggregate_qty_mismatch:binance:long"
+        )
+        for issue in strategy.last_recovery_audit["issues"]
+    )
+
+
+def test_lf_only_master_quantity_mismatch_blocks() -> None:
+    strategy = Strategy()
+    lf = _plan("lf", quantity="0.6")
+
+    _recover(
+        strategy,
+        [lf],
+        quantity="0.6",
+        okx_quantity="0.8",
+    )
+
+    assert strategy.recovery_blocking_manual_required is True
+    assert any(
+        issue.startswith("exchange_aggregate_qty_mismatch:okx:long")
+        for issue in strategy.last_recovery_audit["issues"]
+    )
 
 
 def test_mf_only_active_plan_restores_mf_only() -> None:

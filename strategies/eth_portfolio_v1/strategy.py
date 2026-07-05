@@ -1994,13 +1994,19 @@ class Strategy:
         # Keep the established LF state hydration and stop-repair path. The
         # multi-sleeve path below is activated only when an MF plan exists.
         if not mf_plans:
-            _lf_coverage_issues, lf_exchange_audit = (
+            lf_coverage_issues, lf_exchange_audit = (
                 self._validate_multi_sleeve_exchange_coverage(
                     snapshots=snapshot_by_exchange,
                     plans=plans,
                 )
             )
             audit["exchange"] = lf_exchange_audit
+            if lf_coverage_issues:
+                self._block_portfolio_recovery(
+                    audit=audit,
+                    issues=lf_coverage_issues,
+                )
+                return []
             active_plan = lf_plans[0] if lf_plans else None
             active_master: Position | None = None
             if active_plan is not None:

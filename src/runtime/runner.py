@@ -164,6 +164,7 @@ FATAL_STARTUP_ERROR_MARKERS = (
     "closed-kline warmup did not catch up",
     "startup snapshot is required before live trading",
     "startup reconciliation missing exchange snapshots",
+    "startup reconciliation failed",
     "runtime recovery failed",
     "portfolio v1 requires hedge mode",
 )
@@ -3816,26 +3817,37 @@ class LiveRuntimeRunner:
                     severity=alert_dict.get("severity", "error"),
                 )
             )
-        if report.verdict in {
-            "fail_unresolved_follower_position",
-        }:
+        verdict = (
+            report.verdict.value
+            if hasattr(report.verdict, "value")
+            else str(report.verdict)
+        )
+        if not report.ok:
             logger.error(
                 "Startup reconciliation failed | verdict=%s issues=%s",
-                report.verdict.value,
+                verdict,
                 report.issues,
             )
-        elif report.stale_plans_closed > 0 or report.fake_order_refs_found:
+            raise LiveRuntimeError(
+                "startup reconciliation failed: "
+                f"verdict={verdict} issues={list(report.issues)}"
+            )
+        if (
+            verdict == "pass_with_cleanup"
+            or report.stale_plans_closed > 0
+            or report.fake_order_refs_found
+        ):
             logger.info(
                 "Startup reconciliation passed with cleanup | "
                 "verdict=%s stale_plans_closed=%s fake_refs=%s",
-                report.verdict.value,
+                verdict,
                 report.stale_plans_closed,
                 len(report.fake_order_refs_found),
             )
         else:
             logger.info(
                 "Startup reconciliation passed | verdict=%s",
-                report.verdict.value,
+                verdict,
             )
 
     def _get_sync_contexts(self) -> tuple[SyncExchangeContext, ...]:
