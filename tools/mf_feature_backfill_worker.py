@@ -73,6 +73,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         default="recent-to-oldest")
     # Limits
     parser.add_argument("--max-minutes-per-cycle", type=int, default=1440)
+    parser.add_argument("--required-minutes", type=int, default=4320)
     parser.add_argument("--max-days-per-cycle", type=int, default=1)
     parser.add_argument("--max-trades-per-cycle", type=int, default=500_000)
     parser.add_argument("--max-seconds-per-cycle", type=float, default=60.0)
@@ -127,6 +128,7 @@ def run_cycle(
     range_footprint_range_pct: Decimal = Decimal("0.002"),
     range_footprint_price_step: Decimal = Decimal("1"),
     range_footprint_warmup_days: int = 1,
+    required_minutes: int = 4320,
 ) -> dict:
     # -------- guard --------
     if save_raw_trades:
@@ -173,6 +175,7 @@ def run_cycle(
             exchange=exchange,
             store=store,
             max_minutes_per_cycle=max_minutes_per_cycle,
+            required_minutes=max(1, int(required_minutes)),
             direction=direction,
             safe_archive_end_ms=safe_archive_end,
             range_pct=str(range_footprint_range_pct),
@@ -557,6 +560,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.range_footprint_price_step
             ),
             range_footprint_warmup_days=args.range_footprint_warmup_days,
+            required_minutes=args.required_minutes,
         )
         _update_status(
             args.status_path,

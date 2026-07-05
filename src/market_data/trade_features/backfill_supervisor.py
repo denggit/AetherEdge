@@ -33,6 +33,7 @@ class TradeFeatureBackfillConfig:
     global_lock_path: Path
     global_status_path: Path
     worker_log_path: Path
+    required_minutes: int = 4320
     stale_after_seconds: int = 180
     restart_cooldown_seconds: int = 300
     failure_cooldown_seconds: int = 3600
@@ -181,6 +182,8 @@ class TradeFeatureBackfillSupervisor:
             self.config.raw_root,
             "--max-seconds-per-cycle",
             str(self.config.max_seconds_per_cycle),
+            "--required-minutes",
+            str(max(1, int(self.config.required_minutes))),
             "--contract-value",
             self.config.contract_value,
             "--price-bucket-size",

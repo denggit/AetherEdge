@@ -96,6 +96,9 @@ from src.runtime.startup_catchup import (
     _deviation_pct,
     evaluate_startup_catchup_eligibility,
 )
+from src.runtime.startup_feature_backfill import (
+    resolve_startup_feature_backfill_providers,
+)
 from src.runtime.strategy_positions import (
     StrategyPositionSnapshotIndex,
     resolve_strategy_position_snapshot_index,
@@ -166,9 +169,6 @@ FATAL_STARTUP_ERROR_MARKERS = (
     "startup reconciliation failed",
     "runtime recovery failed",
     "strategy position mode requirement failed",
-)
-from src.runtime.startup_feature_backfill import (
-    resolve_startup_feature_backfill_providers,
 )
 
 

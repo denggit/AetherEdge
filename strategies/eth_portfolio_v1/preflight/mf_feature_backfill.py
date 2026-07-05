@@ -215,6 +215,10 @@ class PortfolioV1MfFeatureBackfillProvider:
                     "logs/mf_feature_backfill_worker.out",
                 )
             ),
+            required_minutes=self.project_env.get_int(
+                "AETHER_MF_FEATURE_BACKFILL_REQUIRED_MINUTES",
+                config.mf.decision_buffer_minutes,
+            ),
             max_seconds_per_cycle=self.project_env.get_float(
                 "AETHER_MF_FEATURE_BACKFILL_MAX_SECONDS_PER_CYCLE",
                 60.0,

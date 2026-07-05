@@ -17,6 +17,10 @@ from src.planner import ExecutionPlanner
 from src.runtime.config import LiveRuntimeConfig
 from src.runtime.models import RuntimeMode
 from src.runtime.runner import LiveRuntimeRunner
+from src.runtime.startup_feature_backfill import (
+    resolve_startup_feature_backfill_providers,
+)
+import src.runtime.runner as runner_module
 
 
 class _Provider:
@@ -118,6 +122,18 @@ def test_no_provider_passes_without_health_entry() -> None:
 
     assert "feature_backfill_results" not in (
         runner._health.metadata
+    )
+
+
+def test_runner_imports_feature_backfill_resolver() -> None:
+    assert (
+        runner_module.resolve_startup_feature_backfill_providers
+        is resolve_startup_feature_backfill_providers
+    )
+    source = inspect.getsource(runner_module)
+    assert (
+        "from src.runtime.startup_feature_backfill import"
+        in source
     )
 
 
