@@ -8,7 +8,9 @@ import subprocess
 import sys
 
 from src.market_data.backfill.scanner import RangeBackfillScanner
-from src.market_data.backfill.coordinator import LF_RANGE_BACKFILL_PRIORITY
+from src.market_data.backfill.coordinator import (
+    BACKGROUND_BACKFILL_PRIORITY,
+)
 from src.market_data.backfill.status_store import (
     RangeBackfillStatusStore,
     now_ms,
@@ -132,7 +134,7 @@ class RangeBackfillSupervisor:
             return False
         if self._in_restart_cooldown():
             return False
-        # Respect global raw-trade lock: if MF holds it, LF must not start
+        # Respect a higher-priority holder of the shared raw-trade lock.
         if _global_raw_trade_lock_held_by_higher_priority(
             lock_path=self.config.global_lock_path
         ):
@@ -505,8 +507,8 @@ def _global_raw_trade_lock_held_by_higher_priority(
 ) -> bool:
     """Check if the global raw-trade lock is held by a higher-priority worker.
 
-    MF priority = 100 > LF priority = 10. If the lock exists and the holder
-    has a higher priority, LF range backfill must yield.
+    If the lock exists and its holder has a higher priority, this worker
+    must yield.
     """
     import json
 
@@ -519,7 +521,7 @@ def _global_raw_trade_lock_held_by_higher_priority(
         if not isinstance(data, dict):
             return True  # malformed lock → be safe, yield
         holder_priority = int(data.get("priority", 0))
-        # LF range backfill is priority 10; yield to anything higher
-        return holder_priority > LF_RANGE_BACKFILL_PRIORITY
+        # Yield to any valid higher-priority workload.
+        return holder_priority > BACKGROUND_BACKFILL_PRIORITY
     except (OSError, json.JSONDecodeError, ValueError):
         return True  # unreadable lock → be safe, yield

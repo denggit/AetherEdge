@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from src.market_data.backfill.coordinator import (
-    MF_FEATURE_BACKFILL_PRIORITY,
+    EXPEDITED_BACKFILL_PRIORITY,
     RawTradeBackfillCoordinator,
 )
 from src.market_data.backfill.models import BucketGap
@@ -138,7 +138,7 @@ def test_supervisor_does_not_start_while_mf_holds_global_lock(
     )
     assert mf.try_acquire(
         owner="mf_feature_backfill",
-        priority=MF_FEATURE_BACKFILL_PRIORITY,
+        priority=EXPEDITED_BACKFILL_PRIORITY,
         symbol="ETH-USDT-PERP",
     )
     supervisor = RangeBackfillSupervisor(

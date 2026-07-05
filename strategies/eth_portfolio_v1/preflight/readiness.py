@@ -10,7 +10,9 @@ from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
 from src.market_data.storage.trade_feature_store import (
     SqliteTradeFeatureStore,
 )
-from src.market_data.trade_features.coverage import resolve_mf_readiness
+from src.market_data.trade_features.coverage import (
+    resolve_trade_feature_readiness,
+)
 
 
 _FOUR_HOURS_MS = 4 * 60 * 60 * 1000
@@ -370,7 +372,7 @@ class PortfolioV1ReadinessInspector:
             issues.append("mf_tradebar_missing")
             readiness_audit: dict[str, Any] = {}
         else:
-            readiness = resolve_mf_readiness(
+            readiness = resolve_trade_feature_readiness(
                 symbol=self.symbol,
                 exchange=self.exchange,
                 store=store,
@@ -381,6 +383,13 @@ class PortfolioV1ReadinessInspector:
                 price_step=self.price_step,
             )
             readiness_audit = dict(readiness.audit())
+            readiness_audit["mf_signal_feature_ready"] = bool(
+                readiness_audit.get("tradebar_ready", False)
+                and readiness_audit.get(
+                    "range_footprint_ready",
+                    False,
+                )
+            )
             for field in (
                 "tradebar_ready",
                 "fixed_time_footprint_ready",

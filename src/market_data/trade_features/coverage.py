@@ -17,18 +17,16 @@ _OKX_ARCHIVE_TIMEZONE = timezone(timedelta(hours=8))
 
 
 @dataclass(frozen=True)
-class MfFeatureReadiness:
+class TradeFeatureReadiness:
     """Aggregated readiness status for the trade-derived feature pipeline."""
 
     tradebar_ready: bool = False
     fixed_time_footprint_ready: bool = False
     range_footprint_ready: bool = False
-    mf_signal_feature_ready: bool = False
     price_ready: bool = False
     orderflow_ready: bool = False
     footprint_ready: bool = False
     coverage_ready: bool = False
-    mf_signal_ready: bool = False
 
     coverage: TradeDerivedFeatureCoverage | None = None
     worker_running: bool = False
@@ -41,12 +39,10 @@ class MfFeatureReadiness:
             "tradebar_ready": self.tradebar_ready,
             "fixed_time_footprint_ready": self.fixed_time_footprint_ready,
             "range_footprint_ready": self.range_footprint_ready,
-            "mf_signal_feature_ready": self.mf_signal_feature_ready,
             "price_ready": self.price_ready,
             "orderflow_ready": self.orderflow_ready,
             "footprint_ready": self.footprint_ready,
             "coverage_ready": self.coverage_ready,
-            "mf_signal_ready": self.mf_signal_ready,
             "coverage": _coverage_audit(self.coverage),
             "worker_running": self.worker_running,
             "waiting_for_global_lock": self.waiting_for_global_lock,
@@ -72,7 +68,7 @@ def safe_okx_archive_end_ms(now_ms: int | None = None) -> int:
     return int(current_day_start.timestamp() * 1000) - 1
 
 
-def mf_feature_coverage_scan(
+def trade_feature_coverage_scan(
     *,
     symbol: str,
     exchange: str,
@@ -109,7 +105,7 @@ def mf_feature_coverage_scan(
     )
 
 
-def resolve_mf_readiness(
+def resolve_trade_feature_readiness(
     *,
     symbol: str,
     exchange: str,
@@ -121,9 +117,9 @@ def resolve_mf_readiness(
     now_ms: int | None = None,
     range_pct: str = "0.002",
     price_step: str = "1",
-) -> MfFeatureReadiness:
+) -> TradeFeatureReadiness:
     """Resolve independent price, order-flow, and footprint readiness gates."""
-    coverage = mf_feature_coverage_scan(
+    coverage = trade_feature_coverage_scan(
         symbol=symbol,
         exchange=exchange,
         store=store,
@@ -149,23 +145,20 @@ def resolve_mf_readiness(
         and int(extra.get("degraded_footprint", required)) == 0
     )
     range_footprint_ready = bool(extra.get("range_footprint_ready", False))
-    mf_signal_feature_ready = tradebar_ready and range_footprint_ready
     coverage_ready = (
         tradebar_ready
         and fixed_time_footprint_ready
         and range_footprint_ready
     )
 
-    return MfFeatureReadiness(
+    return TradeFeatureReadiness(
         tradebar_ready=tradebar_ready,
         fixed_time_footprint_ready=fixed_time_footprint_ready,
         range_footprint_ready=range_footprint_ready,
-        mf_signal_feature_ready=mf_signal_feature_ready,
         price_ready=tradebar_ready,
         orderflow_ready=orderflow_ready,
         footprint_ready=fixed_time_footprint_ready,
         coverage_ready=coverage_ready,
-        mf_signal_ready=False,
         coverage=coverage,
         worker_running=(
             _check_worker_running(worker_status_path)

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.market_data.backfill.coordinator import (
-    LF_RANGE_BACKFILL_PRIORITY,
+    BACKGROUND_BACKFILL_PRIORITY,
     RawTradeBackfillCoordinator,
 )
 from src.market_data.models import TimeRange, TradeFeatureBackfillTarget
@@ -219,7 +219,7 @@ def test_fresh_lf_lock_makes_mf_worker_wait_without_raw_read(
     )
     assert lf.try_acquire(
         owner="range_backfill",
-        priority=LF_RANGE_BACKFILL_PRIORITY,
+        priority=BACKGROUND_BACKFILL_PRIORITY,
         symbol="ETH-USDT-PERP",
         raw_days=1,
     )

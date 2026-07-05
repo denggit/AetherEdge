@@ -16,7 +16,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.market_data.backfill.models import RangeBackfillRequest
 from src.market_data.backfill.lock import RangeBackfillLock
 from src.market_data.backfill.coordinator import (
-    LF_RANGE_BACKFILL_PRIORITY,
+    BACKGROUND_BACKFILL_PRIORITY,
     RawTradeBackfillCoordinator,
 )
 from src.market_data.backfill.service import RangeBackfillService
@@ -184,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     if not coordinator.try_acquire(
         owner="range_backfill",
-        priority=LF_RANGE_BACKFILL_PRIORITY,
+        priority=BACKGROUND_BACKFILL_PRIORITY,
         symbol=request.symbol,
         raw_days=request.max_days_per_cycle,
     ):

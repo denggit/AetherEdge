@@ -292,8 +292,8 @@ def test_startup_executes_gate_before_recovery_and_on_start(
     )
     monkeypatch.setattr(
         runner,
-        "_check_mf_feature_backfill_at_startup",
-        lambda: step("mf_readiness"),
+        "_check_startup_feature_backfills",
+        lambda: step("feature_readiness"),
     )
     monkeypatch.setattr(
         runner,

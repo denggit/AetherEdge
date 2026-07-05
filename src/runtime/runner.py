@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 from pathlib import Path
 import time
@@ -69,7 +70,6 @@ from src.runtime.features import (
     range_aggregate_unavailable_feature,
     range_bar_closed_feature,
     range_footprint_feature,
-    trade_feature_readiness_feature,
     trade_footprint_feature,
 )
 from src.runtime.heartbeat import RuntimeHeartbeatService
@@ -82,7 +82,6 @@ from src.runtime.market_features import (
     resolve_market_feature_observers,
 )
 from src.runtime.models import RuntimeHealth, RuntimeMode, RuntimePhase
-from src.runtime.mf_feature_backfill_supervisor import MfFeatureBackfillSupervisor
 from src.runtime.range_backfill_supervisor import RangeBackfillSupervisor, RangeBackfillSupervisorConfig
 from src.runtime.range_micro_repair_supervisor import (
     RangeMicroRepairSupervisor,
@@ -167,6 +166,9 @@ FATAL_STARTUP_ERROR_MARKERS = (
     "startup reconciliation failed",
     "runtime recovery failed",
     "strategy position mode requirement failed",
+)
+from src.runtime.startup_feature_backfill import (
+    resolve_startup_feature_backfill_providers,
 )
 
 
@@ -311,9 +313,10 @@ class LiveRuntimeRunner:
         self._range_speed_complete_history = 0
         self._range_speed_min_periods = 0
         self._range_backfill_supervisor = self.services.get("range_backfill_supervisor")
-        self._mf_feature_backfill_supervisor = self.services.get(
-            "mf_feature_backfill_supervisor"
+        self._startup_feature_backfill_providers = self.services.get(
+            "startup_feature_backfill_providers"
         )
+        self._feature_backfill_providers_resolved = False
         self._range_micro_repair_supervisor = self.services.get(
             "range_micro_repair_supervisor"
         )
@@ -771,7 +774,7 @@ class LiveRuntimeRunner:
                 self._range_speed_min_periods,
                 self._range_speed_min_periods - loaded_range_speed_history,
             )
-        await self._check_mf_feature_backfill_at_startup()
+        await self._check_startup_feature_backfills()
         self._set_health(RuntimePhase.CATCHING_UP, healthy=True, warmup_complete=True)
         snapshots = await self._run_recovery()
         # ── State convergence: reconcile exchange truth against local state ──
@@ -793,111 +796,121 @@ class LiveRuntimeRunner:
         self._set_health(RuntimePhase.RUNNING, healthy=True, warmup_complete=True, caught_up=True)
         logger.info("Live runtime startup phase completed")
 
-    async def _check_mf_feature_backfill_at_startup(self) -> None:
-        """Audit and optionally launch a strategy feature repair worker.
-
-        This check never gates or fails the LF startup path.
-        """
-        if not callable(
-            getattr(
-                self.context.strategy,
-                "trade_feature_readiness",
-                None,
-            )
-        ):
+    async def _check_startup_feature_backfills(self) -> None:
+        providers = self._get_startup_feature_backfill_providers()
+        if not providers:
             return
 
-        enabled = self._project_env.get_bool(
-            "AETHER_MF_FEATURE_BACKFILL_ENABLED", False
-        )
-        if not enabled:
-            result: dict[str, Any] = {
-                "enabled": False,
-                "action": "none",
-                "reason": "mf_supervisor_disabled",
-                "mf_signal_ready": False,
-            }
-        else:
-            supervisor = self._mf_feature_backfill_supervisor
-            if supervisor is None:
-                supervisor = MfFeatureBackfillSupervisor(
-                    symbol=self.app_config.symbol,
-                    exchange=self.app_config.data_exchange.value,
-                    market_db=self._project_env.get(
-                        "AETHER_MARKET_DATA_DB",
-                        "data/market_data/aether_market_data.sqlite3",
-                    ),
-                    required_minutes=self._project_env.get_int(
-                        "AETHER_MF_FEATURE_BACKFILL_REQUIRED_MINUTES", 4320
-                    ),
-                    max_seconds_per_cycle=self._project_env.get_float(
-                        "AETHER_MF_FEATURE_BACKFILL_MAX_SECONDS_PER_CYCLE",
-                        60.0,
-                    ),
-                    raw_root=self._project_env.get(
-                        "AETHER_RANGE_BACKFILL_RAW_ROOT",
-                        "data/okx/raw/trades",
-                    ),
-                    contract_value=self._project_env.get(
-                        "AETHER_MF_FEATURE_CONTRACT_VALUE", "0.01"
-                    ),
-                    price_bucket_size=self._project_env.get(
-                        "AETHER_MF_FEATURE_PRICE_BUCKET_SIZE", "1"
-                    ),
-                    range_footprint_range_pct=self._project_env.get(
-                        "AETHER_MF_RANGE_FOOTPRINT_RANGE_PCT", "0.002"
-                    ),
-                    range_footprint_price_step=self._project_env.get(
-                        "AETHER_MF_RANGE_FOOTPRINT_PRICE_STEP", "1"
-                    ),
-                    range_footprint_warmup_days=self._project_env.get_int(
-                        "AETHER_MF_RANGE_FOOTPRINT_WARMUP_DAYS", 1
-                    ),
-                    large_trade_threshold=self._project_env.get(
-                        "AETHER_MF_FEATURE_LARGE_TRADE_THRESHOLD", "10000"
-                    ),
-                )
-                self._mf_feature_backfill_supervisor = supervisor
+        results: dict[str, Mapping[str, Any]] = {}
+        for provider in providers:
+            name = str(provider.name)
             try:
-                raw_result = await asyncio.to_thread(
-                    supervisor.check_and_launch
+                result = await self._invoke_provider_method(
+                    provider,
+                    "check_and_launch",
                 )
-                result = {
-                    "enabled": True,
-                    **dict(raw_result),
-                    "mf_signal_ready": False,
-                }
             except Exception as exc:
-                result = {
-                    "enabled": True,
-                    "action": "none",
-                    "reason": "mf_supervisor_failed",
-                    "error": str(exc),
-                    "coverage_ready": False,
-                    "mf_signal_ready": False,
-                }
                 logger.warning(
-                    "MF feature supervisor failed; LF startup continues | error=%s",
+                    "Startup feature backfill provider failed | "
+                    "provider=%s error=%s",
+                    name,
                     exc,
                 )
+                result = await self._provider_failure_result(
+                    provider,
+                    exc,
+                )
+            results[name] = dict(result)
+            await self._publish_feature_backfill_events(
+                provider,
+                result,
+            )
+            logger.info(
+                "Startup feature backfill audit | "
+                "provider=%s result=%s",
+                name,
+                result,
+            )
 
-        result["mf_signal_ready"] = await self._publish_mf_readiness(
-            coverage=result.get("coverage", {}),
-            reason=result.get("reason"),
-            action=result.get("action"),
-            source="runtime_mf_feature_backfill_supervisor",
-            coverage_ready_fallback=bool(
-                result.get("coverage_ready", False)
-            ),
-        )
         self._set_health(
             self._health.phase,
             metadata={
                 **dict(self._health.metadata),
-                "mf_supervisor": result,
+                "feature_backfill_results": results,
             },
         )
-        logger.info("MF feature supervisor startup audit | result=%s", result)
+
+    def _get_startup_feature_backfill_providers(
+        self,
+    ) -> tuple[object, ...]:
+        if self._feature_backfill_providers_resolved:
+            return tuple(
+                self._startup_feature_backfill_providers or ()
+            )
+        if self._startup_feature_backfill_providers is None:
+            self._startup_feature_backfill_providers = (
+                resolve_startup_feature_backfill_providers(
+                    self.context.strategy
+                )
+            )
+        else:
+            self._startup_feature_backfill_providers = tuple(
+                self._startup_feature_backfill_providers
+            )
+        self._feature_backfill_providers_resolved = True
+        return tuple(self._startup_feature_backfill_providers)
+
+    async def _invoke_provider_method(
+        self,
+        provider: object,
+        method_name: str,
+        *args: object,
+    ) -> Any:
+        method = getattr(provider, method_name)
+        if inspect.iscoroutinefunction(method):
+            return await method(*args)
+        result = await asyncio.to_thread(method, *args)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    async def _provider_failure_result(
+        self,
+        provider: object,
+        exc: BaseException,
+    ) -> Mapping[str, Any]:
+        mapper = getattr(provider, "failure_result", None)
+        if callable(mapper):
+            mapped = await self._invoke_provider_method(
+                provider,
+                "failure_result",
+                exc,
+            )
+            if isinstance(mapped, Mapping):
+                return dict(mapped)
+        return {
+            "action": "none",
+            "reason": "provider_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    async def _publish_feature_backfill_events(
+        self,
+        provider: object,
+        result: Mapping[str, Any],
+    ) -> None:
+        events = await self._invoke_provider_method(
+            provider,
+            "market_feature_events",
+            result,
+        )
+        for event in tuple(events or ()):
+            if not isinstance(event, MarketFeatureEvent):
+                raise TypeError(
+                    "feature backfill provider returned a non-market "
+                    f"event: {type(event).__name__}"
+                )
+            await self.process_market_feature(event)
 
     async def _check_strategy_position_mode_requirements(
         self,
@@ -1002,58 +1015,6 @@ class LiveRuntimeRunner:
                 f"strategy={strategy_id} symbol={self.app_config.symbol} "
                 f"issues={failures}"
             )
-
-    async def _publish_mf_readiness(
-        self,
-        *,
-        coverage: Any,
-        reason: Any,
-        action: Any,
-        source: str,
-        coverage_ready_fallback: bool = False,
-    ) -> bool:
-        snapshot = (
-            dict(coverage) if isinstance(coverage, Mapping) else {}
-        )
-        readiness = {
-            "mf_signal_feature_ready": bool(
-                snapshot.get("mf_signal_feature_ready", False)
-            ),
-            "range_footprint_ready": bool(
-                snapshot.get("range_footprint_ready", False)
-            ),
-            "tradebar_ready": bool(
-                snapshot.get("tradebar_ready", False)
-            ),
-            "fixed_time_footprint_ready": bool(
-                snapshot.get("fixed_time_footprint_ready", False)
-            ),
-            "coverage_ready": bool(
-                snapshot.get(
-                    "coverage_ready", coverage_ready_fallback
-                )
-            ),
-            "reason": reason,
-            "action": action,
-        }
-        signal_ready = all(
-            readiness[field]
-            for field in (
-                "mf_signal_feature_ready",
-                "range_footprint_ready",
-                "tradebar_ready",
-            )
-        )
-        await self.process_market_feature(
-            trade_feature_readiness_feature(
-                symbol=self.app_config.symbol,
-                exchange=self.app_config.data_exchange,
-                event_time_ms=int(time.time() * 1000),
-                readiness=readiness,
-                source=source,
-            )
-        )
-        return signal_ready
 
     async def _bootstrap_account_config_if_enabled(self) -> None:
         if self.runtime_config.mode is not RuntimeMode.LIVE_RUNTIME:
@@ -2489,75 +2450,92 @@ class LiveRuntimeRunner:
             tasks.append(asyncio.create_task(self._periodic_follower_close_check(self._stop_event)))
         # Heartbeat periodic task
         tasks.append(asyncio.create_task(self._heartbeat_service.run_periodic(self._stop_event)))
-        if (
-            self._mf_feature_backfill_supervisor is not None
-            or callable(
-                getattr(
-                    self.context.strategy,
-                    "trade_feature_readiness",
-                    None,
-                )
-            )
-        ):
+        if self._get_startup_feature_backfill_providers():
             tasks.append(
                 asyncio.create_task(
-                    self._periodic_mf_readiness_refresh(
+                    self._periodic_feature_readiness_refresh(
                         self._stop_event
                     )
                 )
             )
         return tasks
 
-    async def _periodic_mf_readiness_refresh(
+    async def _periodic_feature_readiness_refresh(
         self, stop_event: asyncio.Event
     ) -> None:
-        interval = max(
-            10.0,
-            self._project_env.get_float(
-                "AETHER_MF_FEATURE_READINESS_POLL_SECONDS", 60.0
-            ),
-        )
+        providers = self._get_startup_feature_backfill_providers()
+        intervals = {
+            str(provider.name): max(
+                10.0,
+                float(provider.poll_interval_seconds),
+            )
+            for provider in providers
+        }
+        if not intervals:
+            return
+        tick_seconds = min(intervals.values())
+        last_polled = {
+            str(provider.name): 0.0 for provider in providers
+        }
         while not stop_event.is_set():
             try:
                 await asyncio.wait_for(
-                    stop_event.wait(), timeout=interval
+                    stop_event.wait(),
+                    timeout=tick_seconds,
                 )
                 continue
             except asyncio.TimeoutError:
                 pass
-            supervisor = self._mf_feature_backfill_supervisor
-            scan = getattr(supervisor, "scan_coverage", None)
-            provider = getattr(
-                self.context.strategy,
-                "trade_feature_readiness",
-                None,
-            )
-            use_supervisor = bool(
-                callable(scan)
-                and self._project_env.get_bool(
-                    "AETHER_MF_FEATURE_BACKFILL_ENABLED", False
+
+            now = time.monotonic()
+            for provider in providers:
+                name = str(provider.name)
+                if (
+                    now - last_polled[name]
+                    < intervals[name]
+                ):
+                    continue
+                last_polled[name] = now
+                try:
+                    result = await self._invoke_provider_method(
+                        provider,
+                        "poll_readiness",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Feature readiness provider failed | "
+                        "provider=%s error=%s",
+                        name,
+                        exc,
+                    )
+                    result = await self._provider_failure_result(
+                        provider,
+                        exc,
+                    )
+                await self._publish_feature_backfill_events(
+                    provider,
+                    result,
                 )
-            )
-            readiness_reader = scan if use_supervisor else provider
-            if not callable(readiness_reader):
-                return
-            try:
-                coverage = await asyncio.to_thread(readiness_reader)
-                await self._publish_mf_readiness(
-                    coverage=coverage,
-                    reason="periodic_coverage_scan",
-                    action="none",
-                    source=(
-                        "runtime_mf_feature_coverage_poll"
-                        if use_supervisor
-                        else "strategy_mf_feature_coverage_poll"
-                    ),
+                self._record_feature_backfill_result(
+                    name,
+                    result,
                 )
-            except Exception as exc:
-                logger.warning(
-                    "MF feature readiness refresh failed | error=%s",
-                    exc,
-                )
+
+    def _record_feature_backfill_result(
+        self,
+        name: str,
+        result: Mapping[str, Any],
+    ) -> None:
+        metadata = dict(self._health.metadata)
+        results = dict(
+            metadata.get("feature_backfill_results", {})
+        )
+        results[name] = dict(result)
+        metadata["feature_backfill_results"] = results
+        self._set_health(
+            self._health.phase,
+            metadata=metadata,
+        )
 
     async def _periodic_follower_close_check(self, stop_event: asyncio.Event) -> None:
         await asyncio.sleep(30)
@@ -2978,17 +2956,20 @@ class LiveRuntimeRunner:
         ):
             return
 
-        contract_value = self._project_env.get(
-            "AETHER_MF_FEATURE_CONTRACT_VALUE", "0.01"
+        contract_value = str(
+            raw_config.get("contract_value", "0.01")
         )
-        price_bucket_size = self._project_env.get(
-            "AETHER_MF_FEATURE_PRICE_BUCKET_SIZE", "1"
+        price_bucket_size = str(
+            raw_config.get("price_bucket_size", "1")
         )
         if self._fixed_time_trade_bar_builder is None:
             self._fixed_time_trade_bar_builder = FixedTimeTradeBarBuilder(
                 contract_value=contract_value,
-                large_trade_threshold_notional=self._project_env.get(
-                    "AETHER_MF_FEATURE_LARGE_TRADE_THRESHOLD", "10000"
+                large_trade_threshold_notional=str(
+                    raw_config.get(
+                        "large_trade_threshold",
+                        "10000",
+                    )
                 ),
             )
         if self._trade_footprint_builder is None:

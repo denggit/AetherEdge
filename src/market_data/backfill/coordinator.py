@@ -11,23 +11,21 @@ from src.market_data.backfill.status_store import now_ms, process_id_exists, wor
 
 logger = logging.getLogger(__name__)
 
-# Priority constants: higher = wins
-MF_FEATURE_BACKFILL_PRIORITY = 100
-LF_RANGE_BACKFILL_PRIORITY = 10
+# Priority constants: higher = wins.
+EXPEDITED_BACKFILL_PRIORITY = 100
+BACKGROUND_BACKFILL_PRIORITY = 10
 
 DEFAULT_GLOBAL_LOCK_PATH = "data/state/raw_trade_backfill_global.lock"
 DEFAULT_GLOBAL_STATUS_PATH = "data/state/raw_trade_backfill_global_status.json"
 
 
 class RawTradeBackfillCoordinator:
-    """Global coordinator to prevent MF backfill and LF range backfill
-    from downloading/reading the same raw trade archives simultaneously.
+    """Coordinate workers sharing the same raw-trade archives.
 
     Priority rules:
-    - MF (priority=100) always preempts LF (priority=10).
-    - If MF is running, LF must not start.
-    - If LF is running and MF wants the lock, MF waits a short cooldown
-      then checks for LF staleness. Stale LF workers are evicted.
+    - Higher-priority work takes precedence over background work.
+    - Active holders cannot be evicted unless stale or explicitly forced.
+    - Stale lower-priority workers may be evicted.
     - All workers must release the lock on exit.
     """
 

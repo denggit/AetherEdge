@@ -160,12 +160,14 @@ def test_mf_signal_ready_always_false_in_readiness_gate() -> None:
     assert "False" in src or "return False" in src
 
 
-def test_mf_signal_ready_always_false_in_coverage() -> None:
-    from src.market_data.trade_features.coverage import resolve_mf_readiness
+def test_market_data_readiness_has_no_strategy_signal_gate() -> None:
+    from src.market_data.trade_features.coverage import (
+        resolve_trade_feature_readiness,
+    )
     import inspect
 
-    src = inspect.getsource(resolve_mf_readiness)
-    assert "mf_signal_ready=False" in src or "mf_signal_ready = False" in src
+    src = inspect.getsource(resolve_trade_feature_readiness)
+    assert ("mf_" + "signal") not in src
 
 
 # ---------------------------------------------------------------------------

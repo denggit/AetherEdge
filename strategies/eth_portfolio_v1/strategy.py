@@ -29,6 +29,7 @@ from src.platform.exchanges.models import (
     PositionSide,
 )
 from src.platform.markets import get_market_profile
+from src.platform.config import get_project_env_config
 from src.order_management.models import ExchangeOrderResult
 from src.platform.snapshot import PlatformSnapshot
 from src.runtime.position_mode_gate import PositionModeRequirement
@@ -286,6 +287,7 @@ class Strategy:
         self._stop_update_blocked_bar_close_time_ms: int | None = None
         self.recovered = False
         self.started = False
+        self._mf_feature_backfill_provider: object | None = None
 
     def configure_range_coverage(
         self,
@@ -386,6 +388,23 @@ class Strategy:
 
         return self.live_smoke_provider(**kwargs)
 
+    def startup_feature_backfill_providers(
+        self,
+    ) -> tuple[object, ...]:
+        """Declare the strategy-owned trade-feature repair provider."""
+
+        if self._mf_feature_backfill_provider is None:
+            from strategies.eth_portfolio_v1.preflight.mf_feature_backfill import (
+                PortfolioV1MfFeatureBackfillProvider,
+            )
+
+            self._mf_feature_backfill_provider = (
+                PortfolioV1MfFeatureBackfillProvider(
+                    strategy=self,
+                )
+            )
+        return (self._mf_feature_backfill_provider,)
+
     def market_feature_observers(self) -> tuple[object, ...]:
         """Keep LF and MF behind the normalized observer boundary."""
 
@@ -394,10 +413,23 @@ class Strategy:
     def trade_feature_runtime_config(self) -> Mapping[str, Any]:
         """Describe generic trade-derived features required by the MF observer."""
 
+        project_env = get_project_env_config()
         return {
             "enabled": self.config.mf.enabled,
             "range_pct": str(self.config.mf.range_pct),
             "range_price_step": str(self.config.mf.range_price_step),
+            "contract_value": project_env.get(
+                "AETHER_MF_FEATURE_CONTRACT_VALUE",
+                "0.01",
+            ),
+            "price_bucket_size": project_env.get(
+                "AETHER_MF_FEATURE_PRICE_BUCKET_SIZE",
+                "1",
+            ),
+            "large_trade_threshold": project_env.get(
+                "AETHER_MF_FEATURE_LARGE_TRADE_THRESHOLD",
+                "10000",
+            ),
         }
 
     def trade_feature_readiness(self) -> Mapping[str, Any]:

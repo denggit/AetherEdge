@@ -14,7 +14,9 @@ from src.market_data.models import (
     TradeFootprintFeature,
 )
 from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
-from src.market_data.trade_features.coverage import resolve_mf_readiness
+from src.market_data.trade_features.coverage import (
+    resolve_trade_feature_readiness,
+)
 from strategies.eth_portfolio_v1.domain.mf_low_sweep import (
     evaluate_mf_low_sweep,
 )
@@ -256,7 +258,7 @@ class MfDataReadiness:
         self._last: dict[str, Any] | None = None
 
     def readiness(self) -> Mapping[str, Any]:
-        result = resolve_mf_readiness(
+        result = resolve_trade_feature_readiness(
             symbol=self.symbol,
             exchange=self.exchange,
             store=self._store,
@@ -267,6 +269,10 @@ class MfDataReadiness:
             price_step=self._price_step,
         )
         audit = dict(result.audit())
+        audit["mf_signal_feature_ready"] = bool(
+            audit.get("tradebar_ready", False)
+            and audit.get("range_footprint_ready", False)
+        )
         signal_ready = all(
             bool(audit.get(field, False))
             for field in (

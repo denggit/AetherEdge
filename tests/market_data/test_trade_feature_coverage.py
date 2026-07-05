@@ -12,8 +12,8 @@ from src.market_data.models import (
 from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
 from src.market_data.trade_features.coverage import (
     compute_backfill_target,
-    mf_feature_coverage_scan,
-    resolve_mf_readiness,
+    resolve_trade_feature_readiness,
+    trade_feature_coverage_scan,
     safe_okx_archive_end_ms,
 )
 
@@ -118,7 +118,7 @@ def _write_range_ready(
 
 def test_mf_feature_coverage_scan_no_data(tmp_path: Path) -> None:
     store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
-    coverage = mf_feature_coverage_scan(
+    coverage = trade_feature_coverage_scan(
         symbol="ETH-USDT-PERP",
         exchange="okx",
         store=store,
@@ -136,7 +136,7 @@ def test_mf_feature_coverage_scan_complete(tmp_path: Path) -> None:
         _write_pair(store, _base(i))
     _write_range_ready(store, _base(4) + _MINUTE - 1)
 
-    coverage = mf_feature_coverage_scan(
+    coverage = trade_feature_coverage_scan(
         symbol="ETH-USDT-PERP",
         exchange="okx",
         store=store,
@@ -152,7 +152,7 @@ def test_mf_feature_coverage_scan_missing_gap(tmp_path: Path) -> None:
     _write_pair(store, _base(0))
     _write_pair(store, _base(2))  # skip _base(1)
 
-    coverage = mf_feature_coverage_scan(
+    coverage = trade_feature_coverage_scan(
         symbol="ETH-USDT-PERP",
         exchange="okx",
         store=store,
@@ -170,16 +170,14 @@ def test_resolve_mf_readiness_always_signal_false(tmp_path: Path) -> None:
         _write_pair(store, _base(i))
     _write_range_ready(store, _base(99) + _MINUTE - 1)
 
-    readiness = resolve_mf_readiness(
+    readiness = resolve_trade_feature_readiness(
         symbol="ETH-USDT-PERP",
         exchange="okx",
         store=store,
         required_minutes=100,
         reference_end_ms=_base(99) + _MINUTE - 1,
     )
-    assert readiness.mf_signal_ready is False
     assert readiness.coverage_ready is True
-    assert readiness.mf_signal_feature_ready is True
     assert readiness.range_footprint_ready is True
 
 
@@ -189,7 +187,7 @@ def test_resolve_mf_readiness_degraded_footprint(tmp_path: Path) -> None:
                 fp_quality="DEGRADED_LOW_TRADE_COUNT")
     _write_pair(store, _base(1))
 
-    readiness = resolve_mf_readiness(
+    readiness = resolve_trade_feature_readiness(
         symbol="ETH-USDT-PERP",
         exchange="okx",
         store=store,
@@ -198,20 +196,19 @@ def test_resolve_mf_readiness_degraded_footprint(tmp_path: Path) -> None:
     )
     assert readiness.degraded_footprint is True
     assert readiness.footprint_ready is False
-    assert readiness.mf_signal_ready is False
 
 
 def test_audit_has_required_fields(tmp_path: Path) -> None:
     store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
-    readiness = resolve_mf_readiness(
+    readiness = resolve_trade_feature_readiness(
         symbol="ETH-USDT-PERP", exchange="okx", store=store, required_minutes=10,
     )
     audit = readiness.audit()
     for key in (
         "tradebar_ready", "fixed_time_footprint_ready",
-        "range_footprint_ready", "mf_signal_feature_ready",
+        "range_footprint_ready",
         "price_ready", "orderflow_ready", "footprint_ready",
-        "coverage_ready", "mf_signal_ready", "coverage",
+        "coverage_ready", "coverage",
         "worker_running", "waiting_for_global_lock",
         "degraded_footprint", "current_day_archive_not_ready",
     ):
@@ -259,7 +256,7 @@ def test_coverage_fixed_footprint_does_not_satisfy_range_footprint_ready(
     for i in range(3):
         _write_pair(store, _base(i))
 
-    readiness = resolve_mf_readiness(
+    readiness = resolve_trade_feature_readiness(
         symbol="ETH-USDT-PERP",
         exchange="okx",
         store=store,
@@ -270,7 +267,6 @@ def test_coverage_fixed_footprint_does_not_satisfy_range_footprint_ready(
     assert readiness.tradebar_ready is True
     assert readiness.fixed_time_footprint_ready is True
     assert readiness.range_footprint_ready is False
-    assert readiness.mf_signal_feature_ready is False
 
 
 def test_coverage_range_footprint_missing_blocks_mf_signal_feature_ready(
@@ -280,7 +276,7 @@ def test_coverage_range_footprint_missing_blocks_mf_signal_feature_ready(
     for i in range(2):
         _write_pair(store, _base(i))
 
-    coverage = mf_feature_coverage_scan(
+    coverage = trade_feature_coverage_scan(
         symbol="ETH-USDT-PERP",
         exchange="okx",
         store=store,
@@ -316,7 +312,7 @@ def test_range_context_closed_after_window_start_cannot_seed_earlier_signals(
         complete=True,
     )
 
-    readiness = resolve_mf_readiness(
+    readiness = resolve_trade_feature_readiness(
         symbol="ETH-USDT-PERP",
         exchange="okx",
         store=store,
@@ -325,7 +321,6 @@ def test_range_context_closed_after_window_start_cannot_seed_earlier_signals(
     )
 
     assert readiness.range_footprint_ready is False
-    assert readiness.mf_signal_feature_ready is False
     assert (
         readiness.coverage.extra[
             "range_footprint_context_seed_available_time_ms"

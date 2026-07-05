@@ -108,7 +108,6 @@ def resolve_strategy_position_snapshots(
             base_quantity=base_quantity,
             average_entry_price=_optional_decimal(fields["avg_entry"]),
             stop_price=_optional_decimal(fields["stop_price"]),
-            sleeve_id=_optional_string(_safe_getattr(position, "sleeve_id")),
             engine=_legacy_engine(position),
             entry_time_ms=_optional_int(_safe_getattr(position, "entry_time_ms")),
             metadata=_legacy_metadata(position),

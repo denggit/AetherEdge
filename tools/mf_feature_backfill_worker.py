@@ -28,7 +28,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.market_data.backfill.coordinator import (  # noqa: E402
-    MF_FEATURE_BACKFILL_PRIORITY,
+    EXPEDITED_BACKFILL_PRIORITY,
     RawTradeBackfillCoordinator,
 )
 from src.market_data.backfill.status_store import now_ms  # noqa: E402
@@ -54,7 +54,7 @@ from src.market_data.models import (  # noqa: E402
 from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore  # noqa: E402
 from src.market_data.trade_features.coverage import (  # noqa: E402
     compute_backfill_target,
-    resolve_mf_readiness,
+    resolve_trade_feature_readiness,
     safe_okx_archive_end_ms,
 )
 from src.platform.data.models import MarketTrade  # noqa: E402
@@ -145,7 +145,7 @@ def run_cycle(
     )
     acquired = coordinator.try_acquire(
         owner="mf_feature_backfill",
-        priority=MF_FEATURE_BACKFILL_PRIORITY,
+        priority=EXPEDITED_BACKFILL_PRIORITY,
         symbol=symbol,
         raw_days=max_days_per_cycle,
     )
@@ -154,7 +154,7 @@ def run_cycle(
         holder_priority = int(holder.get("priority", 0) or 0)
         reason = (
             "waiting_for_lower_priority_worker"
-            if holder_priority < MF_FEATURE_BACKFILL_PRIORITY
+            if holder_priority < EXPEDITED_BACKFILL_PRIORITY
             else "global_lock_not_acquired"
         )
         return {
@@ -407,7 +407,7 @@ def run_cycle(
                 end_ms=end_ms,
                 complete=True,
             )
-        readiness_after = resolve_mf_readiness(
+        readiness_after = resolve_trade_feature_readiness(
             symbol=symbol,
             exchange=exchange,
             store=store,
@@ -480,7 +480,10 @@ def run_cycle(
                 "reason": coverage_after.reason,
             },
             "range_footprint_coverage_after": range_coverage_after,
-            "mf_signal_feature_ready": readiness_after.mf_signal_feature_ready,
+            "mf_signal_feature_ready": bool(
+                readiness_after.tradebar_ready
+                and readiness_after.range_footprint_ready
+            ),
             "current_day_gap_unrecoverable_until_archive": current_day_gap,
             "elapsed_seconds": time.time() - cycle_start,
         }
