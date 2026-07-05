@@ -208,6 +208,56 @@ def test_portfolio_v1_startup_calls_mf_feature_supervisor_when_enabled(
     assert runner._health.phase is RuntimePhase.RUNNING
 
 
+def test_portfolio_v1_supervisor_coverage_emits_readiness_event(
+    monkeypatch,
+) -> None:
+    class ReadySupervisor:
+        def check_and_launch(self):
+            return {
+                "action": "none",
+                "reason": "coverage_complete",
+                "coverage": {
+                    "mf_signal_feature_ready": True,
+                    "range_footprint_ready": True,
+                    "tradebar_ready": True,
+                    "fixed_time_footprint_ready": True,
+                    "coverage_ready": True,
+                },
+            }
+
+    config = _app_config_for_strategy("eth_portfolio_v1")
+    runner = LiveRuntimeRunner(
+        app_config=config,
+        app_context=_context(),
+        runtime_config=LiveRuntimeConfig(
+            app=config, mode=RuntimeMode.LIVE_RUNTIME
+        ),
+        services={
+            "project_env_config": _project_env(
+                AETHER_MF_FEATURE_BACKFILL_ENABLED="true"
+            ),
+            "mf_feature_backfill_supervisor": ReadySupervisor(),
+        },
+    )
+    emitted = []
+
+    async def capture(event):
+        emitted.append(event)
+
+    monkeypatch.setattr(runner, "process_market_feature", capture)
+    asyncio.run(runner._check_mf_feature_backfill_at_startup())
+
+    assert len(emitted) == 1
+    assert emitted[0].type_value == "trade_feature_readiness"
+    assert emitted[0].data["mf_signal_feature_ready"] is True
+    assert emitted[0].data["source"] == (
+        "runtime_mf_feature_backfill_supervisor"
+    )
+    assert runner._health.metadata["mf_supervisor"][
+        "mf_signal_ready"
+    ] is True
+
+
 def test_portfolio_v1_startup_marks_mf_supervisor_disabled_when_disabled(
     monkeypatch,
 ) -> None:

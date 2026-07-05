@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from src.platform.exchanges.models import ExchangeName
-from src.runtime.features import fixed_time_trade_bar_feature
 from src.signals import SignalAction
 from strategies.eth_portfolio_v1.domain.mf_data import (
     MfDataBuffer,
@@ -15,10 +13,24 @@ from strategies.eth_portfolio_v1.execution.mf_signal_mapper import (
     MfSizingInput,
 )
 
-from _mf_test_helpers import READY, config, range_footprint, setup_bars
+from _mf_test_helpers import (
+    READY,
+    closed_tradebar_event,
+    config,
+    range_footprint,
+    seed_large_share_history,
+    setup_bars,
+)
 
 
-def _entry_result(tmp_path, *, bars=None, pressure="0.80"):
+def _entry_result(
+    tmp_path,
+    *,
+    bars=None,
+    pressure="0.80",
+    equity=Decimal("1000"),
+    available_equity=Decimal("500"),
+):
     cfg = config()
     bars = setup_bars() if bars is None else bars
     buffer = MfDataBuffer(
@@ -26,7 +38,10 @@ def _entry_result(tmp_path, *, bars=None, pressure="0.80"):
         store_path=str(tmp_path / "features.sqlite3"),
         decision_buffer_minutes=100,
         decision_buffer_max_minutes=100,
-        large_share_quantile_window_days=1,
+        large_share_quantile_window_days=90,
+    )
+    seed_large_share_history(
+        buffer, before_open_time_ms=bars[0].open_time_ms
     )
     buffer.append_many(bars[:-1])
     buffer.append_range_footprint(
@@ -51,14 +66,12 @@ def _entry_result(tmp_path, *, bars=None, pressure="0.80"):
         ),
         readiness=READY,
         sizing_provider=lambda: MfSizingInput(
-            equity=Decimal("1000"),
-            available_equity=Decimal("500"),
+            equity=equity,
+            available_equity=available_equity,
         ),
     )
     signals = observer.on_market_feature(
-        fixed_time_trade_bar_feature(
-            bars[-1], exchange=ExchangeName.OKX
-        )
+        closed_tradebar_event(bars[-1])
     )
     return signals, observer, sleeve
 
@@ -84,11 +97,12 @@ def test_large_share_below_historical_threshold_produces_no_signal(
     assert signals == ()
 
 
-def test_no_single_swing_produces_no_signal(tmp_path) -> None:
+def test_no_primary_low_sweep_event_produces_no_signal(tmp_path) -> None:
     bars = setup_bars(latest_close="95")
     signals, observer, _ = _entry_result(tmp_path, bars=bars)
     assert signals == ()
-    assert observer.last_mf_signal_audit["single_swing"] is False
+    assert observer.last_mf_signal_audit["single_swing"] is True
+    assert observer.last_mf_signal_audit["low_sweep_event"] is False
 
 
 def test_entry_signal_has_independent_mf_scope(tmp_path) -> None:
@@ -102,7 +116,7 @@ def test_entry_signal_has_independent_mf_scope(tmp_path) -> None:
     assert signal.metadata["entry_mode"] == "next_open"
     assert signal.metadata["sizing_input"]["position_fraction"] == "0.10"
     assert signal.metadata["sizing_input"]["equity"] == "1000"
-    assert signal.quantity == Decimal("100") / Decimal("89.5")
+    assert signal.quantity == Decimal("100") / Decimal("90")
     causal = signal.metadata["audit"]
     assert (
         signal.metadata["entry_execution_time_ms"]
@@ -119,3 +133,21 @@ def test_entry_signal_has_independent_mf_scope(tmp_path) -> None:
         is not None
     )
     assert signal.action is not SignalAction.CANCEL_ALL_STOP_ORDERS
+
+
+def test_available_equity_not_ready_blocks_open(tmp_path) -> None:
+    signals, observer, _ = _entry_result(
+        tmp_path, available_equity=None
+    )
+    assert signals == ()
+    assert observer.last_mf_signal_audit["blocked_reason"] == (
+        "sizing_not_ready"
+    )
+
+
+def test_available_equity_caps_mf_target_notional(tmp_path) -> None:
+    signals, _, _ = _entry_result(
+        tmp_path, available_equity=Decimal("50")
+    )
+    assert signals[0].quantity == Decimal("50") / Decimal("90")
+    assert signals[0].metadata["sizing_input"]["target_notional"] == "50"

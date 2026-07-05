@@ -340,6 +340,11 @@ class Strategy:
             "range_price_step": str(self.config.mf.range_price_step),
         }
 
+    def trade_feature_readiness(self) -> Mapping[str, Any]:
+        """Expose the R007 coverage resolver to the generic runtime poll."""
+
+        return self.mf_data_readiness.readiness()
+
     @property
     def last_mf_signal_audit(self) -> Mapping[str, Any]:
         return dict(self.mf_feature_observer.last_mf_signal_audit)
@@ -369,6 +374,7 @@ class Strategy:
                         "range_footprint_ready": False,
                         "tradebar_ready": False,
                         "reason": "startup_readiness_error",
+                        "source": "strategy_startup_store_scan",
                     }
                 )
         if self.config.structural_stop.enabled:

@@ -148,7 +148,13 @@ def range_aggregate_unavailable_feature(
     )
 
 
-def fixed_time_trade_bar_feature(bar, *, exchange) -> "MarketFeatureEvent":
+def fixed_time_trade_bar_feature(
+    bar,
+    *,
+    exchange,
+    next_open_price: Decimal | None = None,
+    next_open_time_ms: int | None = None,
+) -> "MarketFeatureEvent":
     from src.market_data.models import FixedTimeTradeBar as _FTB
     ftb: _FTB = bar  # type: ignore[no-redef]
     return MarketFeatureEvent(
@@ -179,6 +185,12 @@ def fixed_time_trade_bar_feature(bar, *, exchange) -> "MarketFeatureEvent":
             "large_sell_notional": _d(ftb.large_sell_notional),
             "large_trade_count": ftb.large_trade_count,
             "large_trade_share": _d(ftb.large_trade_share),
+            "next_open_price": (
+                None
+                if next_open_price is None
+                else _d(next_open_price)
+            ),
+            "next_open_time_ms": next_open_time_ms,
             "quality": ftb.quality,
             "source": ftb.source,
         },
@@ -247,6 +259,27 @@ def range_footprint_feature(feature, *, exchange) -> "MarketFeatureEvent":
             "quality": fp.quality,
             "source": fp.source,
         },
+    )
+
+
+def trade_feature_readiness_feature(
+    *,
+    symbol: str,
+    exchange,
+    event_time_ms: int,
+    readiness,
+    source: str,
+) -> "MarketFeatureEvent":
+    data = dict(readiness)
+    data["source"] = str(source)
+    return MarketFeatureEvent(
+        event_type="trade_feature_readiness",
+        symbol=symbol,
+        exchange=exchange,
+        timeframe="1m",
+        event_time_ms=int(event_time_ms),
+        available_time_ms=int(event_time_ms),
+        data=data,
     )
 
 

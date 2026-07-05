@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from decimal import Decimal
+from pathlib import Path
 
 from src.signals import SignalAction
 from strategies.eth_portfolio_v1.domain.models import Side, V8DecisionType, V8TradeDecision
@@ -12,15 +14,26 @@ from strategies.eth_portfolio_v1.domain.mf_sleeve import MfSleeveState
 from strategies.eth_portfolio_v1.strategy import Strategy
 
 
-def test_mf_sleeve_is_active_capable_but_disabled_by_default() -> None:
+def test_mf_sleeve_is_enabled_by_default() -> None:
     strategy = Strategy()
     mf = strategy.mf_sleeve
 
     assert isinstance(mf, MfSleeveState)
-    assert mf.enabled is False
+    assert mf.enabled is True
     assert mf.sleeve_id == MF_RESERVED_SLEEVE_ID
     assert mf.position_snapshots() == ()
     assert strategy.config.mf.exit_variant == "time48"
+
+
+def test_portfolio_v1_default_config_enables_mf() -> None:
+    config_path = (
+        Path(__file__).resolve().parents[3]
+        / "strategies"
+        / "eth_portfolio_v1"
+        / "config.json"
+    )
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+    assert payload["mf"]["enabled"] is True
 
 
 def test_lf_entry_signal_metadata_contains_v1_sleeve_scope() -> None:

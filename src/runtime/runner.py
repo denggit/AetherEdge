@@ -66,6 +66,7 @@ from src.runtime.features import (
     range_aggregate_unavailable_feature,
     range_bar_closed_feature,
     range_footprint_feature,
+    trade_feature_readiness_feature,
     trade_footprint_feature,
 )
 from src.runtime.heartbeat import RuntimeHeartbeatService
@@ -864,6 +865,15 @@ class LiveRuntimeRunner:
                     exc,
                 )
 
+        result["mf_signal_ready"] = await self._publish_mf_readiness(
+            coverage=result.get("coverage", {}),
+            reason=result.get("reason"),
+            action=result.get("action"),
+            source="runtime_mf_feature_backfill_supervisor",
+            coverage_ready_fallback=bool(
+                result.get("coverage_ready", False)
+            ),
+        )
         self._set_health(
             self._health.phase,
             metadata={
@@ -872,6 +882,58 @@ class LiveRuntimeRunner:
             },
         )
         logger.info("MF feature supervisor startup audit | result=%s", result)
+
+    async def _publish_mf_readiness(
+        self,
+        *,
+        coverage: Any,
+        reason: Any,
+        action: Any,
+        source: str,
+        coverage_ready_fallback: bool = False,
+    ) -> bool:
+        snapshot = (
+            dict(coverage) if isinstance(coverage, Mapping) else {}
+        )
+        readiness = {
+            "mf_signal_feature_ready": bool(
+                snapshot.get("mf_signal_feature_ready", False)
+            ),
+            "range_footprint_ready": bool(
+                snapshot.get("range_footprint_ready", False)
+            ),
+            "tradebar_ready": bool(
+                snapshot.get("tradebar_ready", False)
+            ),
+            "fixed_time_footprint_ready": bool(
+                snapshot.get("fixed_time_footprint_ready", False)
+            ),
+            "coverage_ready": bool(
+                snapshot.get(
+                    "coverage_ready", coverage_ready_fallback
+                )
+            ),
+            "reason": reason,
+            "action": action,
+        }
+        signal_ready = all(
+            readiness[field]
+            for field in (
+                "mf_signal_feature_ready",
+                "range_footprint_ready",
+                "tradebar_ready",
+            )
+        )
+        await self.process_market_feature(
+            trade_feature_readiness_feature(
+                symbol=self.app_config.symbol,
+                exchange=self.app_config.data_exchange,
+                event_time_ms=int(time.time() * 1000),
+                readiness=readiness,
+                source=source,
+            )
+        )
+        return signal_ready
 
     async def _bootstrap_account_config_if_enabled(self) -> None:
         if self.runtime_config.mode is not RuntimeMode.LIVE_RUNTIME:
@@ -2278,7 +2340,79 @@ class LiveRuntimeRunner:
             tasks.append(asyncio.create_task(self._periodic_follower_close_check(self._stop_event)))
         # Heartbeat periodic task
         tasks.append(asyncio.create_task(self._heartbeat_service.run_periodic(self._stop_event)))
+        if (
+            str(self.app_config.strategy).strip().lower()
+            == "eth_portfolio_v1"
+            and (
+                self._mf_feature_backfill_supervisor is not None
+                or callable(
+                    getattr(
+                        self.context.strategy,
+                        "trade_feature_readiness",
+                        None,
+                    )
+                )
+            )
+        ):
+            tasks.append(
+                asyncio.create_task(
+                    self._periodic_mf_readiness_refresh(
+                        self._stop_event
+                    )
+                )
+            )
         return tasks
+
+    async def _periodic_mf_readiness_refresh(
+        self, stop_event: asyncio.Event
+    ) -> None:
+        interval = max(
+            10.0,
+            self._project_env.get_float(
+                "AETHER_MF_FEATURE_READINESS_POLL_SECONDS", 60.0
+            ),
+        )
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(), timeout=interval
+                )
+                continue
+            except asyncio.TimeoutError:
+                pass
+            supervisor = self._mf_feature_backfill_supervisor
+            scan = getattr(supervisor, "scan_coverage", None)
+            provider = getattr(
+                self.context.strategy,
+                "trade_feature_readiness",
+                None,
+            )
+            use_supervisor = bool(
+                callable(scan)
+                and self._project_env.get_bool(
+                    "AETHER_MF_FEATURE_BACKFILL_ENABLED", False
+                )
+            )
+            readiness_reader = scan if use_supervisor else provider
+            if not callable(readiness_reader):
+                return
+            try:
+                coverage = await asyncio.to_thread(readiness_reader)
+                await self._publish_mf_readiness(
+                    coverage=coverage,
+                    reason="periodic_coverage_scan",
+                    action="none",
+                    source=(
+                        "runtime_mf_feature_coverage_poll"
+                        if use_supervisor
+                        else "strategy_mf_feature_coverage_poll"
+                    ),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "MF feature readiness refresh failed | error=%s",
+                    exc,
+                )
 
     async def _periodic_follower_close_check(self, stop_event: asyncio.Event) -> None:
         await asyncio.sleep(30)
@@ -2738,7 +2872,12 @@ class LiveRuntimeRunner:
         for bar in tradebars:
             await self.process_market_feature(
                 fixed_time_trade_bar_feature(
-                    bar, exchange=trade.exchange
+                    bar,
+                    exchange=trade.exchange,
+                    next_open_price=trade.price,
+                    next_open_time_ms=(
+                        trade.trade_time_ms or trade.event_time_ms
+                    ),
                 )
             )
         for feature in footprints:

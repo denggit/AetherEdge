@@ -17,18 +17,48 @@ COINBACKTEST_PORTFOLIO_SOURCE = (
 COINBACKTEST_CHILD_SOURCE = (
     "backtest/mf/low_sweep/low_sweep_V1_a0_footprint_backtest.py"
 )
+COINBACKTEST_RESEARCH_SOURCES = (
+    "research/low_sweep_a_upgrade_research.py",
+    "research/low_sweep_panic_reversal_strategy_probe.py",
+    "research/focused_low_sweep_reversal_event_lab.py",
+)
 MF_VARIANT_NAME = (
     "A0_fp_abs_delta_high__single_swing__next_open__time48__no_stop"
 )
 MF_ENGINE_NAME = "MF_LOW_SWEEP_TIME48"
 MF_POSITION_ID_PREFIX = "mf-low-sweep-time48-"
 MF_RANGE_FOOTPRINT_EVENT_TYPE = "range_footprint_feature"
+MF_READINESS_EVENT_TYPE = "trade_feature_readiness"
 
 # Source mapping:
 # - portfolio wrapper _build_mf_args/_make_mf_variant
 # - child formal_variant_specs
 # - research build_low_sweep_events/build_fixed_candidate_masks/
-#   build_candidate_layer_masks/build_support_mask
+#   build_candidate_layer_masks/build_support_mask/build_canonical_events
+MF_EVENT_SPIKE_THRESHOLDS = tuple(
+    Decimal(value) for value in ("0.0060", "0.0080", "0.0100", "0.0120")
+)
+MF_EVENT_BREAKOUT_THRESHOLDS = tuple(
+    Decimal(value) for value in ("0.0000", "0.0005")
+)
+MF_EVENT_MAX_SWING_AGES = (12, 24, 48, 96, 240, 1_440)
+MF_EVENT_MIN_PROMINENCE_PCTS = tuple(
+    Decimal(value) for value in ("0.0015", "0.0030")
+)
+MF_EVENT_VARIANTS = ("fade_close_through",)
+MF_PIVOT_LEFT = 6
+MF_PIVOT_RIGHT = 3
+MF_MIN_SWING_AGE = 3
+MF_CLOSE_THROUGH_BUFFER_PCT = Decimal("0")
+MF_A0_SPIKE_THRESHOLD = Decimal("0.0100")
+MF_A_CLOSE_POS_MAX = Decimal("0.30")
+MF_LARGE_SHARE_QUANTILE = Decimal("0.80")
+MF_LARGE_SHARE_WINDOW_DAYS = 90
+MF_LARGE_SHARE_WINDOW_SAMPLES = 129_600
+MF_LARGE_SHARE_MIN_SAMPLES = 43_200
+MF_FOOTPRINT_ABS_DELTA_THRESHOLD = Decimal("0.60")
+MF_TIME_EXIT_BARS = 48
+
 MF_ENTRY_REQUIRED_FIELDS = (
     "spike_pct",
     "close_pos",
@@ -37,6 +67,8 @@ MF_ENTRY_REQUIRED_FIELDS = (
     "swing_low",
     "swing_low_age",
     "swing_low_prominence_pct",
+    "low_sweep_event",
+    "event_variant",
     "single_swing",
     "fp_max_bucket_abs_delta_pressure",
     "fp_abs_delta_high_threshold",
@@ -46,20 +78,24 @@ MF_ENTRY_REQUIRED_FIELDS = (
 
 @dataclass(frozen=True)
 class MfLowSweepConfig:
-    enabled: bool = False
+    enabled: bool = True
     position_fraction: Decimal = Decimal("0.10")
-    footprint_abs_delta_threshold: Decimal = Decimal("0.60")
-    spike_threshold: Decimal = Decimal("0.0100")
-    close_pos_max: Decimal = Decimal("0.30")
-    large_share_quantile: Decimal = Decimal("0.80")
-    large_share_window_days: int = 90
-    large_share_min_samples: int = 43_200
-    pivot_left: int = 6
-    pivot_right: int = 3
-    min_swing_age: int = 3
-    max_swing_age: int = 1_440
-    min_swing_prominence_pct: Decimal = Decimal("0.0015")
-    holding_minutes: int = 48
+    footprint_abs_delta_threshold: Decimal = (
+        MF_FOOTPRINT_ABS_DELTA_THRESHOLD
+    )
+    spike_threshold: Decimal = MF_A0_SPIKE_THRESHOLD
+    close_pos_max: Decimal = MF_A_CLOSE_POS_MAX
+    large_share_quantile: Decimal = MF_LARGE_SHARE_QUANTILE
+    large_share_window_days: int = MF_LARGE_SHARE_WINDOW_DAYS
+    large_share_min_samples: int = MF_LARGE_SHARE_MIN_SAMPLES
+    pivot_left: int = MF_PIVOT_LEFT
+    pivot_right: int = MF_PIVOT_RIGHT
+    min_swing_age: int = MF_MIN_SWING_AGE
+    max_swing_age: int = MF_EVENT_MAX_SWING_AGES[-1]
+    min_swing_prominence_pct: Decimal = (
+        MF_EVENT_MIN_PROMINENCE_PCTS[0]
+    )
+    holding_minutes: int = MF_TIME_EXIT_BARS
     decision_buffer_minutes: int = 4_320
     decision_buffer_max_minutes: int = 10_080
     range_pct: Decimal = Decimal("0.002")
@@ -74,20 +110,80 @@ class MfLowSweepConfig:
             raise ValueError(
                 "mf.footprint_abs_delta_threshold must be within [0, 1]"
             )
-        if self.holding_minutes != 48:
-            raise ValueError("MF live holding_minutes must be 48")
-        if self.pivot_left <= 0 or self.pivot_right <= 0:
-            raise ValueError("MF pivot windows must be positive")
-        if self.max_swing_age < self.min_swing_age:
-            raise ValueError("MF max_swing_age must be >= min_swing_age")
-        if self.large_share_min_samples <= 0:
-            raise ValueError("MF large_share_min_samples must be positive")
+        exact_values = {
+            "footprint_abs_delta_threshold": (
+                self.footprint_abs_delta_threshold,
+                MF_FOOTPRINT_ABS_DELTA_THRESHOLD,
+            ),
+            "spike_threshold": (
+                self.spike_threshold,
+                MF_A0_SPIKE_THRESHOLD,
+            ),
+            "close_pos_max": (self.close_pos_max, MF_A_CLOSE_POS_MAX),
+            "large_share_quantile": (
+                self.large_share_quantile,
+                MF_LARGE_SHARE_QUANTILE,
+            ),
+            "large_share_window_days": (
+                self.large_share_window_days,
+                MF_LARGE_SHARE_WINDOW_DAYS,
+            ),
+            "large_share_min_samples": (
+                self.large_share_min_samples,
+                MF_LARGE_SHARE_MIN_SAMPLES,
+            ),
+            "pivot_left": (self.pivot_left, MF_PIVOT_LEFT),
+            "pivot_right": (self.pivot_right, MF_PIVOT_RIGHT),
+            "min_swing_age": (
+                self.min_swing_age,
+                MF_MIN_SWING_AGE,
+            ),
+            "max_swing_age": (
+                self.max_swing_age,
+                MF_EVENT_MAX_SWING_AGES[-1],
+            ),
+            "min_swing_prominence_pct": (
+                self.min_swing_prominence_pct,
+                MF_EVENT_MIN_PROMINENCE_PCTS[0],
+            ),
+            "holding_minutes": (
+                self.holding_minutes,
+                MF_TIME_EXIT_BARS,
+            ),
+            "range_pct": (self.range_pct, Decimal("0.002")),
+            "range_price_step": (
+                self.range_price_step,
+                Decimal("1"),
+            ),
+        }
+        mismatched = [
+            name
+            for name, (actual, expected) in exact_values.items()
+            if actual != expected
+        ]
+        if mismatched:
+            raise ValueError(
+                "MF CoinBacktest parity parameters cannot be overridden: "
+                + ", ".join(mismatched)
+            )
+        if self.decision_buffer_minutes < self.max_swing_age + self.pivot_left:
+            raise ValueError(
+                "mf.decision_buffer_minutes is too small for swing parity"
+            )
+        if (
+            self.decision_buffer_minutes
+            > self.decision_buffer_max_minutes
+        ):
+            raise ValueError(
+                "mf.decision_buffer_minutes must not exceed "
+                "decision_buffer_max_minutes"
+            )
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any] | None) -> "MfLowSweepConfig":
         raw = dict(value or {})
         return cls(
-            enabled=_config_bool(raw.get("enabled"), default=False),
+            enabled=_config_bool(raw.get("enabled"), default=True),
             position_fraction=Decimal(
                 str(raw.get("position_fraction", "0.10"))
             ),
@@ -157,10 +253,29 @@ def _config_bool(value: Any, *, default: bool) -> bool:
 __all__ = [
     "COINBACKTEST_CHILD_SOURCE",
     "COINBACKTEST_PORTFOLIO_SOURCE",
+    "COINBACKTEST_RESEARCH_SOURCES",
+    "MF_A0_SPIKE_THRESHOLD",
+    "MF_A_CLOSE_POS_MAX",
+    "MF_CLOSE_THROUGH_BUFFER_PCT",
     "MF_ENGINE_NAME",
     "MF_ENTRY_REQUIRED_FIELDS",
+    "MF_EVENT_BREAKOUT_THRESHOLDS",
+    "MF_EVENT_MAX_SWING_AGES",
+    "MF_EVENT_MIN_PROMINENCE_PCTS",
+    "MF_EVENT_SPIKE_THRESHOLDS",
+    "MF_EVENT_VARIANTS",
+    "MF_FOOTPRINT_ABS_DELTA_THRESHOLD",
+    "MF_LARGE_SHARE_MIN_SAMPLES",
+    "MF_LARGE_SHARE_QUANTILE",
+    "MF_LARGE_SHARE_WINDOW_DAYS",
+    "MF_LARGE_SHARE_WINDOW_SAMPLES",
+    "MF_MIN_SWING_AGE",
+    "MF_PIVOT_LEFT",
+    "MF_PIVOT_RIGHT",
     "MF_POSITION_ID_PREFIX",
     "MF_RANGE_FOOTPRINT_EVENT_TYPE",
+    "MF_READINESS_EVENT_TYPE",
+    "MF_TIME_EXIT_BARS",
     "MF_VARIANT_NAME",
     "MfLowSweepConfig",
     "MfSignalDecision",

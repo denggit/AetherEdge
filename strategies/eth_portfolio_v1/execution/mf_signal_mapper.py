@@ -44,15 +44,13 @@ class MfSignalMapper:
         if (
             sizing.equity is None
             or sizing.equity <= 0
+            or sizing.available_equity is None
+            or sizing.available_equity <= 0
             or decision.reference_price <= 0
         ):
             return None
         target_notional = sizing.equity * self.config.position_fraction
-        if (
-            sizing.available_equity is not None
-            and sizing.available_equity >= 0
-        ):
-            target_notional = min(target_notional, sizing.available_equity)
+        target_notional = min(target_notional, sizing.available_equity)
         if target_notional <= 0:
             return None
         quantity = target_notional / decision.reference_price

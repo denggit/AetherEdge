@@ -17,7 +17,7 @@ from strategies.eth_portfolio_v1.domain.sleeves import MF_RESERVED_SLEEVE_ID
 class MfSleeveState:
     strategy_id: str
     symbol: str
-    enabled: bool = False
+    enabled: bool = True
     sleeve_id: str = MF_RESERVED_SLEEVE_ID
     position_id: str | None = None
     quantity: Decimal = Decimal("0")

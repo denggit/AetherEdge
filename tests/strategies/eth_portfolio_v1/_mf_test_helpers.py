@@ -4,6 +4,9 @@ from dataclasses import replace
 from decimal import Decimal
 
 from src.market_data.models import FixedTimeTradeBar, RangeFootprintFeature
+from src.platform.exchanges.models import ExchangeName
+from src.runtime.features import fixed_time_trade_bar_feature
+from strategies.eth_portfolio_v1.domain.mf_data import MfDataBuffer
 from strategies.eth_portfolio_v1.domain.mf_signal import MfLowSweepConfig
 
 
@@ -13,6 +16,7 @@ READY = {
     "mf_signal_feature_ready": True,
     "range_footprint_ready": True,
     "tradebar_ready": True,
+    "source": "test_readiness_fixture",
 }
 
 
@@ -20,9 +24,48 @@ def config(**overrides) -> MfLowSweepConfig:
     base = MfLowSweepConfig(
         enabled=True,
         position_fraction=Decimal("0.10"),
-        large_share_min_samples=5,
     )
     return replace(base, **overrides)
+
+
+def historical_large_shares(
+    *,
+    value: str = "0.10",
+    count: int = 43_200,
+) -> tuple[Decimal, ...]:
+    return (Decimal(value),) * count
+
+
+def seed_large_share_history(
+    buffer: MfDataBuffer,
+    *,
+    before_open_time_ms: int,
+    value: str = "0.10",
+) -> None:
+    start = before_open_time_ms - 43_200 * MINUTE_MS
+    for index in range(43_200):
+        buffer._large_trade_shares.append(
+            (start + index * MINUTE_MS, Decimal(value))
+        )
+    buffer._latest_history_open_time_ms = before_open_time_ms - MINUTE_MS
+
+
+def closed_tradebar_event(
+    item: FixedTimeTradeBar,
+    *,
+    next_open_price: str = "90",
+    next_open_time_ms: int | None = None,
+):
+    return fixed_time_trade_bar_feature(
+        item,
+        exchange=ExchangeName.OKX,
+        next_open_price=Decimal(next_open_price),
+        next_open_time_ms=(
+            item.close_time_ms + 1
+            if next_open_time_ms is None
+            else next_open_time_ms
+        ),
+    )
 
 
 def setup_bars(

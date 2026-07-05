@@ -20,6 +20,7 @@ from strategies.eth_portfolio_v1.domain.mf_low_sweep import (
 )
 from strategies.eth_portfolio_v1.domain.mf_signal import (
     MF_RANGE_FOOTPRINT_EVENT_TYPE,
+    MF_READINESS_EVENT_TYPE,
     MfLowSweepConfig,
 )
 from strategies.eth_portfolio_v1.domain.mf_sleeve import MfSleeveState
@@ -278,6 +279,7 @@ class MfDataReadiness:
             **audit,
             "mf_signal_ready": signal_ready,
             "exit_variant": "time48",
+            "source": "strategy_startup_store_scan",
         }
         return dict(self._last)
 
@@ -321,6 +323,8 @@ class MfFeatureObserver:
         self._latest_tradebar_open_time_ms: int | None = None
         self._latest_footprint_open_time_ms: int | None = None
         self._latest_footprint_audit: dict[str, Any] | None = None
+        self._next_open_price: Decimal | None = None
+        self._next_open_time_ms: int | None = None
         self._last_evaluated_open_time_ms: int | None = None
         self._last_causal_warning_ms = 0
         self.last_mf_signal_audit: dict[str, Any] = {
@@ -328,10 +332,43 @@ class MfFeatureObserver:
             "data_ready": False,
             "blocked_reason": "data_not_ready",
             "reason": "data_not_ready",
+            "readiness_source": self._readiness.get(
+                "source", "unavailable"
+            ),
         }
 
-    def set_readiness(self, readiness: Mapping[str, Any]) -> None:
+    def set_readiness(
+        self,
+        readiness: Mapping[str, Any],
+        *,
+        source: str | None = None,
+    ) -> None:
         self._readiness = dict(readiness)
+        if source is not None:
+            self._readiness["source"] = str(source)
+        self._log_readiness_transition()
+        self.last_mf_signal_audit.update(
+            {
+                "enabled": self.config.enabled,
+                "data_ready": all(
+                    bool(self._readiness.get(field, False))
+                    for field in (
+                        "mf_signal_feature_ready",
+                        "range_footprint_ready",
+                        "tradebar_ready",
+                    )
+                ),
+                "signal_feature_ready": bool(
+                    self._readiness.get(
+                        "mf_signal_feature_ready", False
+                    )
+                ),
+                "readiness_source": self._readiness.get(
+                    "source", "unavailable"
+                ),
+                "readiness_reason": self._readiness.get("reason"),
+            }
+        )
 
     def on_market_feature(self, event: Any) -> tuple[Any, ...]:
         feature = self._handle_event(event)
@@ -371,6 +408,8 @@ class MfFeatureObserver:
             ),
             readiness=self._readiness,
             sleeve=self._sleeve,
+            next_open_price=self._next_open_price,
+            next_open_time_ms=self._next_open_time_ms,
         )
         self.last_mf_signal_audit = _json_safe(audit)
         if audit.get("blocked_reason") == "invalid_causal_feature":
@@ -393,6 +432,19 @@ class MfFeatureObserver:
                 if self._sizing_provider is not None
                 else MfSizingInput(None, None)
             )
+            self.last_mf_signal_audit["sizing_input"] = {
+                "equity": (
+                    None if sizing.equity is None else str(sizing.equity)
+                ),
+                "available_equity": (
+                    None
+                    if sizing.available_equity is None
+                    else str(sizing.available_equity)
+                ),
+                "position_fraction": str(
+                    self.config.position_fraction
+                ),
+            }
             signal = self._signal_mapper.map_open(
                 decision, sizing=sizing
             )
@@ -408,7 +460,10 @@ class MfFeatureObserver:
                 quantity=signal.quantity or Decimal("0"),
                 signal_time_ms=decision.signal_time_ms,
                 entry_execution_time_ms=decision.entry_execution_time_ms,
-                tradebar_open_time_ms=bar.open_time_ms,
+                tradebar_open_time_ms=int(
+                    decision.audit.get("entry_tradebar_open_time_ms")
+                    or bar.open_time_ms + 60_000
+                ),
             )
             self.last_mf_signal_audit["sleeve_state"] = (
                 self._sleeve.state_label
@@ -453,6 +508,24 @@ class MfFeatureObserver:
             bar = self._event_to_tradebar(event)
             if bar is None:
                 return None
+            data = getattr(event, "data", {})
+            if isinstance(data, Mapping):
+                raw_price = data.get("next_open_price")
+                raw_time = data.get("next_open_time_ms")
+                try:
+                    self._next_open_price = (
+                        None
+                        if raw_price is None
+                        else Decimal(str(raw_price))
+                    )
+                    self._next_open_time_ms = (
+                        None
+                        if raw_time is None
+                        else int(raw_time)
+                    )
+                except (ArithmeticError, TypeError, ValueError):
+                    self._next_open_price = None
+                    self._next_open_time_ms = None
             self._tradebar_count += 1
             self._last_tradebar_ms = int(
                 getattr(event, "event_time_ms", 0)
@@ -492,6 +565,17 @@ class MfFeatureObserver:
             if self._buffer is not None:
                 self._buffer.append_range_footprint(feature)
             return feature
+        if type_value == MF_READINESS_EVENT_TYPE:
+            data = getattr(event, "data", {})
+            if not isinstance(data, Mapping):
+                return None
+            self.set_readiness(
+                data,
+                source=str(
+                    data.get("source", "runtime_readiness_event")
+                ),
+            )
+            return None
         return None
 
     def _log_readiness_transition(self) -> None:
@@ -505,8 +589,9 @@ class MfFeatureObserver:
         self._last_readiness_state = state
         logger.info(
             "MF data readiness changed | signal_feature_ready=%s "
-            "range_footprint_ready=%s tradebar_ready=%s",
+            "range_footprint_ready=%s tradebar_ready=%s source=%s",
             *state,
+            self._readiness.get("source", "unavailable"),
         )
 
     @staticmethod

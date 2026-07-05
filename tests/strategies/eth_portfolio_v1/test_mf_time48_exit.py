@@ -79,3 +79,25 @@ def test_holding_48_completed_minutes_generates_close() -> None:
     assert signal.metadata["position_id"] == sleeve.position_id
     assert signal.quantity == sleeve.quantity
     assert audit["exit_reason"] == "mf_time48_exit"
+
+
+def test_overdue_pending_close_does_not_duplicate_exit() -> None:
+    bars = setup_bars()
+    completed_through = bars[-1].close_time_ms + 1
+    sleeve = _active_sleeve(
+        entry_time_ms=completed_through - 49 * 60_000
+    )
+    sleeve.reserve_close()
+    decision, audit = evaluate_mf_low_sweep(
+        config=config(),
+        bars=bars,
+        range_footprints=[
+            range_footprint(
+                available_time_ms=bars[-1].open_time_ms - 1
+            )
+        ],
+        readiness=READY,
+        sleeve=sleeve,
+    )
+    assert decision is None
+    assert audit["blocked_reason"] == "pending_close"

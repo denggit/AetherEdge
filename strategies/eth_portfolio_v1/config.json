@@ -96,7 +96,7 @@
     "global_risk_scale": "1.3"
   },
   "mf": {
-    "enabled": false,
+    "enabled": true,
     "position_fraction": "0.10",
     "exit_variant": "time48",
     "holding_minutes": 48,

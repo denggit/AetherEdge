@@ -3,8 +3,6 @@ from __future__ import annotations
 import logging
 from decimal import Decimal
 
-from src.platform.exchanges.models import ExchangeName
-from src.runtime.features import fixed_time_trade_bar_feature
 from strategies.eth_portfolio_v1.domain.mf_data import (
     MfDataBuffer,
     MfFeatureObserver,
@@ -15,7 +13,14 @@ from strategies.eth_portfolio_v1.execution.mf_signal_mapper import (
     MfSizingInput,
 )
 
-from _mf_test_helpers import READY, config, range_footprint, setup_bars
+from _mf_test_helpers import (
+    READY,
+    closed_tradebar_event,
+    config,
+    range_footprint,
+    seed_large_share_history,
+    setup_bars,
+)
 
 
 def _observer(tmp_path):
@@ -26,7 +31,10 @@ def _observer(tmp_path):
         store_path=str(tmp_path / "features.sqlite3"),
         decision_buffer_minutes=100,
         decision_buffer_max_minutes=100,
-        large_share_quantile_window_days=1,
+        large_share_quantile_window_days=90,
+    )
+    seed_large_share_history(
+        buffer, before_open_time_ms=bars[0].open_time_ms
     )
     buffer.append_many(bars[:-1])
     buffer.append_range_footprint(
@@ -60,9 +68,7 @@ def test_no_per_minute_decision_completed_log(tmp_path, caplog) -> None:
     observer, latest, _ = _observer(tmp_path)
     with caplog.at_level(logging.INFO):
         observer.on_market_feature(
-            fixed_time_trade_bar_feature(
-                latest, exchange=ExchangeName.OKX
-            )
+            closed_tradebar_event(latest)
         )
     assert not any(
         "MF decision completed" in record.message
@@ -95,9 +101,7 @@ def test_exit_event_logs_once(tmp_path, caplog) -> None:
     )
     with caplog.at_level(logging.INFO):
         observer.on_market_feature(
-            fixed_time_trade_bar_feature(
-                latest, exchange=ExchangeName.OKX
-            )
+            closed_tradebar_event(latest)
         )
     assert sum(
         "MF exit signal generated" in record.message
