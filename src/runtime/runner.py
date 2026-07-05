@@ -70,6 +70,10 @@ from src.runtime.features import (
     trade_footprint_feature,
 )
 from src.runtime.heartbeat import RuntimeHeartbeatService
+from src.runtime.hedge_mode_gate import (
+    fetch_position_mode_statuses,
+    portfolio_v1_requires_hedge_mode,
+)
 from src.runtime.market_features import (
     dispatch_market_feature_event,
     resolve_market_feature_observers,
@@ -749,6 +753,7 @@ class LiveRuntimeRunner:
         self._initialize_rangebar_trust_window()
         self._set_health(RuntimePhase.WARMING_UP, healthy=True)
         await self._bootstrap_account_config_if_enabled()
+        await self._check_portfolio_v1_hedge_mode()
         await self._run_warmup()
         loaded_range_speed_history = await self._warmup_range_speed_history()
         if (
@@ -882,6 +887,69 @@ class LiveRuntimeRunner:
             },
         )
         logger.info("MF feature supervisor startup audit | result=%s", result)
+
+    async def _check_portfolio_v1_hedge_mode(self) -> None:
+        if not portfolio_v1_requires_hedge_mode(
+            self.app_config.strategy
+        ):
+            return
+
+        statuses = await fetch_position_mode_statuses(
+            exchanges=self.app_config.exchanges,
+            symbol=self.app_config.symbol,
+            account_clients=self._get_account_clients(),
+            source="startup_hard_gate",
+        )
+        audit = {
+            "strategy": "eth_portfolio_v1",
+            "symbol": self.app_config.symbol,
+            "required_mode": PositionMode.HEDGE.value,
+            "ok": all(status.hedge_mode for status in statuses),
+            "exchanges": [status.audit() for status in statuses],
+            "source": "startup_hard_gate",
+        }
+        self._set_health(
+            self._health.phase,
+            metadata={
+                **dict(self._health.metadata),
+                "portfolio_v1_hedge_mode": audit,
+            },
+        )
+
+        failed = []
+        for status in statuses:
+            if status.hedge_mode:
+                logger.info(
+                    "Portfolio V1 hedge mode validated | "
+                    "strategy=eth_portfolio_v1 exchange=%s symbol=%s "
+                    "required_mode=hedge actual_mode=%s "
+                    "source=startup_hard_gate",
+                    status.exchange.value,
+                    status.symbol,
+                    status.mode,
+                )
+                continue
+            failed.append(status)
+            logger.error(
+                "Portfolio V1 hedge mode validation failed | "
+                "strategy=eth_portfolio_v1 exchange=%s symbol=%s "
+                "required_mode=hedge actual_mode=%s "
+                "source=startup_hard_gate error=%s",
+                status.exchange.value,
+                status.symbol,
+                status.mode,
+                status.error,
+            )
+
+        if failed:
+            detail = ", ".join(
+                f"{status.exchange.value}={status.mode}"
+                for status in failed
+            )
+            raise LiveRuntimeError(
+                "portfolio v1 requires hedge mode on every target "
+                f"exchange | symbol={self.app_config.symbol} | {detail}"
+            )
 
     async def _publish_mf_readiness(
         self,

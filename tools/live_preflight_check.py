@@ -50,6 +50,10 @@ from src.platform.exchanges.models import ExchangeConfig
 from src.platform.execution.factory import create_execution_client
 from src.platform.snapshot import PlatformSnapshot, fetch_platform_snapshot
 from src.runtime import RuntimeMode, runtime_mode_from_env
+from src.runtime.hedge_mode_gate import (
+    portfolio_v1_requires_hedge_mode,
+    position_mode_status,
+)
 from src.runtime.tasks.scheduler import closed_bar_open_time_ms
 from src.strategy import load_strategy
 from src.utils.log import get_logger
@@ -167,7 +171,7 @@ async def main() -> int:
 
     # ── 3. Strategy identity check ──
     try:
-        strategy = load_strategy(app_config)
+        strategy = load_strategy(app_config.strategy)
     except Exception as exc:
         report.add("load_strategy", "fail", error=str(exc))
         report.verdict = "fail_config"
@@ -212,6 +216,15 @@ async def main() -> int:
         report.add("exchange_snapshots", "warn", detail={"skipped": True})
 
     # ── 6. Check local PositionPlan store for stale state ──
+    if not _check_portfolio_v1_hedge_mode(
+        report,
+        strategy_id=strategy_id,
+        app_config=app_config,
+        snapshots=snapshots,
+    ):
+        _maybe_write_report(args.report, report)
+        return EXIT_FAIL_CONFIG
+
     plan_store = SqlitePositionPlanStore(str(plan_db))
     journal = SqliteOrderJournalStore(str(journal_db))
 
@@ -296,6 +309,89 @@ async def _fetch_snapshots(
             report.verdict = "fail_config"
             return None
     return tuple(snapshots)
+
+
+def _check_portfolio_v1_hedge_mode(
+    report: PreflightReport,
+    *,
+    strategy_id: object,
+    app_config: AppConfig,
+    snapshots: tuple[PlatformSnapshot, ...],
+) -> bool:
+    if not (
+        portfolio_v1_requires_hedge_mode(strategy_id)
+        or portfolio_v1_requires_hedge_mode(app_config.strategy)
+    ):
+        return True
+
+    snapshots_by_exchange = {
+        snapshot.balance.exchange: snapshot for snapshot in snapshots
+    }
+    statuses = []
+    for exchange in app_config.exchanges:
+        snapshot = snapshots_by_exchange.get(exchange)
+        status = position_mode_status(
+            exchange=exchange,
+            symbol=app_config.symbol,
+            value=(
+                None if snapshot is None else snapshot.position_mode
+            ),
+            source="preflight_hard_gate",
+            error=(
+                "snapshot_missing"
+                if snapshot is None
+                else None
+            ),
+        )
+        statuses.append(status)
+        detail = status.audit()
+        if status.hedge_mode:
+            logger.info(
+                "[preflight] hedge_mode ok exchange=%s mode=%s",
+                exchange.value,
+                status.mode,
+            )
+            report.add(
+                f"portfolio_v1_hedge_mode_{exchange.value}",
+                "ok",
+                detail=detail,
+            )
+        else:
+            logger.error(
+                "[preflight] hedge_mode failed exchange=%s "
+                "required=hedge actual=%s",
+                exchange.value,
+                status.mode,
+            )
+            report.add(
+                f"portfolio_v1_hedge_mode_{exchange.value}",
+                "fail",
+                detail=detail,
+                error=(
+                    "portfolio v1 requires hedge mode; "
+                    f"actual_mode={status.mode}"
+                ),
+            )
+
+    ok = bool(statuses) and all(
+        status.hedge_mode for status in statuses
+    )
+    report.add(
+        "portfolio_v1_hedge_mode",
+        "ok" if ok else "fail",
+        detail={
+            "strategy": "eth_portfolio_v1",
+            "symbol": app_config.symbol,
+            "required_mode": "hedge",
+            "hedge_mode_ok": ok,
+            "source": "preflight_hard_gate",
+            "exchanges": [status.audit() for status in statuses],
+        },
+        error=None if ok else "hedge mode hard gate failed",
+    )
+    if not ok:
+        report.verdict = "fail_config"
+    return ok
 
 
 async def _check_stale_state(
@@ -425,7 +521,7 @@ async def _check_kline_warmup(app_config: AppConfig, report: PreflightReport) ->
         from src.market_data.warmup.gap_detector import interval_to_ms
         from src.runtime.requirements import resolve_strategy_runtime_requirements
 
-        strategy = load_strategy(app_config)
+        strategy = load_strategy(app_config.strategy)
         requirements = resolve_strategy_runtime_requirements(
             strategy, fallback_data_streams=app_config.data_streams
         )

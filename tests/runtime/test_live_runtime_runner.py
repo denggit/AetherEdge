@@ -144,6 +144,9 @@ def _stub_non_mf_startup_work(
 
     monkeypatch.setattr(runner, "_initialize_rangebar_trust_window", lambda: None)
     monkeypatch.setattr(runner, "_bootstrap_account_config_if_enabled", _noop)
+    monkeypatch.setattr(
+        runner, "_check_portfolio_v1_hedge_mode", _noop
+    )
     monkeypatch.setattr(runner, "_run_warmup", _warmup)
     monkeypatch.setattr(runner, "_warmup_range_speed_history", _warmup_range_speed)
     monkeypatch.setattr(runner, "_run_recovery", _recovery)
