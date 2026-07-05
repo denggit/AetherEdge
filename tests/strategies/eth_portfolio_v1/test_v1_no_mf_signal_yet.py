@@ -5,24 +5,22 @@ from decimal import Decimal
 from src.signals import SignalAction
 from strategies.eth_portfolio_v1.domain.models import Side, V8DecisionType, V8TradeDecision
 from strategies.eth_portfolio_v1.domain.sleeves import (
-    DisabledSleeve,
     LF_SLEEVE_ID,
     MF_RESERVED_SLEEVE_ID,
 )
+from strategies.eth_portfolio_v1.domain.mf_sleeve import MfSleeveState
 from strategies.eth_portfolio_v1.strategy import Strategy
 
 
-def test_mf_placeholder_has_no_market_event_or_signal_surface() -> None:
+def test_mf_sleeve_is_active_capable_but_disabled_by_default() -> None:
     strategy = Strategy()
     mf = strategy.mf_sleeve
 
-    assert isinstance(mf, DisabledSleeve)
+    assert isinstance(mf, MfSleeveState)
     assert mf.enabled is False
     assert mf.sleeve_id == MF_RESERVED_SLEEVE_ID
     assert mf.position_snapshots() == ()
-    assert not hasattr(mf, "on_kline")
-    assert not hasattr(mf, "on_trade")
-    assert not hasattr(mf, "signals")
+    assert strategy.config.mf.exit_variant == "time48"
 
 
 def test_lf_entry_signal_metadata_contains_v1_sleeve_scope() -> None:

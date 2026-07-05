@@ -10,7 +10,13 @@ from typing import Any, Mapping, Sequence
 
 from src.app import AppConfig, AppContext
 from src.app.alerts import AppAlert
-from src.market_data.derived import RangeBarAggregator, RangeBarBuilder
+from src.market_data.derived import (
+    FixedTimeTradeBarBuilder,
+    RangeBarAggregator,
+    RangeBarBuilder,
+    RangeFootprintBuilder,
+    TradeFootprintBuilder,
+)
 from src.market_data.events import MarketFeatureEvent
 from src.market_data.models import MarketDataSet, RangeBar, RangeBarAggregate, RangeCoverageStatus, TimeRange, WarmupRequest
 from src.market_data.range_checkpoint import (
@@ -53,7 +59,15 @@ from src.runtime.account_config import (
 )
 from src.runtime.account_sync import AccountStateSyncService, OrderStateSyncService, RequestThrottle, SyncExchangeContext
 from src.runtime.config import LiveRuntimeConfig, live_runtime_config_from_app
-from src.runtime.features import closed_kline_feature, range_aggregate_feature, range_aggregate_unavailable_feature, range_bar_closed_feature
+from src.runtime.features import (
+    closed_kline_feature,
+    fixed_time_trade_bar_feature,
+    range_aggregate_feature,
+    range_aggregate_unavailable_feature,
+    range_bar_closed_feature,
+    range_footprint_feature,
+    trade_footprint_feature,
+)
 from src.runtime.heartbeat import RuntimeHeartbeatService
 from src.runtime.market_features import (
     dispatch_market_feature_event,
@@ -203,6 +217,15 @@ class LiveRuntimeRunner:
         self._range_bar_store = self.services.get("range_bar_store")
         self._range_bar_builder = self.services.get("range_bar_builder")
         self._range_bar_aggregator = self.services.get("range_bar_aggregator")
+        self._fixed_time_trade_bar_builder = self.services.get(
+            "fixed_time_trade_bar_builder"
+        )
+        self._trade_footprint_builder = self.services.get(
+            "trade_footprint_builder"
+        )
+        self._range_footprint_builder = self.services.get(
+            "range_footprint_builder"
+        )
         self._range_checkpoint_store = self.services.get("range_checkpoint_store")
         self._range_checkpoint_writer = self.services.get("range_checkpoint_writer")
         self._range_repair_journal_store = self.services.get(
@@ -375,7 +398,7 @@ class LiveRuntimeRunner:
         self.stats.feature_events_seen += 1
         # Track closed bar open times for heartbeat diagnostics.
         hb = getattr(self, "_heartbeat_service", None)
-        if hb is not None and event.event_type.value == "closed_kline":
+        if hb is not None and event.type_value == "closed_kline":
             open_ms = event.data.get("open_time_ms") if isinstance(event.data, dict) else None
             if isinstance(open_ms, int):
                 hb.note_closed_bar(open_ms)
@@ -2622,6 +2645,7 @@ class LiveRuntimeRunner:
                 break
 
     async def _process_trade(self, trade: MarketTrade) -> None:
+        await self._dispatch_trade_derived_features(trade)
         if not self.requirements.range_bars.enabled:
             return
         builder = self._get_range_bar_builder()
@@ -2660,6 +2684,69 @@ class LiveRuntimeRunner:
                 await self.process_market_feature(range_bar_closed_feature(bar, exchange=trade.exchange))
         self._submit_range_checkpoint_if_due(trade)
         self._append_range_repair_trade(trade)
+
+    async def _dispatch_trade_derived_features(
+        self, trade: MarketTrade
+    ) -> None:
+        config_provider = getattr(
+            self.context.strategy, "trade_feature_runtime_config", None
+        )
+        if not callable(config_provider):
+            return
+        raw_config = config_provider()
+        if not isinstance(raw_config, Mapping) or not bool(
+            raw_config.get("enabled", False)
+        ):
+            return
+
+        contract_value = self._project_env.get(
+            "AETHER_MF_FEATURE_CONTRACT_VALUE", "0.01"
+        )
+        price_bucket_size = self._project_env.get(
+            "AETHER_MF_FEATURE_PRICE_BUCKET_SIZE", "1"
+        )
+        if self._fixed_time_trade_bar_builder is None:
+            self._fixed_time_trade_bar_builder = FixedTimeTradeBarBuilder(
+                contract_value=contract_value,
+                large_trade_threshold_notional=self._project_env.get(
+                    "AETHER_MF_FEATURE_LARGE_TRADE_THRESHOLD", "10000"
+                ),
+            )
+        if self._trade_footprint_builder is None:
+            self._trade_footprint_builder = TradeFootprintBuilder(
+                contract_value=contract_value,
+                price_bucket_size=price_bucket_size,
+            )
+        if self._range_footprint_builder is None:
+            self._range_footprint_builder = RangeFootprintBuilder(
+                contract_value=contract_value,
+                range_pct=str(raw_config.get("range_pct", "0.002")),
+                price_step=str(
+                    raw_config.get("range_price_step", "1")
+                ),
+            )
+
+        range_features = self._range_footprint_builder.on_trade(trade)
+        tradebars = self._fixed_time_trade_bar_builder.on_trade(trade)
+        footprints = self._trade_footprint_builder.on_trade(trade)
+        for feature in range_features:
+            await self.process_market_feature(
+                range_footprint_feature(
+                    feature, exchange=trade.exchange
+                )
+            )
+        for bar in tradebars:
+            await self.process_market_feature(
+                fixed_time_trade_bar_feature(
+                    bar, exchange=trade.exchange
+                )
+            )
+        for feature in footprints:
+            await self.process_market_feature(
+                trade_footprint_feature(
+                    feature, exchange=trade.exchange
+                )
+            )
 
     def _submit_range_checkpoint_if_due(self, trade: MarketTrade) -> bool:
         now_ms = int(time.time() * 1000)

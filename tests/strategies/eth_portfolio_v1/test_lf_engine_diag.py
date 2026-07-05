@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from strategies.eth_portfolio_v1.diagnostics.lf_engine_diag import (
+    _coerce_bool,
     build_lf_engine_diag,
     format_lf_engine_diag,
 )
@@ -176,3 +177,21 @@ def test_pretty_text_contains_all_three_engine_sections() -> None:
     assert "\n  bull:" in text
     assert "\n  bear:" in text
     assert "missing=long:no_12bar_breakout" in text
+
+
+def test_coerce_bool_string_false_is_false() -> None:
+    assert _coerce_bool("False") is False
+    assert _coerce_bool("false") is False
+    assert _coerce_bool("0") is False
+    assert _coerce_bool("no") is False
+    assert _coerce_bool("n") is False
+    assert _coerce_bool("") is False
+    assert _coerce_bool("true") is True
+    assert _coerce_bool("True") is True
+    assert _coerce_bool("1") is True
+    assert _coerce_bool("yes") is True
+    assert _coerce_bool("y") is True
+
+
+def test_coerce_bool_unknown_string_is_not_true() -> None:
+    assert _coerce_bool("not-a-bool") is None

@@ -213,5 +213,42 @@ def trade_footprint_feature(fpf, *, exchange) -> "MarketFeatureEvent":
     )
 
 
+def range_footprint_feature(feature, *, exchange) -> "MarketFeatureEvent":
+    from src.market_data.models import RangeFootprintFeature as _RFF
+
+    fp: _RFF = feature  # type: ignore[no-redef]
+    return MarketFeatureEvent(
+        event_type="range_footprint_feature",
+        symbol=fp.symbol,
+        exchange=exchange,
+        timeframe=None,
+        event_time_ms=fp.range_end_ms,
+        available_time_ms=fp.available_time_ms,
+        data={
+            "range_pct": _d(fp.range_pct),
+            "price_step": _d(fp.price_step),
+            "range_bar_id": fp.range_bar_id,
+            "range_start_ms": fp.range_start_ms,
+            "range_end_ms": fp.range_end_ms,
+            "available_time_ms": fp.available_time_ms,
+            "fp_max_bucket_abs_delta_pressure": _d(
+                fp.fp_max_bucket_abs_delta_pressure
+            ),
+            "fp_low_bucket_delta_pressure": _d(
+                fp.fp_low_bucket_delta_pressure
+            ),
+            "fp_high_bucket_delta_pressure": _d(
+                fp.fp_high_bucket_delta_pressure
+            ),
+            "fp_delta_pressure": _d(fp.fp_delta_pressure),
+            "bucket_count": fp.bucket_count,
+            "trade_count": fp.trade_count,
+            "context_available": fp.context_available,
+            "quality": fp.quality,
+            "source": fp.source,
+        },
+    )
+
+
 def _d(value: Decimal) -> str:
     return format(value.normalize(), "f")

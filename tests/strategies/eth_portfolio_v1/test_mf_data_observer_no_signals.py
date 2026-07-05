@@ -3,10 +3,15 @@ from __future__ import annotations
 from decimal import Decimal
 from pathlib import Path
 
-from src.market_data.models import FixedTimeTradeBar, TradeFootprintFeature
+from src.market_data.models import (
+    FixedTimeTradeBar,
+    RangeFootprintFeature,
+    TradeFootprintFeature,
+)
 from src.platform.exchanges.models import ExchangeName
 from src.runtime.features import (
     fixed_time_trade_bar_feature,
+    range_footprint_feature,
     trade_footprint_feature,
 )
 from strategies.eth_portfolio_v1.domain.mf_data import (
@@ -54,6 +59,25 @@ def _footprint(open_time_ms: int) -> TradeFootprintFeature:
         fp_max_bucket_abs_delta_pressure=Decimal("0.8"),
         context_available=True,
         quality="COMPLETE",
+    )
+
+
+def _range_footprint(available_time_ms: int) -> RangeFootprintFeature:
+    return RangeFootprintFeature(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct=Decimal("0.002"),
+        price_step=Decimal("1"),
+        range_bar_id=20260705000001,
+        range_start_ms=available_time_ms - 1_000,
+        range_end_ms=available_time_ms,
+        available_time_ms=available_time_ms,
+        fp_max_bucket_abs_delta_pressure=Decimal("0.8"),
+        fp_low_bucket_delta_pressure=Decimal("-0.2"),
+        fp_high_bucket_delta_pressure=Decimal("0.4"),
+        fp_delta_pressure=Decimal("0.1"),
+        bucket_count=3,
+        trade_count=5,
     )
 
 
@@ -143,3 +167,17 @@ def test_footprint_event_updates_audit_and_marks_minute_mismatch() -> None:
         audit["latest_footprint"]["fp_max_bucket_abs_delta_pressure"]
         == "0.8"
     )
+
+
+def test_range_footprint_event_reaches_observer_buffer(tmp_path: Path) -> None:
+    buffer = MfDataBuffer(
+        symbol="ETH-USDT-PERP",
+        store_path=str(tmp_path / "features.sqlite3"),
+    )
+    observer = MfFeatureObserver(buffer)
+    feature = _range_footprint(1_700_000_000_000)
+    event = range_footprint_feature(feature, exchange=ExchangeName.OKX)
+
+    assert observer.on_market_feature(event) == ()
+    assert observer.audit()["range_footprint_count"] == 1
+    assert buffer.range_footprints() == (feature,)

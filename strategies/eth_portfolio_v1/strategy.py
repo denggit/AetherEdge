@@ -24,12 +24,20 @@ from strategies.eth_portfolio_v1.diagnostics.lf_engine_diag import (
     build_lf_engine_diag,
     format_lf_engine_diag,
 )
+from strategies.eth_portfolio_v1.domain.mf_data import (
+    MfDataBuffer,
+    MfDataReadiness,
+    MfFeatureObserver,
+)
+from strategies.eth_portfolio_v1.domain.mf_signal import (
+    MfLowSweepConfig,
+)
+from strategies.eth_portfolio_v1.domain.mf_sleeve import MfSleeveState
 from strategies.eth_portfolio_v1.domain.models import BarReadyContext, Side, V8DecisionType, V8TradeDecision
 from strategies.eth_portfolio_v1.domain.position_snapshots import LfSleeveSnapshotAdapter
 from strategies.eth_portfolio_v1.domain.position_state import V8PositionState
 from strategies.eth_portfolio_v1.domain.sleeve_registry import SleeveRegistry
 from strategies.eth_portfolio_v1.domain.sleeves import (
-    DisabledSleeve,
     LF_SLEEVE_ID,
     LfSleeveState,
     MF_RESERVED_SLEEVE_ID,
@@ -39,6 +47,10 @@ from strategies.eth_portfolio_v1.engines.bull_reclaim_v2 import BullReclaimV2Eng
 from strategies.eth_portfolio_v1.engines.momentum_v3 import MomentumV3Engine
 from strategies.eth_portfolio_v1.engines.router import MomentumEntryFilterConfig, PortfolioRouter
 from strategies.eth_portfolio_v1.execution.signal_mapper import SignalMapperConfig, V8SignalMapper
+from strategies.eth_portfolio_v1.execution.mf_signal_mapper import (
+    MfSignalMapper,
+    MfSizingInput,
+)
 from strategies.eth_portfolio_v1.execution.range_exit import RangeExitConfig, evaluate_range_exit
 from strategies.eth_portfolio_v1.execution.scoped_stop_replace import (
     StopIdentifier,
@@ -80,6 +92,7 @@ class V10BConfig:
     entry_filters: MomentumEntryFilterConfig
     structural_stop: StructuralStopConfig
     global_risk_scale: Decimal
+    mf: MfLowSweepConfig
 
     @classmethod
     def from_file(cls, path: str | Path = DEFAULT_CONFIG_PATH) -> "V10BConfig":
@@ -107,6 +120,7 @@ class V10BConfig:
             entry_filters=MomentumEntryFilterConfig.from_mapping(data),
             structural_stop=StructuralStopConfig.from_mapping(data.get("structural_stop", {})),
             global_risk_scale=Decimal(str(data.get("risk", {}).get("global_risk_scale", "1.3"))),
+            mf=MfLowSweepConfig.from_mapping(data.get("mf", {})),
         )
 
 
@@ -184,8 +198,44 @@ class Strategy:
                 symbol=self.config.symbol,
             ),
         )
-        self.mf_sleeve = DisabledSleeve(MF_RESERVED_SLEEVE_ID)
+        self.mf_sleeve = MfSleeveState(
+            strategy_id=self.config.strategy_id,
+            symbol=self.config.symbol,
+            enabled=self.config.mf.enabled,
+        )
         self.sleeves = SleeveRegistry((self.lf_sleeve, self.mf_sleeve))
+        self.mf_data_buffer = MfDataBuffer(
+            symbol=self.config.symbol,
+            exchange=self.config.data_exchange,
+            decision_buffer_minutes=self.config.mf.decision_buffer_minutes,
+            decision_buffer_max_minutes=(
+                self.config.mf.decision_buffer_max_minutes
+            ),
+            large_share_quantile_window_days=(
+                self.config.mf.large_share_window_days
+            ),
+            range_pct=self.config.mf.range_pct,
+            range_price_step=self.config.mf.range_price_step,
+        )
+        self.mf_data_readiness = MfDataReadiness(
+            symbol=self.config.symbol,
+            exchange=self.config.data_exchange,
+            required_minutes=self.config.mf.decision_buffer_minutes,
+            range_pct=str(self.config.mf.range_pct),
+            price_step=str(self.config.mf.range_price_step),
+        )
+        self.mf_signal_mapper = MfSignalMapper(
+            strategy_id=self.config.strategy_id,
+            symbol=self.config.symbol,
+            config=self.config.mf,
+        )
+        self.mf_feature_observer = MfFeatureObserver(
+            self.mf_data_buffer,
+            config=self.config.mf,
+            sleeve=self.mf_sleeve,
+            signal_mapper=self.mf_signal_mapper,
+            sizing_provider=self._mf_sizing_input,
+        )
         self.router = PortfolioRouter(
             engines=(BullReclaimV2Engine(), MomentumV3Engine(), BearV3OnlyEngine()),
             entry_filter_config=self.config.entry_filters,
@@ -276,6 +326,24 @@ class Strategy:
     def runtime_requirements(self) -> Mapping[str, Any]:
         return dict(self.config.runtime_requirements)
 
+    def market_feature_observers(self) -> tuple[object, ...]:
+        """Keep LF and MF behind the normalized observer boundary."""
+
+        return (self, self.mf_feature_observer)
+
+    def trade_feature_runtime_config(self) -> Mapping[str, Any]:
+        """Describe generic trade-derived features required by the MF observer."""
+
+        return {
+            "enabled": self.config.mf.enabled,
+            "range_pct": str(self.config.mf.range_pct),
+            "range_price_step": str(self.config.mf.range_price_step),
+        }
+
+    @property
+    def last_mf_signal_audit(self) -> Mapping[str, Any]:
+        return dict(self.mf_feature_observer.last_mf_signal_audit)
+
     def position_snapshots(self) -> tuple[StrategyPositionSnapshot, ...]:
         """Expose active V1 logical positions through the generic provider."""
 
@@ -284,6 +352,25 @@ class Strategy:
     async def on_start(self, snapshot: PlatformSnapshot) -> Sequence[TradeSignal]:
         self.started = True
         self._refresh_account_equity(snapshot)
+        if self.config.mf.enabled:
+            try:
+                self.mf_data_buffer.load_initial()
+                self.mf_feature_observer.set_readiness(
+                    self.mf_data_readiness.readiness()
+                )
+            except Exception as exc:
+                logger.warning(
+                    "MF startup data remains not ready | error=%s",
+                    exc,
+                )
+                self.mf_feature_observer.set_readiness(
+                    {
+                        "mf_signal_feature_ready": False,
+                        "range_footprint_ready": False,
+                        "tradebar_ready": False,
+                        "reason": "startup_readiness_error",
+                    }
+                )
         if self.config.structural_stop.enabled:
             available = len(self._closed_strategy_bars())
             log = logger.info if available >= self.config.structural_stop.lookback_bars else logger.warning
@@ -364,6 +451,16 @@ class Strategy:
         source: str,
         event_time_ms: int | None,
     ) -> Sequence[TradeSignal]:
+        if (
+            signal.metadata
+            and signal.metadata.get("sleeve_id") == MF_RESERVED_SLEEVE_ID
+        ):
+            self._handle_mf_order_results(
+                signal=signal,
+                results=results,
+                event_time_ms=event_time_ms,
+            )
+            return []
         if signal.action in {SignalAction.PLACE_STOP_LOSS_LONG, SignalAction.PLACE_STOP_LOSS_SHORT}:
             return self._handle_stop_order_results(signal=signal, results=results, event_time_ms=event_time_ms)
         if signal.action not in {SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT, SignalAction.CLOSE_LONG, SignalAction.CLOSE_SHORT}:
@@ -401,6 +498,58 @@ class Strategy:
             elif self.position.in_pos and _is_entry_side(event.side, self.position.side) and not is_master:
                 signals.extend(self._handle_follower_entry_fill(event=event, filled_qty=filled_qty))
         return signals
+
+    def _mf_sizing_input(self) -> MfSizingInput:
+        return MfSizingInput(
+            equity=self.equity,
+            available_equity=self.exchange_available.get(
+                self.config.data_exchange
+            ),
+        )
+
+    def _handle_mf_order_results(
+        self,
+        *,
+        signal: TradeSignal,
+        results: Sequence[ExchangeOrderResult],
+        event_time_ms: int | None,
+    ) -> None:
+        master = next(
+            (
+                result
+                for result in results
+                if result.exchange.value == self.config.data_exchange
+            ),
+            None,
+        )
+        if signal.action is SignalAction.OPEN_LONG:
+            if (
+                master is not None
+                and master.ok
+                and master.status is OrderStatus.FILLED
+                and master.avg_fill_price is not None
+            ):
+                self.mf_sleeve.confirm_open(
+                    quantity=signal.quantity or Decimal("0"),
+                    average_entry_price=master.avg_fill_price,
+                    entry_time_ms=int(
+                        signal.metadata.get("entry_execution_time_ms")
+                        or event_time_ms
+                        or signal.created_time_ms
+                    ),
+                )
+            elif master is not None:
+                self.mf_sleeve.reject_open()
+            return
+        if signal.action is SignalAction.CLOSE_LONG:
+            if (
+                master is not None
+                and master.ok
+                and master.status is OrderStatus.FILLED
+            ):
+                self.mf_sleeve.confirm_close()
+            elif master is not None:
+                self.mf_sleeve.reject_close()
 
     def _entry_has_master_fill_event(self, events: Sequence[AccountEvent]) -> bool:
         return any(event.exchange.value == self.config.data_exchange for event in events)

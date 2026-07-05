@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from strategies.eth_portfolio_v1.domain.mf_live_policy import (
+    MF_LIVE_EXIT_VARIANT,
     R007_MF_EXIT_VARIANT,
     validate_mf_exit_variant,
 )
@@ -31,7 +32,11 @@ def test_mf_live_forbids_mfe_lock_exit_variants() -> None:
         PROJECT_ROOT / "src" / "runtime",
         PROJECT_ROOT / "tools" / "mf_feature_backfill_worker.py",
     )
-    forbidden_tokens = ("mfe_" + "lock", "comfort_" + "leg", "profit_" + "lock")
+    forbidden_tokens = (
+        "mfe_" + "lock",
+        "comfort_" + "leg",
+        "profit_" + "lock",
+    )
     for source in protected_sources:
         paths = source.rglob("*.py") if source.is_dir() else (source,)
         for path in paths:
@@ -41,10 +46,26 @@ def test_mf_live_forbids_mfe_lock_exit_variants() -> None:
             for token in forbidden_tokens:
                 assert token not in text, f"{path} contains forbidden MF exit token"
 
+    r008_sources = (
+        PROJECT_ROOT / "strategies" / "eth_portfolio_v1" / "domain" / "mf_data.py",
+        PROJECT_ROOT / "strategies" / "eth_portfolio_v1" / "domain" / "mf_live_policy.py",
+        PROJECT_ROOT / "strategies" / "eth_portfolio_v1" / "domain" / "mf_low_sweep.py",
+        PROJECT_ROOT / "strategies" / "eth_portfolio_v1" / "domain" / "mf_signal.py",
+        PROJECT_ROOT / "strategies" / "eth_portfolio_v1" / "domain" / "mf_sleeve.py",
+        PROJECT_ROOT / "strategies" / "eth_portfolio_v1" / "execution" / "mf_signal_mapper.py",
+    )
+    standalone_forbidden = "m" + "fe"
+    for path in r008_sources:
+        assert standalone_forbidden not in path.read_text(
+            encoding="utf-8"
+        ).lower()
+
 
 def test_mf_exit_variant_time48_only_guard() -> None:
     assert R007_MF_EXIT_VARIANT == "none"
-    assert validate_mf_exit_variant("none") == "none"
+    assert MF_LIVE_EXIT_VARIANT == "time48"
     assert validate_mf_exit_variant("time48") == "time48"
+    with pytest.raises(ValueError, match="not allowed"):
+        validate_mf_exit_variant("none")
     with pytest.raises(ValueError, match="not allowed"):
         validate_mf_exit_variant("time72")

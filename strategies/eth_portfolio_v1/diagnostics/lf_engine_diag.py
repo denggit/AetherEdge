@@ -312,6 +312,15 @@ def _coerce_int(value: Any) -> int | None:
 def _coerce_bool(value: Any) -> bool | None:
     if value is None:
         return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y"}:
+            return True
+        if normalized in {"false", "0", "no", "n", ""}:
+            return False
+        return None
     return bool(value)
 
 
