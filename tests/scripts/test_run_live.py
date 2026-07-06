@@ -34,6 +34,20 @@ class TestFatalStartupErrorClassification:
         )
         assert _is_fatal_startup_error(exc) is True
 
+    def test_missing_required_live_strategy_is_fatal(self):
+        exc = LiveRuntimeError(
+            "direct-live trading requires AETHER_REQUIRED_LIVE_STRATEGY "
+            "to be set in .env"
+        )
+        assert _is_fatal_startup_error(exc) is True
+
+    def test_required_live_strategy_mismatch_is_fatal(self):
+        exc = LiveRuntimeError(
+            "live strategy does not match required launch target | "
+            "required=eth_portfolio_v1 actual=other"
+        )
+        assert _is_fatal_startup_error(exc) is True
+
     def test_producer_unhealthy_is_not_fatal(self):
         exc = LiveRuntimeError("producer unhealthy: trades:failed:connection refused")
         assert _is_fatal_startup_error(exc) is False

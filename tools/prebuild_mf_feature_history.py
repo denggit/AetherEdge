@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import time
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -22,6 +23,10 @@ from src.market_data.trade_features.coverage import (  # noqa: E402
 )
 from src.market_data.backfill.status_store import now_ms  # noqa: E402
 from tools.mf_feature_backfill_worker import run_cycle  # noqa: E402
+
+
+_DAY_MS = 86_400_000
+_OKX_TIMEZONE = timezone(timedelta(hours=8))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -136,6 +141,12 @@ def run_prebuild(args: argparse.Namespace) -> int:
         "last_result": None,
         "last_readiness": None,
         "error": False,
+        **_progress_snapshot(
+            result={},
+            readiness={},
+            target_days=int(args.target_days),
+            elapsed_seconds=0.0,
+        ),
     }
     _write_status(status_path, status)
 
@@ -144,6 +155,17 @@ def run_prebuild(args: argparse.Namespace) -> int:
             args,
             required_minutes=required_minutes,
         )
+        status.update(
+            _progress_snapshot(
+                result={},
+                readiness=last_readiness,
+                target_days=int(args.target_days),
+                elapsed_seconds=(
+                    time.monotonic() - started_monotonic
+                ),
+            )
+        )
+        _write_status(status_path, status)
         if _is_ready(last_readiness):
             return _complete(
                 status_path=status_path,
@@ -237,11 +259,18 @@ def run_prebuild(args: argparse.Namespace) -> int:
                 required_minutes=required_minutes,
             )
             elapsed = time.monotonic() - started_monotonic
+            progress = _progress_snapshot(
+                result=last_result,
+                readiness=last_readiness,
+                target_days=int(args.target_days),
+                elapsed_seconds=elapsed,
+            )
             _print_progress(
                 cycle=cycle,
                 result=last_result,
                 readiness=last_readiness,
                 elapsed=elapsed,
+                progress=progress,
             )
             status.update(
                 {
@@ -252,6 +281,7 @@ def run_prebuild(args: argparse.Namespace) -> int:
                     "last_result": last_result,
                     "last_readiness": last_readiness,
                     "error": False,
+                    **progress,
                 }
             )
             _write_status(status_path, status)
@@ -317,6 +347,171 @@ def _required_windows(
     return requested_minutes, required_minutes
 
 
+def _format_okx_time(timestamp_ms: int | None) -> str:
+    if timestamp_ms is None:
+        return "unknown"
+    value = datetime.fromtimestamp(
+        int(timestamp_ms) / 1_000,
+        tz=UTC,
+    ).astimezone(_OKX_TIMEZONE)
+    return value.strftime("%Y-%m-%d %H:%M:%S") + "+08"
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "unknown"
+    total_seconds = max(0, int(round(seconds)))
+    days, remainder = divmod(total_seconds, 86_400)
+    hours, remainder = divmod(remainder, 3_600)
+    minutes, remaining_seconds = divmod(remainder, 60)
+    if days:
+        return f"{days}d{hours}h"
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{remaining_seconds:02d}s"
+    return f"{remaining_seconds}s"
+
+
+def _progress_snapshot(
+    *,
+    result: Mapping[str, Any],
+    readiness: Mapping[str, Any],
+    target_days: int,
+    elapsed_seconds: float,
+) -> dict[str, Any]:
+    readiness_coverage = readiness.get("coverage")
+    coverage = (
+        readiness_coverage
+        if isinstance(readiness_coverage, Mapping)
+        else {}
+    )
+    coverage_extra_value = coverage.get("extra")
+    coverage_extra = (
+        coverage_extra_value
+        if isinstance(coverage_extra_value, Mapping)
+        else {}
+    )
+    result_coverage_value = result.get("coverage_after")
+    result_coverage = (
+        result_coverage_value
+        if isinstance(result_coverage_value, Mapping)
+        else {}
+    )
+    safe_end_ms = _first_int(
+        result.get("safe_archive_end_ms"),
+        result.get("safe_end_ms"),
+        coverage_extra.get("safe_archive_end_ms"),
+        coverage_extra.get("reference_end_ms"),
+    )
+    processed_through_ms = _first_int(
+        result.get("processed_through_ms"),
+        coverage.get("latest_complete_close_time_ms"),
+        result.get("target_end_ms"),
+    )
+    target_end_ms = _first_int(
+        result.get("target_end_ms"),
+        processed_through_ms,
+    )
+    total_days = float(max(1, int(target_days)))
+    required_start_ms = (
+        None
+        if safe_end_ms is None
+        else safe_end_ms - int(total_days * _DAY_MS) + 1
+    )
+    completed_days = 0.0
+    if (
+        required_start_ms is not None
+        and processed_through_ms is not None
+    ):
+        completed_days = min(
+            total_days,
+            max(
+                0.0,
+                (
+                    processed_through_ms
+                    - required_start_ms
+                    + 1
+                )
+                / _DAY_MS,
+            ),
+        )
+    remaining_days = max(0.0, total_days - completed_days)
+    progress_pct = completed_days / total_days * 100.0
+    avg_seconds_per_day = (
+        None
+        if completed_days <= 0
+        else max(0.0, float(elapsed_seconds)) / completed_days
+    )
+    eta_seconds = (
+        None
+        if avg_seconds_per_day is None
+        else remaining_days * avg_seconds_per_day
+    )
+    cycle_elapsed = _first_float(result.get("elapsed_seconds"))
+    coverage_complete_minutes = _first_int(
+        result_coverage.get("complete_minutes"),
+        coverage.get("complete_minutes"),
+    )
+    coverage_missing_minutes = _first_int(
+        result_coverage.get("missing_minutes"),
+        coverage.get("missing_minutes"),
+    )
+    return {
+        "progress": (
+            f"{completed_days:.2f}/{total_days:.2f}d"
+        ),
+        "progress_pct": progress_pct,
+        "completed_days": completed_days,
+        "total_days": total_days,
+        "remaining_days": remaining_days,
+        "eta": _format_duration(eta_seconds),
+        "eta_seconds": eta_seconds,
+        "target_okx": _format_okx_time(target_end_ms),
+        "safe_end_okx": _format_okx_time(safe_end_ms),
+        "required_start_okx": _format_okx_time(required_start_ms),
+        "avg_seconds_per_day": avg_seconds_per_day,
+        "cycle_elapsed": cycle_elapsed,
+        "bars_written": _first_int(
+            result.get("total_bars_written"),
+            result.get("tradebars_written"),
+        ),
+        "footprints_written": _first_int(
+            result.get("total_footprints_written"),
+            result.get("fixed_footprints_written"),
+        ),
+        "range_footprints_written": _first_int(
+            result.get("range_footprints_written"),
+        ),
+        "coverage_complete_minutes": coverage_complete_minutes,
+        "coverage_missing_minutes": coverage_missing_minutes,
+        "processed_through_ms": processed_through_ms,
+        "cycle_truncated": bool(
+            result.get("cycle_truncated", False)
+        ),
+    }
+
+
+def _first_int(*values: Any) -> int | None:
+    for value in values:
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _first_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _readiness_audit(
     args: argparse.Namespace,
     *,
@@ -368,7 +563,10 @@ def _print_progress(
     result: Mapping[str, Any],
     readiness: Mapping[str, Any],
     elapsed: float,
+    progress: Mapping[str, Any],
 ) -> None:
+    cycle_elapsed = progress.get("cycle_elapsed")
+    avg_seconds_per_day = progress.get("avg_seconds_per_day")
     print(
         "[prebuild-mf] "
         f"cycle={cycle} "
@@ -380,6 +578,29 @@ def _print_progress(
         f"{readiness.get('fixed_time_footprint_ready', False)} "
         f"range_fp={readiness.get('range_footprint_ready', False)} "
         f"target={result.get('target_end_ms', 'pending')} "
+        f"target_okx={progress['target_okx']} "
+        f"safe_end_okx={progress['safe_end_okx']} "
+        f"required_start_okx={progress['required_start_okx']} "
+        f"completed_days={progress['completed_days']:.2f} "
+        f"total_days={progress['total_days']:.2f} "
+        f"progress={progress['progress']} "
+        f"progress_pct={progress['progress_pct']:.1f}% "
+        f"remaining_days={progress['remaining_days']:.2f} "
+        f"eta={progress['eta']} "
+        "cycle_elapsed="
+        f"{'unknown' if cycle_elapsed is None else f'{cycle_elapsed:.1f}s'} "
+        "avg_seconds_per_day="
+        f"{'unknown' if avg_seconds_per_day is None else f'{avg_seconds_per_day:.1f}'} "
+        f"bars_written={progress['bars_written']} "
+        f"footprints_written={progress['footprints_written']} "
+        "range_footprints_written="
+        f"{progress['range_footprints_written']} "
+        "coverage_complete_minutes="
+        f"{progress['coverage_complete_minutes']} "
+        "coverage_missing_minutes="
+        f"{progress['coverage_missing_minutes']} "
+        f"processed_through_ms={progress['processed_through_ms']} "
+        f"cycle_truncated={progress['cycle_truncated']} "
         f"elapsed={elapsed:.1f}",
         flush=True,
     )

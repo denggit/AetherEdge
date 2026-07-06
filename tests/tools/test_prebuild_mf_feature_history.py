@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import UTC, datetime
+
+import pytest
 
 from tools import prebuild_mf_feature_history as tool
 
@@ -238,12 +241,78 @@ def test_default_command_arguments() -> None:
     assert args.large_share_window_days == 90
 
 
+def test_format_okx_time_uses_utc_plus_8() -> None:
+    timestamp_ms = int(
+        datetime(
+            2026,
+            4,
+            13,
+            12,
+            40,
+            59,
+            tzinfo=UTC,
+        ).timestamp()
+        * 1_000
+    )
+
+    assert tool._format_okx_time(timestamp_ms) == (
+        "2026-04-13 20:40:59+08"
+    )
+
+
+def test_progress_snapshot_calculates_days_percentage_and_eta() -> None:
+    required_start_ms = 1_700_000_000_000
+    safe_end_ms = required_start_ms + 95 * 86_400_000 - 1
+    processed_through_ms = (
+        required_start_ms + 10 * 86_400_000 - 1
+    )
+
+    progress = tool._progress_snapshot(
+        result={
+            "target_end_ms": processed_through_ms,
+            "safe_archive_end_ms": safe_end_ms,
+            "processed_through_ms": processed_through_ms,
+            "elapsed_seconds": 476.0,
+            "total_bars_written": 4_320,
+            "total_footprints_written": 4_320,
+            "range_footprints_written": 123,
+            "coverage_after": {
+                "complete_minutes": 14_400,
+                "missing_minutes": 122_400,
+            },
+            "cycle_truncated": True,
+        },
+        readiness=_readiness(False),
+        target_days=95,
+        elapsed_seconds=400.0,
+    )
+
+    assert progress["completed_days"] == pytest.approx(10.0)
+    assert progress["progress_pct"] == pytest.approx(
+        10 / 95 * 100
+    )
+    assert progress["remaining_days"] == pytest.approx(85.0)
+    assert progress["avg_seconds_per_day"] == pytest.approx(40.0)
+    assert progress["eta_seconds"] == pytest.approx(3_400.0)
+    assert progress["eta"] != "unknown"
+    assert progress["coverage_complete_minutes"] == 14_400
+    assert progress["coverage_missing_minutes"] == 122_400
+
+
 def test_progress_summary_contains_cycle_status_and_ready(
     tmp_path,
     monkeypatch,
     capsys,
 ) -> None:
     readiness = iter((_readiness(False), _readiness(True)))
+    target_days = 120
+    required_start_ms = 1_700_000_000_000
+    safe_end_ms = (
+        required_start_ms + target_days * 86_400_000 - 1
+    )
+    processed_through_ms = (
+        required_start_ms + 12 * 86_400_000 - 1
+    )
     monkeypatch.setattr(
         tool,
         "_readiness_audit",
@@ -255,6 +324,17 @@ def test_progress_summary_contains_cycle_status_and_ready(
         lambda **kwargs: {
             "status": "ok",
             "reason": "cycle_complete",
+            "target_end_ms": processed_through_ms,
+            "safe_archive_end_ms": safe_end_ms,
+            "processed_through_ms": processed_through_ms,
+            "elapsed_seconds": 60.0,
+            "total_bars_written": 4_320,
+            "total_footprints_written": 4_320,
+            "range_footprints_written": 10,
+            "coverage_after": {
+                "complete_minutes": 17_280,
+                "missing_minutes": 155_520,
+            },
         },
     )
 
@@ -264,6 +344,21 @@ def test_progress_summary_contains_cycle_status_and_ready(
     assert "[prebuild-mf] cycle=1" in output
     assert "status=ok" in output
     assert "ready=True" in output
+    assert "target_okx=" in output
+    assert "progress=12.00/120.00d" in output
+    assert "remaining_days=108.00" in output
+    assert "eta=" in output
+    status = json.loads(
+        (tmp_path / "status.json").read_text(encoding="utf-8")
+    )
+    assert status["progress"] == "12.00/120.00d"
+    assert status["progress_pct"] == pytest.approx(10.0)
+    assert status["completed_days"] == pytest.approx(12.0)
+    assert status["remaining_days"] == pytest.approx(108.0)
+    assert status["eta_seconds"] is not None
+    assert status["target_okx"] != "unknown"
+    assert status["safe_end_okx"] != "unknown"
+    assert status["required_start_okx"] != "unknown"
 
 
 # ---------------------------------------------------------------------------

@@ -130,6 +130,27 @@ def test_realtime_large_share_samples_filter_quality_and_expire(
     assert buffer.audit()["large_share_samples"] == 1
 
 
+def test_large_share_history_before_excludes_current_signal_bar(
+    tmp_path: Path,
+) -> None:
+    buffer = MfDataBuffer(
+        symbol="ETH-USDT-PERP",
+        store_path=str(tmp_path / "features.sqlite3"),
+    )
+    previous = bar(index=0, large_share="0.10")
+    current = bar(index=1, large_share="0.90")
+    buffer.append_tradebar(previous)
+    buffer.append_tradebar(current)
+
+    assert buffer.large_trade_share_history(
+        before_open_time_ms=current.open_time_ms
+    ) == (Decimal("0.10"),)
+    assert buffer.large_trade_share_history() == (
+        Decimal("0.10"),
+        Decimal("0.90"),
+    )
+
+
 def test_lightweight_load_preserves_quantile_and_swing_audit(
     tmp_path: Path,
     monkeypatch,

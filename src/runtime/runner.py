@@ -170,6 +170,8 @@ FATAL_STARTUP_ERROR_MARKERS = (
     "runtime recovery failed",
     "strategy position mode requirement failed",
     "live preflight/smoke report gate failed",
+    "direct-live trading requires aether_required_live_strategy",
+    "live strategy does not match required launch target",
 )
 
 
