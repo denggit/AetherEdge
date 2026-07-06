@@ -400,17 +400,22 @@ class MfFeatureObserver:
         if source is not None:
             self._readiness["source"] = str(source)
         self._log_readiness_transition()
+        _READINESS_GATE_FIELDS = (
+            "mf_signal_feature_ready",
+            "range_footprint_ready",
+            "tradebar_ready",
+            "fixed_time_footprint_ready",
+            "coverage_ready",
+            "large_share_samples_ready",
+        )
+        _gates = {
+            field: bool(self._readiness.get(field, False))
+            for field in _READINESS_GATE_FIELDS
+        }
         self.last_mf_signal_audit.update(
             {
                 "enabled": self.config.enabled,
-                "data_ready": all(
-                    bool(self._readiness.get(field, False))
-                    for field in (
-                        "mf_signal_feature_ready",
-                        "range_footprint_ready",
-                        "tradebar_ready",
-                    )
-                ),
+                "data_ready": all(_gates.values()),
                 "signal_feature_ready": bool(
                     self._readiness.get(
                         "mf_signal_feature_ready", False
@@ -420,6 +425,7 @@ class MfFeatureObserver:
                     "source", "unavailable"
                 ),
                 "readiness_reason": self._readiness.get("reason"),
+                "readiness_gates": _gates,
             }
         )
 
@@ -679,15 +685,37 @@ class MfFeatureObserver:
             bool(self._readiness.get("mf_signal_feature_ready", False)),
             bool(self._readiness.get("range_footprint_ready", False)),
             bool(self._readiness.get("tradebar_ready", False)),
+            bool(self._readiness.get("fixed_time_footprint_ready", False)),
+            bool(self._readiness.get("coverage_ready", False)),
+            bool(self._readiness.get("large_share_samples_ready", False)),
         )
         if state == self._last_readiness_state:
             return
         self._last_readiness_state = state
+        missing = [
+            name
+            for name, ok in zip(
+                (
+                    "signal_feature",
+                    "range_footprint",
+                    "tradebar",
+                    "fixed_time_footprint",
+                    "coverage",
+                    "large_share_samples",
+                ),
+                state,
+            )
+            if not ok
+        ]
         logger.info(
             "MF data readiness changed | signal_feature_ready=%s "
-            "range_footprint_ready=%s tradebar_ready=%s source=%s",
+            "range_footprint_ready=%s tradebar_ready=%s "
+            "fixed_time_footprint_ready=%s coverage_ready=%s "
+            "large_share_samples_ready=%s source=%s "
+            "missing_gates=%s",
             *state,
             self._readiness.get("source", "unavailable"),
+            missing,
         )
 
     @staticmethod

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.app import AppConfig
 
@@ -69,15 +74,25 @@ def live_reports_required(
     runtime_mode: object,
     strategy: object,
     configured: bool = False,
+    is_direct_live: bool = False,
 ) -> bool:
+    """Return True when live launch reports must be validated before startup.
+
+    Reports are always required when:
+    - ``is_direct_live`` is True (AETHER_LIVE_TRADING=true + DRY_RUN=false).
+    - ``AETHER_REQUIRE_LIVE_GATE_REPORTS`` is explicitly enabled.
+    - The strategy is ``eth_portfolio_v1``.
+    """
     mode = getattr(runtime_mode, "value", runtime_mode)
-    return (
-        str(mode).strip().lower() == "live_runtime"
-        and (
-            configured
-            or strategy_identity(strategy) == "eth_portfolio_v1"
-        )
-    )
+    if str(mode).strip().lower() != "live_runtime":
+        return False
+    if is_direct_live:
+        return True
+    if configured:
+        return True
+    if strategy_identity(strategy) == "eth_portfolio_v1":
+        return True
+    return False
 
 
 def _read_report(path: Path) -> Mapping[str, Any] | None:

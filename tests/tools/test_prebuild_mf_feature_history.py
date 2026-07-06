@@ -264,3 +264,349 @@ def test_progress_summary_contains_cycle_status_and_ready(
     assert "[prebuild-mf] cycle=1" in output
     assert "status=ok" in output
     assert "ready=True" in output
+
+
+# ---------------------------------------------------------------------------
+# End-to-end tests with real SQLite store (R011)
+# ---------------------------------------------------------------------------
+
+def test_resolve_trade_feature_readiness_reads_real_sqlite_data(
+    tmp_path, monkeypatch,
+) -> None:
+    """resolve_trade_feature_readiness reads from a real SQLite store and
+    correctly reports readiness based on actual data present (or absent)."""
+    from decimal import Decimal
+    from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
+    from src.market_data.trade_features.coverage import resolve_trade_feature_readiness
+
+    db_path = tmp_path / "market.sqlite3"
+    store = SqliteTradeFeatureStore(path=db_path)
+
+    # Start with empty store — readiness must be False
+    readiness = resolve_trade_feature_readiness(
+        symbol="ETH-USDT-PERP", exchange="okx", store=store,
+        required_minutes=10, reference_end_ms=1_749_999_960_000,
+    )
+    audit = dict(readiness.audit())
+    audit["ready"] = tool._is_ready(audit)
+    assert audit["ready"] is False
+
+    # Write a small amount of data — still not enough
+    from src.market_data.models import FixedTimeTradeBar
+
+    store.upsert_tradebars_many(
+        [
+            FixedTimeTradeBar(
+                exchange="okx", symbol="ETH-USDT-PERP", timeframe="1m",
+                open_time_ms=1_749_999_900_000,
+                close_time_ms=1_749_999_959_999,
+                available_time_ms=1_749_999_959_999,
+                open=Decimal("3000"), high=Decimal("3005"),
+                low=Decimal("2995"), close=Decimal("3002"),
+                volume=Decimal("10"), buy_volume=Decimal("6"),
+                sell_volume=Decimal("4"), buy_notional=Decimal("18000"),
+                sell_notional=Decimal("12000"), delta_volume=Decimal("2"),
+                delta_notional=Decimal("6000"), abs_delta_notional=Decimal("6000"),
+                trade_count=5, large_trade_share=Decimal("0.05"),
+                quality="COMPLETE",
+            )
+        ]
+    )
+
+    readiness = resolve_trade_feature_readiness(
+        symbol="ETH-USDT-PERP", exchange="okx", store=store,
+        required_minutes=10, reference_end_ms=1_749_999_960_000,
+    )
+    audit2 = dict(readiness.audit())
+    audit2["ready"] = tool._is_ready(audit2)
+    assert audit2["ready"] is False  # still not enough
+
+
+def test_resolve_trade_feature_readiness_with_insufficient_sqlite_data(
+    tmp_path, monkeypatch,
+) -> None:
+    """resolve_trade_feature_readiness with a sparse SQLite store returns
+    ready=False when coverage is insufficient."""
+    from decimal import Decimal
+    from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
+    from src.market_data.models import FixedTimeTradeBar
+    from src.market_data.trade_features.coverage import resolve_trade_feature_readiness
+
+    db_path = tmp_path / "market.sqlite3"
+    store = SqliteTradeFeatureStore(path=db_path)
+    bucket_ms = 60_000
+    ref_end = 1_749_999_960_000
+
+    import src.market_data.trade_features.coverage as cov
+    monkeypatch.setattr(cov, "safe_okx_archive_end_ms", lambda now_ms=None: ref_end)
+
+    # Write only 10 bars, but require 100
+    bars = []
+    for i in range(10):
+        open_ms = ref_end - (10 - i - 1) * bucket_ms
+        close_ms = open_ms + bucket_ms - 1
+        bars.append(
+            FixedTimeTradeBar(
+                exchange="okx", symbol="ETH-USDT-PERP", timeframe="1m",
+                open_time_ms=open_ms, close_time_ms=close_ms,
+                available_time_ms=close_ms,
+                open=Decimal("3000"), high=Decimal("3005"),
+                low=Decimal("2995"), close=Decimal("3002"),
+                volume=Decimal("10"), buy_volume=Decimal("6"),
+                sell_volume=Decimal("4"), buy_notional=Decimal("18000"),
+                sell_notional=Decimal("12000"), delta_volume=Decimal("2"),
+                delta_notional=Decimal("6000"), abs_delta_notional=Decimal("6000"),
+                trade_count=5, large_trade_share=Decimal("0.05"),
+                quality="COMPLETE",
+            )
+        )
+    store.upsert_tradebars_many(bars)
+
+    readiness = resolve_trade_feature_readiness(
+        symbol="ETH-USDT-PERP", exchange="okx", store=store,
+        required_minutes=100, reference_end_ms=ref_end,
+    )
+    audit = dict(readiness.audit())
+    audit["ready"] = tool._is_ready(audit)
+
+    assert audit["ready"] is False
+
+
+def test_run_prebuild_exits_nonzero_when_target_days_invalid(tmp_path) -> None:
+    """run_prebuild exits non-zero when target_days <= 0."""
+    result = tool.run_prebuild(
+        tool.build_parser().parse_args(
+            [
+                "--target-days", "0",
+                "--status-path", str(tmp_path / "status.json"),
+            ]
+        )
+    )
+    assert result == 1
+
+
+def test_run_prebuild_no_download_flag_passed_to_worker(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """--no-download causes no_download=True in run_cycle kwargs."""
+    readiness = iter((_readiness(False), _readiness(True)))
+    monkeypatch.setattr(
+        tool,
+        "_readiness_audit",
+        lambda *args, **kwargs: next(readiness),
+    )
+    captured = {}
+
+    def cycle(**kwargs):
+        captured.update(kwargs)
+        return {"status": "ok", "reason": "cycle_complete"}
+
+    monkeypatch.setattr(tool, "run_cycle", cycle)
+
+    result = tool.run_prebuild(
+        _args(tmp_path, "--no-download")
+    )
+
+    assert result == 0
+    assert captured.get("no_download") is True
+
+
+def test_run_prebuild_failed_cycle_counts_as_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A cycle with status='error' counts as a failure and eventually exits
+    non-zero after max_failures."""
+    monkeypatch.setattr(
+        tool,
+        "_readiness_audit",
+        lambda *args, **kwargs: _readiness(False),
+    )
+    monkeypatch.setattr(
+        tool,
+        "run_cycle",
+        lambda **kwargs: {
+            "status": "error",
+            "reason": "run_cycle_exception",
+        },
+    )
+
+    result = tool.run_prebuild(
+        _args(tmp_path, "--max-failures", "2")
+    )
+
+    assert result != 0
+    status = json.loads(
+        (tmp_path / "status.json").read_text(encoding="utf-8")
+    )
+    assert status["ready"] is False
+    assert status["error"] is True
+
+
+def test_run_prebuild_respects_max_seconds(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """When max_seconds is reached, prebuild exits non-zero."""
+    monkeypatch.setattr(
+        tool,
+        "_readiness_audit",
+        lambda *args, **kwargs: _readiness(False),
+    )
+    # Simulate time passage
+    elapsed = [0.0]
+
+    real_monotonic = tool.time.monotonic
+
+    def fake_monotonic():
+        result = real_monotonic()
+        if elapsed[0] > 0:
+            return result + 999_999  # way past max_seconds
+        return result
+
+    monkeypatch.setattr(tool.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(
+        tool,
+        "run_cycle",
+        lambda **kwargs: elapsed.__setitem__(0, 1.0)
+        or {"status": "partial", "reason": "cycle_limit_reached"},
+    )
+
+    result = tool.run_prebuild(
+        _args(tmp_path, "--max-seconds", "30")
+    )
+
+    assert result != 0
+    status = json.loads(
+        (tmp_path / "status.json").read_text(encoding="utf-8")
+    )
+    assert status["error"] is True
+
+
+def test_run_prebuild_multiple_cycles_with_sqlite_data_verification(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Simulate 3 cycles: run_cycle writes data to real SQLite, readiness
+    flips to True after cycle 3, status JSON reflects ready state."""
+    from decimal import Decimal
+    from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
+
+    db_path = tmp_path / "market.sqlite3"
+
+    # Simple readiness callback: returns True when called after cycle >= 3
+    audit_store = {"calls": 0}
+
+    def counting_readiness(args, *, required_minutes):
+        audit_store["calls"] += 1
+        # After 3 run_cycle calls, we declare ready
+        ready = audit_store["calls"] > 3
+        return {
+            "tradebar_ready": ready,
+            "fixed_time_footprint_ready": ready,
+            "range_footprint_ready": ready,
+            "coverage_ready": ready,
+            "ready": ready,
+        }
+
+    monkeypatch.setattr(tool, "_readiness_audit", counting_readiness)
+
+    # run_cycle writes data to a real SQLite store each call
+    sqlite_writes = []
+
+    def data_writing_run_cycle(**kwargs):
+        store = SqliteTradeFeatureStore(path=str(db_path))
+        # Write a small record proving this cycle touched SQLite
+        from src.market_data.models import FixedTimeTradeBar
+
+        idx = len(sqlite_writes) + 1
+        bar = FixedTimeTradeBar(
+            exchange="okx", symbol="ETH-USDT-PERP", timeframe="1m",
+            open_time_ms=1_749_999_900_000 + idx * 60_000,
+            close_time_ms=1_749_999_900_000 + (idx + 1) * 60_000 - 1,
+            available_time_ms=1_749_999_900_000 + (idx + 1) * 60_000 - 1,
+            open=Decimal("3000"), high=Decimal("3005"),
+            low=Decimal("2995"), close=Decimal("3002"),
+            volume=Decimal("10"), buy_volume=Decimal("6"),
+            sell_volume=Decimal("4"), buy_notional=Decimal("18000"),
+            sell_notional=Decimal("12000"), delta_volume=Decimal("2"),
+            delta_notional=Decimal("6000"), abs_delta_notional=Decimal("6000"),
+            trade_count=5, large_trade_share=Decimal("0.05"),
+            quality="COMPLETE",
+        )
+        store.upsert_tradebars_many([bar])
+        sqlite_writes.append(len(sqlite_writes) + 1)
+        return {
+            "status": "partial" if len(sqlite_writes) < 3 else "ok",
+            "reason": (
+                "cycle_limit_reached"
+                if len(sqlite_writes) < 3
+                else "cycle_complete"
+            ),
+            "total_bars_written": 1,
+        }
+
+    monkeypatch.setattr(tool, "run_cycle", data_writing_run_cycle)
+
+    result = tool.run_prebuild(
+        _args(
+            tmp_path,
+            "--target-days", "1",
+            "--large-share-min-samples", "1",
+            "--large-share-window-days", "1",
+            "--max-cycles", "5",
+            "--market-db", str(db_path),
+        )
+    )
+
+    assert result == 0
+    # Verify SQLite was actually written to
+    assert len(sqlite_writes) == 3
+
+    # Verify the data is actually in the store
+    store = SqliteTradeFeatureStore(path=str(db_path))
+    with store._connect() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM tradebar_1m_features WHERE symbol=?",
+            ("ETH-USDT-PERP",),
+        ).fetchone()[0]
+    assert count == 3
+
+    status = json.loads(
+        (tmp_path / "status.json").read_text(encoding="utf-8")
+    )
+    assert status["ready"] is True
+    assert status["cycles"] == 3
+    assert status["error"] is False
+
+
+def test_run_prebuild_status_json_ready_false_on_incomplete(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Status JSON shows ready=false when max_cycles reached without readiness."""
+    monkeypatch.setattr(
+        tool,
+        "_readiness_audit",
+        lambda *args, **kwargs: _readiness(False),
+    )
+    monkeypatch.setattr(
+        tool,
+        "run_cycle",
+        lambda **kwargs: {
+            "status": "partial",
+            "reason": "cycle_limit_reached",
+        },
+    )
+
+    result = tool.run_prebuild(
+        _args(tmp_path, "--max-cycles", "1")
+    )
+
+    assert result != 0
+    status = json.loads(
+        (tmp_path / "status.json").read_text(encoding="utf-8")
+    )
+    assert status["ready"] is False
+    assert status["error"] is True

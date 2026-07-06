@@ -42,7 +42,6 @@ def _kwargs(tmp_path: Path) -> dict:
         "market_db": str(tmp_path / "market.sqlite3"),
         "raw_root": str(tmp_path / "raw"),
         "status_path": str(tmp_path / "mf_status.json"),
-        "lock_path": str(tmp_path / "mf.lock"),
         "global_lock_path": str(tmp_path / "global.lock"),
         "global_status_path": str(tmp_path / "global_status.json"),
         "mode": "live",

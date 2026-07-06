@@ -29,7 +29,6 @@ class TradeFeatureBackfillConfig:
     repository_root: Path
     market_db: str
     status_path: Path
-    lock_path: Path
     global_lock_path: Path
     global_status_path: Path
     worker_log_path: Path
@@ -172,8 +171,6 @@ class TradeFeatureBackfillSupervisor:
             self.config.market_db,
             "--status-path",
             str(self.config.status_path),
-            "--lock-path",
-            str(self.config.lock_path),
             "--global-lock-path",
             str(self.config.global_lock_path),
             "--global-status-path",

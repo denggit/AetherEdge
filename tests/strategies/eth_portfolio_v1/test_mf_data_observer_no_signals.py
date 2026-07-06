@@ -222,3 +222,126 @@ def test_stale_live_tradebar_is_blocked_before_signal_evaluation(
         "live_feature_stale"
     )
     assert observer.last_mf_signal_audit["live_fresh_ready"] is False
+
+
+# ---------------------------------------------------------------------------
+# R011: Tightened readiness gate tests
+# ---------------------------------------------------------------------------
+
+def test_observer_no_signal_when_fixed_time_footprint_not_ready(
+    tmp_path: Path,
+) -> None:
+    """MF observer must not produce signals when fixed_time_footprint_ready is
+    False, even if mf_signal_feature_ready is True."""
+    observer = MfFeatureObserver()
+
+    observer.set_readiness(
+        {
+            "mf_signal_feature_ready": True,
+            "range_footprint_ready": True,
+            "tradebar_ready": True,
+            "fixed_time_footprint_ready": False,
+            "coverage_ready": False,
+            "large_share_samples_ready": True,
+        },
+        source="test",
+    )
+
+    audit = observer.last_mf_signal_audit
+    assert audit["data_ready"] is False
+    gates = audit.get("readiness_gates", {})
+    assert gates.get("fixed_time_footprint_ready") is False
+    assert gates.get("coverage_ready") is False
+
+
+def test_observer_no_signal_when_coverage_not_ready(
+    tmp_path: Path,
+) -> None:
+    """MF observer must not produce signals when coverage_ready is False."""
+    observer = MfFeatureObserver()
+
+    observer.set_readiness(
+        {
+            "mf_signal_feature_ready": True,
+            "range_footprint_ready": True,
+            "tradebar_ready": True,
+            "fixed_time_footprint_ready": True,
+            "coverage_ready": False,
+            "large_share_samples_ready": True,
+        },
+        source="test",
+    )
+
+    audit = observer.last_mf_signal_audit
+    assert audit["data_ready"] is False
+    assert audit["readiness_gates"]["coverage_ready"] is False
+
+
+def test_observer_no_signal_when_large_share_samples_not_ready(
+    tmp_path: Path,
+) -> None:
+    """MF observer must not produce signals when large_share_samples_ready is
+    False."""
+    observer = MfFeatureObserver()
+
+    observer.set_readiness(
+        {
+            "mf_signal_feature_ready": True,
+            "range_footprint_ready": True,
+            "tradebar_ready": True,
+            "fixed_time_footprint_ready": True,
+            "coverage_ready": True,
+            "large_share_samples_ready": False,
+        },
+        source="test",
+    )
+
+    audit = observer.last_mf_signal_audit
+    assert audit["data_ready"] is False
+    assert audit["readiness_gates"]["large_share_samples_ready"] is False
+
+
+def test_observer_all_gates_true_data_is_ready(
+    tmp_path: Path,
+) -> None:
+    """When all 6 readiness gates are True, data_ready is True."""
+    observer = MfFeatureObserver()
+
+    observer.set_readiness(
+        {
+            "mf_signal_feature_ready": True,
+            "range_footprint_ready": True,
+            "tradebar_ready": True,
+            "fixed_time_footprint_ready": True,
+            "coverage_ready": True,
+            "large_share_samples_ready": True,
+        },
+        source="test",
+    )
+
+    audit = observer.last_mf_signal_audit
+    assert audit["data_ready"] is True
+    gates = audit["readiness_gates"]
+    assert all(gates.values())
+
+
+def test_observer_readiness_transition_logs_missing_fields(
+    tmp_path: Path,
+) -> None:
+    """When readiness changes, missing gates are listed in the log."""
+    observer = MfFeatureObserver()
+
+    observer.set_readiness(
+        {
+            "mf_signal_feature_ready": False,
+            "range_footprint_ready": False,
+            "tradebar_ready": True,
+            "fixed_time_footprint_ready": False,
+            "coverage_ready": False,
+            "large_share_samples_ready": False,
+        },
+        source="test",
+    )
+
+    # After setting partial readiness, data_ready must be False
+    assert observer.last_mf_signal_audit["data_ready"] is False

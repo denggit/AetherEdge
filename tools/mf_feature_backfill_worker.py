@@ -85,7 +85,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--raw-root", default="data/okx/raw/trades")
     parser.add_argument("--market-db", default="data/market_data/aether_market_data.sqlite3")
     parser.add_argument("--status-path", default="data/state/mf_feature_backfill_status.json")
-    parser.add_argument("--lock-path", default="data/state/mf_feature_backfill.lock")
     parser.add_argument("--global-lock-path",
                         default="data/state/raw_trade_backfill_global.lock")
     parser.add_argument("--global-status-path",
@@ -110,7 +109,6 @@ def run_cycle(
     market_db: str,
     raw_root: str,
     status_path: str,
-    lock_path: str,
     global_lock_path: str,
     global_status_path: str,
     mode: str,
@@ -559,7 +557,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             market_db=args.market_db,
             raw_root=args.raw_root,
             status_path=args.status_path,
-            lock_path=args.lock_path,
             global_lock_path=args.global_lock_path,
             global_status_path=args.global_status_path,
             mode=args.mode,

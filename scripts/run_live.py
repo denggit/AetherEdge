@@ -82,10 +82,18 @@ async def main() -> None:
     config = AppConfig.from_env(defaults_path=args.defaults)
     runtime_mode = runtime_mode_from_env(defaults_path=args.defaults)
     if runtime_mode is RuntimeMode.LIVE_RUNTIME:
+        is_direct_live = PROJECT_ENV_CONFIG.get_bool(
+            "AETHER_LIVE_TRADING", False
+        ) and not PROJECT_ENV_CONFIG.get_bool("AETHER_DRY_RUN", True)
         required_strategy = PROJECT_ENV_CONFIG.get(
             "AETHER_REQUIRED_LIVE_STRATEGY",
             "",
         )
+        if is_direct_live and not required_strategy:
+            raise LiveRuntimeError(
+                "direct-live trading requires AETHER_REQUIRED_LIVE_STRATEGY "
+                "to be set in .env"
+            )
         if (
             required_strategy
             and strategy_identity(config.strategy)
@@ -103,6 +111,7 @@ async def main() -> None:
                 "AETHER_REQUIRE_LIVE_GATE_REPORTS",
                 False,
             ),
+            is_direct_live=is_direct_live,
         )
         if require_reports:
             preflight_report = (

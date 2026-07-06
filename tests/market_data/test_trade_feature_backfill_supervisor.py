@@ -24,7 +24,6 @@ def _config(tmp_path: Path) -> TradeFeatureBackfillConfig:
         repository_root=tmp_path,
         market_db=str(tmp_path / "market.sqlite3"),
         status_path=tmp_path / "status.json",
-        lock_path=tmp_path / "worker.lock",
         global_lock_path=tmp_path / "global.lock",
         global_status_path=tmp_path / "global-status.json",
         worker_log_path=tmp_path / "worker.out",

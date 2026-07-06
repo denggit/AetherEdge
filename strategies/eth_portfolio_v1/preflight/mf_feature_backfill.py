@@ -205,12 +205,6 @@ class PortfolioV1MfFeatureBackfillProvider:
                     "data/state/mf_feature_backfill_status.json",
                 )
             ),
-            lock_path=Path(
-                self.project_env.get(
-                    "AETHER_MF_FEATURE_BACKFILL_LOCK_PATH",
-                    "data/state/mf_feature_backfill.lock",
-                )
-            ),
             global_lock_path=Path(
                 self.project_env.get(
                     "AETHER_RAW_TRADE_BACKFILL_GLOBAL_LOCK_PATH",

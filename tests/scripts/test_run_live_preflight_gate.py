@@ -153,3 +153,124 @@ def test_non_live_mode_does_not_require_reports() -> None:
         )
         is False
     )
+
+
+# ---------------------------------------------------------------------------
+# Direct-live gate tests (R011-live-blocker-fix2)
+# ---------------------------------------------------------------------------
+
+def test_direct_live_always_requires_reports_even_without_config_flag() -> None:
+    """live_runtime + is_direct_live=True forces reports regardless of configured."""
+    assert (
+        live_reports_required(
+            runtime_mode="live_runtime",
+            strategy="strategies.eth_lf_portfolio_v10b:Strategy",
+            configured=False,
+            is_direct_live=True,
+        )
+        is True
+    )
+
+
+def test_direct_live_requires_reports_for_any_strategy() -> None:
+    """is_direct_live=True forces reports even for non-portfolio_v1 strategies."""
+    assert (
+        live_reports_required(
+            runtime_mode="live_runtime",
+            strategy="some_other_strategy",
+            configured=False,
+            is_direct_live=True,
+        )
+        is True
+    )
+
+
+def test_dry_run_live_runtime_does_not_force_reports_unless_portfolio_v1() -> None:
+    """Non-direct-live (dry_run=True or live_trading=False) does not force reports
+    unless strategy is eth_portfolio_v1 or configured flag is set."""
+    assert (
+        live_reports_required(
+            runtime_mode="live_runtime",
+            strategy="strategies.eth_lf_portfolio_v10b:Strategy",
+            configured=False,
+            is_direct_live=False,
+        )
+        is False
+    )
+
+
+def test_eth_portfolio_v1_always_requires_reports_even_when_not_direct_live() -> None:
+    """eth_portfolio_v1 always requires reports regardless of direct-live flags."""
+    assert (
+        live_reports_required(
+            runtime_mode="live_runtime",
+            strategy="strategies.eth_portfolio_v1:Strategy",
+            configured=False,
+            is_direct_live=False,
+        )
+        is True
+    )
+
+
+def test_direct_live_reports_validate_all_fields_blocks_on_missing(
+    tmp_path,
+) -> None:
+    """When reports are required, missing preflight report blocks launch."""
+    smoke_path = tmp_path / "smoke.json"
+    smoke_path.write_text(json.dumps(_report("smoke")), encoding="utf-8")
+
+    result = validate_live_launch_reports(
+        app_config=_app(),
+        preflight_report_path=tmp_path / "missing.json",
+        smoke_report_path=smoke_path,
+        now_ms=NOW_MS,
+    )
+
+    assert result.ok is False
+    assert "preflight_report_missing_or_invalid" in result.issues
+
+
+def test_direct_live_reports_blocks_on_mutation_attempted(
+    tmp_path,
+) -> None:
+    """mutation_attempted=true must block launch."""
+    preflight = _report("preflight")
+    preflight["mutation_attempted"] = True
+
+    result = _validate(tmp_path, preflight=preflight)
+
+    assert result.ok is False
+    assert "preflight_mutation_attempted" in result.issues
+
+
+def test_direct_live_reports_blocks_on_stale(
+    tmp_path,
+) -> None:
+    """Stale report must block launch."""
+    preflight = _report("preflight")
+    preflight["generated_at_ms"] = NOW_MS - 601_000
+
+    result = _validate(tmp_path, preflight=preflight)
+
+    assert result.ok is False
+    assert "preflight_report_stale" in result.issues
+
+
+def test_direct_live_reports_blocks_on_not_ok(
+    tmp_path,
+) -> None:
+    """ok=false must block launch."""
+    preflight = _report("preflight")
+    preflight["ok"] = False
+
+    result = _validate(tmp_path, preflight=preflight)
+
+    assert result.ok is False
+    assert "preflight_report_not_ok" in result.issues
+
+
+def test_direct_live_valid_reports_pass_gate(
+    tmp_path,
+) -> None:
+    """Valid reports pass the gate."""
+    assert _validate(tmp_path).ok is True
