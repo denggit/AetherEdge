@@ -229,11 +229,11 @@ def test_default_command_arguments() -> None:
 
     assert args.symbol == "ETH-USDT-PERP"
     assert args.exchange == "okx"
-    assert args.target_days == 120
+    assert args.target_days == 95
     assert args.max_minutes_per_cycle == 4320
     assert args.max_days_per_cycle == 3
-    assert args.max_trades_per_cycle == 2_000_000
-    assert args.max_seconds_per_cycle == 600
+    assert args.max_trades_per_cycle == 20_000_000
+    assert args.max_seconds_per_cycle == 1800
     assert args.max_cycles == 200
     assert args.max_seconds == 0
     assert args.download is True
@@ -338,7 +338,7 @@ def test_progress_summary_contains_cycle_status_and_ready(
         },
     )
 
-    assert tool.run_prebuild(_args(tmp_path)) == 0
+    assert tool.run_prebuild(_args(tmp_path, "--target-days", "120")) == 0
 
     output = capsys.readouterr().out
     assert "[prebuild-mf] cycle=1" in output

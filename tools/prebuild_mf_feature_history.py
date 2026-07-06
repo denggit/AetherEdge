@@ -71,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--contract-value", default="0.01")
     parser.add_argument("--price-bucket-size", default="1")
     parser.add_argument("--large-trade-threshold", default="10000")
-    parser.add_argument("--target-days", type=int, default=120)
+    parser.add_argument("--target-days", type=int, default=95)
     parser.add_argument(
         "--large-share-min-samples",
         type=int,
@@ -91,12 +91,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-trades-per-cycle",
         type=int,
-        default=2_000_000,
+        default=20_000_000,
     )
     parser.add_argument(
         "--max-seconds-per-cycle",
         type=float,
-        default=600.0,
+        default=1800.0,
     )
     parser.add_argument("--max-cycles", type=int, default=200)
     parser.add_argument("--max-seconds", type=float, default=0.0)
