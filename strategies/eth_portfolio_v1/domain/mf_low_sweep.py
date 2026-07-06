@@ -20,6 +20,23 @@ from strategies.eth_portfolio_v1.domain.mf_sleeve import MfSleeveState
 
 
 _MINUTE_MS = 60_000
+MF_READINESS_GATE_FIELDS = (
+    "mf_signal_feature_ready",
+    "range_footprint_ready",
+    "tradebar_ready",
+    "fixed_time_footprint_ready",
+    "coverage_ready",
+    "large_share_samples_ready",
+)
+
+
+def mf_readiness_gates(
+    readiness: Mapping[str, Any],
+) -> dict[str, bool]:
+    return {
+        field: bool(readiness.get(field, False))
+        for field in MF_READINESS_GATE_FIELDS
+    }
 
 
 def evaluate_mf_low_sweep(
@@ -78,23 +95,13 @@ def evaluate_mf_low_sweep(
         }
     )
 
-    data_ready = all(
-        bool(readiness.get(field, False))
-        for field in (
-            "mf_signal_feature_ready",
-            "range_footprint_ready",
-            "tradebar_ready",
-        )
-    )
+    data_ready = all(audit["readiness_gates"].values())
     audit["data_ready"] = data_ready
-    audit["signal_feature_ready"] = bool(
-        readiness.get("mf_signal_feature_ready", False)
-    )
-    if not config.enabled:
-        _set_reason(audit, "disabled")
-        return None, audit
     if not data_ready:
         _set_reason(audit, "data_not_ready")
+        return None, audit
+    if not config.enabled:
+        _set_reason(audit, "disabled")
         return None, audit
 
     tradebar_causal = int(latest.available_time_ms) <= decision_time_ms
@@ -533,14 +540,19 @@ def _base_audit(
     sleeve: MfSleeveState,
     signal_time_ms: int,
 ) -> dict[str, Any]:
+    readiness_gates = mf_readiness_gates(readiness)
     return {
         "enabled": config.enabled,
         "data_ready": False,
-        "signal_feature_ready": bool(
-            readiness.get("mf_signal_feature_ready", False)
-        ),
+        "signal_feature_ready": readiness_gates[
+            "mf_signal_feature_ready"
+        ],
         "readiness_source": readiness.get("source", "unavailable"),
         "readiness_reason": readiness.get("reason"),
+        "readiness_gates": readiness_gates,
+        "missing_readiness_gates": [
+            field for field, ready in readiness_gates.items() if not ready
+        ],
         "entry_candidate": False,
         "entry_signal": False,
         "exit_signal": False,
@@ -584,4 +596,8 @@ def _set_reason(
     audit["reason"] = reason
 
 
-__all__ = ["evaluate_mf_low_sweep"]
+__all__ = [
+    "MF_READINESS_GATE_FIELDS",
+    "evaluate_mf_low_sweep",
+    "mf_readiness_gates",
+]

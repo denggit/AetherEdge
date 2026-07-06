@@ -373,14 +373,11 @@ def test_resolve_trade_feature_readiness_with_insufficient_sqlite_data(
 
 
 def test_run_prebuild_exits_nonzero_when_target_days_invalid(tmp_path) -> None:
-    """run_prebuild exits non-zero when target_days <= 0."""
-    result = tool.run_prebuild(
-        tool.build_parser().parse_args(
-            [
-                "--target-days", "0",
-                "--status-path", str(tmp_path / "status.json"),
-            ]
-        )
+    result = tool.main(
+        [
+            "--target-days", "0",
+            "--status-path", str(tmp_path / "status.json"),
+        ]
     )
     assert result == 1
 
@@ -484,67 +481,139 @@ def test_run_prebuild_respects_max_seconds(
     assert status["error"] is True
 
 
-def test_run_prebuild_multiple_cycles_with_sqlite_data_verification(
+def test_run_prebuild_reaches_ready_with_real_sqlite_feature_coverage(
     tmp_path,
     monkeypatch,
 ) -> None:
-    """Simulate 3 cycles: run_cycle writes data to real SQLite, readiness
-    flips to True after cycle 3, status JSON reflects ready state."""
     from decimal import Decimal
-    from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
+    import src.market_data.trade_features.coverage as coverage_module
+    from src.market_data.models import (
+        FixedTimeTradeBar,
+        RangeFootprintFeature,
+        TradeFootprintFeature,
+    )
+    from src.market_data.storage.trade_feature_store import (
+        SqliteTradeFeatureStore,
+    )
 
     db_path = tmp_path / "market.sqlite3"
+    minute_ms = 60_000
+    required_minutes = 9
+    minutes_per_cycle = required_minutes // 3
+    safe_end_ms = 1_749_999_959_999
+    window_start_ms = safe_end_ms - required_minutes * minute_ms + 1
+    cycles: list[int] = []
+    monkeypatch.setattr(
+        tool,
+        "_required_windows",
+        lambda args: (required_minutes, required_minutes),
+    )
+    monkeypatch.setattr(
+        coverage_module,
+        "safe_okx_archive_end_ms",
+        lambda now_ms=None: safe_end_ms,
+    )
 
-    # Simple readiness callback: returns True when called after cycle >= 3
-    audit_store = {"calls": 0}
-
-    def counting_readiness(args, *, required_minutes):
-        audit_store["calls"] += 1
-        # After 3 run_cycle calls, we declare ready
-        ready = audit_store["calls"] > 3
-        return {
-            "tradebar_ready": ready,
-            "fixed_time_footprint_ready": ready,
-            "range_footprint_ready": ready,
-            "coverage_ready": ready,
-            "ready": ready,
-        }
-
-    monkeypatch.setattr(tool, "_readiness_audit", counting_readiness)
-
-    # run_cycle writes data to a real SQLite store each call
-    sqlite_writes = []
-
-    def data_writing_run_cycle(**kwargs):
-        store = SqliteTradeFeatureStore(path=str(db_path))
-        # Write a small record proving this cycle touched SQLite
-        from src.market_data.models import FixedTimeTradeBar
-
-        idx = len(sqlite_writes) + 1
-        bar = FixedTimeTradeBar(
-            exchange="okx", symbol="ETH-USDT-PERP", timeframe="1m",
-            open_time_ms=1_749_999_900_000 + idx * 60_000,
-            close_time_ms=1_749_999_900_000 + (idx + 1) * 60_000 - 1,
-            available_time_ms=1_749_999_900_000 + (idx + 1) * 60_000 - 1,
-            open=Decimal("3000"), high=Decimal("3005"),
-            low=Decimal("2995"), close=Decimal("3002"),
-            volume=Decimal("10"), buy_volume=Decimal("6"),
-            sell_volume=Decimal("4"), buy_notional=Decimal("18000"),
-            sell_notional=Decimal("12000"), delta_volume=Decimal("2"),
-            delta_notional=Decimal("6000"), abs_delta_notional=Decimal("6000"),
-            trade_count=5, large_trade_share=Decimal("0.05"),
-            quality="COMPLETE",
+    def data_writing_run_cycle(**kwargs) -> dict[str, object]:
+        cycle = len(cycles)
+        segment_start_ms = (
+            window_start_ms + cycle * minutes_per_cycle * minute_ms
         )
-        store.upsert_tradebars_many([bar])
-        sqlite_writes.append(len(sqlite_writes) + 1)
+        open_times = [
+            segment_start_ms + index * minute_ms
+            for index in range(minutes_per_cycle)
+        ]
+        store = SqliteTradeFeatureStore(path=str(db_path))
+        store.upsert_tradebars_many(
+            [
+                FixedTimeTradeBar(
+                    exchange="okx",
+                    symbol="ETH-USDT-PERP",
+                    timeframe="1m",
+                    open_time_ms=open_ms,
+                    close_time_ms=open_ms + minute_ms - 1,
+                    available_time_ms=open_ms + minute_ms - 1,
+                    open=Decimal("3000"),
+                    high=Decimal("3005"),
+                    low=Decimal("2995"),
+                    close=Decimal("3002"),
+                    volume=Decimal("10"),
+                    buy_volume=Decimal("6"),
+                    sell_volume=Decimal("4"),
+                    buy_notional=Decimal("18000"),
+                    sell_notional=Decimal("12000"),
+                    delta_volume=Decimal("2"),
+                    delta_notional=Decimal("6000"),
+                    abs_delta_notional=Decimal("6000"),
+                    trade_count=5,
+                    large_trade_share=Decimal("0.05"),
+                    quality="COMPLETE",
+                )
+                for open_ms in open_times
+            ]
+        )
+        store.upsert_footprints_many(
+            [
+                TradeFootprintFeature(
+                    exchange="okx",
+                    symbol="ETH-USDT-PERP",
+                    timeframe="1m",
+                    open_time_ms=open_ms,
+                    close_time_ms=open_ms + minute_ms - 1,
+                    available_time_ms=open_ms + minute_ms - 1,
+                    delta_notional=Decimal("6000"),
+                    abs_delta_notional=Decimal("6000"),
+                    taker_buy_ratio=Decimal("0.6"),
+                    close_pos=Decimal("0.5"),
+                    range_pct=Decimal("0.002"),
+                    return_pct=Decimal("0.001"),
+                    fp_max_bucket_abs_delta_pressure=Decimal("0.8"),
+                    context_available=True,
+                    quality="COMPLETE",
+                )
+                for open_ms in open_times
+            ]
+        )
+        store.upsert_range_footprints_many(
+            [
+                RangeFootprintFeature(
+                    exchange="okx",
+                    symbol="ETH-USDT-PERP",
+                    range_pct=Decimal("0.002"),
+                    price_step=Decimal("1"),
+                    range_bar_id=cycle + 1,
+                    range_start_ms=segment_start_ms - 1_000,
+                    range_end_ms=segment_start_ms,
+                    available_time_ms=segment_start_ms,
+                    fp_max_bucket_abs_delta_pressure=Decimal("0.8"),
+                    fp_low_bucket_delta_pressure=Decimal("-0.2"),
+                    fp_high_bucket_delta_pressure=Decimal("0.4"),
+                    fp_delta_pressure=Decimal("0.1"),
+                    bucket_count=3,
+                    trade_count=5,
+                    context_available=True,
+                    quality="COMPLETE",
+                )
+            ]
+        )
+        store.mark_range_footprint_coverage(
+            symbol="ETH-USDT-PERP",
+            exchange="okx",
+            range_pct=Decimal("0.002"),
+            price_step=Decimal("1"),
+            start_ms=segment_start_ms,
+            end_ms=open_times[-1] + minute_ms - 1,
+            complete=True,
+        )
+        cycles.append(cycle + 1)
         return {
-            "status": "partial" if len(sqlite_writes) < 3 else "ok",
+            "status": "partial" if len(cycles) < 3 else "ok",
             "reason": (
                 "cycle_limit_reached"
-                if len(sqlite_writes) < 3
+                if len(cycles) < 3
                 else "cycle_complete"
             ),
-            "total_bars_written": 1,
+            "total_bars_written": len(open_times),
         }
 
     monkeypatch.setattr(tool, "run_cycle", data_writing_run_cycle)
@@ -556,22 +625,31 @@ def test_run_prebuild_multiple_cycles_with_sqlite_data_verification(
             "--large-share-min-samples", "1",
             "--large-share-window-days", "1",
             "--max-cycles", "5",
-            "--market-db", str(db_path),
         )
     )
 
     assert result == 0
-    # Verify SQLite was actually written to
-    assert len(sqlite_writes) == 3
-
-    # Verify the data is actually in the store
+    assert cycles == [1, 2, 3]
     store = SqliteTradeFeatureStore(path=str(db_path))
     with store._connect() as conn:
-        count = conn.execute(
-            "SELECT COUNT(*) FROM tradebar_1m_features WHERE symbol=?",
-            ("ETH-USDT-PERP",),
-        ).fetchone()[0]
-    assert count == 3
+        counts = {
+            table: conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE symbol=?",
+                ("ETH-USDT-PERP",),
+            ).fetchone()[0]
+            for table in (
+                "tradebar_1m_features",
+                "trade_footprint_1m_features",
+                "range_footprint_features",
+                "range_footprint_backfill_coverage",
+            )
+        }
+    assert counts == {
+        "tradebar_1m_features": required_minutes,
+        "trade_footprint_1m_features": required_minutes,
+        "range_footprint_features": 3,
+        "range_footprint_backfill_coverage": 3,
+    }
 
     status = json.loads(
         (tmp_path / "status.json").read_text(encoding="utf-8")
@@ -579,6 +657,7 @@ def test_run_prebuild_multiple_cycles_with_sqlite_data_verification(
     assert status["ready"] is True
     assert status["cycles"] == 3
     assert status["error"] is False
+    assert status["last_readiness"]["coverage_ready"] is True
 
 
 def test_run_prebuild_status_json_ready_false_on_incomplete(

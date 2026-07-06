@@ -19,6 +19,7 @@ from src.market_data.trade_features.coverage import (
 )
 from strategies.eth_portfolio_v1.domain.mf_low_sweep import (
     evaluate_mf_low_sweep,
+    mf_readiness_gates,
 )
 from strategies.eth_portfolio_v1.domain.mf_signal import (
     MF_RANGE_FOOTPRINT_EVENT_TYPE,
@@ -366,7 +367,7 @@ class MfFeatureObserver:
         self._signal_mapper = signal_mapper
         self._sizing_provider = sizing_provider
         self._readiness = dict(readiness or {})
-        self._last_readiness_state: tuple[bool, bool, bool] | None = None
+        self._last_readiness_state: tuple[bool, ...] | None = None
         self._last_tradebar_ms = 0
         self._last_footprint_ms = 0
         self._last_range_footprint_ms = 0
@@ -400,32 +401,24 @@ class MfFeatureObserver:
         if source is not None:
             self._readiness["source"] = str(source)
         self._log_readiness_transition()
-        _READINESS_GATE_FIELDS = (
-            "mf_signal_feature_ready",
-            "range_footprint_ready",
-            "tradebar_ready",
-            "fixed_time_footprint_ready",
-            "coverage_ready",
-            "large_share_samples_ready",
-        )
-        _gates = {
-            field: bool(self._readiness.get(field, False))
-            for field in _READINESS_GATE_FIELDS
-        }
+        gates = mf_readiness_gates(self._readiness)
         self.last_mf_signal_audit.update(
             {
                 "enabled": self.config.enabled,
-                "data_ready": all(_gates.values()),
-                "signal_feature_ready": bool(
-                    self._readiness.get(
-                        "mf_signal_feature_ready", False
-                    )
-                ),
+                "data_ready": all(gates.values()),
+                "signal_feature_ready": gates[
+                    "mf_signal_feature_ready"
+                ],
                 "readiness_source": self._readiness.get(
                     "source", "unavailable"
                 ),
                 "readiness_reason": self._readiness.get("reason"),
-                "readiness_gates": _gates,
+                "readiness_gates": gates,
+                "missing_readiness_gates": [
+                    field
+                    for field, ready in gates.items()
+                    if not ready
+                ],
             }
         )
 

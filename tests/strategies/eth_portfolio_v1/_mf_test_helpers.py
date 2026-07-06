@@ -16,6 +16,9 @@ READY = {
     "mf_signal_feature_ready": True,
     "range_footprint_ready": True,
     "tradebar_ready": True,
+    "fixed_time_footprint_ready": True,
+    "coverage_ready": True,
+    "large_share_samples_ready": True,
     "source": "test_readiness_fixture",
 }
 

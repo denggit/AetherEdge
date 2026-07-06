@@ -110,12 +110,7 @@ def run_prebuild(args: argparse.Namespace) -> int:
     started_at_ms = now_ms()
     started_monotonic = time.monotonic()
     status_path = Path(args.status_path)
-    requested_minutes = max(1, int(args.target_days)) * 1440
-    required_minutes = max(
-        requested_minutes,
-        max(1, int(args.large_share_min_samples)),
-        max(1, int(args.large_share_window_days)) * 1_440,
-    )
+    requested_minutes, required_minutes = _required_windows(args)
     cycles = 0
     consecutive_failures = 0
     last_result: Mapping[str, Any] | None = None
@@ -308,6 +303,18 @@ def run_prebuild(args: argparse.Namespace) -> int:
             readiness=last_readiness,
             error_detail=f"{type(exc).__name__}: {exc}",
         )
+
+
+def _required_windows(
+    args: argparse.Namespace,
+) -> tuple[int, int]:
+    requested_minutes = max(1, int(args.target_days)) * 1440
+    required_minutes = max(
+        requested_minutes,
+        max(1, int(args.large_share_min_samples)),
+        max(1, int(args.large_share_window_days)) * 1_440,
+    )
+    return requested_minutes, required_minutes
 
 
 def _readiness_audit(
