@@ -178,9 +178,11 @@ def test_mf_signal_recovery_metadata_is_saved_to_position_plan(
             "entry_tradebar_open_time_ms": 1_700_000_060_000,
             "signal_time_ms": 1_700_000_000_000,
             "time48_holding_minutes": 48,
+            "fixed_time_exit_holding_minutes": 48,
             "exit_variant": "time48",
             "quantity_scope": "mf_sleeve_quantity",
             "protective_stop_required": False,
+            "unconfirmed_master_close_policy": "manual_required",
             "audit": {"decimal_value": Decimal("0.60")},
         },
     )
@@ -210,7 +212,8 @@ def test_mf_signal_recovery_metadata_is_saved_to_position_plan(
     assert plan.metadata["sleeve_id"] == "mf"
     assert plan.metadata["entry_execution_time_ms"] == 1_700_000_060_000
     assert plan.metadata["entry_tradebar_open_time_ms"] == 1_700_000_060_000
-    assert plan.metadata["time48_holding_minutes"] == 48
+    assert plan.metadata["fixed_time_exit_holding_minutes"] == 48
+    assert plan.metadata["signal_metadata"]["time48_holding_minutes"] == 48
     assert plan.metadata["average_entry_price"] == "2000"
     assert plan.metadata["signal_metadata"]["audit"]["decimal_value"] == "0.60"
 
@@ -262,6 +265,7 @@ def test_unconfirmed_mf_close_is_persisted_as_manual_required(
             "position_id": MF_POSITION,
             "execution_purpose": "normal_close",
             "reduce_only": True,
+            "unconfirmed_master_close_policy": "manual_required",
         },
     )
     intent = OrderIntent(

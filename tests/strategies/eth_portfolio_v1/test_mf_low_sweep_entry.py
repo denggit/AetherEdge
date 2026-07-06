@@ -119,6 +119,8 @@ def test_entry_signal_has_independent_mf_scope(tmp_path) -> None:
         "entry_tradebar_open_time_ms"
     ]
     assert signal.metadata["time48_holding_minutes"] == 48
+    assert signal.metadata["fixed_time_exit_holding_minutes"] == 48
+    assert signal.metadata["unconfirmed_master_close_policy"] == "manual_required"
     assert signal.metadata["quantity_scope"] == "mf_sleeve_quantity"
     assert signal.metadata["protective_stop_required"] is False
     assert signal.metadata["sizing_input"]["position_fraction"] == "0.10"

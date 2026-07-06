@@ -28,6 +28,12 @@ class TestFatalStartupErrorClassification:
         exc = LiveRuntimeError("runtime recovery failed: ('bad',)")
         assert _is_fatal_startup_error(exc) is True
 
+    def test_live_report_gate_failure_is_fatal(self):
+        exc = LiveRuntimeError(
+            "live preflight/smoke report gate failed | issues=['preflight_report_missing_or_invalid']"
+        )
+        assert _is_fatal_startup_error(exc) is True
+
     def test_producer_unhealthy_is_not_fatal(self):
         exc = LiveRuntimeError("producer unhealthy: trades:failed:connection refused")
         assert _is_fatal_startup_error(exc) is False

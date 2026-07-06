@@ -124,9 +124,11 @@ class MfSignalMapper:
                 "entry_tradebar_open_time_ms"
             ),
             "time48_holding_minutes": self.config.holding_minutes,
+            "fixed_time_exit_holding_minutes": self.config.holding_minutes,
             "quantity_scope": "mf_sleeve_quantity",
             "stop_scope": decision.position_id,
             "protective_stop_required": False,
+            "unconfirmed_master_close_policy": "manual_required",
             "audit": _json_safe_mapping(decision.audit),
         }
         if self.target_exchanges:

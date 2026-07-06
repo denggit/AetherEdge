@@ -348,9 +348,8 @@ class MultiExchangeOrderCoordinator:
                             },
                         )
                     )
-                if (
+                if _requires_manual_on_unconfirmed_master_close(
                     signal.metadata
-                    and signal.metadata.get("sleeve_id") == "mf"
                 ):
                     metadata = {
                         **dict(existing.metadata),
@@ -969,6 +968,24 @@ def _optional_decimal(value) -> Decimal | None:
     return Decimal(str(value))
 
 
+def _requires_manual_on_unconfirmed_master_close(
+    signal_metadata: Mapping[str, Any] | None,
+) -> bool:
+    if not signal_metadata:
+        return False
+    return (
+        str(
+            signal_metadata.get(
+                "unconfirmed_master_close_policy",
+                "",
+            )
+        )
+        .strip()
+        .lower()
+        == "manual_required"
+    )
+
+
 def _position_plan_metadata(
     signal_metadata: Mapping[str, Any] | None,
     *,
@@ -986,10 +1003,11 @@ def _position_plan_metadata(
         "entry_execution_time_ms",
         "entry_tradebar_open_time_ms",
         "signal_time_ms",
-        "time48_holding_minutes",
+        "fixed_time_exit_holding_minutes",
         "exit_variant",
         "quantity_scope",
         "protective_stop_required",
+        "unconfirmed_master_close_policy",
     ):
         if key in safe_signal:
             metadata[key] = safe_signal[key]

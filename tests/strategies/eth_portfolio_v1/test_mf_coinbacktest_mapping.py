@@ -4,6 +4,7 @@ from pathlib import Path
 
 from strategies.eth_portfolio_v1.domain.mf_signal import (
     COINBACKTEST_CHILD_SOURCE,
+    COINBACKTEST_PORTFOLIO_RELATIVE_SOURCE,
     COINBACKTEST_PORTFOLIO_SOURCE,
     COINBACKTEST_RESEARCH_SOURCES,
     MF_ENTRY_REQUIRED_FIELDS,
@@ -19,20 +20,37 @@ from strategies.eth_portfolio_v1.domain.mf_signal import (
     MF_PIVOT_RIGHT,
     MF_TIME_EXIT_BARS,
     MF_VARIANT_NAME,
+    resolve_coinbacktest_source_root,
 )
 
 
 def test_coinbacktest_portfolio_source_path_is_recorded() -> None:
+    assert COINBACKTEST_PORTFOLIO_RELATIVE_SOURCE.endswith(
+        "eth_portfolio_V1_lf_v10b_low_sweep_mf_backtest.py"
+    )
     assert COINBACKTEST_PORTFOLIO_SOURCE.endswith(
         "eth_portfolio_V1_lf_v10b_low_sweep_mf_backtest.py"
     )
-    assert Path(COINBACKTEST_PORTFOLIO_SOURCE).is_file()
-    source_root = Path(COINBACKTEST_PORTFOLIO_SOURCE).parents[2]
-    assert (source_root / COINBACKTEST_CHILD_SOURCE).is_file()
-    assert all(
-        (source_root / source).is_file()
-        for source in COINBACKTEST_RESEARCH_SOURCES
-    )
+
+
+def test_coinbacktest_source_root_is_optional_and_portable(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("AETHER_COINBACKTEST_ROOT", raising=False)
+    assert resolve_coinbacktest_source_root(COINBACKTEST_PORTFOLIO_RELATIVE_SOURCE) is None
+
+    source_root = tmp_path / "CoinBacktest"
+    portfolio = source_root / COINBACKTEST_PORTFOLIO_RELATIVE_SOURCE
+    portfolio.parent.mkdir(parents=True)
+    portfolio.write_text("# provenance placeholder\n", encoding="utf-8")
+    for source in (COINBACKTEST_CHILD_SOURCE, *COINBACKTEST_RESEARCH_SOURCES):
+        path = source_root / source
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# provenance placeholder\n", encoding="utf-8")
+
+    monkeypatch.setenv("AETHER_COINBACKTEST_ROOT", str(source_root))
+    resolved = resolve_coinbacktest_source_root(COINBACKTEST_PORTFOLIO_RELATIVE_SOURCE)
+    assert resolved == source_root
+    assert (resolved / COINBACKTEST_CHILD_SOURCE).is_file()
+    assert all((resolved / source).is_file() for source in COINBACKTEST_RESEARCH_SOURCES)
 
 
 def test_only_time48_leg_is_mapped() -> None:

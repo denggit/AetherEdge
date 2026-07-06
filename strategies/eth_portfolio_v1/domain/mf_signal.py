@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
+import os
+from pathlib import Path
 from typing import Any, Mapping
 
 from strategies.eth_portfolio_v1.domain.mf_live_policy import (
@@ -10,9 +12,13 @@ from strategies.eth_portfolio_v1.domain.mf_live_policy import (
 )
 
 
-COINBACKTEST_PORTFOLIO_SOURCE = (
-    r"D:\Code_Project\CoinBacktest\backtest\portfolio"
-    r"\eth_portfolio_V1_lf_v10b_low_sweep_mf_backtest.py"
+COINBACKTEST_PORTFOLIO_RELATIVE_SOURCE = (
+    "backtest/portfolio/"
+    "eth_portfolio_V1_lf_v10b_low_sweep_mf_backtest.py"
+)
+COINBACKTEST_PORTFOLIO_SOURCE = os.getenv(
+    "AETHER_COINBACKTEST_PORTFOLIO_SOURCE",
+    COINBACKTEST_PORTFOLIO_RELATIVE_SOURCE,
 )
 COINBACKTEST_CHILD_SOURCE = (
     "backtest/mf/low_sweep/low_sweep_V1_a0_footprint_backtest.py"
@@ -235,6 +241,29 @@ class MfSignalDecision:
     audit: Mapping[str, Any] = field(default_factory=dict)
 
 
+def resolve_coinbacktest_source_root(
+    portfolio_source: str | os.PathLike[str] | None = None,
+) -> Path | None:
+    """Return the CoinBacktest root when local provenance files exist.
+
+    The default provenance path is repository-relative so AetherEdge remains
+    portable across Windows/Linux servers.  Developers who keep CoinBacktest
+    elsewhere can set ``AETHER_COINBACKTEST_PORTFOLIO_SOURCE`` to an absolute
+    path; live runtime does not depend on this optional mapping.
+    """
+
+    path = Path(portfolio_source or COINBACKTEST_PORTFOLIO_SOURCE)
+    if not path.is_absolute():
+        env_root = os.getenv("AETHER_COINBACKTEST_ROOT")
+        if not env_root:
+            return None
+        path = Path(env_root) / path
+    try:
+        return path.parents[2] if path.is_file() else None
+    except IndexError:
+        return None
+
+
 def _config_bool(value: Any, *, default: bool) -> bool:
     if value is None:
         return default
@@ -252,6 +281,7 @@ def _config_bool(value: Any, *, default: bool) -> bool:
 
 __all__ = [
     "COINBACKTEST_CHILD_SOURCE",
+    "COINBACKTEST_PORTFOLIO_RELATIVE_SOURCE",
     "COINBACKTEST_PORTFOLIO_SOURCE",
     "COINBACKTEST_RESEARCH_SOURCES",
     "MF_A0_SPIKE_THRESHOLD",
@@ -279,4 +309,5 @@ __all__ = [
     "MF_VARIANT_NAME",
     "MfLowSweepConfig",
     "MfSignalDecision",
+    "resolve_coinbacktest_source_root",
 ]

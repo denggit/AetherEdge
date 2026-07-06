@@ -169,6 +169,7 @@ FATAL_STARTUP_ERROR_MARKERS = (
     "startup reconciliation failed",
     "runtime recovery failed",
     "strategy position mode requirement failed",
+    "live preflight/smoke report gate failed",
 )
 
 
