@@ -252,6 +252,48 @@ def test_live_worker_rejects_save_raw_trades(tmp_path: Path) -> None:
         worker.run_cycle(**kwargs)
 
 
+def test_live_worker_rejects_raw_archive_download(
+    tmp_path: Path,
+) -> None:
+    kwargs = _kwargs(tmp_path)
+    kwargs["no_download"] = False
+
+    with pytest.raises(ValueError, match="requires --no-download"):
+        worker.run_cycle(**kwargs)
+
+
+def test_prebuild_worker_allows_archive_download(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs = _kwargs(tmp_path)
+    kwargs["mode"] = "prebuild"
+    kwargs["no_download"] = False
+    calls = []
+
+    class _DownloadArchive(_Archive):
+        def ensure_daily_file(self, **values):
+            calls.append(values)
+            return super().ensure_daily_file(**values)
+
+    monkeypatch.setattr(worker, "OkxHistoricalTradeArchive", _DownloadArchive)
+    monkeypatch.setattr(
+        worker,
+        "iter_okx_archive_dates_for_utc_range",
+        lambda *_: iter((date(2026, 7, 3),)),
+    )
+    monkeypatch.setattr(
+        worker,
+        "iter_trade_csv_chunks",
+        lambda *_args, **_kwargs: iter(()),
+    )
+
+    worker.run_cycle(**kwargs)
+
+    assert calls
+    assert calls[0]["allow_download"] is True
+
+
 def test_fresh_lf_lock_makes_mf_worker_wait_without_raw_read(
     tmp_path: Path,
 ) -> None:

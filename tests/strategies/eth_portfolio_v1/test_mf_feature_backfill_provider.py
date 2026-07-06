@@ -9,6 +9,7 @@ from src.market_data.trade_features.backfill_supervisor import (
 from src.platform.config import ProjectEnvConfig
 from strategies.eth_portfolio_v1.preflight.mf_feature_backfill import (
     PortfolioV1MfFeatureBackfillProvider,
+    resolve_mf_feature_backfill_enabled,
 )
 from strategies.eth_portfolio_v1.strategy import Strategy
 
@@ -62,6 +63,8 @@ def _coverage(ready: bool) -> dict[str, bool]:
         "tradebar_ready": ready,
         "fixed_time_footprint_ready": ready,
         "coverage_ready": ready,
+        "large_share_samples_ready": ready,
+        "large_share_sample_count": 129_600 if ready else 0,
     }
 
 
@@ -91,6 +94,36 @@ def test_strategy_exposes_startup_feature_backfill_provider(
     )
 
 
+def test_direct_live_defaults_feature_backfill_enabled() -> None:
+    assert resolve_mf_feature_backfill_enabled(
+        {
+            "AETHER_RUNTIME_MODE": "live_runtime",
+            "AETHER_LIVE_TRADING": "true",
+            "AETHER_DRY_RUN": "false",
+        }
+    )
+
+
+def test_non_live_defaults_feature_backfill_disabled() -> None:
+    assert not resolve_mf_feature_backfill_enabled(
+        {
+            "AETHER_RUNTIME_MODE": "legacy_app",
+            "AETHER_LIVE_TRADING": "false",
+        }
+    )
+
+
+def test_explicit_false_disables_feature_backfill() -> None:
+    assert not resolve_mf_feature_backfill_enabled(
+        {
+            "AETHER_RUNTIME_MODE": "live_runtime",
+            "AETHER_LIVE_TRADING": "true",
+            "AETHER_DRY_RUN": "false",
+            "AETHER_MF_FEATURE_BACKFILL_ENABLED": "false",
+        }
+    )
+
+
 def test_provider_builds_generic_supervisor_with_worker_config(
     tmp_path,
 ) -> None:
@@ -109,6 +142,7 @@ def test_provider_builds_generic_supervisor_with_worker_config(
         "mf_feature_backfill_worker.py"
     )
     assert config.market_db == str(tmp_path / "market.sqlite3")
+    assert config.required_minutes == 129_600
 
 
 def test_coverage_ready_emits_true_readiness(tmp_path) -> None:

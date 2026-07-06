@@ -246,6 +246,8 @@ class MfDataReadiness:
         global_lock_path: str | None = None,
         range_pct: str = "0.002",
         price_step: str = "1",
+        large_share_min_samples: int = 43_200,
+        large_share_window_days: int = 90,
     ) -> None:
         self.symbol = symbol
         self.exchange = exchange
@@ -255,6 +257,12 @@ class MfDataReadiness:
         self._global_lock_path = global_lock_path
         self._range_pct = range_pct
         self._price_step = price_step
+        self._large_share_min_samples = max(
+            1, int(large_share_min_samples)
+        )
+        self._large_share_window_days = max(
+            1, int(large_share_window_days)
+        )
         self._last: dict[str, Any] | None = None
 
     def readiness(self) -> Mapping[str, Any]:
@@ -269,9 +277,42 @@ class MfDataReadiness:
             price_step=self._price_step,
         )
         audit = dict(result.audit())
+        coverage = audit.get("coverage")
+        coverage_extra = (
+            dict(coverage.get("extra", {}))
+            if isinstance(coverage, Mapping)
+            else {}
+        )
+        large_share_sample_count = int(
+            coverage_extra.get("tradebar_complete_minutes", 0) or 0
+        )
+        large_share_samples_ready = (
+            large_share_sample_count
+            >= self._large_share_min_samples
+            and int(result.coverage.required_minutes)
+            >= min(
+                self._large_share_window_days * 1_440,
+                self._large_share_min_samples,
+            )
+            if result.coverage is not None
+            else False
+        )
+        audit["large_share_sample_count"] = large_share_sample_count
+        audit["large_share_min_samples"] = (
+            self._large_share_min_samples
+        )
+        audit["large_share_window_days"] = (
+            self._large_share_window_days
+        )
+        audit["large_share_samples_ready"] = (
+            large_share_samples_ready
+        )
         audit["mf_signal_feature_ready"] = bool(
             audit.get("tradebar_ready", False)
             and audit.get("range_footprint_ready", False)
+            and audit.get("fixed_time_footprint_ready", False)
+            and audit.get("coverage_ready", False)
+            and large_share_samples_ready
         )
         signal_ready = all(
             bool(audit.get(field, False))
@@ -279,6 +320,9 @@ class MfDataReadiness:
                 "mf_signal_feature_ready",
                 "range_footprint_ready",
                 "tradebar_ready",
+                "fixed_time_footprint_ready",
+                "coverage_ready",
+                "large_share_samples_ready",
             )
         )
         self._last = {
@@ -286,6 +330,9 @@ class MfDataReadiness:
             "mf_signal_ready": signal_ready,
             "exit_variant": "time48",
             "source": "strategy_startup_store_scan",
+            "live_freshness_required": True,
+            "live_freshness_max_age_ms": 300_000,
+            "mf_freshness_mode": "live_freshness_at_event",
         }
         return dict(self._last)
 
@@ -405,6 +452,46 @@ class MfFeatureObserver:
                 "missing_features": ["mf_buffer", "mf_sleeve"],
             }
             return ()
+        freshness_required = bool(
+            self._readiness.get("live_freshness_required", False)
+        )
+        freshness_max_age_ms = max(
+            0,
+            int(
+                self._readiness.get(
+                    "live_freshness_max_age_ms",
+                    300_000,
+                )
+            ),
+        )
+        event_available_ms = max(
+            int(bar.available_time_ms),
+            int(self._next_open_time_ms or 0),
+        )
+        event_age_ms = max(
+            0,
+            int(time.time() * 1000) - event_available_ms,
+        )
+        if freshness_required and event_age_ms > freshness_max_age_ms:
+            self.last_mf_signal_audit = {
+                "enabled": self.config.enabled,
+                "data_ready": False,
+                "signal_feature_ready": bool(
+                    self._readiness.get(
+                        "mf_signal_feature_ready", False
+                    )
+                ),
+                "blocked_reason": "live_feature_stale",
+                "reason": "live_feature_stale",
+                "live_fresh_ready": False,
+                "live_feature_age_ms": event_age_ms,
+                "live_freshness_max_age_ms": freshness_max_age_ms,
+                "signal_time_ms": event_available_ms,
+                "readiness_source": self._readiness.get(
+                    "source", "unavailable"
+                ),
+            }
+            return ()
         decision, audit = evaluate_mf_low_sweep(
             config=self.config,
             bars=self._buffer.recent_bars(),
@@ -417,6 +504,9 @@ class MfFeatureObserver:
             next_open_price=self._next_open_price,
             next_open_time_ms=self._next_open_time_ms,
         )
+        audit["live_fresh_ready"] = True
+        audit["live_feature_age_ms"] = event_age_ms
+        audit["live_freshness_max_age_ms"] = freshness_max_age_ms
         self.last_mf_signal_audit = _json_safe(audit)
         if audit.get("blocked_reason") == "invalid_causal_feature":
             signal_time_ms = int(audit.get("signal_time_ms") or 0)

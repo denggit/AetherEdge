@@ -131,8 +131,14 @@ def run_cycle(
     required_minutes: int = 4320,
 ) -> dict:
     # -------- guard --------
+    normalized_mode = str(mode).strip().lower()
+    if normalized_mode == "live" and not no_download:
+        raise ValueError(
+            "live mode requires --no-download; raw archive downloads "
+            "must run in prebuild/background mode"
+        )
     if save_raw_trades:
-        if mode == "live":
+        if normalized_mode == "live":
             raise ValueError("--save-raw-trades is forbidden in live mode")
         logger.warning("save_raw_trades=True is NOT recommended")
 
@@ -174,7 +180,10 @@ def run_cycle(
             symbol=symbol,
             exchange=exchange,
             store=store,
-            max_minutes_per_cycle=max_minutes_per_cycle,
+            max_minutes_per_cycle=min(
+                max(1, int(max_minutes_per_cycle)),
+                max(1, int(max_days_per_cycle)) * 1_440,
+            ),
             required_minutes=max(1, int(required_minutes)),
             direction=direction,
             safe_archive_end_ms=safe_archive_end,
@@ -345,6 +354,7 @@ def run_cycle(
 
                 if chunk_sleep_seconds > 0:
                     time.sleep(chunk_sleep_seconds)
+                coordinator.heartbeat()
 
             if cycle_truncated:
                 break
@@ -489,6 +499,8 @@ def run_cycle(
             ),
             "current_day_gap_unrecoverable_until_archive": current_day_gap,
             "elapsed_seconds": time.time() - cycle_start,
+            "mode": normalized_mode,
+            "no_download": bool(no_download),
         }
 
     finally:
@@ -525,11 +537,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not log_file:
         logging.getLogger().addHandler(logging.StreamHandler(sys.stderr))
 
+    if args.mode == "live" and not args.no_download:
+        logger.error("live mode requires --no-download")
+        return 1
     if args.save_raw_trades and args.mode == "live":
         logger.error("--save-raw-trades is forbidden in live mode")
         return 1
 
-    _update_status(args.status_path, running=True, mode=args.mode, symbol=args.symbol)
+    _update_status(
+        args.status_path,
+        running=True,
+        mode=args.mode,
+        symbol=args.symbol,
+        no_download=bool(args.no_download),
+    )
 
     try:
         result = run_cycle(
@@ -562,17 +583,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             range_footprint_warmup_days=args.range_footprint_warmup_days,
             required_minutes=args.required_minutes,
         )
+        result.setdefault("mode", args.mode)
+        result.setdefault("no_download", bool(args.no_download))
         _update_status(
             args.status_path,
             running=False,
             last_result=result,
             worker_heartbeat_ms=now_ms(),
+            mode=args.mode,
+            symbol=args.symbol,
+            no_download=bool(args.no_download),
         )
         logger.info("Cycle result: %s", json.dumps(result, default=str))
         return 0
     except Exception:
         logger.exception("MF feature backfill worker failed")
-        _update_status(args.status_path, running=False, error=True)
+        _update_status(
+            args.status_path,
+            running=False,
+            error=True,
+            mode=args.mode,
+            symbol=args.symbol,
+            no_download=bool(args.no_download),
+        )
         return 1
 
 

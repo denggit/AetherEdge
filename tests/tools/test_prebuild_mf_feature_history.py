@@ -187,6 +187,40 @@ def test_no_download_passes_true_to_worker(
     assert captured["no_download"] is True
 
 
+def test_effective_required_minutes_covers_large_share_window(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    readiness_calls = []
+    readiness = iter((_readiness(False), _readiness(True)))
+
+    def capture_readiness(_args, *, required_minutes):
+        readiness_calls.append(required_minutes)
+        return next(readiness)
+
+    monkeypatch.setattr(tool, "_readiness_audit", capture_readiness)
+    captured = {}
+    monkeypatch.setattr(
+        tool,
+        "run_cycle",
+        lambda **kwargs: captured.update(kwargs)
+        or {"status": "ok", "reason": "cycle_complete"},
+    )
+
+    result = tool.run_prebuild(
+        _args(tmp_path, "--target-days", "3")
+    )
+
+    assert result == 0
+    assert readiness_calls == [129_600, 129_600]
+    assert captured["required_minutes"] == 129_600
+    status = json.loads(
+        (tmp_path / "status.json").read_text(encoding="utf-8")
+    )
+    assert status["requested_minutes"] == 4_320
+    assert status["effective_required_minutes"] == 129_600
+
+
 def test_default_command_arguments() -> None:
     args = tool.build_parser().parse_args([])
 
@@ -200,6 +234,8 @@ def test_default_command_arguments() -> None:
     assert args.max_cycles == 200
     assert args.max_seconds == 0
     assert args.download is True
+    assert args.large_share_min_samples == 43_200
+    assert args.large_share_window_days == 90
 
 
 def test_progress_summary_contains_cycle_status_and_ready(

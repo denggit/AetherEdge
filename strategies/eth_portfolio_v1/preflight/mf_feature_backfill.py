@@ -41,9 +41,11 @@ class PortfolioV1MfFeatureBackfillProvider:
             if project_env is not None
             else get_project_env_config()
         )
-        self.enabled = self.project_env.get_bool(
-            "AETHER_MF_FEATURE_BACKFILL_ENABLED",
-            False,
+        self.enabled = resolve_mf_feature_backfill_enabled(
+            self.project_env.values
+        )
+        self.required_minutes = effective_mf_required_minutes(
+            self.strategy.config
         )
         self.poll_interval_seconds = max(
             10.0,
@@ -134,6 +136,15 @@ class PortfolioV1MfFeatureBackfillProvider:
             "coverage_ready": bool(
                 coverage.get("coverage_ready", False)
             ),
+            "large_share_samples_ready": bool(
+                coverage.get("large_share_samples_ready", False)
+            ),
+            "large_share_sample_count": int(
+                coverage.get("large_share_sample_count", 0) or 0
+            ),
+            "live_freshness_required": True,
+            "live_freshness_max_age_ms": 300_000,
+            "mf_freshness_mode": "live_freshness_at_event",
             "reason": result.get("reason"),
             "action": result.get("action"),
         }
@@ -143,6 +154,9 @@ class PortfolioV1MfFeatureBackfillProvider:
                 "mf_signal_feature_ready",
                 "range_footprint_ready",
                 "tradebar_ready",
+                "fixed_time_footprint_ready",
+                "coverage_ready",
+                "large_share_samples_ready",
             )
         )
         return (
@@ -215,9 +229,12 @@ class PortfolioV1MfFeatureBackfillProvider:
                     "logs/mf_feature_backfill_worker.out",
                 )
             ),
-            required_minutes=self.project_env.get_int(
-                "AETHER_MF_FEATURE_BACKFILL_REQUIRED_MINUTES",
-                config.mf.decision_buffer_minutes,
+            required_minutes=max(
+                self.required_minutes,
+                self.project_env.get_int(
+                    "AETHER_MF_FEATURE_BACKFILL_REQUIRED_MINUTES",
+                    self.required_minutes,
+                ),
             ),
             max_seconds_per_cycle=self.project_env.get_float(
                 "AETHER_MF_FEATURE_BACKFILL_MAX_SECONDS_PER_CYCLE",
@@ -268,9 +285,12 @@ class PortfolioV1MfFeatureBackfillProvider:
                 "AETHER_MARKET_DATA_DB",
                 "data/market_data/aether_market_data.sqlite3",
             ),
-            required_minutes=self.project_env.get_int(
-                "AETHER_MF_FEATURE_BACKFILL_REQUIRED_MINUTES",
-                config.mf.decision_buffer_minutes,
+            required_minutes=max(
+                self.required_minutes,
+                self.project_env.get_int(
+                    "AETHER_MF_FEATURE_BACKFILL_REQUIRED_MINUTES",
+                    self.required_minutes,
+                ),
             ),
             worker_status_path=self.project_env.get(
                 "AETHER_MF_FEATURE_BACKFILL_STATUS_PATH",
@@ -282,8 +302,45 @@ class PortfolioV1MfFeatureBackfillProvider:
             ),
             range_pct=str(config.mf.range_pct),
             price_step=str(config.mf.range_price_step),
+            large_share_min_samples=config.mf.large_share_min_samples,
+            large_share_window_days=config.mf.large_share_window_days,
         )
         return readiness.readiness
 
 
-__all__ = ["PortfolioV1MfFeatureBackfillProvider"]
+def effective_mf_required_minutes(config: object) -> int:
+    mf = getattr(config, "mf")
+    return max(
+        int(mf.decision_buffer_minutes),
+        int(mf.large_share_min_samples),
+        int(mf.large_share_window_days) * 1_440,
+    )
+
+
+def resolve_mf_feature_backfill_enabled(
+    values: Mapping[str, str],
+) -> bool:
+    raw = values.get("AETHER_MF_FEATURE_BACKFILL_ENABLED")
+    if raw not in (None, ""):
+        return str(raw).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+    return (
+        str(values.get("AETHER_RUNTIME_MODE", "")).strip().lower()
+        == "live_runtime"
+        and str(values.get("AETHER_LIVE_TRADING", "")).strip().lower()
+        in {"1", "true", "yes", "y", "on"}
+        and str(values.get("AETHER_DRY_RUN", "")).strip().lower()
+        not in {"1", "true", "yes", "y", "on"}
+    )
+
+
+__all__ = [
+    "PortfolioV1MfFeatureBackfillProvider",
+    "effective_mf_required_minutes",
+    "resolve_mf_feature_backfill_enabled",
+]

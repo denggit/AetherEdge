@@ -16,6 +16,9 @@ from src.market_data.storage import SqliteKlineStore, SqliteRangeBarStore
 from src.market_data.storage.trade_feature_store import (
     SqliteTradeFeatureStore,
 )
+from src.market_data.trade_features.coverage import (
+    safe_okx_archive_end_ms,
+)
 from src.platform import ExchangeName
 from src.platform.data.models import MarketDataSource, MarketKline
 from strategies.eth_portfolio_v1.preflight.readiness import (
@@ -33,6 +36,7 @@ def _seed_ready_stores(
     tmp_path,
     *,
     degraded_range_footprint: bool = False,
+    mf_latest_close_ms: int | None = None,
 ) -> tuple[str, str]:
     market_path = str(tmp_path / "market.sqlite3")
     checkpoint_path = str(tmp_path / "checkpoint.sqlite3")
@@ -106,7 +110,12 @@ def _seed_ready_stores(
         )
 
     feature_store = SqliteTradeFeatureStore(market_path)
-    latest_open = ((NOW_MS - 2 * MINUTE_MS) // MINUTE_MS) * MINUTE_MS
+    if mf_latest_close_ms is None:
+        latest_open = (
+            (NOW_MS - 2 * MINUTE_MS) // MINUTE_MS
+        ) * MINUTE_MS
+    else:
+        latest_open = int(mf_latest_close_ms) - MINUTE_MS + 1
     bars = []
     footprints = []
     for index in range(4):
@@ -199,6 +208,7 @@ def _inspect(
     *,
     now_ms: int = NOW_MS,
     large_share_min_samples: int = 2,
+    readiness_mode: str = "live_freshness",
 ):
     return PortfolioV1ReadinessInspector(
         symbol=SYMBOL,
@@ -208,6 +218,7 @@ def _inspect(
         range_speed_min_periods=2,
         mf_required_minutes=3,
         large_share_min_samples=large_share_min_samples,
+        readiness_mode=readiness_mode,
         now_ms=now_ms,
     ).inspect()
 
@@ -304,3 +315,64 @@ def test_degraded_range_footprint_fails(tmp_path) -> None:
     result = _inspect(market, checkpoint)
 
     assert "mf_range_footprint_degraded" in result.issues
+
+
+def test_historical_preflight_accepts_safe_archive_edge(
+    tmp_path,
+) -> None:
+    safe_end = safe_okx_archive_end_ms(NOW_MS)
+    market, checkpoint = _seed_ready_stores(
+        tmp_path,
+        mf_latest_close_ms=safe_end,
+    )
+
+    result = _inspect(
+        market,
+        checkpoint,
+        readiness_mode="historical_preflight",
+    )
+
+    assert result.mf["ok"] is True
+    assert result.mf["historical_coverage_ready"] is True
+    assert result.mf["live_fresh_ready"] is False
+    assert result.mf["mf_freshness_mode"] == "historical_preflight"
+    assert result.mf["safe_archive_end_ms"] == safe_end
+    assert "mf_tradebar_stale" not in result.issues
+
+
+def test_historical_preflight_rejects_gap_before_safe_archive_edge(
+    tmp_path,
+) -> None:
+    safe_end = safe_okx_archive_end_ms(NOW_MS)
+    market, checkpoint = _seed_ready_stores(
+        tmp_path,
+        mf_latest_close_ms=safe_end - 10 * MINUTE_MS,
+    )
+
+    result = _inspect(
+        market,
+        checkpoint,
+        readiness_mode="historical_preflight",
+    )
+
+    assert result.mf["ok"] is False
+    assert "mf_tradebar_ready_false" in result.issues
+
+
+def test_live_freshness_mode_rejects_safe_archive_staleness(
+    tmp_path,
+) -> None:
+    safe_end = safe_okx_archive_end_ms(NOW_MS)
+    market, checkpoint = _seed_ready_stores(
+        tmp_path,
+        mf_latest_close_ms=safe_end,
+    )
+
+    result = _inspect(
+        market,
+        checkpoint,
+        readiness_mode="live_freshness",
+    )
+
+    assert "mf_tradebar_stale" in result.issues
+    assert result.mf["live_fresh_ready"] is False

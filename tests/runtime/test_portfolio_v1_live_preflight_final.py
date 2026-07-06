@@ -113,7 +113,12 @@ class _Inspector:
     ) -> None:
         self.result = PortfolioV1ReadinessResult(
             lf={"ok": lf_ok},
-            mf={"ok": mf_ok},
+            mf={
+                "ok": mf_ok,
+                "mf_freshness_mode": "historical_preflight",
+                "historical_coverage_ready": mf_ok,
+                "live_fresh_ready": False,
+            },
             causal={"ok": causal_ok},
             issues=tuple(
                 issue
@@ -185,6 +190,7 @@ def _gate(
     binance_positions=(),
     okx_stops=(),
     inspector=None,
+    startup_feature_backfill_enabled=True,
 ):
     app = app or _app()
     strategy = strategy or _strategy()
@@ -247,8 +253,27 @@ def _gate(
         required_master_exchange=ExchangeName.OKX,
         required_follower_exchange=ExchangeName.BINANCE,
         call_strategy_on_start=False,
+        report_kind="preflight",
+        startup_feature_backfill_enabled=(
+            startup_feature_backfill_enabled
+        ),
     )
     return gate, plan_store
+
+
+@pytest.mark.asyncio
+async def test_explicitly_disabled_mf_backfill_fails_config(
+    tmp_path,
+) -> None:
+    gate, _ = _gate(
+        tmp_path,
+        startup_feature_backfill_enabled=False,
+    )
+
+    report = await gate.run()
+
+    assert report.exit_code == EXIT_FAIL_CONFIG
+    assert "mf_feature_backfill_must_be_enabled" in report.issues
 
 
 def _save_mf_plan(
@@ -522,6 +547,9 @@ async def test_report_has_required_sections_and_no_secrets(tmp_path) -> None:
     payload = report.to_dict()
 
     for section in (
+        "generated_at_ms",
+        "report_kind",
+        "data_exchange",
         "hedge_mode",
         "account_snapshot_summary",
         "position_plan_summary",
@@ -532,6 +560,10 @@ async def test_report_has_required_sections_and_no_secrets(tmp_path) -> None:
         "startup_gate_results",
     ):
         assert section in payload
+    assert payload["report_kind"] == "preflight"
+    assert payload["mf_data_readiness"]["mf_freshness_mode"] == (
+        "historical_preflight"
+    )
     assert "should-not-leak" not in text
     for sensitive_name in (
         "API_KEY",

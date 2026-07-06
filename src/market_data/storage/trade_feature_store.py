@@ -759,17 +759,10 @@ class SqliteTradeFeatureStore:
 
             safe_archive_end_ms = safe_okx_archive_end_ms()
         if reference_end_ms is None:
-            candidates = [
-                value
-                for value in (
-                    latest_tradebar,
-                    latest_footprint,
-                    latest_range_footprint,
-                    safe_archive_end_ms,
-                )
-                if value is not None
-            ]
-            reference_end_ms = max(candidates) if candidates else safe_archive_end_ms
+            # Historical coverage is anchored to the last complete OKX
+            # archive day. Newer live rows must not move this window into
+            # the current, intentionally incomplete archive day.
+            reference_end_ms = safe_archive_end_ms
 
         end_ms = int(reference_end_ms)
         start_ms = end_ms - (required_minutes * _ONE_MINUTE_MS) + 1
@@ -809,6 +802,14 @@ class SqliteTradeFeatureStore:
         first_missing: tuple[int, int] | None = None
         first_incomplete: tuple[int, int] | None = None
         first_degraded_footprint: tuple[int, int] | None = None
+        first_missing_tradebar: tuple[int, int] | None = None
+        first_missing_footprint: tuple[int, int] | None = None
+        last_missing: tuple[int, int] | None = None
+        last_incomplete: tuple[int, int] | None = None
+        last_degraded_footprint: tuple[int, int] | None = None
+        last_missing_tradebar: tuple[int, int] | None = None
+        last_missing_footprint: tuple[int, int] | None = None
+        contiguous: dict[str, dict[str, object]] = {}
         missing_tb_count = 0
         missing_fp_count = 0
         degraded_tb_count = 0
@@ -842,30 +843,87 @@ class SqliteTradeFeatureStore:
                 missing_fp_count += 1
             elif not fp_complete:
                 degraded_fp_count += 1
-                if first_degraded_footprint is None:
-                    first_degraded_footprint = (
-                        bucket,
-                        bucket + _ONE_MINUTE_MS - 1,
-                    )
             if tb_quality is not None and fp_info is None:
                 tradebar_without_footprint += 1
             if fp_info is not None and tb_quality is None:
                 footprint_without_tradebar += 1
 
-            if tb_quality is None or fp_info is None:
+            bucket_missing = tb_quality is None or fp_info is None
+            bucket_complete = tb_complete and fp_complete
+            bucket_incomplete = not bucket_complete
+            bucket_degraded = (
+                tb_quality is not None
+                and fp_info is not None
+                and not bucket_complete
+            )
+            footprint_degraded = fp_info is not None and not fp_complete
+            _observe_contiguous_bucket(
+                contiguous,
+                "missing",
+                active=bucket_missing,
+                bucket=bucket,
+            )
+            _observe_contiguous_bucket(
+                contiguous,
+                "incomplete",
+                active=bucket_incomplete,
+                bucket=bucket,
+            )
+            _observe_contiguous_bucket(
+                contiguous,
+                "degraded",
+                active=bucket_degraded,
+                bucket=bucket,
+            )
+            _observe_contiguous_bucket(
+                contiguous,
+                "degraded_footprint",
+                active=footprint_degraded,
+                bucket=bucket,
+            )
+            _observe_contiguous_bucket(
+                contiguous,
+                "missing_tradebar",
+                active=tb_quality is None,
+                bucket=bucket,
+            )
+            _observe_contiguous_bucket(
+                contiguous,
+                "missing_footprint",
+                active=fp_info is None,
+                bucket=bucket,
+            )
+
+            if bucket_missing:
                 missing += 1
-                if first_missing is None:
-                    first_missing = (bucket, bucket + _ONE_MINUTE_MS - 1)
-                if first_incomplete is None:
-                    first_incomplete = (bucket, bucket + _ONE_MINUTE_MS - 1)
-            elif tb_complete and fp_complete:
+            elif bucket_complete:
                 complete += 1
             else:
                 degraded += 1
-                if first_incomplete is None:
-                    first_incomplete = (bucket, bucket + _ONE_MINUTE_MS - 1)
 
             bucket += _ONE_MINUTE_MS
+
+        first_missing, last_missing = _contiguous_bounds(
+            contiguous, "missing"
+        )
+        first_incomplete, last_incomplete = _contiguous_bounds(
+            contiguous, "incomplete"
+        )
+        _, _last_degraded = _contiguous_bounds(
+            contiguous, "degraded"
+        )
+        (
+            first_degraded_footprint,
+            last_degraded_footprint,
+        ) = _contiguous_bounds(contiguous, "degraded_footprint")
+        (
+            first_missing_tradebar,
+            last_missing_tradebar,
+        ) = _contiguous_bounds(contiguous, "missing_tradebar")
+        (
+            first_missing_footprint,
+            last_missing_footprint,
+        ) = _contiguous_bounds(contiguous, "missing_footprint")
 
         fixed_time_available = missing == 0 and degraded == 0
         range_summary = self.range_footprint_coverage_summary(
@@ -929,6 +987,33 @@ class SqliteTradeFeatureStore:
                 "safe_archive_end_ms": safe_archive_end_ms,
                 "reference_end_ms": end_ms,
                 "first_incomplete_range": first_incomplete,
+                "last_incomplete_range": last_incomplete,
+                "first_missing_range_contiguous": first_missing,
+                "last_missing_range_contiguous": last_missing,
+                "first_incomplete_range_contiguous": first_incomplete,
+                "last_incomplete_range_contiguous": last_incomplete,
+                "first_degraded_range_contiguous": (
+                    _contiguous_bounds(contiguous, "degraded")[0]
+                ),
+                "last_degraded_range_contiguous": _last_degraded,
+                "first_degraded_footprint_range_contiguous": (
+                    first_degraded_footprint
+                ),
+                "last_degraded_footprint_range_contiguous": (
+                    last_degraded_footprint
+                ),
+                "first_missing_tradebar_range_contiguous": (
+                    first_missing_tradebar
+                ),
+                "last_missing_tradebar_range_contiguous": (
+                    last_missing_tradebar
+                ),
+                "first_missing_footprint_range_contiguous": (
+                    first_missing_footprint
+                ),
+                "last_missing_footprint_range_contiguous": (
+                    last_missing_footprint
+                ),
                 "first_degraded_footprint_range": first_degraded_footprint,
                 "fixed_time_coverage_ready": fixed_time_available,
                 **range_summary,
@@ -957,7 +1042,6 @@ class SqliteTradeFeatureStore:
         if row is None or row[0] is None:
             return None
         return int(row[0])
-
     # ==================================================================
     # Schema
     # ==================================================================
@@ -1137,6 +1221,64 @@ class SqliteTradeFeatureStore:
 # ==================================================================
 # Serialisation helpers
 # ==================================================================
+
+def _observe_contiguous_bucket(
+    states: dict[str, dict[str, object]],
+    name: str,
+    *,
+    active: bool,
+    bucket: int,
+) -> None:
+    state = states.setdefault(
+        name,
+        {
+            "current": None,
+            "first": None,
+            "last": None,
+        },
+    )
+    current = state["current"]
+    if active:
+        if current is None:
+            current = [bucket, bucket + _ONE_MINUTE_MS - 1]
+            state["current"] = current
+        else:
+            current[1] = bucket + _ONE_MINUTE_MS - 1
+        return
+    if current is None:
+        return
+    completed = (int(current[0]), int(current[1]))
+    if state["first"] is None:
+        state["first"] = completed
+    state["last"] = completed
+    state["current"] = None
+
+
+def _contiguous_bounds(
+    states: dict[str, dict[str, object]],
+    name: str,
+) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
+    state = states.get(name)
+    if state is None:
+        return None, None
+    current = state.get("current")
+    if current is not None:
+        completed = (int(current[0]), int(current[1]))
+        if state.get("first") is None:
+            state["first"] = completed
+        state["last"] = completed
+        state["current"] = None
+    first = state.get("first")
+    last = state.get("last")
+    return (
+        None
+        if first is None
+        else (int(first[0]), int(first[1])),
+        None
+        if last is None
+        else (int(last[0]), int(last[1])),
+    )
+
 
 def _tradebar_params(bar: FixedTimeTradeBar) -> tuple[object, ...]:
     return (

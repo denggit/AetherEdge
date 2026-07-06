@@ -46,6 +46,10 @@ from src.order_management.position_plan.models import LegSyncStatus, PositionPla
 from src.order_management.reconciliation.models import ReconciliationVerdict
 from src.platform import ExchangeName
 from src.platform.account.factory import create_account_client
+from src.platform.config import (
+    load_project_env_config,
+    set_project_env_config,
+)
 from src.platform.exchanges.models import ExchangeConfig
 from src.platform.execution.factory import create_execution_client
 from src.platform.snapshot import PlatformSnapshot, fetch_platform_snapshot
@@ -140,12 +144,18 @@ class PreflightReport:
 async def main() -> int:
     args = parse_args()
     report = PreflightReport(started_time_ms=_now_ms())
+    project_env = load_project_env_config(
+        env_file=args.env_file,
+        example_file=REPO_ROOT / ".env.example",
+        include_process_env=False,
+    )
+    set_project_env_config(project_env)
 
     # ── 1. Load config ──
     try:
         app_config = AppConfig.from_env(
             defaults_path=args.defaults,
-            env_file=args.env_file,
+            environ=project_env.values,
         )
         if args.strategy:
             strategy_path = strategy_plugin_path(args.strategy)
@@ -586,8 +596,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--report",
-        default=str(REPO_ROOT / "data" / "state" / "live_preflight_report.json"),
-        help="Output report path (default: data/state/live_preflight_report.json)",
+        default=str(
+            REPO_ROOT
+            / "data"
+            / "reports"
+            / "preflight"
+            / "portfolio_v1_preflight.json"
+        ),
+        help="Output report path",
     )
     parser.add_argument(
         "--apply-reconcile",

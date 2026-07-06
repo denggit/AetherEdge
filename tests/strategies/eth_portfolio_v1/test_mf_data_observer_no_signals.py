@@ -18,6 +18,7 @@ from strategies.eth_portfolio_v1.domain.mf_data import (
     MfDataBuffer,
     MfFeatureObserver,
 )
+from strategies.eth_portfolio_v1.domain.mf_sleeve import MfSleeveState
 
 
 def _bar(open_time_ms: int) -> FixedTimeTradeBar:
@@ -181,3 +182,43 @@ def test_range_footprint_event_reaches_observer_buffer(tmp_path: Path) -> None:
     assert observer.on_market_feature(event) == ()
     assert observer.audit()["range_footprint_count"] == 1
     assert buffer.range_footprints() == (feature,)
+
+
+def test_stale_live_tradebar_is_blocked_before_signal_evaluation(
+    tmp_path: Path,
+) -> None:
+    buffer = MfDataBuffer(
+        symbol="ETH-USDT-PERP",
+        store_path=str(tmp_path / "features.sqlite3"),
+    )
+    observer = MfFeatureObserver(
+        buffer,
+        sleeve=MfSleeveState(
+            strategy_id="eth_portfolio_v1",
+            symbol="ETH-USDT-PERP",
+        ),
+        readiness={
+            "mf_signal_feature_ready": True,
+            "range_footprint_ready": True,
+            "tradebar_ready": True,
+            "live_freshness_required": True,
+            "live_freshness_max_age_ms": 300_000,
+        },
+    )
+    stale = _bar(1_700_000_000_000)
+
+    assert (
+        observer.on_market_feature(
+            fixed_time_trade_bar_feature(
+                stale,
+                exchange=ExchangeName.OKX,
+                next_open_price=Decimal("1000"),
+                next_open_time_ms=stale.close_time_ms + 1,
+            )
+        )
+        == ()
+    )
+    assert observer.last_mf_signal_audit["blocked_reason"] == (
+        "live_feature_stale"
+    )
+    assert observer.last_mf_signal_audit["live_fresh_ready"] is False

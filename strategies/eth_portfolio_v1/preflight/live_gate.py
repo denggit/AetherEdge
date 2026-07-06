@@ -67,10 +67,15 @@ class LiveGateCheck:
 
 @dataclass
 class PortfolioV1LiveGateReport:
+    generated_at_ms: int = field(
+        default_factory=lambda: int(time.time() * 1000)
+    )
+    report_kind: str = "smoke"
     strategy: str = "eth_portfolio_v1"
     symbol: str = ""
     runtime_mode: str = ""
     exchanges: list[str] = field(default_factory=list)
+    data_exchange: str = ""
     hedge_mode: dict[str, Any] = field(default_factory=dict)
     account_snapshot_summary: dict[str, Any] = field(default_factory=dict)
     position_plan_summary: dict[str, Any] = field(default_factory=dict)
@@ -111,9 +116,12 @@ class PortfolioV1LiveGateReport:
         return _sanitize(
             {
                 "strategy": self.strategy,
+                "generated_at_ms": self.generated_at_ms,
+                "report_kind": self.report_kind,
                 "symbol": self.symbol,
                 "runtime_mode": self.runtime_mode,
                 "exchanges": list(self.exchanges),
+                "data_exchange": self.data_exchange,
                 "hedge_mode": dict(self.hedge_mode),
                 "account_snapshot_summary": dict(
                     self.account_snapshot_summary
@@ -169,6 +177,8 @@ class PortfolioV1LiveGate:
         required_master_exchange: ExchangeName,
         required_follower_exchange: ExchangeName,
         call_strategy_on_start: bool = True,
+        report_kind: str = "smoke",
+        startup_feature_backfill_enabled: bool = True,
         sensitive_values: Sequence[str] = (),
     ) -> None:
         self.app_config = app_config
@@ -193,17 +203,23 @@ class PortfolioV1LiveGate:
         self.required_master_exchange = required_master_exchange
         self.required_follower_exchange = required_follower_exchange
         self.call_strategy_on_start = call_strategy_on_start
+        self.report_kind = str(report_kind)
+        self.startup_feature_backfill_enabled = bool(
+            startup_feature_backfill_enabled
+        )
         self.sensitive_values = tuple(
             value for value in sensitive_values if value
         )
 
     async def run(self) -> PortfolioV1LiveGateReport:
         report = PortfolioV1LiveGateReport(
+            report_kind=self.report_kind,
             symbol=self.app_config.symbol,
             runtime_mode=self.runtime_config.mode.value,
             exchanges=[
                 exchange.value for exchange in self.app_config.exchanges
             ],
+            data_exchange=self.app_config.data_exchange.value,
             database_paths={
                 name: str(path)
                 for name, path in self.database_paths.items()
@@ -431,6 +447,8 @@ class PortfolioV1LiveGate:
             getattr(mf_config, "enabled", False)
         ):
             issues.append("mf_must_be_enabled")
+        elif not self.startup_feature_backfill_enabled:
+            issues.append("mf_feature_backfill_must_be_enabled")
         if str(getattr(mf_config, "exit_variant", "")) != "time48":
             issues.append("mf_exit_variant_must_be_time48")
         if self.app_config.dry_run:
@@ -480,6 +498,9 @@ class PortfolioV1LiveGate:
             ),
             "mf_enabled": bool(
                 getattr(mf_config, "enabled", False)
+            ),
+            "mf_feature_backfill_enabled": (
+                self.startup_feature_backfill_enabled
             ),
             "mf_exit_variant": getattr(
                 mf_config, "exit_variant", None

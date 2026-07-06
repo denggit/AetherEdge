@@ -193,6 +193,12 @@ def compute_backfill_target(
     """
     max_minutes = max(1, int(max_minutes_per_cycle))
     required = max(1, int(required_minutes))
+    normalized_direction = str(direction).strip().lower()
+    if normalized_direction not in {
+        "oldest-to-recent",
+        "recent-to-oldest",
+    }:
+        raise ValueError(f"unsupported backfill direction: {direction}")
     safe_end = (
         safe_okx_archive_end_ms(now_ms)
         if safe_archive_end_ms is None
@@ -206,9 +212,22 @@ def compute_backfill_target(
     )
 
     if latest_tradebar is None and latest_footprint is None:
+        required_start = safe_end - required * _ONE_MINUTE_MS + 1
+        if normalized_direction == "oldest-to-recent":
+            start_ms = required_start
+            end_ms = min(
+                safe_end,
+                start_ms + max_minutes * _ONE_MINUTE_MS - 1,
+            )
+        else:
+            end_ms = safe_end
+            start_ms = max(
+                required_start,
+                end_ms - max_minutes * _ONE_MINUTE_MS + 1,
+            )
         return TradeFeatureBackfillTarget(
-            start_ms=safe_end - max_minutes * _ONE_MINUTE_MS + 1,
-            end_ms=safe_end,
+            start_ms=start_ms,
+            end_ms=end_ms,
             reason="initial_empty_store",
         )
 
@@ -221,7 +240,7 @@ def compute_backfill_target(
         start_ms, end_ms = _bounded_window(
             missing_footprint,
             max_minutes=max_minutes,
-            direction=direction,
+            direction=normalized_direction,
         )
         return TradeFeatureBackfillTarget(
             start_ms=start_ms,
@@ -238,7 +257,7 @@ def compute_backfill_target(
         start_ms, end_ms = _bounded_window(
             degraded_footprint,
             max_minutes=max_minutes,
-            direction=direction,
+            direction=normalized_direction,
         )
         return TradeFeatureBackfillTarget(
             start_ms=start_ms,
@@ -277,7 +296,18 @@ def compute_backfill_target(
         return None
 
     extra = dict(coverage.extra or {})
-    incomplete = extra.get("first_incomplete_range")
+    incomplete_key = (
+        "first_incomplete_range_contiguous"
+        if normalized_direction == "oldest-to-recent"
+        else "last_incomplete_range_contiguous"
+    )
+    incomplete = extra.get(incomplete_key)
+    if incomplete is None:
+        incomplete = extra.get(
+            "first_incomplete_range"
+            if normalized_direction == "oldest-to-recent"
+            else "last_incomplete_range"
+        )
     if incomplete is None:
         incomplete = coverage.first_missing_range
     if incomplete is None:
@@ -290,21 +320,21 @@ def compute_backfill_target(
         start_ms, end_ms = _bounded_window(
             (range_start, safe_end),
             max_minutes=max_minutes,
-            direction=direction,
+            direction=normalized_direction,
         )
         return TradeFeatureBackfillTarget(
             start_ms=start_ms,
             end_ms=end_ms,
             reason=range_reason,
         )
-    start_ms, end_ms = (int(incomplete[0]), int(incomplete[1]))
+    start_ms, end_ms = _bounded_window(
+        (int(incomplete[0]), int(incomplete[1])),
+        max_minutes=max_minutes,
+        direction=normalized_direction,
+    )
     return TradeFeatureBackfillTarget(
         start_ms=start_ms,
-        end_ms=min(
-            safe_end,
-            end_ms,
-            start_ms + max_minutes * _ONE_MINUTE_MS - 1,
-        ),
+        end_ms=min(safe_end, end_ms),
         reason="gap_from_coverage_scan",
     )
 

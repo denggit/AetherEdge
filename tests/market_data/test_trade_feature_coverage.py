@@ -116,6 +116,56 @@ def _write_range_ready(
     )
 
 
+def _write_target_ready(
+    store: SqliteTradeFeatureStore,
+    *,
+    start_ms: int,
+    end_ms: int,
+    range_bar_id: int,
+) -> None:
+    open_times = range(
+        (start_ms // _MINUTE) * _MINUTE,
+        (end_ms // _MINUTE) * _MINUTE + 1,
+        _MINUTE,
+    )
+    values = tuple(open_times)
+    store.upsert_tradebars_many(
+        [_make_bar(open_ms) for open_ms in values]
+    )
+    store.upsert_footprints_many(
+        [_make_fp(open_ms) for open_ms in values]
+    )
+    store.upsert_range_footprints_many(
+        [
+            RangeFootprintFeature(
+                exchange="okx",
+                symbol="ETH-USDT-PERP",
+                range_pct=Decimal("0.002"),
+                price_step=Decimal("1"),
+                range_bar_id=range_bar_id,
+                range_start_ms=start_ms - 1_000,
+                range_end_ms=start_ms,
+                available_time_ms=start_ms,
+                fp_max_bucket_abs_delta_pressure=Decimal("0.8"),
+                fp_low_bucket_delta_pressure=Decimal("-0.2"),
+                fp_high_bucket_delta_pressure=Decimal("0.8"),
+                fp_delta_pressure=Decimal("0.1"),
+                bucket_count=3,
+                trade_count=9,
+            )
+        ]
+    )
+    store.mark_range_footprint_coverage(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        range_pct="0.002",
+        price_step="1",
+        start_ms=start_ms,
+        end_ms=end_ms,
+        complete=True,
+    )
+
+
 def test_mf_feature_coverage_scan_no_data(tmp_path: Path) -> None:
     store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
     coverage = trade_feature_coverage_scan(
@@ -232,6 +282,27 @@ def test_compute_backfill_target_initial_empty_store(tmp_path: Path) -> None:
     assert target.reason == "initial_empty_store"
     assert target.end_ms == safe_end
     assert target.start_ms == safe_end - 5 * _MINUTE + 1
+
+
+def test_empty_store_oldest_direction_starts_required_window(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
+    safe_end = _base(172_799) + _MINUTE - 1
+
+    target = compute_backfill_target(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        store=store,
+        required_minutes=172_800,
+        max_minutes_per_cycle=4_320,
+        direction="oldest-to-recent",
+        safe_archive_end_ms=safe_end,
+    )
+
+    assert target is not None
+    assert target.start_ms == _base(0)
+    assert target.end_ms == _base(4_319) + _MINUTE - 1
 
 
 def test_compute_backfill_target_returns_none_when_complete(tmp_path: Path) -> None:
@@ -466,6 +537,161 @@ def test_compute_backfill_target_gap_after_latest(tmp_path: Path) -> None:
     assert target.reason == "gap_after_latest"
     assert target.start_ms == _base(2)
     assert target.end_ms == _base(3) + _MINUTE - 1
+
+
+def test_recent_only_store_targets_older_gap_in_full_batch(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
+    required = 172_800
+    recent = 4_320
+    safe_end = _base(required - 1) + _MINUTE - 1
+    for start in range(required - recent, required, 720):
+        rows = range(start, min(required, start + 720))
+        store.upsert_tradebars_many(
+            [_make_bar(_base(index)) for index in rows]
+        )
+        store.upsert_footprints_many(
+            [_make_fp(_base(index)) for index in rows]
+        )
+
+    target = compute_backfill_target(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        store=store,
+        required_minutes=required,
+        max_minutes_per_cycle=4_320,
+        direction="oldest-to-recent",
+        safe_archive_end_ms=safe_end,
+    )
+
+    assert target is not None
+    assert target.reason == "gap_from_coverage_scan"
+    assert target.start_ms == _base(0)
+    assert target.end_ms == _base(4_319) + _MINUTE - 1
+
+
+def test_recent_to_oldest_uses_latest_contiguous_gap(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
+    for index in (*range(4), 8, 9):
+        _write_pair(store, _base(index))
+    safe_end = _base(9) + _MINUTE - 1
+
+    target = compute_backfill_target(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        store=store,
+        required_minutes=10,
+        max_minutes_per_cycle=3,
+        direction="recent-to-oldest",
+        safe_archive_end_ms=safe_end,
+    )
+
+    assert target is not None
+    assert target.start_ms == _base(5)
+    assert target.end_ms == _base(7) + _MINUTE - 1
+
+
+def test_missing_range_footprint_targets_batch_not_one_minute(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
+    for index in range(10):
+        _write_pair(store, _base(index))
+
+    target = compute_backfill_target(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        store=store,
+        required_minutes=10,
+        max_minutes_per_cycle=4,
+        direction="oldest-to-recent",
+        safe_archive_end_ms=_base(9) + _MINUTE - 1,
+    )
+
+    assert target is not None
+    assert target.end_ms - target.start_ms + 1 == 4 * _MINUTE
+
+
+def test_contiguous_degraded_footprints_target_full_batch(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
+    for index in range(10):
+        _write_pair(store, _base(index))
+    store.upsert_footprints_many(
+        [
+            _make_fp(
+                _base(index),
+                quality="MISSING_FOOTPRINT_CONTEXT",
+                context_available=False,
+            )
+            for index in range(2, 8)
+        ]
+    )
+
+    target = compute_backfill_target(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        store=store,
+        required_minutes=10,
+        max_minutes_per_cycle=4,
+        direction="oldest-to-recent",
+        safe_archive_end_ms=_base(9) + _MINUTE - 1,
+    )
+
+    assert target is not None
+    assert target.reason == "degraded_footprint_recompute"
+    assert target.start_ms == _base(2)
+    assert target.end_ms == _base(5) + _MINUTE - 1
+
+
+def test_120_day_sqlite_backfill_simulation_finishes_in_40_cycles(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
+    required = 120 * 1_440
+    per_cycle = 4_320
+    safe_end = _base(required - 1) + _MINUTE - 1
+    cycles = 0
+
+    while cycles <= 45:
+        target = compute_backfill_target(
+            symbol="ETH-USDT-PERP",
+            exchange="okx",
+            store=store,
+            required_minutes=required,
+            max_minutes_per_cycle=per_cycle,
+            direction="oldest-to-recent",
+            safe_archive_end_ms=safe_end,
+        )
+        if target is None:
+            break
+        cycles += 1
+        _write_target_ready(
+            store,
+            start_ms=target.start_ms,
+            end_ms=target.end_ms,
+            range_bar_id=cycles,
+        )
+
+    readiness = resolve_trade_feature_readiness(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        store=store,
+        required_minutes=required,
+        reference_end_ms=safe_end,
+        range_pct="0.002",
+        price_step="1",
+    )
+
+    assert cycles == 40
+    assert readiness.coverage is not None
+    assert readiness.coverage.complete_minutes == required
+    assert readiness.coverage_ready is True
+    assert readiness.range_footprint_ready is True
 
 
 def test_coverage_fails_when_footprint_missing(tmp_path: Path) -> None:

@@ -16,6 +16,10 @@ from src.runtime.live_smoke import (
     strategy_plugin_path,
     write_live_smoke_report,
 )
+from src.platform.config import (
+    load_project_env_config,
+    set_project_env_config,
+)
 from src.strategy import load_strategy
 
 
@@ -29,6 +33,13 @@ async def run_server_smoke(
 ):
     strategy_path = strategy_plugin_path(strategy_name)
     try:
+        root = Path(repo_root)
+        project_env = load_project_env_config(
+            env_file=env_file,
+            example_file=root / ".env.example",
+            include_process_env=False,
+        )
+        set_project_env_config(project_env)
         strategy = load_strategy(strategy_path)
         provider_factory = getattr(strategy, provider_hook, None)
         if not callable(provider_factory):
@@ -45,6 +56,12 @@ async def run_server_smoke(
             defaults_path=defaults_path,
             env_file=env_file,
             repo_root=repo_root,
+            project_env=project_env,
+            report_kind=(
+                "preflight"
+                if provider_hook == "live_preflight_provider"
+                else "smoke"
+            ),
         )
         return await FiniteLiveSmokeRunner(provider).run()
     except Exception as exc:
@@ -77,7 +94,7 @@ def parse_args() -> argparse.Namespace:
             / "data"
             / "reports"
             / "preflight"
-            / "live_server_smoke.json"
+            / "portfolio_v1_server_smoke.json"
         ),
     )
     return parser.parse_args()

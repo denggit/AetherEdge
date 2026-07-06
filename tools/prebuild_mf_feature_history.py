@@ -72,6 +72,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--large-trade-threshold", default="10000")
     parser.add_argument("--target-days", type=int, default=120)
     parser.add_argument(
+        "--large-share-min-samples",
+        type=int,
+        default=43_200,
+    )
+    parser.add_argument(
+        "--large-share-window-days",
+        type=int,
+        default=90,
+    )
+    parser.add_argument(
         "--max-minutes-per-cycle",
         type=int,
         default=4320,
@@ -104,7 +114,12 @@ def run_prebuild(args: argparse.Namespace) -> int:
     started_at_ms = now_ms()
     started_monotonic = time.monotonic()
     status_path = Path(args.status_path)
-    required_minutes = max(1, int(args.target_days)) * 1440
+    requested_minutes = max(1, int(args.target_days)) * 1440
+    required_minutes = max(
+        requested_minutes,
+        max(1, int(args.large_share_min_samples)),
+        max(1, int(args.large_share_window_days)) * 1_440,
+    )
     cycles = 0
     consecutive_failures = 0
     last_result: Mapping[str, Any] | None = None
@@ -117,6 +132,14 @@ def run_prebuild(args: argparse.Namespace) -> int:
         "exchange": args.exchange,
         "market_db": args.market_db,
         "target_days": int(args.target_days),
+        "requested_minutes": requested_minutes,
+        "effective_required_minutes": required_minutes,
+        "large_share_min_samples": int(
+            args.large_share_min_samples
+        ),
+        "large_share_window_days": int(
+            args.large_share_window_days
+        ),
         "cycles": 0,
         "ready": False,
         "last_result": None,
@@ -443,6 +466,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.target_days <= 0:
         print("[prebuild-mf] failed reason=target_days_must_be_positive")
+        return 1
+    if args.large_share_min_samples <= 0:
+        print(
+            "[prebuild-mf] failed "
+            "reason=large_share_min_samples_must_be_positive"
+        )
+        return 1
+    if args.large_share_window_days <= 0:
+        print(
+            "[prebuild-mf] failed "
+            "reason=large_share_window_days_must_be_positive"
+        )
         return 1
     return run_prebuild(args)
 

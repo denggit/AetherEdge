@@ -4,6 +4,7 @@ import json
 import time
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 from src.market_data.models import FixedTimeTradeBar
 from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
@@ -12,6 +13,7 @@ from strategies.eth_portfolio_v1.domain.mf_data import (
     MfDataReadiness,
     MfFeatureObserver,
 )
+import strategies.eth_portfolio_v1.domain.mf_data as mf_data_module
 
 
 def _make_bar(open_time_ms: int, close_time_ms: int, *, large_share: str = "0.05") -> FixedTimeTradeBar:
@@ -166,6 +168,81 @@ def test_readiness_has_full_audit_info(tmp_path: Path) -> None:
     )
     info = readiness.readiness()
     assert "coverage_ready" in info
+
+
+def test_readiness_blocks_when_large_share_samples_are_insufficient(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    coverage = SimpleNamespace(required_minutes=4_320)
+    monkeypatch.setattr(
+        mf_data_module,
+        "resolve_trade_feature_readiness",
+        lambda **_: SimpleNamespace(
+            coverage=coverage,
+            audit=lambda: {
+                "tradebar_ready": True,
+                "fixed_time_footprint_ready": True,
+                "range_footprint_ready": True,
+                "coverage_ready": True,
+                "coverage": {
+                    "extra": {
+                        "tradebar_complete_minutes": 4_320,
+                    }
+                },
+            },
+        ),
+    )
+    readiness = MfDataReadiness(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        store_path=str(tmp_path / "test.sqlite3"),
+        required_minutes=4_320,
+        large_share_min_samples=43_200,
+    )
+
+    audit = readiness.readiness()
+
+    assert audit["large_share_samples_ready"] is False
+    assert audit["mf_signal_ready"] is False
+
+
+def test_readiness_passes_large_share_sample_gate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    coverage = SimpleNamespace(required_minutes=129_600)
+    monkeypatch.setattr(
+        mf_data_module,
+        "resolve_trade_feature_readiness",
+        lambda **_: SimpleNamespace(
+            coverage=coverage,
+            audit=lambda: {
+                "tradebar_ready": True,
+                "fixed_time_footprint_ready": True,
+                "range_footprint_ready": True,
+                "coverage_ready": True,
+                "coverage": {
+                    "extra": {
+                        "tradebar_complete_minutes": 129_600,
+                    }
+                },
+            },
+        ),
+    )
+    readiness = MfDataReadiness(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        store_path=str(tmp_path / "test.sqlite3"),
+        required_minutes=129_600,
+        large_share_min_samples=43_200,
+        large_share_window_days=90,
+    )
+
+    audit = readiness.readiness()
+
+    assert audit["large_share_samples_ready"] is True
+    assert audit["mf_signal_ready"] is True
 
 
 # ---------------------------------------------------------------------------

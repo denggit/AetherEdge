@@ -241,9 +241,19 @@ class Strategy:
         self.mf_data_readiness = MfDataReadiness(
             symbol=self.config.symbol,
             exchange=self.config.data_exchange,
-            required_minutes=self.config.mf.decision_buffer_minutes,
+            required_minutes=max(
+                self.config.mf.decision_buffer_minutes,
+                self.config.mf.large_share_min_samples,
+                self.config.mf.large_share_window_days * 1_440,
+            ),
             range_pct=str(self.config.mf.range_pct),
             price_step=str(self.config.mf.range_price_step),
+            large_share_min_samples=(
+                self.config.mf.large_share_min_samples
+            ),
+            large_share_window_days=(
+                self.config.mf.large_share_window_days
+            ),
         )
         self.mf_signal_mapper = MfSignalMapper(
             strategy_id=self.config.strategy_id,

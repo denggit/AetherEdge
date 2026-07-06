@@ -9,7 +9,10 @@ from src.order_management import (
     SqlitePositionPlanStore,
 )
 from src.platform.account.factory import create_account_client
-from src.platform.config import load_env_config
+from src.platform.config import (
+    ProjectEnvConfig,
+    get_project_env_config,
+)
 from src.platform.exchanges.models import (
     ExchangeConfig,
     ExchangeName,
@@ -26,6 +29,10 @@ from strategies.eth_portfolio_v1.preflight.live_gate import (
 from strategies.eth_portfolio_v1.preflight.readiness import (
     PortfolioV1ReadinessInspector,
 )
+from strategies.eth_portfolio_v1.preflight.mf_feature_backfill import (
+    effective_mf_required_minutes,
+    resolve_mf_feature_backfill_enabled,
+)
 
 
 class PortfolioV1LiveSmokeProvider:
@@ -39,19 +46,27 @@ class PortfolioV1LiveSmokeProvider:
         defaults_path: str | Path,
         env_file: str | Path | None,
         repo_root: str | Path,
+        project_env: ProjectEnvConfig | None = None,
+        report_kind: str = "smoke",
     ) -> None:
         self.strategy = strategy
         self.strategy_path = strategy_path
         self.defaults_path = Path(defaults_path)
         self.env_file = env_file
         self.repo_root = Path(repo_root)
+        self.project_env = (
+            project_env
+            if project_env is not None
+            else get_project_env_config()
+        )
+        self.report_kind = str(report_kind)
 
     async def run(self) -> PortfolioV1LiveGateReport:
         try:
-            env = load_env_config(self.env_file)
+            env = dict(self.project_env.values)
             app_config = AppConfig.from_env(
                 defaults_path=self.defaults_path,
-                env_file=self.env_file,
+                environ=env,
             )
             app_config = replace(
                 app_config,
@@ -60,7 +75,7 @@ class PortfolioV1LiveSmokeProvider:
             runtime_config = live_runtime_config_from_app(
                 app_config,
                 defaults_path=self.defaults_path,
-                env_file=self.env_file,
+                environ=env,
             )
         except Exception as exc:
             return _bootstrap_failure(
@@ -170,7 +185,8 @@ class PortfolioV1LiveSmokeProvider:
             range_speed_min_periods=(
                 config.entry_filters.range_speed_min_periods
             ),
-            mf_required_minutes=config.mf.decision_buffer_minutes,
+            mf_required_minutes=effective_mf_required_minutes(config),
+            readiness_mode="historical_preflight",
             large_share_min_samples=(
                 config.mf.large_share_min_samples
             ),
@@ -192,6 +208,10 @@ class PortfolioV1LiveSmokeProvider:
             required_master_exchange=ExchangeName.OKX,
             required_follower_exchange=ExchangeName.BINANCE,
             call_strategy_on_start=True,
+            report_kind=self.report_kind,
+            startup_feature_backfill_enabled=(
+                resolve_mf_feature_backfill_enabled(env)
+            ),
             sensitive_values=tuple(
                 str(value)
                 for key, value in env.items()
@@ -230,6 +250,7 @@ def _add_context(
 ) -> None:
     report.symbol = app_config.symbol
     report.runtime_mode = runtime_config.mode.value
+    report.data_exchange = app_config.data_exchange.value
     report.exchanges = [
         exchange.value for exchange in app_config.exchanges
     ]

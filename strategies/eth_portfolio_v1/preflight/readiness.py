@@ -4,14 +4,16 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
+from src.market_data.models import TimeRange
 from src.market_data.storage.trade_feature_store import (
     SqliteTradeFeatureStore,
 )
 from src.market_data.trade_features.coverage import (
     resolve_trade_feature_readiness,
+    safe_okx_archive_end_ms,
 )
 
 
@@ -68,6 +70,10 @@ class PortfolioV1ReadinessInspector:
         large_share_window_days: int = 90,
         lf_max_staleness_ms: int = _FOUR_HOURS_MS + 10 * _MINUTE_MS,
         mf_max_staleness_ms: int = 5 * _MINUTE_MS,
+        readiness_mode: Literal[
+            "historical_preflight",
+            "live_freshness",
+        ] = "historical_preflight",
         now_ms: int | None = None,
     ) -> None:
         self.symbol = symbol
@@ -90,6 +96,14 @@ class PortfolioV1ReadinessInspector:
         )
         self.lf_max_staleness_ms = max(0, int(lf_max_staleness_ms))
         self.mf_max_staleness_ms = max(0, int(mf_max_staleness_ms))
+        if readiness_mode not in {
+            "historical_preflight",
+            "live_freshness",
+        }:
+            raise ValueError(
+                f"unsupported MF readiness mode: {readiness_mode}"
+            )
+        self.readiness_mode = readiness_mode
         self.now_ms = (
             int(now_ms) if now_ms is not None else int(time.time() * 1000)
         )
@@ -326,6 +340,7 @@ class PortfolioV1ReadinessInspector:
             "market_data_db_path": str(self.market_data_db_path),
             "required_minutes": self.mf_required_minutes,
             "large_share_min_samples": self.large_share_min_samples,
+            "mf_freshness_mode": self.readiness_mode,
         }
         if not self.market_data_db_path.is_file():
             issues.append("mf_feature_db_missing")
@@ -334,19 +349,50 @@ class PortfolioV1ReadinessInspector:
             store = SqliteTradeFeatureStore(
                 path=self.market_data_db_path
             )
-            bars = store.load_recent_tradebars(
-                symbol=self.symbol,
-                exchange=self.exchange,
-                limit=max(
+            safe_archive_end = safe_okx_archive_end_ms(self.now_ms)
+            if self.readiness_mode == "historical_preflight":
+                history_minutes = max(
                     self.mf_required_minutes,
                     self.large_share_min_samples + 1,
-                ),
-            )
-            footprints = store.load_recent_footprints(
-                symbol=self.symbol,
-                exchange=self.exchange,
-                limit=max(2, self.mf_required_minutes),
-            )
+                    self.large_share_window_days * 1_440,
+                )
+                historical_start = (
+                    safe_archive_end
+                    - history_minutes * _MINUTE_MS
+                    + 1
+                )
+                history_range = TimeRange(
+                    historical_start,
+                    safe_archive_end,
+                )
+                bars = store.load_range_tradebars(
+                    symbol=self.symbol,
+                    exchange=self.exchange,
+                    time_range=history_range,
+                )
+                footprints = store.load_range_footprints(
+                    symbol=self.symbol,
+                    exchange=self.exchange,
+                    time_range=history_range,
+                )
+                readiness_reference_end = safe_archive_end
+            else:
+                bars = store.load_recent_tradebars(
+                    symbol=self.symbol,
+                    exchange=self.exchange,
+                    limit=max(
+                        self.mf_required_minutes,
+                        self.large_share_min_samples + 1,
+                    ),
+                )
+                footprints = store.load_recent_footprints(
+                    symbol=self.symbol,
+                    exchange=self.exchange,
+                    limit=max(2, self.mf_required_minutes),
+                )
+                readiness_reference_end = (
+                    None if not bars else bars[-1].close_time_ms
+                )
         except (sqlite3.Error, TypeError, ValueError) as exc:
             issues.append(f"mf_store_read_failed:{exc}")
             audit["error"] = str(exc)
@@ -377,7 +423,7 @@ class PortfolioV1ReadinessInspector:
                 exchange=self.exchange,
                 store=store,
                 required_minutes=self.mf_required_minutes,
-                reference_end_ms=latest_bar.close_time_ms,
+                reference_end_ms=readiness_reference_end,
                 now_ms=self.now_ms,
                 range_pct=self.range_pct,
                 price_step=self.price_step,
@@ -404,7 +450,11 @@ class PortfolioV1ReadinessInspector:
             or self.now_ms - latest_bar.close_time_ms
             > self.mf_max_staleness_ms
         )
-        if tradebar_stale:
+        live_fresh_ready = not tradebar_stale
+        if (
+            self.readiness_mode == "live_freshness"
+            and tradebar_stale
+        ):
             issues.append("mf_tradebar_stale")
         if latest_bar is not None and latest_bar.quality != "COMPLETE":
             issues.append("mf_tradebar_degraded")
@@ -520,6 +570,19 @@ class PortfolioV1ReadinessInspector:
                 ),
                 "latest_signal_time_ms": signal_time_ms,
                 "tradebar_stale": tradebar_stale,
+                "live_fresh_ready": live_fresh_ready,
+                "historical_coverage_ready": bool(
+                    readiness_audit.get("coverage_ready", False)
+                ),
+                "safe_archive_end_ms": safe_archive_end,
+                "latest_tradebar_age_ms": (
+                    None
+                    if latest_bar is None
+                    else max(
+                        0,
+                        self.now_ms - latest_bar.close_time_ms,
+                    )
+                ),
                 "large_share_sample_count": large_share_samples,
                 "missing_required_fields": missing_fields,
                 "future_feature_row_count": future_rows,
