@@ -280,6 +280,7 @@ def _evaluate_fresh_tradebar(
 @pytest.mark.parametrize(
     "missing_gate",
     (
+        "mf_signal_feature_ready",
         "fixed_time_footprint_ready",
         "coverage_ready",
         "large_share_samples_ready",

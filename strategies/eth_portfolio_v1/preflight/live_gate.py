@@ -91,6 +91,7 @@ class PortfolioV1LiveGateReport:
     verdict: str = "fail_unknown"
     exit_code: int = EXIT_FAIL_UNKNOWN
     issues: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
     _sensitive_values: tuple[str, ...] = field(
         default=(), repr=False
     )
@@ -102,11 +103,12 @@ class PortfolioV1LiveGateReport:
         ok: bool,
         detail: Mapping[str, Any] | None = None,
         error: str | None = None,
+        status: str | None = None,
     ) -> None:
         self.startup_gate_results.append(
             LiveGateCheck(
                 name=name,
-                status="ok" if ok else "fail",
+                status=status or ("ok" if ok else "fail"),
                 detail=dict(detail or {}),
                 error=error,
             )
@@ -145,6 +147,7 @@ class PortfolioV1LiveGateReport:
                 "verdict": self.verdict,
                 "exit_code": self.exit_code,
                 "issues": list(self.issues),
+                "warnings": list(self.warnings),
             },
             sensitive_values=self._sensitive_values,
         )
@@ -329,32 +332,118 @@ class PortfolioV1LiveGate:
                 "mf_data_readiness"
             ]
             report.causal_audit = readiness_audit["causal_audit"]
+            readiness_issues = tuple(
+                str(issue) for issue in readiness.issues
+            )
+            lf_ready = bool(report.lf_data_readiness.get("ok"))
+            mf_ready = bool(report.mf_data_readiness.get("ok"))
+            mf_enabled = self._mf_enabled()
+            mf_blocking = bool(
+                mf_enabled
+                and not mf_ready
+                and not self.startup_feature_backfill_enabled
+            )
+            mf_degraded = bool(
+                mf_enabled
+                and not mf_ready
+                and self.startup_feature_backfill_enabled
+            )
+            mf_issues = [
+                issue
+                for issue in readiness_issues
+                if issue.startswith("mf_")
+            ]
+            report.lf_data_readiness.update(
+                {
+                    "blocking": not lf_ready,
+                    "readiness_scope": "lf_primary_strategy",
+                    "issues": [
+                        issue
+                        for issue in readiness_issues
+                        if issue.startswith("lf_")
+                    ],
+                }
+            )
+            report.mf_data_readiness.update(
+                {
+                    "blocking": mf_blocking,
+                    "sleeve_ready": mf_ready,
+                    "signals_enabled": bool(mf_enabled and mf_ready),
+                    "background_prebuild_required": bool(
+                        mf_enabled and not mf_ready
+                    ),
+                    "readiness_scope": "mf_sleeve",
+                    "issues": mf_issues,
+                }
+            )
+            causal_blocking = self._causal_failure_blocks(readiness)
+            report.causal_audit["blocking"] = causal_blocking
             report.add(
                 "lf_data_readiness",
-                ok=bool(report.lf_data_readiness.get("ok")),
+                ok=lf_ready,
                 detail=report.lf_data_readiness,
             )
             report.add(
                 "mf_data_readiness",
-                ok=bool(report.mf_data_readiness.get("ok")),
+                ok=mf_ready,
                 detail=report.mf_data_readiness,
+                status="warn" if mf_degraded else None,
             )
             report.add(
                 "causal_no_future_audit",
-                ok=bool(report.causal_audit.get("ok")),
+                ok=not causal_blocking,
                 detail=report.causal_audit,
+                status=(
+                    "warn"
+                    if not causal_blocking
+                    and not bool(report.causal_audit.get("ok"))
+                    else None
+                ),
             )
-            if not readiness.ok:
+            if mf_degraded:
+                report.warnings.append(
+                    "mf_data_not_ready_sleeve_disabled_until_ready"
+                )
+
+            hard_readiness_issues: list[str] = []
+            for issue in readiness_issues:
+                if not lf_ready and issue.startswith("lf_"):
+                    hard_readiness_issues.append(issue)
+                elif mf_blocking and issue.startswith("mf_"):
+                    hard_readiness_issues.append(issue)
+                elif causal_blocking and (
+                    issue == "causal_future_violation"
+                    or "future" in issue
+                ):
+                    hard_readiness_issues.append(issue)
+            if not lf_ready and not any(
+                issue.startswith("lf_")
+                for issue in hard_readiness_issues
+            ):
+                hard_readiness_issues.append("lf_data_not_ready")
+            if mf_blocking and not any(
+                issue.startswith("mf_")
+                for issue in hard_readiness_issues
+            ):
+                hard_readiness_issues.append("mf_data_not_ready")
+            if causal_blocking and not any(
+                issue == "causal_future_violation"
+                for issue in hard_readiness_issues
+            ):
+                hard_readiness_issues.append("causal_future_violation")
+            if hard_readiness_issues:
                 return self._fail(
                     report,
                     verdict="fail_market_data",
                     exit_code=EXIT_FAIL_MARKET_DATA,
-                    issues=list(readiness.issues),
+                    issues=hard_readiness_issues,
                 )
 
             if self.call_strategy_on_start:
                 on_start_issues = await self._call_on_start_read_only(
-                    snapshots, report
+                    snapshots,
+                    report,
+                    allow_mf_not_ready=mf_degraded,
                 )
                 if on_start_issues:
                     return self._fail(
@@ -447,8 +536,6 @@ class PortfolioV1LiveGate:
             getattr(mf_config, "enabled", False)
         ):
             issues.append("mf_must_be_enabled")
-        elif not self.startup_feature_backfill_enabled:
-            issues.append("mf_feature_backfill_must_be_enabled")
         if str(getattr(mf_config, "exit_variant", "")) != "time48":
             issues.append("mf_exit_variant_must_be_time48")
         if self.app_config.dry_run:
@@ -820,6 +907,8 @@ class PortfolioV1LiveGate:
         self,
         snapshots: Sequence[PlatformSnapshot],
         report: PortfolioV1LiveGateReport,
+        *,
+        allow_mf_not_ready: bool = False,
     ) -> list[str]:
         on_start = getattr(self.strategy, "on_start", None)
         if not callable(on_start):
@@ -848,7 +937,7 @@ class PortfolioV1LiveGate:
         issues: list[str] = []
         if signals:
             issues.append("strategy_on_start_emitted_signals")
-        if not mf_ready:
+        if not mf_ready and not allow_mf_not_ready:
             issues.append("strategy_on_start_mf_not_ready")
         report.add(
             "strategy_on_start_read_only",
@@ -858,6 +947,10 @@ class PortfolioV1LiveGate:
                 "signals_executed": False,
                 "producers_started": False,
                 "mf_data_ready": mf_ready,
+                "mf_signals_enabled": mf_ready,
+                "mf_not_ready_blocking": bool(
+                    not mf_ready and not allow_mf_not_ready
+                ),
                 "mf_readiness_source": mf_audit.get(
                     "readiness_source"
                 ),
@@ -869,6 +962,32 @@ class PortfolioV1LiveGate:
             ),
         )
         return issues
+
+    def _mf_enabled(self) -> bool:
+        strategy_config = getattr(self.strategy, "config", None)
+        mf_config = getattr(strategy_config, "mf", None)
+        return bool(getattr(mf_config, "enabled", False))
+
+    @staticmethod
+    def _causal_failure_blocks(
+        readiness: object,
+    ) -> bool:
+        causal = getattr(readiness, "causal", {})
+        if bool(causal.get("ok")):
+            return False
+        known_checks = (
+            "lf_closed_bar_not_future",
+            "lf_range_available_not_future",
+            "no_future_feature_rows",
+        )
+        if not any(check in causal for check in known_checks):
+            return True
+        if not all(bool(causal.get(check)) for check in known_checks):
+            return True
+        return any(
+            issue.startswith(("lf_", "mf_")) and "future" in issue
+            for issue in getattr(readiness, "issues", ())
+        )
 
     def _mutation_issues(self) -> list[str]:
         attempts = [

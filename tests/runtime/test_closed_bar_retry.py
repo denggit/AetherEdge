@@ -6,6 +6,8 @@ import pytest
 
 from src.app import AppConfig, AppContext
 from src.market_data.events import MarketFeatureEvent
+from src.market_data.models import TimeRange
+from src.market_data.storage import SqliteKlineStore
 from src.platform import Balance, ExchangeName, LeverageInfo, PositionMode
 from src.platform.data.models import MarketKline
 from src.platform.markets import get_market_profile
@@ -66,6 +68,20 @@ class _Strategy:
         return []
 
 
+class _FailingKlineStore:
+    def save(self, rows):
+        raise RuntimeError("disk unavailable")
+
+
+class _RecordingKlineStore:
+    def __init__(self) -> None:
+        self.rows = []
+
+    def save(self, rows):
+        self.rows.extend(rows)
+        return len(rows)
+
+
 @pytest.mark.asyncio
 async def test_closed_bar_retry_starts_at_05s_alerts_once_and_emits_once() -> None:
     data = _Data()
@@ -101,7 +117,84 @@ async def test_closed_bar_retry_starts_at_05s_alerts_once_and_emits_once() -> No
     assert len(alerts.items) == 1
 
 
-def _runner(*, strategy: _Strategy, data: _Data, alerts: _Alerts) -> LiveRuntimeRunner:
+@pytest.mark.asyncio
+async def test_closed_bar_poll_upserts_same_open_time_without_duplicate(
+    tmp_path,
+) -> None:
+    store = SqliteKlineStore(tmp_path / "market.sqlite3")
+    first_data = _Data()
+    first_data.responses = [[_kline(0)]]
+    second_data = _Data()
+    second_data.responses = [[_kline(0)]]
+
+    first = _runner(
+        strategy=_Strategy(),
+        data=first_data,
+        alerts=_Alerts(),
+        kline_store=store,
+    )
+    second = _runner(
+        strategy=_Strategy(),
+        data=second_data,
+        alerts=_Alerts(),
+        kline_store=store,
+    )
+
+    assert await first.poll_closed_bar_once(now_ms=H4 + 5_000)
+    assert await second.poll_closed_bar_once(now_ms=H4 + 5_000)
+    rows = store.load(
+        symbol="ETH-USDT-PERP",
+        interval="4h",
+        time_range=TimeRange(0, H4),
+    )
+
+    assert len(rows) == 1
+    assert rows[0].open_time_ms == 0
+
+
+@pytest.mark.asyncio
+async def test_closed_bar_store_failure_alerts_and_still_processes_feature(
+    caplog,
+) -> None:
+    data = _Data()
+    data.responses = [[_kline(0)]]
+    strategy = _Strategy()
+    alerts = _Alerts()
+    runner = _runner(
+        strategy=strategy,
+        data=data,
+        alerts=alerts,
+        kline_store=_FailingKlineStore(),
+    )
+
+    events = await runner.poll_closed_bar_once(now_ms=H4 + 5_000)
+
+    assert [event.type_value for event in events] == ["closed_kline"]
+    assert len(strategy.events) == 1
+    assert alerts.items[-1].subject == (
+        "AetherEdge closed kline persistence failed"
+    )
+    assert "Failed to persist live closed kline" in caplog.text
+
+
+def test_closed_bar_persistence_adds_no_unbounded_kline_cache() -> None:
+    runner = _runner(
+        strategy=_Strategy(),
+        data=_Data(),
+        alerts=_Alerts(),
+        kline_store=_FailingKlineStore(),
+    )
+
+    assert not hasattr(runner, "_all_klines")
+
+
+def _runner(
+    *,
+    strategy: _Strategy,
+    data: _Data,
+    alerts: _Alerts,
+    kline_store=None,
+) -> LiveRuntimeRunner:
     cfg = AppConfig(
         symbol="ETH-USDT-PERP",
         exchanges=(ExchangeName.OKX,),
@@ -114,6 +207,11 @@ def _runner(*, strategy: _Strategy, data: _Data, alerts: _Alerts) -> LiveRuntime
         alert_queue_maxsize=20,
         dry_run=True,
         enable_email_alerts=False,
+    )
+    resolved_kline_store = (
+        _RecordingKlineStore()
+        if kline_store is None
+        else kline_store
     )
     context = AppContext(
         data=data,
@@ -134,7 +232,11 @@ def _runner(*, strategy: _Strategy, data: _Data, alerts: _Alerts) -> LiveRuntime
             closed_bar_retry_interval_ms=5_000,
             closed_bar_missing_alert_after_ms=120_000,
         ),
-        services={"recovery_service": None, "snapshot": _snapshot()},
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "kline_store": resolved_kline_store,
+        },
     )
 
 

@@ -533,6 +533,7 @@ class LiveRuntimeRunner:
                 )
             return []
         closed_kline = closed_rows[-1]
+        self._persist_closed_kline(closed_kline)
         drain_result = await self._drain_market_events_before_closed_bar(
             closed_bar_close_time_ms=closed_kline.close_time_ms,
         )
@@ -705,6 +706,46 @@ class LiveRuntimeRunner:
 
         self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_kline)
         return features
+
+    def _persist_closed_kline(self, kline: MarketKline) -> None:
+        """Upsert one confirmed live closed kline without blocking its decision."""
+        try:
+            repository = self.services.get("kline_store")
+            if repository is None:
+                repository = SqliteKlineStore(
+                    self.runtime_config.market_data_db_path
+                )
+                self.services["kline_store"] = repository
+            repository.save([kline])
+        except Exception as exc:
+            logger.exception(
+                "Failed to persist live closed kline | symbol=%s interval=%s open_time_ms=%s close_time_ms=%s",
+                kline.symbol,
+                kline.interval,
+                kline.open_time_ms,
+                kline.close_time_ms,
+            )
+            try:
+                self.context.alerts.emit(
+                    AppAlert(
+                        subject="AetherEdge closed kline persistence failed",
+                        severity="error",
+                        content=(
+                            f"symbol={kline.symbol}\n"
+                            f"interval={kline.interval}\n"
+                            f"open_time_ms={kline.open_time_ms}\n"
+                            f"close_time_ms={kline.close_time_ms}\n"
+                            f"error={type(exc).__name__}:{exc}\n"
+                        ),
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to emit closed kline persistence alert | symbol=%s interval=%s open_time_ms=%s",
+                    kline.symbol,
+                    kline.interval,
+                    kline.open_time_ms,
+                )
 
     def _load_range_aggregates_for_bucket(self, bucket_start_ms: int) -> list[RangeBarAggregate]:
         store = self._get_range_bar_store()

@@ -135,6 +135,47 @@ class _Inspector:
         return self.result
 
 
+class _MfGapInspector:
+    def __init__(self) -> None:
+        self.result = PortfolioV1ReadinessResult(
+            lf={"ok": True},
+            mf={
+                "ok": False,
+                "mf_freshness_mode": "historical_preflight",
+                "historical_coverage_ready": False,
+                "live_fresh_ready": False,
+            },
+            causal={
+                "ok": False,
+                "lf_closed_bar_not_future": True,
+                "lf_range_available_not_future": True,
+                "mf_tradebar_available_by_signal": False,
+                "mf_range_footprint_available_by_signal": False,
+                "mf_fixed_time_footprint_available_by_signal": False,
+                "no_future_feature_rows": True,
+            },
+            issues=(
+                "mf_tradebar_stale",
+                "causal_future_violation",
+            ),
+        )
+
+    def inspect(self):
+        return self.result
+
+
+class _OnStartNotReadyStrategy:
+    def __init__(self) -> None:
+        self.config = _strategy().config
+        self.last_mf_signal_audit = {
+            "data_ready": False,
+            "readiness_source": "test",
+        }
+
+    async def on_start(self, snapshot):
+        return ()
+
+
 def _app(
     *,
     exchanges=(ExchangeName.OKX, ExchangeName.BINANCE),
@@ -191,6 +232,7 @@ def _gate(
     okx_stops=(),
     inspector=None,
     startup_feature_backfill_enabled=True,
+    call_strategy_on_start=False,
 ):
     app = app or _app()
     strategy = strategy or _strategy()
@@ -252,7 +294,7 @@ def _gate(
         repo_root=tmp_path,
         required_master_exchange=ExchangeName.OKX,
         required_follower_exchange=ExchangeName.BINANCE,
-        call_strategy_on_start=False,
+        call_strategy_on_start=call_strategy_on_start,
         report_kind="preflight",
         startup_feature_backfill_enabled=(
             startup_feature_backfill_enabled
@@ -262,7 +304,7 @@ def _gate(
 
 
 @pytest.mark.asyncio
-async def test_explicitly_disabled_mf_backfill_fails_config(
+async def test_explicitly_disabled_mf_backfill_passes_when_mf_ready(
     tmp_path,
 ) -> None:
     gate, _ = _gate(
@@ -272,8 +314,8 @@ async def test_explicitly_disabled_mf_backfill_fails_config(
 
     report = await gate.run()
 
-    assert report.exit_code == EXIT_FAIL_CONFIG
-    assert "mf_feature_backfill_must_be_enabled" in report.issues
+    assert report.exit_code == EXIT_PASS
+    assert report.ok is True
 
 
 def _save_mf_plan(
@@ -506,26 +548,130 @@ async def test_mf_explicit_no_stop_policy_does_not_fail(tmp_path) -> None:
     ] is False
 
 
-@pytest.mark.parametrize(
-    ("inspector", "expected_issue"),
-    (
-        (_Inspector(lf_ok=False), "lf_closed_kline_stale"),
-        (_Inspector(mf_ok=False), "mf_tradebar_stale"),
-        (_Inspector(causal_ok=False), "causal_future_violation"),
-    ),
-)
 @pytest.mark.asyncio
-async def test_readiness_or_causal_failure_is_market_data_failure(
+async def test_lf_and_mf_ready_passes(tmp_path) -> None:
+    gate, _ = _gate(tmp_path, inspector=_Inspector())
+
+    report = await gate.run()
+
+    assert report.exit_code == EXIT_PASS
+    assert report.ok is True
+    assert report.warnings == []
+    assert report.mf_data_readiness["sleeve_ready"] is True
+    assert report.mf_data_readiness["signals_enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_mf_not_ready_with_backfill_is_nonblocking_warning(
     tmp_path,
-    inspector,
-    expected_issue,
 ) -> None:
-    gate, _ = _gate(tmp_path, inspector=inspector)
+    gate, _ = _gate(
+        tmp_path,
+        inspector=_MfGapInspector(),
+        startup_feature_backfill_enabled=True,
+    )
+
+    report = await gate.run()
+
+    assert report.exit_code == EXIT_PASS
+    assert report.ok is True
+    assert report.issues == []
+    assert report.warnings == [
+        "mf_data_not_ready_sleeve_disabled_until_ready"
+    ]
+    assert report.mf_data_readiness["ok"] is False
+    assert report.mf_data_readiness["blocking"] is False
+    assert report.mf_data_readiness["sleeve_ready"] is False
+    assert report.mf_data_readiness["signals_enabled"] is False
+    assert report.mf_data_readiness[
+        "background_prebuild_required"
+    ] is True
+    assert report.mf_data_readiness["readiness_scope"] == "mf_sleeve"
+    assert "mf_tradebar_stale" in report.mf_data_readiness["issues"]
+    assert report.causal_audit["ok"] is False
+    assert report.causal_audit["blocking"] is False
+
+
+@pytest.mark.asyncio
+async def test_mf_degraded_on_start_gate_remains_nonblocking(
+    tmp_path,
+) -> None:
+    gate, _ = _gate(
+        tmp_path,
+        strategy=_OnStartNotReadyStrategy(),
+        inspector=_MfGapInspector(),
+        startup_feature_backfill_enabled=True,
+        call_strategy_on_start=True,
+    )
+
+    report = await gate.run()
+
+    assert report.exit_code == EXIT_PASS
+    on_start = next(
+        check
+        for check in report.startup_gate_results
+        if check.name == "strategy_on_start_read_only"
+    )
+    assert on_start.status == "ok"
+    assert on_start.detail["mf_signals_enabled"] is False
+    assert on_start.detail["mf_not_ready_blocking"] is False
+
+
+@pytest.mark.asyncio
+async def test_mf_not_ready_without_backfill_is_market_data_failure(
+    tmp_path,
+) -> None:
+    gate, _ = _gate(
+        tmp_path,
+        inspector=_Inspector(mf_ok=False),
+        startup_feature_backfill_enabled=False,
+    )
 
     report = await gate.run()
 
     assert report.exit_code == EXIT_FAIL_MARKET_DATA
-    assert expected_issue in report.issues
+    assert "mf_tradebar_stale" in report.issues
+    assert report.mf_data_readiness["blocking"] is True
+
+
+@pytest.mark.asyncio
+async def test_lf_not_ready_remains_market_data_failure(tmp_path) -> None:
+    gate, _ = _gate(tmp_path, inspector=_Inspector(lf_ok=False))
+
+    report = await gate.run()
+
+    assert report.exit_code == EXIT_FAIL_MARKET_DATA
+    assert "lf_closed_kline_stale" in report.issues
+
+
+@pytest.mark.asyncio
+async def test_lf_and_mf_not_ready_keeps_lf_hard_and_mf_warning(
+    tmp_path,
+) -> None:
+    gate, _ = _gate(
+        tmp_path,
+        inspector=_Inspector(lf_ok=False, mf_ok=False),
+        startup_feature_backfill_enabled=True,
+    )
+
+    report = await gate.run()
+
+    assert report.exit_code == EXIT_FAIL_MARKET_DATA
+    assert "lf_closed_kline_stale" in report.issues
+    assert "mf_tradebar_stale" not in report.issues
+    assert report.warnings == [
+        "mf_data_not_ready_sleeve_disabled_until_ready"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_causal_failure_remains_market_data_failure(tmp_path) -> None:
+    gate, _ = _gate(tmp_path, inspector=_Inspector(causal_ok=False))
+
+    report = await gate.run()
+
+    assert report.exit_code == EXIT_FAIL_MARKET_DATA
+    assert "causal_future_violation" in report.issues
 
 
 @pytest.mark.asyncio
@@ -558,6 +704,7 @@ async def test_report_has_required_sections_and_no_secrets(tmp_path) -> None:
         "mf_data_readiness",
         "causal_audit",
         "startup_gate_results",
+        "warnings",
     ):
         assert section in payload
     assert payload["report_kind"] == "preflight"
