@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Sequence
@@ -18,6 +19,13 @@ from src.market_data.models import (
 logger = logging.getLogger(__name__)
 
 _ONE_MINUTE_MS = 60_000
+
+
+@dataclass(frozen=True)
+class LargeTradeShareSample:
+    open_time_ms: int
+    large_trade_share: Decimal | None
+    quality: str
 
 
 class SqliteTradeFeatureStore:
@@ -315,6 +323,39 @@ class SqliteTradeFeatureStore:
         bars = [_row_to_tradebar(row) for row in rows]
         bars.reverse()
         return bars
+
+    def load_recent_large_trade_shares(
+        self,
+        *,
+        symbol: str,
+        exchange: str,
+        limit: int,
+    ) -> list[LargeTradeShareSample]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT open_time_ms, large_trade_share, quality
+                FROM tradebar_1m_features
+                WHERE symbol = ? AND exchange = ?
+                ORDER BY open_time_ms DESC
+                LIMIT ?
+                """,
+                (symbol, exchange, max(1, int(limit))),
+            ).fetchall()
+        samples = [
+            LargeTradeShareSample(
+                open_time_ms=int(row[0]),
+                large_trade_share=(
+                    None
+                    if row[1] is None
+                    else Decimal(str(row[1]))
+                ),
+                quality=str(row[2]),
+            )
+            for row in rows
+        ]
+        samples.reverse()
+        return samples
 
     def load_range_tradebars(
         self, *, symbol: str, exchange: str, time_range: TimeRange,

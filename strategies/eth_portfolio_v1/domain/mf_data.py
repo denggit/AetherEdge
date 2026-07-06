@@ -11,9 +11,13 @@ from src.market_data.models import (
     FixedTimeTradeBar,
     RangeFootprintFeature,
     TimeRange,
+    TradeFeatureQuality,
     TradeFootprintFeature,
 )
-from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
+from src.market_data.storage.trade_feature_store import (
+    LargeTradeShareSample,
+    SqliteTradeFeatureStore,
+)
 from src.market_data.trade_features.coverage import (
     resolve_trade_feature_readiness,
 )
@@ -66,13 +70,16 @@ class MfDataBuffer:
         self._large_share_window_days = max(
             1, int(large_share_quantile_window_days)
         )
+        self._large_share_max_samples = (
+            self._large_share_window_days * 1_440
+        )
         self._range_pct = Decimal(str(range_pct))
         self._range_price_step = Decimal(str(range_price_step))
         self._bars: deque[FixedTimeTradeBar] = deque(
             maxlen=self._decision_maxlen
         )
         self._large_trade_shares: deque[tuple[int, Decimal]] = deque(
-            maxlen=self._large_share_window_days * 1_440
+            maxlen=self._large_share_max_samples + 1
         )
         self._range_footprints: deque[RangeFootprintFeature] = deque(
             maxlen=max(1, int(range_footprint_max_features))
@@ -82,18 +89,22 @@ class MfDataBuffer:
         self._last_audit_ms = 0
 
     def load_initial(self) -> int:
-        history_limit = max(
-            self._decision_default_minutes,
-            self._large_share_window_days * 1_440,
+        large_share_samples = (
+            self._store.load_recent_large_trade_shares(
+                symbol=self.symbol,
+                exchange=self.exchange,
+                limit=self._large_share_max_samples,
+            )
         )
-        history = self._store.load_recent_tradebars(
+        for sample in large_share_samples:
+            self._append_large_share_sample(sample)
+
+        recent_bars = self._store.load_recent_tradebars(
             symbol=self.symbol,
             exchange=self.exchange,
-            limit=history_limit,
+            limit=self._decision_default_minutes,
         )
-        for bar in history:
-            self._append_large_share(bar)
-        for bar in history[-self._decision_default_minutes :]:
+        for bar in recent_bars:
             self._bars.append(bar)
 
         latest_range_ms = (
@@ -157,14 +168,15 @@ class MfDataBuffer:
     def large_trade_share_history(
         self, *, before_open_time_ms: int | None = None
     ) -> tuple[Decimal, ...]:
-        return tuple(
+        values = [
             value
             for open_time_ms, value in self._large_trade_shares
             if (
                 before_open_time_ms is None
                 or open_time_ms < before_open_time_ms
             )
-        )
+        ]
+        return tuple(values[-self._large_share_max_samples :])
 
     @property
     def bar_count(self) -> int:
@@ -210,7 +222,10 @@ class MfDataBuffer:
             "exchange": self.exchange,
             "bar_count": len(self._bars),
             "decision_buffer_maxlen": self._decision_maxlen,
-            "large_share_samples": len(self._large_trade_shares),
+            "large_share_samples": min(
+                len(self._large_trade_shares),
+                self._large_share_max_samples,
+            ),
             "range_footprint_count": len(self._range_footprints),
             "loaded_initial": self._loaded_initial,
             "latest_bar": latest,
@@ -222,15 +237,47 @@ class MfDataBuffer:
         return self.audit()
 
     def _append_large_share(self, bar: FixedTimeTradeBar) -> None:
+        self._append_large_share_sample(
+            LargeTradeShareSample(
+                open_time_ms=bar.open_time_ms,
+                large_trade_share=bar.large_trade_share,
+                quality=bar.quality,
+            )
+        )
+
+    def _append_large_share_sample(
+        self,
+        sample: LargeTradeShareSample,
+    ) -> None:
+        open_time_ms = int(sample.open_time_ms)
         if (
             self._latest_history_open_time_ms is not None
-            and bar.open_time_ms <= self._latest_history_open_time_ms
+            and open_time_ms < self._latest_history_open_time_ms
         ):
             return
-        self._large_trade_shares.append(
-            (bar.open_time_ms, bar.large_trade_share)
+        if (
+            open_time_ms == self._latest_history_open_time_ms
+            and self._large_trade_shares
+            and self._large_trade_shares[-1][0] == open_time_ms
+        ):
+            self._large_trade_shares.pop()
+        self._latest_history_open_time_ms = open_time_ms
+        value = sample.large_trade_share
+        if (
+            sample.quality == TradeFeatureQuality.COMPLETE.value
+            and value is not None
+            and value.is_finite()
+        ):
+            self._large_trade_shares.append((open_time_ms, value))
+
+        cutoff_ms = open_time_ms - (
+            self._large_share_window_days * 1_440 * 60_000
         )
-        self._latest_history_open_time_ms = bar.open_time_ms
+        while (
+            self._large_trade_shares
+            and self._large_trade_shares[0][0] < cutoff_ms
+        ):
+            self._large_trade_shares.popleft()
 
 
 class MfDataReadiness:

@@ -35,6 +35,7 @@ def _make_bar(
     buy_notional: str = "6000",
     sell_notional: str = "4000",
     trade_count: int = 5,
+    large_trade_share: str = "0",
     quality: str = "COMPLETE",
 ) -> FixedTimeTradeBar:
     if close_time_ms is None:
@@ -63,6 +64,7 @@ def _make_bar(
         delta_notional=delta_not,
         abs_delta_notional=abs(delta_not),
         trade_count=trade_count,
+        large_trade_share=Decimal(large_trade_share),
         quality=quality,
     )
 
@@ -198,6 +200,70 @@ def test_load_recent_returns_in_order_and_respects_limit(tmp_path: Path) -> None
     loaded = store.load_recent(symbol="ETH-USDT-PERP", exchange="okx", limit=5)
     assert len(loaded) == 5
     assert loaded[0].open_time_ms < loaded[-1].open_time_ms
+
+
+def test_load_recent_large_trade_shares_uses_lightweight_columns(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
+    store.upsert_tradebars_many(
+        [
+            _make_bar(
+                open_time_ms=_base(index),
+                large_trade_share=str(Decimal(index) / Decimal("10")),
+                quality=quality,
+            )
+            for index, quality in enumerate(
+                (
+                    "COMPLETE",
+                    "DEGRADED_LOW_TRADE_COUNT",
+                    "MISSING",
+                    "COMPLETE",
+                )
+            )
+        ]
+    )
+    statements: list[str] = []
+    real_connect = store._connect
+
+    def traced_connect():
+        connection = real_connect()
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(store, "_connect", traced_connect)
+
+    samples = store.load_recent_large_trade_shares(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        limit=3,
+    )
+
+    assert [sample.open_time_ms for sample in samples] == [
+        _base(1),
+        _base(2),
+        _base(3),
+    ]
+    assert [sample.large_trade_share for sample in samples] == [
+        Decimal("0.1"),
+        Decimal("0.2"),
+        Decimal("0.3"),
+    ]
+    assert [sample.quality for sample in samples] == [
+        "DEGRADED_LOW_TRADE_COUNT",
+        "MISSING",
+        "COMPLETE",
+    ]
+    select = next(
+        statement
+        for statement in statements
+        if "FROM tradebar_1m_features" in statement
+    )
+    columns = " ".join(select.split()).split(" FROM ", 1)[0]
+    assert columns == (
+        "SELECT open_time_ms, large_trade_share, quality"
+    )
 
 
 # ---------------------------------------------------------------------------

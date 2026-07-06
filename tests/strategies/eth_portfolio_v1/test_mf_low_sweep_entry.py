@@ -28,6 +28,7 @@ def _entry_result(
     *,
     bars=None,
     pressure="0.80",
+    history_value="0.10",
     equity=Decimal("1000"),
     available_equity=Decimal("500"),
 ):
@@ -41,7 +42,9 @@ def _entry_result(
         large_share_quantile_window_days=90,
     )
     seed_large_share_history(
-        buffer, before_open_time_ms=bars[0].open_time_ms
+        buffer,
+        before_open_time_ms=bars[0].open_time_ms,
+        value=history_value,
     )
     buffer.append_many(bars[:-1])
     buffer.append_range_footprint(
@@ -81,6 +84,7 @@ def test_a0_single_swing_generates_next_open_mf_signal(tmp_path) -> None:
     assert len(signals) == 1
     assert signals[0].action is SignalAction.OPEN_LONG
     assert observer.last_mf_signal_audit["entry_signal"] is True
+    assert observer.last_mf_signal_audit["large_share_rq80_90d"] is True
 
 
 def test_fp_abs_delta_below_threshold_produces_no_signal(tmp_path) -> None:
@@ -93,8 +97,42 @@ def test_large_share_below_historical_threshold_produces_no_signal(
     tmp_path,
 ) -> None:
     bars = setup_bars(latest_large_share="0.05")
-    signals, _, _ = _entry_result(tmp_path, bars=bars)
+    signals, observer, _ = _entry_result(tmp_path, bars=bars)
     assert signals == ()
+    assert observer.last_mf_signal_audit["large_share_rq80_90d"] is False
+
+
+def test_large_share_history_only_changes_quantile_feature(
+    tmp_path,
+) -> None:
+    low_signals, low_observer, _ = _entry_result(
+        tmp_path,
+        history_value="0.10",
+    )
+    high_signals, high_observer, _ = _entry_result(
+        tmp_path,
+        history_value="0.95",
+    )
+
+    assert len(low_signals) == 1
+    assert high_signals == ()
+    assert low_observer.last_mf_signal_audit[
+        "large_share_rq80_90d"
+    ] is True
+    assert high_observer.last_mf_signal_audit[
+        "large_share_rq80_90d"
+    ] is False
+    for field in (
+        "swing_low",
+        "swing_low_age",
+        "swing_low_prominence_pct",
+        "low_sweep_event",
+        "spike_pct",
+        "close_pos",
+    ):
+        assert low_observer.last_mf_signal_audit[field] == (
+            high_observer.last_mf_signal_audit[field]
+        )
 
 
 def test_no_primary_low_sweep_event_produces_no_signal(tmp_path) -> None:
