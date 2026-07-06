@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -49,7 +50,22 @@ class FakeProcess:
         return None
 
 
-def test_supervisor_starts_when_history_insufficient(tmp_path, monkeypatch) -> None:
+def _config(tmp_path: Path, **overrides) -> RangeBackfillSupervisorConfig:
+    values = {
+        "status_path": tmp_path / "status.json",
+        "lock_path": tmp_path / "range.lock",
+        "global_lock_path": tmp_path / "global_raw_trade.lock",
+        "global_status_path": (
+            tmp_path / "global_raw_trade_status.json"
+        ),
+    }
+    values.update(overrides)
+    return RangeBackfillSupervisorConfig(**values)
+
+
+def test_supervisor_starts_when_history_insufficient_without_global_lock(
+    tmp_path, monkeypatch
+) -> None:
     started: list[FakeProcess] = []
 
     def fake_popen(*args, **kwargs):
@@ -59,9 +75,8 @@ def test_supervisor_starts_when_history_insufficient(tmp_path, monkeypatch) -> N
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
     supervisor = RangeBackfillSupervisor(
-        RangeBackfillSupervisorConfig(
-            status_path=tmp_path / "status.json",
-            lock_path=tmp_path / "range.lock",
+        _config(
+            tmp_path,
             repo_root=Path.cwd(),
             market_db_path=tmp_path / "market.sqlite3",
             checkpoint_db_path=tmp_path / "checkpoint.sqlite3",
@@ -88,11 +103,7 @@ def test_supervisor_starts_when_history_insufficient(tmp_path, monkeypatch) -> N
 
 def test_supervisor_never_enables_raw_trade_persistence(tmp_path) -> None:
     supervisor = RangeBackfillSupervisor(
-        RangeBackfillSupervisorConfig(
-            status_path=tmp_path / "status.json",
-            lock_path=tmp_path / "range.lock",
-            save_raw_trades=True,
-        )
+        _config(tmp_path, save_raw_trades=True)
     )
 
     command = supervisor._build_command(
@@ -109,7 +120,7 @@ def test_supervisor_never_enables_raw_trade_persistence(tmp_path) -> None:
 def test_supervisor_does_not_start_when_history_available(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not start")))
     supervisor = RangeBackfillSupervisor(
-        RangeBackfillSupervisorConfig(status_path=tmp_path / "status.json", lock_path=tmp_path / "range.lock")
+        _config(tmp_path)
     )
 
     assert not supervisor.start_if_needed(
@@ -142,9 +153,8 @@ def test_supervisor_does_not_start_while_mf_holds_global_lock(
         symbol="ETH-USDT-PERP",
     )
     supervisor = RangeBackfillSupervisor(
-        RangeBackfillSupervisorConfig(
-            status_path=tmp_path / "status.json",
-            lock_path=tmp_path / "range.lock",
+        _config(
+            tmp_path,
             global_lock_path=global_lock,
             global_status_path=global_status,
         )
@@ -168,11 +178,154 @@ def test_supervisor_does_not_start_while_mf_holds_global_lock(
     )
 
 
+def test_supervisor_starts_when_high_priority_global_lock_is_stale(
+    tmp_path, monkeypatch
+) -> None:
+    global_lock = tmp_path / "global_raw_trade.lock"
+    global_status = tmp_path / "global_raw_trade_status.json"
+    holder = RawTradeBackfillCoordinator(
+        lock_path=global_lock,
+        status_path=global_status,
+    )
+    assert holder.try_acquire(
+        owner="mf_feature_backfill",
+        priority=EXPEDITED_BACKFILL_PRIORITY,
+    )
+    status = dict(holder.status() or {})
+    status["worker_heartbeat_ms"] = 1
+    global_status.write_text(json.dumps(status), encoding="utf-8")
+    started: list[FakeProcess] = []
+    monkeypatch.setattr(
+        "subprocess.Popen",
+        lambda *args, **kwargs: started.append(
+            FakeProcess(*args, **kwargs)
+        )
+        or started[-1],
+    )
+    supervisor = RangeBackfillSupervisor(
+        _config(tmp_path, heartbeat_stale_seconds=1)
+    )
+    try:
+        assert supervisor.start_if_needed(
+            symbol="ETH-USDT-PERP",
+            exchange="okx",
+            range_pct="0.002",
+            bucket_interval="4h",
+            complete_history=0,
+            min_periods=100,
+        )
+    finally:
+        holder.release()
+
+    assert started
+
+
+def test_supervisor_starts_when_high_priority_lock_pid_is_missing(
+    tmp_path, monkeypatch
+) -> None:
+    global_lock = tmp_path / "global_raw_trade.lock"
+    global_lock.write_text(
+        json.dumps(
+            {
+                "pid": 999_999_999,
+                "priority": EXPEDITED_BACKFILL_PRIORITY,
+                "owner": "missing_worker",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "src.market_data.backfill.coordinator.process_id_exists",
+        lambda pid: False,
+    )
+    started: list[FakeProcess] = []
+    monkeypatch.setattr(
+        "subprocess.Popen",
+        lambda *args, **kwargs: started.append(
+            FakeProcess(*args, **kwargs)
+        )
+        or started[-1],
+    )
+    supervisor = RangeBackfillSupervisor(_config(tmp_path))
+
+    assert supervisor.start_if_needed(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        range_pct="0.002",
+        bucket_interval="4h",
+        complete_history=0,
+        min_periods=100,
+    )
+    assert started
+
+
+def test_supervisor_fresh_malformed_global_lock_blocks_start(
+    tmp_path, monkeypatch
+) -> None:
+    (tmp_path / "global_raw_trade.lock").write_text(
+        "{", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        "subprocess.Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("fresh malformed lock must block")
+        ),
+    )
+    supervisor = RangeBackfillSupervisor(_config(tmp_path))
+
+    assert not supervisor.start_if_needed(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        range_pct="0.002",
+        bucket_interval="4h",
+        complete_history=0,
+        min_periods=100,
+    )
+
+
+def test_supervisor_finished_high_priority_status_does_not_block(
+    tmp_path, monkeypatch
+) -> None:
+    holder = RawTradeBackfillCoordinator(
+        lock_path=tmp_path / "global_raw_trade.lock",
+        status_path=tmp_path / "global_raw_trade_status.json",
+    )
+    assert holder.try_acquire(
+        owner="mf_feature_backfill",
+        priority=EXPEDITED_BACKFILL_PRIORITY,
+    )
+    status = dict(holder.status() or {})
+    status["running"] = False
+    holder.status_path.write_text(json.dumps(status), encoding="utf-8")
+    started: list[FakeProcess] = []
+    monkeypatch.setattr(
+        "subprocess.Popen",
+        lambda *args, **kwargs: started.append(
+            FakeProcess(*args, **kwargs)
+        )
+        or started[-1],
+    )
+    supervisor = RangeBackfillSupervisor(_config(tmp_path))
+    try:
+        assert supervisor.start_if_needed(
+            symbol="ETH-USDT-PERP",
+            exchange="okx",
+            range_pct="0.002",
+            bucket_interval="4h",
+            complete_history=0,
+            min_periods=100,
+        )
+    finally:
+        holder.release()
+
+    assert started
+
+
 def test_supervisor_stop_terminates_process(tmp_path, monkeypatch) -> None:
     process = FakeProcess()
     monkeypatch.setattr("subprocess.Popen", lambda *args, **kwargs: process)
     supervisor = RangeBackfillSupervisor(
-        RangeBackfillSupervisorConfig(status_path=tmp_path / "status.json", lock_path=tmp_path / "range.lock", repo_root=Path.cwd())
+        _config(tmp_path, repo_root=Path.cwd())
     )
     supervisor.start_if_needed(
         symbol="ETH-USDT-PERP",
@@ -199,9 +352,8 @@ async def test_supervisor_monitor_starts_worker_when_coverage_insufficient(tmp_p
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
     supervisor = RangeBackfillSupervisor(
-        RangeBackfillSupervisorConfig(
-            status_path=tmp_path / "status.json",
-            lock_path=tmp_path / "range.lock",
+        _config(
+            tmp_path,
             repo_root=Path.cwd(),
             monitor_seconds=1,
             restart_cooldown_seconds=0,
@@ -253,9 +405,8 @@ async def test_supervisor_current_day_gap_only_writes_status_without_starting(tm
         lambda **kwargs: 1782777599999,
     )
     supervisor = RangeBackfillSupervisor(
-        RangeBackfillSupervisorConfig(
-            status_path=tmp_path / "status.json",
-            lock_path=tmp_path / "range.lock",
+        _config(
+            tmp_path,
             repo_root=Path.cwd(),
             monitor_seconds=1,
             restart_cooldown_seconds=0,
@@ -309,9 +460,8 @@ def test_supervisor_persisted_no_progress_retry_blocks_restart(tmp_path, monkeyp
         ),
     )
     supervisor = RangeBackfillSupervisor(
-        RangeBackfillSupervisorConfig(
-            status_path=tmp_path / "status.json",
-            lock_path=tmp_path / "range.lock",
+        _config(
+            tmp_path,
             repo_root=Path.cwd(),
             restart_cooldown_seconds=0,
         )
@@ -349,9 +499,8 @@ def test_supervisor_allows_restart_after_persisted_retry_deadline(tmp_path, monk
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
     supervisor = RangeBackfillSupervisor(
-        RangeBackfillSupervisorConfig(
-            status_path=tmp_path / "status.json",
-            lock_path=tmp_path / "range.lock",
+        _config(
+            tmp_path,
             repo_root=Path.cwd(),
             restart_cooldown_seconds=0,
         )
@@ -377,10 +526,7 @@ def test_supervisor_allows_restart_after_persisted_retry_deadline(tmp_path, monk
 
 def test_available_coverage_clears_retry_deadline(tmp_path) -> None:
     supervisor = RangeBackfillSupervisor(
-        RangeBackfillSupervisorConfig(
-            status_path=tmp_path / "status.json",
-            lock_path=tmp_path / "range.lock",
-        )
+        _config(tmp_path)
     )
     supervisor.status_store.patch(
         running=False,
@@ -439,9 +585,8 @@ def test_missing_worker_pid_is_cleared_and_does_not_block_restart(
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
     supervisor = RangeBackfillSupervisor(
-        RangeBackfillSupervisorConfig(
-            status_path=tmp_path / "status.json",
-            lock_path=tmp_path / "range.lock",
+        _config(
+            tmp_path,
             repo_root=Path.cwd(),
             restart_cooldown_seconds=0,
         )
@@ -496,9 +641,8 @@ def test_existing_worker_pid_with_fresh_worker_heartbeat_blocks_restart(
         ),
     )
     supervisor = RangeBackfillSupervisor(
-        RangeBackfillSupervisorConfig(
-            status_path=tmp_path / "status.json",
-            lock_path=tmp_path / "range.lock",
+        _config(
+            tmp_path,
             repo_root=Path.cwd(),
         )
     )
@@ -530,10 +674,7 @@ def test_existing_worker_supports_legacy_heartbeat_field(tmp_path, monkeypatch) 
         lambda pid: True,
     )
     supervisor = RangeBackfillSupervisor(
-        RangeBackfillSupervisorConfig(
-            status_path=tmp_path / "status.json",
-            lock_path=tmp_path / "range.lock",
-        )
+        _config(tmp_path)
     )
     supervisor.status_store.patch(
         running=True,
@@ -551,10 +692,7 @@ def test_coverage_status_only_updates_supervisor_heartbeat(tmp_path, monkeypatch
         lambda: fixed_now_ms,
     )
     supervisor = RangeBackfillSupervisor(
-        RangeBackfillSupervisorConfig(
-            status_path=tmp_path / "status.json",
-            lock_path=tmp_path / "range.lock",
-        )
+        _config(tmp_path)
     )
     supervisor.status_store.patch(
         running=True,

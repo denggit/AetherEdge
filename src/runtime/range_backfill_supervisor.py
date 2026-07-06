@@ -10,6 +10,7 @@ import sys
 from src.market_data.backfill.scanner import RangeBackfillScanner
 from src.market_data.backfill.coordinator import (
     BACKGROUND_BACKFILL_PRIORITY,
+    RawTradeBackfillCoordinator,
 )
 from src.market_data.backfill.status_store import (
     RangeBackfillStatusStore,
@@ -136,7 +137,9 @@ class RangeBackfillSupervisor:
             return False
         # Respect a higher-priority holder of the shared raw-trade lock.
         if _global_raw_trade_lock_held_by_higher_priority(
-            lock_path=self.config.global_lock_path
+            lock_path=self.config.global_lock_path,
+            status_path=self.config.global_status_path,
+            stale_after_seconds=self.config.heartbeat_stale_seconds,
         ):
             self.status_store.patch(
                 running=False,
@@ -504,24 +507,25 @@ def _archive_complete_max_target_end_ms(
 def _global_raw_trade_lock_held_by_higher_priority(
     *,
     lock_path: str | Path = "data/state/raw_trade_backfill_global.lock",
+    status_path: str | Path = (
+        "data/state/raw_trade_backfill_global_status.json"
+    ),
+    stale_after_seconds: int = 180,
 ) -> bool:
-    """Check if the global raw-trade lock is held by a higher-priority worker.
-
-    If the lock exists and its holder has a higher priority, this worker
-    must yield.
-    """
-    import json
-
-    resolved_lock_path = Path(lock_path)
-    if not resolved_lock_path.exists():
-        return False
+    """Return whether a fresh higher-priority raw-trade holder exists."""
+    coordinator = RawTradeBackfillCoordinator(
+        lock_path=lock_path,
+        status_path=status_path,
+        stale_after_seconds=stale_after_seconds,
+    )
+    owner = coordinator.current_owner()
+    if owner is None:
+        return coordinator.has_fresh_holder()
 
     try:
-        data = json.loads(resolved_lock_path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return True  # malformed lock → be safe, yield
-        holder_priority = int(data.get("priority", 0))
-        # Yield to any valid higher-priority workload.
-        return holder_priority > BACKGROUND_BACKFILL_PRIORITY
-    except (OSError, json.JSONDecodeError, ValueError):
-        return True  # unreadable lock → be safe, yield
+        priority = int(owner.get("priority", 0))
+        if priority <= BACKGROUND_BACKFILL_PRIORITY:
+            return False
+        return coordinator.has_fresh_holder()
+    except (TypeError, ValueError):
+        return coordinator.has_fresh_holder()

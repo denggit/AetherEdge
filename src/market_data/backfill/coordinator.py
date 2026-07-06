@@ -77,14 +77,22 @@ class RawTradeBackfillCoordinator:
         if existing is not None:
             existing_priority = int(existing.get("priority", 0))
             if existing_priority > priority:
-                logger.info(
-                    "raw-trade global lock held by higher-priority worker | "
-                    "owner=%s priority=%s my_priority=%s",
+                if not self._is_stale(existing):
+                    logger.info(
+                        "raw-trade global lock held by higher-priority worker | "
+                        "owner=%s priority=%s my_priority=%s",
+                        existing.get("owner", "?"),
+                        existing_priority,
+                        priority,
+                    )
+                    return False
+                logger.warning(
+                    "raw-trade global lock: evicting stale higher-priority "
+                    "worker | owner=%s priority=%s my_priority=%s",
                     existing.get("owner", "?"),
                     existing_priority,
                     priority,
                 )
-                return False
 
             if existing_priority == priority and not force:
                 if not self._is_stale(existing):
@@ -193,11 +201,21 @@ class RawTradeBackfillCoordinator:
     # ------------------------------------------------------------------
 
     def _is_stale(self, lock_data: Mapping[str, Any]) -> bool:
+        status = self.status()
+        if status is not None:
+            lock_token = lock_data.get("token")
+            same_holder = (
+                status.get("token") == lock_token
+                if lock_token is not None
+                else status.get("pid") == lock_data.get("pid")
+            )
+            if same_holder and status.get("running") is False:
+                return True
+
         pid = lock_data.get("pid")
         if pid is not None and process_id_exists(pid) is False:
             return True
 
-        status = self.status()
         if status is not None:
             heartbeat = worker_heartbeat_ms(status)
             if heartbeat is not None:
@@ -214,8 +232,11 @@ class RawTradeBackfillCoordinator:
             if not self.lock_path.exists():
                 return None
             data = json.loads(self.lock_path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else None
-        except (OSError, json.JSONDecodeError):
+            if not isinstance(data, dict):
+                return None
+            int(data.get("priority", 0))
+            return data
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
             return None
 
     def _write_lock(self, *, owner: str, priority: int, symbol: str, raw_days: int) -> None:

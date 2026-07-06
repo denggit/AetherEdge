@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -96,6 +97,61 @@ def test_stale_lock_is_evicted(tmp_path: Path) -> None:
     )
     assert mf.try_acquire(owner="mf", priority=EXPEDITED_BACKFILL_PRIORITY, symbol="ETH") is True
     mf.release()
+
+
+def test_stale_high_priority_lock_is_evicted_by_background(
+    tmp_path: Path,
+) -> None:
+    lock_path = tmp_path / "global.lock"
+    status_path = tmp_path / "global_status.json"
+    expedited = RawTradeBackfillCoordinator(
+        lock_path=lock_path,
+        status_path=status_path,
+    )
+    assert expedited.try_acquire(
+        owner="mf",
+        priority=EXPEDITED_BACKFILL_PRIORITY,
+        symbol="ETH",
+    )
+    status = dict(expedited.status() or {})
+    status["running"] = False
+    status_path.write_text(json.dumps(status), encoding="utf-8")
+
+    background = RawTradeBackfillCoordinator(
+        lock_path=lock_path,
+        status_path=status_path,
+    )
+    try:
+        assert background.try_acquire(
+            owner="range",
+            priority=BACKGROUND_BACKFILL_PRIORITY,
+            symbol="ETH",
+        )
+    finally:
+        background.release()
+        expedited.release()
+
+
+def test_stale_malformed_lock_is_evicted(tmp_path: Path) -> None:
+    lock_path = tmp_path / "global.lock"
+    status_path = tmp_path / "global_status.json"
+    lock_path.write_text('{"priority": "invalid"}', encoding="utf-8")
+    stale_time = time.time() - 3_600
+    os.utime(lock_path, (stale_time, stale_time))
+
+    coordinator = RawTradeBackfillCoordinator(
+        lock_path=lock_path,
+        status_path=status_path,
+        stale_after_seconds=1,
+    )
+    try:
+        assert coordinator.try_acquire(
+            owner="range",
+            priority=BACKGROUND_BACKFILL_PRIORITY,
+            symbol="ETH",
+        )
+    finally:
+        coordinator.release()
 
 
 def test_status_contains_required_fields(tmp_path: Path) -> None:
