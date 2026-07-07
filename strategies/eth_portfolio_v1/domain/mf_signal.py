@@ -202,6 +202,13 @@ class MfLowSweepConfig:
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any] | None) -> "MfLowSweepConfig":
         raw = dict(value or {})
+        if "margin_fraction" in raw and "position_fraction" in raw:
+            margin_fraction_value = Decimal(str(raw["margin_fraction"]))
+            legacy_fraction_value = Decimal(str(raw["position_fraction"]))
+            if margin_fraction_value != legacy_fraction_value:
+                raise ValueError(
+                    "mf.position_fraction and mf.margin_fraction are ambiguous"
+                )
         margin_fraction = raw.get(
             "margin_fraction",
             raw.get("position_fraction", "0.10"),

@@ -318,6 +318,10 @@ def _canonical_quantity(
     master = values.get(master_exchange)
     if master is not None and master > 0:
         return master
+    for exchange in sorted(values):
+        quantity = values[exchange]
+        if quantity > 0:
+            return quantity
     return fallback
 
 

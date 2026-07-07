@@ -134,6 +134,7 @@ class MfSleeveState:
         if not self.exchange_quantities:
             self.clear()
             return
+        self.quantity = _canonical_quantity(self.exchange_quantities)
         self.pending_close = True
 
     def restore_from_plan(self, payload: Mapping[str, Any]) -> bool:
@@ -267,6 +268,14 @@ def _string_decimal_mapping(values: Mapping[str, Decimal]) -> dict[str, str]:
         for exchange, quantity in values.items()
         if quantity > 0
     }
+
+
+def _canonical_quantity(values: Mapping[str, Decimal]) -> Decimal:
+    for exchange in sorted(values):
+        quantity = values[exchange]
+        if quantity > 0:
+            return quantity
+    return Decimal("0")
 
 
 def _exchange_quantities_from_plan(

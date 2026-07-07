@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
 from src.signals import SignalAction
 from strategies.eth_portfolio_v1.domain.mf_data import (
     MfDataBuffer,
     MfFeatureObserver,
 )
+from strategies.eth_portfolio_v1.domain.mf_signal import MfLowSweepConfig
 from strategies.eth_portfolio_v1.domain.mf_sleeve import MfSleeveState
 from strategies.eth_portfolio_v1.execution.mf_signal_mapper import (
     MfSignalMapper,
@@ -285,3 +287,20 @@ def test_available_equity_caps_mf_target_notional(tmp_path) -> None:
     assert signals[0].metadata["sizing_input"][
         "target_notional_by_exchange"
     ] == {"okx": "750"}
+
+
+def test_mf_position_fraction_legacy_alias_maps_to_margin_fraction() -> None:
+    cfg = MfLowSweepConfig.from_mapping({"position_fraction": "0.20"})
+
+    assert cfg.margin_fraction == Decimal("0.20")
+    assert cfg.position_fraction == Decimal("0.20")
+
+
+def test_mf_position_fraction_conflicts_with_margin_fraction() -> None:
+    with pytest.raises(ValueError, match="ambiguous"):
+        MfLowSweepConfig.from_mapping(
+            {
+                "margin_fraction": "0.10",
+                "position_fraction": "0.20",
+            }
+        )

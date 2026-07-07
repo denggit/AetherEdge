@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass, replace
 from decimal import Decimal
@@ -3347,13 +3346,14 @@ class Strategy:
 
     def _load_configured_account_sizing(self) -> None:
         try:
+            from src.platform.config import load_project_env_config
             from src.runtime.account_config import load_account_config_env
 
+            project_env = load_project_env_config()
             config = load_account_config_env(
                 exchanges=(ExchangeName.OKX, ExchangeName.BINANCE),
                 symbol=self.config.symbol,
-                env_file=Path(__file__).resolve().parents[2] / ".env",
-                environ=os.environ,
+                environ=project_env.values,
                 require_leverage=False,
             )
         except Exception as exc:

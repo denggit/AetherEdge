@@ -269,6 +269,21 @@ def test_mf_close_keeps_unclosed_follower_quantity() -> None:
     )
 
     assert strategy.mf_sleeve.pending_close is True
+    assert strategy.mf_sleeve.quantity == Decimal("0.05")
     assert strategy.mf_sleeve.exchange_quantities == {
         "binance": Decimal("0.05")
+    }
+
+    retry_signal = MfSignalMapper(
+        strategy_id=strategy.config.strategy_id,
+        symbol=strategy.config.symbol,
+        config=strategy.config.mf,
+        master_exchange="okx",
+    ).map_close(decision, sleeve=strategy.mf_sleeve)
+
+    assert retry_signal is not None
+    assert retry_signal.quantity == Decimal("0.05")
+    assert retry_signal.metadata["target_exchanges"] == ["binance"]
+    assert retry_signal.metadata["exchange_quantities_base"] == {
+        "binance": "0.05"
     }

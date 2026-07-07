@@ -41,6 +41,17 @@ _OTHER_EXIT_ACTIONS = {
     "manual close signal",
 }
 _EXIT_ACTIONS = _LONG_EXIT_ACTIONS | _SHORT_EXIT_ACTIONS | _OTHER_EXIT_ACTIONS
+_SHRINKABLE_EXIT_ACTIONS = {
+    "close_long",
+    "close_short",
+    "reduce_long",
+    "reduce_short",
+    "follower_close_after_master_close",
+    "recovery_close",
+    "recovery close",
+    "manual_close_signal",
+    "manual close signal",
+}
 
 
 class ExitSafetyError(ValueError):
@@ -153,6 +164,7 @@ class ExitSafetyGuard:
             market_profile=market_profile,
             close_position=False,
         )
+        normalized = _with_report_quantity(normalized, report)
         return normalized, report
 
     def normalize_stop_market(
@@ -266,6 +278,7 @@ class ExitSafetyGuard:
         )
         base_quantity = request.quantity
         native_quantity = None
+        metadata: dict[str, Any] = {}
         if base_quantity is not None:
             conversion = self.quantity_converter.convert_quantity(
                 exchange=exchange,
@@ -274,7 +287,42 @@ class ExitSafetyGuard:
                 market_profile=market_profile,
             )
             native_quantity = conversion.native_quantity
-            if base_quantity > current_base * self.tolerance or native_quantity > current_native * self.tolerance:
+            if (
+                _can_shrink_to_position(action, request)
+                and base_quantity > current_base
+                and base_quantity <= current_base * self.tolerance
+            ):
+                requested_base = base_quantity
+                requested_native = native_quantity
+                shrink_conversion = self.quantity_converter.convert_quantity(
+                    exchange=exchange,
+                    symbol=request.symbol,
+                    base_quantity=current_base,
+                    market_profile=market_profile,
+                )
+                base_quantity = current_base
+                native_quantity = shrink_conversion.native_quantity
+                metadata.update(
+                    {
+                        "quantity_shrunk_to_position": True,
+                        "requested_base_quantity": _decimal_text(
+                            requested_base
+                        ),
+                        "shrunk_base_quantity": _decimal_text(
+                            base_quantity
+                        ),
+                        "requested_native_quantity": _decimal_text(
+                            requested_native
+                        ),
+                        "shrunk_native_quantity": _decimal_text(
+                            native_quantity
+                        ),
+                        "shrink_reason": (
+                            "requested_quantity_slightly_exceeds_position"
+                        ),
+                    }
+                )
+            elif base_quantity > current_base * self.tolerance or native_quantity > current_native * self.tolerance:
                 raise self._error(
                     _exceeds_reason(action),
                     exchange=exchange,
@@ -311,6 +359,7 @@ class ExitSafetyGuard:
             close_position=close_position,
             position_side=request.position_side,
             position_mode=position_mode,
+            metadata=metadata,
         )
 
     def _ensure_existing_position_side_safe(
@@ -362,6 +411,27 @@ class ExitSafetyGuard:
 
 def is_exit_action(action: SignalAction | str) -> bool:
     return _action_value(action) in _EXIT_ACTIONS
+
+
+def _can_shrink_to_position(
+    action: str,
+    request: OrderRequest | StopMarketOrderRequest,
+) -> bool:
+    return (
+        not isinstance(request, StopMarketOrderRequest)
+        and action in _SHRINKABLE_EXIT_ACTIONS
+    )
+
+
+def _with_report_quantity(
+    request: OrderRequest,
+    report: ExitSafetyReport,
+) -> OrderRequest:
+    if not report.metadata.get("quantity_shrunk_to_position"):
+        return request
+    if report.base_quantity is None:
+        return request
+    return replace(request, quantity=report.base_quantity)
 
 
 def target_position_side_for_action(action: SignalAction | str) -> PositionSide | None:
