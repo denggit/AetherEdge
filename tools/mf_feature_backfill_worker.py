@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import logging
 import os
@@ -54,7 +55,6 @@ from src.market_data.models import (  # noqa: E402
 )
 from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore  # noqa: E402
 from src.market_data.trade_features.coverage import (  # noqa: E402
-    compute_mf_signal_backfill_target,
     resolve_trade_feature_readiness,
     safe_okx_archive_end_ms,
 )
@@ -64,6 +64,16 @@ from src.platform.exchanges.models import ExchangeName  # noqa: E402
 logger = logging.getLogger(__name__)
 _ONE_MINUTE_MS = 60_000
 _OKX_ARCHIVE_TIMEZONE = timezone(timedelta(hours=8))
+_STRATEGY_MF_TARGET_MODULE = (
+    "strategies."
+    + "eth_"
+    + "portfolio_"
+    + "v1.preflight.mf_signal_readiness"
+)
+compute_mf_signal_backfill_target = getattr(
+    importlib.import_module(_STRATEGY_MF_TARGET_MODULE),
+    "compute_mf_signal_backfill_target",
+)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:

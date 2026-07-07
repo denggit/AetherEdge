@@ -11,11 +11,13 @@ from src.market_data.models import (
 )
 from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
 from src.market_data.trade_features.coverage import (
-    compute_mf_signal_backfill_target,
     compute_backfill_target,
     resolve_trade_feature_readiness,
     trade_feature_coverage_scan,
     safe_okx_archive_end_ms,
+)
+from strategies.eth_portfolio_v1.preflight.mf_signal_readiness import (
+    compute_mf_signal_backfill_target,
 )
 
 _MINUTE = 60_000
