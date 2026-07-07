@@ -29,6 +29,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.market_data.backfill.coordinator import (  # noqa: E402
+    BACKGROUND_BACKFILL_PRIORITY,
     EXPEDITED_BACKFILL_PRIORITY,
     RawTradeBackfillCoordinator,
 )
@@ -71,7 +72,12 @@ _OKX_ARCHIVE_TIMEZONE = timezone(timedelta(hours=8))
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MF 1m trade-derived feature backfill worker")
     # Mode
-    parser.add_argument("--once", action="store_true", help="Run one cycle and exit")
+    parser.add_argument(
+        "--once",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Run one cycle and exit (default: False for live, True for prebuild)",
+    )
     parser.add_argument("--mode", choices=("live", "prebuild"), default="prebuild")
     parser.add_argument("--direction", choices=("recent-to-oldest", "oldest-to-recent"),
                         default="recent-to-oldest")
@@ -87,6 +93,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-trades-per-cycle", type=int, default=500_000)
     parser.add_argument("--max-seconds-per-cycle", type=float, default=60.0)
     parser.add_argument("--chunk-sleep-seconds", type=float, default=0.0)
+    parser.add_argument("--sleep-seconds", type=float, default=30.0)
     # Symbol
     parser.add_argument("--symbol", default="ETH-USDT-PERP")
     parser.add_argument("--exchange", default="okx")
@@ -101,6 +108,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--log-file", default=None)
     # Flags
     parser.add_argument("--no-download", action="store_true")
+    parser.add_argument(
+        "--global-lock-priority",
+        type=int,
+        default=EXPEDITED_BACKFILL_PRIORITY,
+    )
     parser.add_argument("--save-raw-trades", action="store_true", default=False)
     parser.add_argument("--contract-value", type=str, default="0.01")
     parser.add_argument("--price-bucket-size", type=str, default="1")
@@ -137,14 +149,10 @@ def run_cycle(
     range_footprint_warmup_days: int = 1,
     required_minutes: int = 4320,
     archive_publish_lag_hours: float = 8.0,
+    global_lock_priority: int = EXPEDITED_BACKFILL_PRIORITY,
 ) -> dict:
     # -------- guard --------
     normalized_mode = str(mode).strip().lower()
-    if normalized_mode == "live" and not no_download:
-        raise ValueError(
-            "live mode requires --no-download; raw archive downloads "
-            "must run in prebuild/background mode"
-        )
     if save_raw_trades:
         if normalized_mode == "live":
             raise ValueError("--save-raw-trades is forbidden in live mode")
@@ -161,7 +169,7 @@ def run_cycle(
     )
     acquired = coordinator.try_acquire(
         owner="mf_feature_backfill",
-        priority=EXPEDITED_BACKFILL_PRIORITY,
+        priority=global_lock_priority,
         symbol=symbol,
         raw_days=max_days_per_cycle,
     )
@@ -170,7 +178,7 @@ def run_cycle(
         holder_priority = int(holder.get("priority", 0) or 0)
         reason = (
             "waiting_for_lower_priority_worker"
-            if holder_priority < EXPEDITED_BACKFILL_PRIORITY
+            if holder_priority < global_lock_priority
             else "global_lock_not_acquired"
         )
         return {
@@ -611,8 +619,15 @@ def _update_status(status_path: str, **kwargs: object) -> None:
     os.replace(tmp, path)
 
 
+def resolve_once(args: argparse.Namespace) -> bool:
+    if args.once is not None:
+        return bool(args.once)
+    return str(args.mode).strip().lower() != "live"
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    once = resolve_once(args)
 
     log_file = args.log_file
     if log_file:
@@ -626,9 +641,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not log_file:
         logging.getLogger().addHandler(logging.StreamHandler(sys.stderr))
 
-    if args.mode == "live" and not args.no_download:
-        logger.error("live mode requires --no-download")
-        return 1
     if args.save_raw_trades and args.mode == "live":
         logger.error("--save-raw-trades is forbidden in live mode")
         return 1
@@ -640,53 +652,169 @@ def main(argv: Sequence[str] | None = None) -> int:
         symbol=args.symbol,
         no_download=bool(args.no_download),
         archive_publish_lag_hours=args.archive_publish_lag_hours,
+        sleep_seconds=args.sleep_seconds,
+        global_lock_priority=args.global_lock_priority,
     )
 
     try:
-        result = run_cycle(
-            symbol=args.symbol,
-            exchange=args.exchange,
-            market_db=args.market_db,
-            raw_root=args.raw_root,
-            status_path=args.status_path,
-            global_lock_path=args.global_lock_path,
-            global_status_path=args.global_status_path,
-            mode=args.mode,
-            direction=args.direction,
-            max_minutes_per_cycle=args.max_minutes_per_cycle,
-            max_days_per_cycle=args.max_days_per_cycle,
-            max_trades_per_cycle=args.max_trades_per_cycle,
-            max_seconds_per_cycle=args.max_seconds_per_cycle,
-            chunk_sleep_seconds=args.chunk_sleep_seconds,
-            no_download=args.no_download,
-            save_raw_trades=args.save_raw_trades,
-            contract_value=Decimal(args.contract_value),
-            large_trade_threshold=Decimal(args.large_trade_threshold),
-            price_bucket_size=Decimal(args.price_bucket_size),
-            range_footprint_range_pct=Decimal(
-                args.range_footprint_range_pct
-            ),
-            range_footprint_price_step=Decimal(
-                args.range_footprint_price_step
-            ),
-            range_footprint_warmup_days=args.range_footprint_warmup_days,
-            required_minutes=args.required_minutes,
-            archive_publish_lag_hours=args.archive_publish_lag_hours,
-        )
-        result.setdefault("mode", args.mode)
-        result.setdefault("no_download", bool(args.no_download))
-        _update_status(
-            args.status_path,
-            running=False,
-            last_result=result,
-            worker_heartbeat_ms=now_ms(),
-            mode=args.mode,
-            symbol=args.symbol,
-            no_download=bool(args.no_download),
-            archive_publish_lag_hours=args.archive_publish_lag_hours,
-        )
-        logger.info("Cycle result: %s", json.dumps(result, default=str))
-        return 0
+        while True:
+            result = run_cycle(
+                symbol=args.symbol,
+                exchange=args.exchange,
+                market_db=args.market_db,
+                raw_root=args.raw_root,
+                status_path=args.status_path,
+                global_lock_path=args.global_lock_path,
+                global_status_path=args.global_status_path,
+                mode=args.mode,
+                direction=args.direction,
+                max_minutes_per_cycle=args.max_minutes_per_cycle,
+                max_days_per_cycle=args.max_days_per_cycle,
+                max_trades_per_cycle=args.max_trades_per_cycle,
+                max_seconds_per_cycle=args.max_seconds_per_cycle,
+                chunk_sleep_seconds=args.chunk_sleep_seconds,
+                no_download=args.no_download,
+                save_raw_trades=args.save_raw_trades,
+                contract_value=Decimal(args.contract_value),
+                large_trade_threshold=Decimal(args.large_trade_threshold),
+                price_bucket_size=Decimal(args.price_bucket_size),
+                range_footprint_range_pct=Decimal(
+                    args.range_footprint_range_pct
+                ),
+                range_footprint_price_step=Decimal(
+                    args.range_footprint_price_step
+                ),
+                range_footprint_warmup_days=args.range_footprint_warmup_days,
+                required_minutes=args.required_minutes,
+                archive_publish_lag_hours=args.archive_publish_lag_hours,
+                global_lock_priority=args.global_lock_priority,
+            )
+            result.setdefault("mode", args.mode)
+            result.setdefault("no_download", bool(args.no_download))
+
+            status = str(result.get("status", "error"))
+
+            _update_status(
+                args.status_path,
+                running=True,
+                last_result=result,
+                worker_heartbeat_ms=now_ms(),
+                mode=args.mode,
+                symbol=args.symbol,
+                no_download=bool(args.no_download),
+                archive_publish_lag_hours=args.archive_publish_lag_hours,
+                sleep_seconds=args.sleep_seconds,
+                global_lock_priority=args.global_lock_priority,
+            )
+
+            logger.info("Cycle result: %s", json.dumps(result, default=str))
+
+            # --- exit conditions ---
+            if status == "error":
+                _update_status(
+                    args.status_path,
+                    running=False,
+                    error=True,
+                    mode=args.mode,
+                    symbol=args.symbol,
+                    no_download=bool(args.no_download),
+                    archive_publish_lag_hours=args.archive_publish_lag_hours,
+                    sleep_seconds=args.sleep_seconds,
+                    global_lock_priority=args.global_lock_priority,
+                )
+                return 1
+
+            if status == "up_to_date":
+                _update_status(
+                    args.status_path,
+                    running=False,
+                    last_result=result,
+                    worker_heartbeat_ms=now_ms(),
+                    mode=args.mode,
+                    symbol=args.symbol,
+                    no_download=bool(args.no_download),
+                    archive_publish_lag_hours=args.archive_publish_lag_hours,
+                    sleep_seconds=args.sleep_seconds,
+                    global_lock_priority=args.global_lock_priority,
+                )
+                return 0
+
+            if status == "deferred" and result.get(
+                "current_day_gap_unrecoverable_until_archive"
+            ):
+                _update_status(
+                    args.status_path,
+                    running=False,
+                    last_result=result,
+                    worker_heartbeat_ms=now_ms(),
+                    mode=args.mode,
+                    symbol=args.symbol,
+                    no_download=bool(args.no_download),
+                    archive_publish_lag_hours=args.archive_publish_lag_hours,
+                    sleep_seconds=args.sleep_seconds,
+                    global_lock_priority=args.global_lock_priority,
+                )
+                return 0
+
+            if status == "ok" and result.get("mf_signal_feature_ready"):
+                _update_status(
+                    args.status_path,
+                    running=False,
+                    last_result=result,
+                    worker_heartbeat_ms=now_ms(),
+                    mode=args.mode,
+                    symbol=args.symbol,
+                    no_download=bool(args.no_download),
+                    archive_publish_lag_hours=args.archive_publish_lag_hours,
+                    sleep_seconds=args.sleep_seconds,
+                    global_lock_priority=args.global_lock_priority,
+                )
+                return 0
+
+            if status == "skipped":
+                _update_status(
+                    args.status_path,
+                    running=False,
+                    last_result=result,
+                    worker_heartbeat_ms=now_ms(),
+                    mode=args.mode,
+                    symbol=args.symbol,
+                    no_download=bool(args.no_download),
+                    archive_publish_lag_hours=args.archive_publish_lag_hours,
+                    sleep_seconds=args.sleep_seconds,
+                    global_lock_priority=args.global_lock_priority,
+                )
+                return 0
+
+            if once:
+                exit_code = (
+                    0
+                    if status
+                    in {
+                        "ok",
+                        "partial",
+                        "up_to_date",
+                        "not_ready",
+                        "skipped",
+                        "deferred",
+                    }
+                    else 1
+                )
+                _update_status(
+                    args.status_path,
+                    running=False,
+                    last_result=result,
+                    worker_heartbeat_ms=now_ms(),
+                    mode=args.mode,
+                    symbol=args.symbol,
+                    no_download=bool(args.no_download),
+                    archive_publish_lag_hours=args.archive_publish_lag_hours,
+                    sleep_seconds=args.sleep_seconds,
+                    global_lock_priority=args.global_lock_priority,
+                )
+                return exit_code
+
+            time.sleep(max(0.0, float(args.sleep_seconds)))
     except Exception:
         logger.exception("MF feature backfill worker failed")
         _update_status(
@@ -697,6 +825,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             symbol=args.symbol,
             no_download=bool(args.no_download),
             archive_publish_lag_hours=args.archive_publish_lag_hours,
+            sleep_seconds=args.sleep_seconds,
+            global_lock_priority=args.global_lock_priority,
         )
         return 1
 

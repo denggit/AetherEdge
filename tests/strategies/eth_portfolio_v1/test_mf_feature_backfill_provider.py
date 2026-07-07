@@ -3,6 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from types import MappingProxyType
 
+from src.market_data.backfill.coordinator import (
+    BACKGROUND_BACKFILL_PRIORITY,
+)
 from src.market_data.trade_features.backfill_supervisor import (
     TradeFeatureBackfillSupervisor,
 )
@@ -145,7 +148,10 @@ def test_provider_builds_generic_supervisor_with_worker_config(
     assert config.market_db == str(tmp_path / "market.sqlite3")
     assert config.required_minutes == 129_600
     assert config.worker_mode == "live"
-    assert config.no_download is True
+    assert config.direction == "recent-to-oldest"
+    assert config.run_once is False
+    assert config.no_download is False
+    assert config.global_lock_priority == BACKGROUND_BACKFILL_PRIORITY
 
 
 def test_coverage_ready_emits_true_readiness(tmp_path) -> None:

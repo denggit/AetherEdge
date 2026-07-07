@@ -9,6 +9,7 @@ import pytest
 
 from src.market_data.backfill.coordinator import (
     BACKGROUND_BACKFILL_PRIORITY,
+    EXPEDITED_BACKFILL_PRIORITY,
     RawTradeBackfillCoordinator,
 )
 from src.market_data.models import (
@@ -263,14 +264,36 @@ def test_live_worker_rejects_save_raw_trades(tmp_path: Path) -> None:
         worker.run_cycle(**kwargs)
 
 
-def test_live_worker_rejects_raw_archive_download(
+def test_live_worker_allows_archive_download(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Live mode with no_download=False must allow archive download."""
     kwargs = _kwargs(tmp_path)
     kwargs["no_download"] = False
+    calls = []
 
-    with pytest.raises(ValueError, match="requires --no-download"):
-        worker.run_cycle(**kwargs)
+    class _DownloadArchive(_Archive):
+        def ensure_daily_file(self, **values):
+            calls.append(values)
+            return super().ensure_daily_file(**values)
+
+    monkeypatch.setattr(worker, "OkxHistoricalTradeArchive", _DownloadArchive)
+    monkeypatch.setattr(
+        worker,
+        "iter_okx_archive_dates_for_utc_range",
+        lambda *_: iter((date(2026, 7, 3),)),
+    )
+    monkeypatch.setattr(
+        worker,
+        "iter_trade_csv_chunks",
+        lambda *_args, **_kwargs: iter(()),
+    )
+
+    worker.run_cycle(**kwargs)
+
+    assert calls
+    assert calls[0]["allow_download"] is True
 
 
 def test_prebuild_worker_allows_archive_download(
@@ -609,6 +632,171 @@ def test_processed_through_stops_before_failed_later_day(
     assert result["processed_through_ms"] == _okx_day_end_ms(first_day)
     assert result["processed_through_ms"] < result["target_end_ms"]
     assert result["can_finalize_safe_history"] is False
+
+
+# ---------------------------------------------------------------------------
+# --once / --no-once parser and resolve_once tests
+# ---------------------------------------------------------------------------
+
+
+def test_parser_once_defaults_to_none() -> None:
+    args = worker.parse_args([])
+    assert args.once is None
+
+
+def test_parser_once_flag_sets_true() -> None:
+    args = worker.parse_args(["--once"])
+    assert args.once is True
+
+
+def test_parser_no_once_flag_sets_false() -> None:
+    args = worker.parse_args(["--no-once"])
+    assert args.once is False
+
+
+def test_resolve_once_explicit_overrides_mode() -> None:
+    args = worker.parse_args(["--once", "--mode", "live"])
+    assert worker.resolve_once(args) is True
+
+    args = worker.parse_args(["--no-once", "--mode", "prebuild"])
+    assert worker.resolve_once(args) is False
+
+
+def test_resolve_once_live_defaults_to_false() -> None:
+    args = worker.parse_args(["--mode", "live"])
+    assert worker.resolve_once(args) is False
+
+
+def test_resolve_once_prebuild_defaults_to_true() -> None:
+    args = worker.parse_args(["--mode", "prebuild"])
+    assert worker.resolve_once(args) is True
+
+
+def test_parser_sleep_seconds_default() -> None:
+    args = worker.parse_args([])
+    assert args.sleep_seconds == 30.0
+
+
+def test_parser_global_lock_priority_default() -> None:
+    args = worker.parse_args([])
+    assert args.global_lock_priority == EXPEDITED_BACKFILL_PRIORITY
+
+
+# ---------------------------------------------------------------------------
+# global_lock_priority tests
+# ---------------------------------------------------------------------------
+
+
+def test_run_cycle_uses_global_lock_priority_for_acquire(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run_cycle must pass global_lock_priority to try_acquire."""
+    kwargs = _kwargs(tmp_path)
+    kwargs["global_lock_priority"] = 50
+    acquire_calls = []
+
+    class _TrackingCoordinator:
+        def __init__(self, **kw):
+            pass
+
+        def try_acquire(self, **kw):
+            acquire_calls.append(kw)
+            return False
+
+        def current_owner(self):
+            return {}
+
+        def release(self):
+            pass
+
+        def heartbeat(self):
+            pass
+
+    monkeypatch.setattr(
+        worker, "RawTradeBackfillCoordinator", _TrackingCoordinator
+    )
+
+    result = worker.run_cycle(**kwargs)
+
+    assert result["status"] == "skipped"
+    assert acquire_calls[0]["priority"] == 50
+
+
+def test_run_cycle_global_lock_reason_lower_priority_holder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When holder priority < requested priority, reason is
+    waiting_for_lower_priority_worker."""
+    kwargs = _kwargs(tmp_path)
+    kwargs["global_lock_priority"] = 50
+    acquire_calls = []
+
+    class _TrackingCoordinator:
+        def __init__(self, **kw):
+            pass
+
+        def try_acquire(self, **kw):
+            acquire_calls.append(kw)
+            return False
+
+        def current_owner(self):
+            return {"priority": 10}
+
+        def release(self):
+            pass
+
+        def heartbeat(self):
+            pass
+
+    monkeypatch.setattr(
+        worker, "RawTradeBackfillCoordinator", _TrackingCoordinator
+    )
+
+    result = worker.run_cycle(**kwargs)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "waiting_for_lower_priority_worker"
+    assert acquire_calls[0]["priority"] == 50
+
+
+def test_run_cycle_global_lock_reason_higher_priority_holder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When holder priority >= requested priority, reason is
+    global_lock_not_acquired."""
+    kwargs = _kwargs(tmp_path)
+    kwargs["global_lock_priority"] = 50
+    acquire_calls = []
+
+    class _TrackingCoordinator:
+        def __init__(self, **kw):
+            pass
+
+        def try_acquire(self, **kw):
+            acquire_calls.append(kw)
+            return False
+
+        def current_owner(self):
+            return {"priority": 100}
+
+        def release(self):
+            pass
+
+        def heartbeat(self):
+            pass
+
+    monkeypatch.setattr(
+        worker, "RawTradeBackfillCoordinator", _TrackingCoordinator
+    )
+
+    result = worker.run_cycle(**kwargs)
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "global_lock_not_acquired"
+    assert acquire_calls[0]["priority"] == 50
 
 
 def _okx_day_start_ms(day: date) -> int:

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from src.market_data.backfill.coordinator import (
+    BACKGROUND_BACKFILL_PRIORITY,
     RawTradeBackfillCoordinator,
 )
 from src.market_data.backfill.status_store import (
@@ -33,8 +34,16 @@ class TradeFeatureBackfillConfig:
     global_status_path: Path
     worker_log_path: Path
     required_minutes: int = 4320
-    worker_mode: str = "prebuild"
+    worker_mode: str = "live"
+    direction: str = "recent-to-oldest"
+    max_minutes_per_cycle: int = 1440
+    max_days_per_cycle: int = 1
+    max_trades_per_cycle: int = 500000
+    chunk_sleep_seconds: float = 0.0
+    sleep_seconds: float = 30.0
+    run_once: bool | None = None
     no_download: bool = False
+    global_lock_priority: int = BACKGROUND_BACKFILL_PRIORITY
     stale_after_seconds: int = 180
     restart_cooldown_seconds: int = 300
     failure_cooldown_seconds: int = 3600
@@ -166,12 +175,29 @@ class TradeFeatureBackfillSupervisor:
                 self.config.worker_mode,
             )
             return False
+
+        direction = str(self.config.direction).strip().lower()
+        if direction not in {"recent-to-oldest", "oldest-to-recent"}:
+            logger.error(
+                "Unsupported trade-feature backfill direction: %s",
+                self.config.direction,
+            )
+            return False
+
+        if self.config.run_once is not None:
+            run_once = bool(self.config.run_once)
+        elif worker_mode == "live":
+            run_once = False
+        else:
+            run_once = True
+
         command = [
             sys.executable,
             str(self.config.worker_script),
-            "--once",
             "--mode",
             worker_mode,
+            "--direction",
+            direction,
             "--symbol",
             self.config.symbol,
             "--exchange",
@@ -186,10 +212,22 @@ class TradeFeatureBackfillSupervisor:
             str(self.config.global_status_path),
             "--raw-root",
             self.config.raw_root,
+            "--max-minutes-per-cycle",
+            str(self.config.max_minutes_per_cycle),
+            "--max-days-per-cycle",
+            str(self.config.max_days_per_cycle),
+            "--max-trades-per-cycle",
+            str(self.config.max_trades_per_cycle),
             "--max-seconds-per-cycle",
             str(self.config.max_seconds_per_cycle),
+            "--chunk-sleep-seconds",
+            str(self.config.chunk_sleep_seconds),
+            "--sleep-seconds",
+            str(self.config.sleep_seconds),
             "--required-minutes",
             str(max(1, int(self.config.required_minutes))),
+            "--global-lock-priority",
+            str(self.config.global_lock_priority),
             "--contract-value",
             self.config.contract_value,
             "--price-bucket-size",
@@ -205,6 +243,10 @@ class TradeFeatureBackfillSupervisor:
             "--log-file",
             str(self.config.worker_log_path),
         ]
+        if run_once:
+            command.append("--once")
+        else:
+            command.append("--no-once")
         if self.config.no_download:
             command.append("--no-download")
         try:

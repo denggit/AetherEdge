@@ -9,6 +9,9 @@ from src.market_data.trade_features.backfill_supervisor import (
     TradeFeatureBackfillConfig,
     TradeFeatureBackfillSupervisor,
 )
+from src.market_data.backfill.coordinator import (
+    BACKGROUND_BACKFILL_PRIORITY,
+)
 from src.platform.config import (
     ProjectEnvConfig,
     get_project_env_config,
@@ -102,11 +105,29 @@ class PortfolioV1MfFeatureBackfillProvider:
                 else:
                     coverage = dict(self._readiness_reader())
 
+                # Check if MF signal features are ready.
+                # Ready means either mf_signal_feature_ready is True,
+                # or all individual feature readiness flags are True.
+                feature_ready = bool(
+                    coverage.get("mf_signal_feature_ready")
+                )
+                if not feature_ready:
+                    feature_ready = all(
+                        coverage.get(field)
+                        for field in (
+                            "coverage_ready",
+                            "tradebar_ready",
+                            "fixed_time_footprint_ready",
+                            "range_footprint_ready",
+                            "large_share_samples_ready",
+                        )
+                    )
+
                 # When coverage is not ready at runtime, attempt to
                 # launch a backfill worker.  check_and_launch() already
                 # guards against duplicate launches, cooldown
                 # violations, and global-lock contention.
-                if not coverage.get("mf_signal_feature_ready"):
+                if not feature_ready:
                     return self.check_and_launch()
             else:
                 coverage = dict(self._readiness_reader())
@@ -246,8 +267,46 @@ class PortfolioV1MfFeatureBackfillProvider:
                     self.required_minutes,
                 ),
             ),
-            worker_mode="live",
-            no_download=True,
+            worker_mode=self.project_env.get(
+                "AETHER_MF_FEATURE_BACKFILL_WORKER_MODE",
+                "live",
+            ),
+            direction=self.project_env.get(
+                "AETHER_MF_FEATURE_BACKFILL_DIRECTION",
+                "recent-to-oldest",
+            ),
+            run_once=self.project_env.get_bool(
+                "AETHER_MF_FEATURE_BACKFILL_RUN_ONCE",
+                False,
+            ),
+            no_download=self.project_env.get_bool(
+                "AETHER_MF_FEATURE_BACKFILL_NO_DOWNLOAD",
+                False,
+            ),
+            global_lock_priority=self.project_env.get_int(
+                "AETHER_MF_FEATURE_BACKFILL_GLOBAL_LOCK_PRIORITY",
+                BACKGROUND_BACKFILL_PRIORITY,
+            ),
+            max_minutes_per_cycle=self.project_env.get_int(
+                "AETHER_MF_FEATURE_BACKFILL_MAX_MINUTES_PER_CYCLE",
+                1440,
+            ),
+            max_days_per_cycle=self.project_env.get_int(
+                "AETHER_MF_FEATURE_BACKFILL_MAX_DAYS_PER_CYCLE",
+                1,
+            ),
+            max_trades_per_cycle=self.project_env.get_int(
+                "AETHER_MF_FEATURE_BACKFILL_MAX_TRADES_PER_CYCLE",
+                500000,
+            ),
+            chunk_sleep_seconds=self.project_env.get_float(
+                "AETHER_MF_FEATURE_BACKFILL_CHUNK_SLEEP_SECONDS",
+                0.1,
+            ),
+            sleep_seconds=self.project_env.get_float(
+                "AETHER_MF_FEATURE_BACKFILL_SLEEP_SECONDS",
+                30.0,
+            ),
             max_seconds_per_cycle=self.project_env.get_float(
                 "AETHER_MF_FEATURE_BACKFILL_MAX_SECONDS_PER_CYCLE",
                 60.0,

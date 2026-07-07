@@ -7,6 +7,9 @@ from dataclasses import replace
 from pathlib import Path
 
 from tools import mf_feature_backfill_worker as worker
+from src.market_data.backfill.coordinator import (
+    BACKGROUND_BACKFILL_PRIORITY,
+)
 from src.market_data.trade_features import (
     backfill_supervisor as supervisor_module,
 )
@@ -178,3 +181,40 @@ def test_worker_command_uses_configured_mode_and_no_download(
 
     assert parsed.mode == "live"
     assert parsed.no_download is True
+
+
+def test_default_supervisor_launches_live_recent_to_oldest_no_once(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Default config must launch a live recent-to-oldest no-once worker
+    with BACKGROUND_BACKFILL_PRIORITY and without --no-download."""
+    config = _config(tmp_path)
+    supervisor = TradeFeatureBackfillSupervisor(
+        config=config,
+        coverage_reader=lambda: {"coverage_ready": False},
+    )
+    captured = {}
+
+    def capture_popen(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(
+        supervisor_module.subprocess,
+        "Popen",
+        capture_popen,
+    )
+
+    assert supervisor._launch_worker() is True
+    command = captured["command"]
+    parsed = worker.parse_args(command[2:])
+
+    assert parsed.mode == "live"
+    assert parsed.direction == "recent-to-oldest"
+    assert parsed.once is False
+    assert parsed.no_download is False
+    assert parsed.global_lock_priority == BACKGROUND_BACKFILL_PRIORITY
+    assert "--no-once" in command
+    assert "--no-download" not in command
