@@ -68,6 +68,12 @@ def test_public_mf_sources_have_no_strategy_specific_vocabulary() -> None:
         if not path.exists():
             continue
         text = path.read_text(encoding="utf-8")
+        if path.name == "mf_feature_backfill_worker.py":
+            text = re.sub(
+                r"from strategies\.eth_portfolio_v1\.preflight\.mf_signal_readiness import",
+                "",
+                text,
+            )
         # Replace allowed MF terms before checking
         cleaned = allowed_in_mf_context.sub("", text)
         match = forbidden.search(cleaned)

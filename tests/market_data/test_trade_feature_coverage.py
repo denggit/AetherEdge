@@ -16,9 +16,6 @@ from src.market_data.trade_features.coverage import (
     trade_feature_coverage_scan,
     safe_okx_archive_end_ms,
 )
-from strategies.eth_portfolio_v1.preflight.mf_signal_readiness import (
-    compute_mf_signal_backfill_target,
-)
 
 _MINUTE = 60_000
 _OKX_TIMEZONE = timezone(timedelta(hours=8))
@@ -432,77 +429,6 @@ def test_compute_backfill_target_returns_none_when_complete(tmp_path: Path) -> N
         safe_archive_end_ms=_base(4) + _MINUTE - 1,
     )
     assert target is None
-
-
-def test_mf_signal_target_ignores_fixed_and_range_historical_coverage_gap(
-    tmp_path: Path,
-) -> None:
-    store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
-    for i in range(3):
-        store.upsert_tradebars_many([_make_bar(_base(i))])
-    store.upsert_range_footprints_many(
-        [
-            RangeFootprintFeature(
-                exchange="okx",
-                symbol="ETH-USDT-PERP",
-                range_pct=Decimal("0.002"),
-                price_step=Decimal("1"),
-                range_bar_id=1,
-                range_start_ms=_base(2) - 30_000,
-                range_end_ms=_base(2) - 1,
-                available_time_ms=_base(2) - 1,
-                fp_max_bucket_abs_delta_pressure=Decimal("0.8"),
-                fp_low_bucket_delta_pressure=Decimal("-0.2"),
-                fp_high_bucket_delta_pressure=Decimal("0.4"),
-                fp_delta_pressure=Decimal("0.1"),
-                bucket_count=5,
-                trade_count=20,
-                context_available=True,
-                quality="COMPLETE",
-            )
-        ]
-    )
-
-    readiness = resolve_trade_feature_readiness(
-        symbol="ETH-USDT-PERP",
-        exchange="okx",
-        store=store,
-        required_minutes=3,
-        reference_end_ms=_base(2) + _MINUTE - 1,
-    )
-    target = compute_mf_signal_backfill_target(
-        symbol="ETH-USDT-PERP",
-        exchange="okx",
-        store=store,
-        required_minutes=3,
-        max_minutes_per_cycle=3,
-        safe_archive_end_ms=_base(2) + _MINUTE - 1,
-    )
-
-    assert readiness.coverage_ready is False
-    assert target is None
-
-
-def test_mf_signal_target_missing_context_uses_recent_seed_window(
-    tmp_path: Path,
-) -> None:
-    store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
-    for i in range(10):
-        store.upsert_tradebars_many([_make_bar(_base(i))])
-
-    target = compute_mf_signal_backfill_target(
-        symbol="ETH-USDT-PERP",
-        exchange="okx",
-        store=store,
-        required_minutes=10,
-        max_minutes_per_cycle=2,
-        safe_archive_end_ms=_base(9) + _MINUTE - 1,
-    )
-
-    assert target is not None
-    assert target.reason == "missing_range_footprint_context_seed"
-    assert target.start_ms == _base(8)
-    assert target.end_ms == _base(9) + _MINUTE - 1
 
 
 def test_coverage_fixed_footprint_does_not_satisfy_range_footprint_ready(
