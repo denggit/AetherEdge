@@ -241,3 +241,146 @@ def test_not_ready_event_keeps_mf_signal_blocked(tmp_path) -> None:
 
     assert signals == ()
     assert strategy.last_mf_signal_audit["data_ready"] is False
+
+
+# ---------------------------------------------------------------------------
+# poll_readiness runtime backfill launch tests
+# ---------------------------------------------------------------------------
+
+
+class _PollSupervisor:
+    """Test double that records calls to scan_coverage and check_and_launch."""
+
+    def __init__(self, *, coverage_ready: bool = False, launch_result=None):
+        self.coverage_ready = coverage_ready
+        self.launch_result = launch_result or {
+            "action": "launched",
+            "reason": "coverage_gap",
+            "coverage": _coverage(False),
+        }
+        self.scan_calls = 0
+        self.launch_calls = 0
+
+    def scan_coverage(self):
+        self.scan_calls += 1
+        return _coverage(self.coverage_ready)
+
+    def check_and_launch(self):
+        self.launch_calls += 1
+        return dict(self.launch_result)
+
+
+def test_poll_readiness_launches_when_coverage_not_ready(
+    tmp_path,
+) -> None:
+    """When enabled and coverage is not ready, poll_readiness must delegate
+    to check_and_launch()."""
+    supervisor = _PollSupervisor(coverage_ready=False)
+    provider = PortfolioV1MfFeatureBackfillProvider(
+        strategy=Strategy(),
+        project_env=_env(tmp_path),
+        supervisor=supervisor,
+        readiness_reader=lambda: _coverage(False),
+    )
+
+    result = provider.poll_readiness()
+
+    assert result["action"] == "launched"
+    assert supervisor.scan_calls == 1
+    assert supervisor.launch_calls == 1
+
+
+def test_poll_readiness_skips_launch_when_coverage_ready(
+    tmp_path,
+) -> None:
+    """When coverage is already ready, poll_readiness must NOT call
+    check_and_launch."""
+    supervisor = _PollSupervisor(coverage_ready=True)
+    provider = PortfolioV1MfFeatureBackfillProvider(
+        strategy=Strategy(),
+        project_env=_env(tmp_path),
+        supervisor=supervisor,
+        readiness_reader=lambda: _coverage(True),
+    )
+
+    result = provider.poll_readiness()
+
+    assert result["action"] == "none"
+    assert result["reason"] == "periodic_coverage_scan"
+    assert supervisor.launch_calls == 0
+
+
+def test_poll_readiness_disabled_skips_launch(
+    tmp_path,
+) -> None:
+    """When disabled, poll_readiness must only return readiness, never
+    launch a worker."""
+    supervisor = _PollSupervisor(coverage_ready=False)
+    provider = PortfolioV1MfFeatureBackfillProvider(
+        strategy=Strategy(),
+        project_env=_env(
+            tmp_path,
+            AETHER_MF_FEATURE_BACKFILL_ENABLED="false",
+        ),
+        supervisor=supervisor,
+        readiness_reader=lambda: _coverage(False),
+    )
+
+    result = provider.poll_readiness()
+
+    assert result["enabled"] is False
+    assert result["action"] == "none"
+    assert supervisor.launch_calls == 0
+
+
+def test_poll_readiness_cooldown_preserved(
+    tmp_path,
+) -> None:
+    """When check_and_launch returns a cooldown reason, poll_readiness
+    must pass it through — not silently swallow the guard."""
+    supervisor = _PollSupervisor(
+        coverage_ready=False,
+        launch_result={
+            "action": "none",
+            "reason": "restart_cooldown",
+            "coverage": _coverage(False),
+        },
+    )
+    provider = PortfolioV1MfFeatureBackfillProvider(
+        strategy=Strategy(),
+        project_env=_env(tmp_path),
+        supervisor=supervisor,
+        readiness_reader=lambda: _coverage(False),
+    )
+
+    result = provider.poll_readiness()
+
+    assert result["action"] == "none"
+    assert result["reason"] == "restart_cooldown"
+    assert supervisor.launch_calls == 1
+
+
+def test_poll_readiness_worker_already_running_preserved(
+    tmp_path,
+) -> None:
+    """When check_and_launch detects an already-running worker,
+    poll_readiness must pass through the reason."""
+    supervisor = _PollSupervisor(
+        coverage_ready=False,
+        launch_result={
+            "action": "none",
+            "reason": "worker_already_running",
+            "coverage": _coverage(False),
+        },
+    )
+    provider = PortfolioV1MfFeatureBackfillProvider(
+        strategy=Strategy(),
+        project_env=_env(tmp_path),
+        supervisor=supervisor,
+        readiness_reader=lambda: _coverage(False),
+    )
+
+    result = provider.poll_readiness()
+
+    assert result["action"] == "none"
+    assert result["reason"] == "worker_already_running"

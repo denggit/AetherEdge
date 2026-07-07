@@ -93,6 +93,13 @@ class PortfolioV1MfFeatureBackfillProvider:
                     coverage = dict(scan())
                 else:
                     coverage = dict(self._readiness_reader())
+
+                # When coverage is not ready at runtime, attempt to
+                # launch a backfill worker.  check_and_launch() already
+                # guards against duplicate launches, cooldown
+                # violations, and global-lock contention.
+                if not coverage.get("coverage_ready"):
+                    return self.check_and_launch()
             else:
                 coverage = dict(self._readiness_reader())
             return {
@@ -261,6 +268,18 @@ class PortfolioV1MfFeatureBackfillProvider:
             large_trade_threshold=self.project_env.get(
                 "AETHER_MF_FEATURE_LARGE_TRADE_THRESHOLD",
                 "10000",
+            ),
+            stale_after_seconds=self.project_env.get_int(
+                "AETHER_MF_FEATURE_BACKFILL_STALE_AFTER_SECONDS",
+                180,
+            ),
+            restart_cooldown_seconds=self.project_env.get_int(
+                "AETHER_MF_FEATURE_BACKFILL_RESTART_COOLDOWN_SECONDS",
+                300,
+            ),
+            failure_cooldown_seconds=self.project_env.get_int(
+                "AETHER_MF_FEATURE_BACKFILL_FAILURE_COOLDOWN_SECONDS",
+                3600,
             ),
         )
         return TradeFeatureBackfillSupervisor(

@@ -662,13 +662,49 @@ class SqliteTradeFeatureStore:
             if seed_row is None or seed_row[0] is None
             else int(seed_row[0])
         )
+        coverage_intervals = [
+            (int(row[0]), int(row[1])) for row in coverage_rows
+        ]
         missing_minutes = _missing_minutes_from_coverage(
             start_ms=int(start_ms),
             end_ms=int(end_ms),
-            intervals=[
-                (int(row[0]), int(row[1])) for row in coverage_rows
-            ],
+            intervals=coverage_intervals,
         )
+        missing_gaps = _missing_gaps_from_coverage(
+            start_ms=int(start_ms),
+            end_ms=int(end_ms),
+            intervals=coverage_intervals,
+        )
+        first_missing_gap = missing_gaps[0] if missing_gaps else None
+        last_missing_gap = missing_gaps[-1] if missing_gaps else None
+
+        # Compute contiguous degraded-feature ranges within the window.
+        degraded_gaps: list[tuple[int, int]] = []
+        _current_degraded_start: int | None = None
+        for row in feature_rows:
+            available_time_ms = int(row[0])
+            quality_val = str(row[1]) if row[1] else ""
+            context_ok = bool(row[2])
+            is_degraded = (
+                quality_val != TradeFeatureQuality.COMPLETE.value
+                or not context_ok
+            )
+            if is_degraded:
+                if _current_degraded_start is None:
+                    _current_degraded_start = available_time_ms
+            else:
+                if _current_degraded_start is not None:
+                    degraded_gaps.append(
+                        (_current_degraded_start, available_time_ms - _ONE_MINUTE_MS)
+                    )
+                    _current_degraded_start = None
+        if _current_degraded_start is not None:
+            degraded_gaps.append(
+                (_current_degraded_start, int(end_ms))
+            )
+        first_degraded_gap = degraded_gaps[0] if degraded_gaps else None
+        last_degraded_gap = degraded_gaps[-1] if degraded_gaps else None
+
         coverage_marker_present = bool(coverage_rows)
         ready = (
             context_seed is not None
@@ -687,6 +723,10 @@ class SqliteTradeFeatureStore:
             "range_footprint_coverage_marker_present": coverage_marker_present,
             "range_pct": range_text,
             "price_step": step_text,
+            "first_missing_range_footprint_range": first_missing_gap,
+            "last_missing_range_footprint_range": last_missing_gap,
+            "first_degraded_range_footprint_range": first_degraded_gap,
+            "last_degraded_range_footprint_range": last_degraded_gap,
         }
 
     def tradebar_without_footprint_bounds(
@@ -1461,6 +1501,39 @@ def _missing_minutes_from_coverage(
     total_ms = end_ms - start_ms + 1
     missing_ms = max(0, total_ms - covered_ms)
     return (missing_ms + _ONE_MINUTE_MS - 1) // _ONE_MINUTE_MS
+
+
+def _missing_gaps_from_coverage(
+    *,
+    start_ms: int,
+    end_ms: int,
+    intervals: Sequence[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Return ordered list of (start_ms, end_ms) ranges *not* covered by intervals."""
+    if end_ms < start_ms:
+        return []
+    merged: list[tuple[int, int]] = []
+    for raw_start, raw_end in sorted(intervals):
+        clipped_start = max(start_ms, int(raw_start))
+        clipped_end = min(end_ms, int(raw_end))
+        if clipped_end < clipped_start:
+            continue
+        if merged and clipped_start <= merged[-1][1] + 1:
+            merged[-1] = (
+                merged[-1][0],
+                max(merged[-1][1], clipped_end),
+            )
+        else:
+            merged.append((clipped_start, clipped_end))
+    gaps: list[tuple[int, int]] = []
+    cursor = start_ms
+    for m_start, m_end in merged:
+        if cursor < m_start:
+            gaps.append((cursor, m_start - 1))
+        cursor = max(cursor, m_end + 1)
+    if cursor <= end_ms:
+        gaps.append((cursor, end_ms))
+    return gaps
 
 
 def _now_ms() -> int:

@@ -831,3 +831,247 @@ def test_footprint_store_crud(tmp_path: Path) -> None:
     loaded = store.load_recent_footprints(symbol="ETH-USDT-PERP", exchange="okx", limit=10)
     assert len(loaded) == 1
     assert loaded[0].open_time_ms == _base(0)
+
+
+# ---------------------------------------------------------------------------
+# Range-footprint gap boundary tests
+# ---------------------------------------------------------------------------
+
+
+def test_range_footprint_coverage_summary_exposes_gap_boundaries(
+    tmp_path: Path,
+) -> None:
+    """range_footprint_coverage_summary must return gap boundary tuples
+    computed from coverage markers and degraded feature rows."""
+    store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
+
+    # Write range-footprint features and a coverage marker for minutes 0-4.
+    _write_range_ready(store, _base(4) + _MINUTE - 1, start_ms=_base(0))
+
+    # Window spans minutes 0-9 but coverage only covers 0-4.
+    summary = store.range_footprint_coverage_summary(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        start_ms=_base(0),
+        end_ms=_base(9) + _MINUTE - 1,
+    )
+
+    assert "first_missing_range_footprint_range" in summary
+    assert "last_missing_range_footprint_range" in summary
+    assert "first_degraded_range_footprint_range" in summary
+    assert "last_degraded_range_footprint_range" in summary
+
+    first_missing = summary["first_missing_range_footprint_range"]
+    last_missing = summary["last_missing_range_footprint_range"]
+
+    # Gap should be minutes 5-9 (the uncovered tail).
+    assert first_missing is not None
+    assert first_missing[0] == _base(5)
+    assert first_missing[1] == _base(9) + _MINUTE - 1
+    assert last_missing == first_missing  # single gap
+
+    # No degraded features → degraded gaps should be None.
+    assert summary["first_degraded_range_footprint_range"] is None
+    assert summary["last_degraded_range_footprint_range"] is None
+
+
+def test_compute_backfill_target_advances_range_footprint_oldest_to_recent(
+    tmp_path: Path,
+) -> None:
+    """When fixed-time features are complete but range-footprint coverage
+    has gaps, successive backfill targets must advance — not repeat the
+    same earliest chunk."""
+    store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
+    required = 15  # 15-minute window
+    per_cycle = 5  # 5 minutes per cycle
+    safe_end = _base(14) + _MINUTE - 1
+
+    # Write complete fixed-time features for the entire required window.
+    for i in range(required):
+        _write_pair(store, _base(i))
+
+    # Cycle 1: no range-footprint coverage yet → first 5 minutes.
+    target1 = compute_backfill_target(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        store=store,
+        required_minutes=required,
+        max_minutes_per_cycle=per_cycle,
+        direction="oldest-to-recent",
+        safe_archive_end_ms=safe_end,
+    )
+    assert target1 is not None
+    assert target1.reason == "missing_range_footprint"
+    assert target1.start_ms == _base(0)
+    assert target1.end_ms == _base(4) + _MINUTE - 1
+
+    # Simulate worker: write range-footprint coverage for chunk 1.
+    _write_target_ready(
+        store,
+        start_ms=target1.start_ms,
+        end_ms=target1.end_ms,
+        range_bar_id=1,
+    )
+
+    # Cycle 2: should target the NEXT chunk, not repeat 0-4.
+    target2 = compute_backfill_target(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        store=store,
+        required_minutes=required,
+        max_minutes_per_cycle=per_cycle,
+        direction="oldest-to-recent",
+        safe_archive_end_ms=safe_end,
+    )
+    assert target2 is not None
+    assert target2.reason == "missing_range_footprint"
+    assert target2.start_ms == _base(5)
+    assert target2.end_ms == _base(9) + _MINUTE - 1
+
+    _write_target_ready(
+        store,
+        start_ms=target2.start_ms,
+        end_ms=target2.end_ms,
+        range_bar_id=2,
+    )
+
+    # Cycle 3: final chunk.
+    target3 = compute_backfill_target(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        store=store,
+        required_minutes=required,
+        max_minutes_per_cycle=per_cycle,
+        direction="oldest-to-recent",
+        safe_archive_end_ms=safe_end,
+    )
+    assert target3 is not None
+    assert target3.reason == "missing_range_footprint"
+    assert target3.start_ms == _base(10)
+    assert target3.end_ms == _base(14) + _MINUTE - 1
+
+    _write_target_ready(
+        store,
+        start_ms=target3.start_ms,
+        end_ms=target3.end_ms,
+        range_bar_id=3,
+    )
+
+    # Cycle 4: everything should be complete.
+    target4 = compute_backfill_target(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        store=store,
+        required_minutes=required,
+        max_minutes_per_cycle=per_cycle,
+        direction="oldest-to-recent",
+        safe_archive_end_ms=safe_end,
+    )
+    assert target4 is None
+
+
+def test_compute_backfill_target_range_footprint_recent_to_oldest(
+    tmp_path: Path,
+) -> None:
+    """recent-to-oldest direction must pick the *latest* uncovered
+    range-footprint chunk, not regress to the oldest gap."""
+    store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
+    required = 15
+    per_cycle = 5
+    safe_end = _base(14) + _MINUTE - 1
+
+    # Complete fixed-time features everywhere.
+    for i in range(required):
+        _write_pair(store, _base(i))
+
+    # No range-footprint coverage yet → first target (recent-to-oldest)
+    # should pick the latest 5-minute chunk: minutes 10-14.
+    target1 = compute_backfill_target(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        store=store,
+        required_minutes=required,
+        max_minutes_per_cycle=per_cycle,
+        direction="recent-to-oldest",
+        safe_archive_end_ms=safe_end,
+    )
+    assert target1 is not None
+    assert target1.reason == "missing_range_footprint"
+    assert target1.start_ms == _base(10)
+    assert target1.end_ms == _base(14) + _MINUTE - 1
+
+    _write_target_ready(
+        store,
+        start_ms=target1.start_ms,
+        end_ms=target1.end_ms,
+        range_bar_id=1,
+    )
+
+    # Second target: next latest uncovered chunk (5-9).
+    target2 = compute_backfill_target(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        store=store,
+        required_minutes=required,
+        max_minutes_per_cycle=per_cycle,
+        direction="recent-to-oldest",
+        safe_archive_end_ms=safe_end,
+    )
+    assert target2 is not None
+    assert target2.start_ms == _base(5)
+    assert target2.end_ms == _base(9) + _MINUTE - 1
+
+
+def test_range_footprint_coverage_summary_exposes_degraded_gaps(
+    tmp_path: Path,
+) -> None:
+    """Degraded range-footprint features must produce degraded gap
+    boundaries in the coverage summary."""
+    store = SqliteTradeFeatureStore(path=tmp_path / "test.sqlite3")
+
+    # Write a degraded range-footprint feature and a coverage marker.
+    store.upsert_range_footprints_many(
+        [
+            RangeFootprintFeature(
+                exchange="okx",
+                symbol="ETH-USDT-PERP",
+                range_pct=Decimal("0.002"),
+                price_step=Decimal("1"),
+                range_bar_id=1,
+                range_start_ms=_base(0),
+                range_end_ms=_base(0) + _MINUTE - 1,
+                available_time_ms=_base(0) + _MINUTE - 1,
+                fp_max_bucket_abs_delta_pressure=Decimal("0"),
+                fp_low_bucket_delta_pressure=Decimal("0"),
+                fp_high_bucket_delta_pressure=Decimal("0"),
+                fp_delta_pressure=Decimal("0"),
+                bucket_count=0,
+                trade_count=2,
+                context_available=False,
+                quality="MISSING_FOOTPRINT_CONTEXT",
+            )
+        ]
+    )
+    store.mark_range_footprint_coverage(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        range_pct=Decimal("0.002"),
+        price_step=Decimal("1"),
+        start_ms=_base(0),
+        end_ms=_base(0) + _MINUTE - 1,
+        complete=True,
+    )
+
+    summary = store.range_footprint_coverage_summary(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        start_ms=_base(0),
+        end_ms=_base(0) + _MINUTE - 1,
+    )
+
+    assert summary["range_footprint_ready"] is False
+    assert summary["degraded_range_footprint_count"] == 1
+    assert summary["first_degraded_range_footprint_range"] is not None
+    assert summary["first_degraded_range_footprint_range"][0] == _base(
+        0
+    ) + _MINUTE - 1

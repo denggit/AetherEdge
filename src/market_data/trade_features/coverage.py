@@ -366,6 +366,49 @@ def compute_backfill_target(
         )
     if incomplete is None:
         incomplete = coverage.first_missing_range
+    # ------------------------------------------------------------------
+    # Range-footprint-specific gap detection.
+    #
+    # When fixed-time tradebars and footprints are already complete but
+    # range-footprint coverage has gaps (missing markers or degraded
+    # features), the target must be derived from those gaps so each
+    # cycle advances the covered window rather than re-processing the
+    # same earliest chunk.
+    # ------------------------------------------------------------------
+    if incomplete is None:
+        _rfp_missing_key = (
+            "first_missing_range_footprint_range"
+            if normalized_direction == "oldest-to-recent"
+            else "last_missing_range_footprint_range"
+        )
+        _rfp_missing = extra.get(_rfp_missing_key)
+        _rfp_degraded_key = (
+            "first_degraded_range_footprint_range"
+            if normalized_direction == "oldest-to-recent"
+            else "last_degraded_range_footprint_range"
+        )
+        _rfp_degraded = extra.get(_rfp_degraded_key)
+        _rfp_gap = (
+            _rfp_missing if _rfp_missing is not None else _rfp_degraded
+        )
+        if _rfp_gap is not None:
+            _rfp_start = int(_rfp_gap[0])
+            _rfp_end = int(_rfp_gap[1])
+            _reason = (
+                "missing_range_footprint"
+                if _rfp_missing is not None
+                else "degraded_range_footprint_recompute"
+            )
+            start_ms, end_ms = _bounded_window(
+                (_rfp_start, _rfp_end),
+                max_minutes=max_minutes,
+                direction=normalized_direction,
+            )
+            return TradeFeatureBackfillTarget(
+                start_ms=start_ms,
+                end_ms=min(safe_end, end_ms),
+                reason=_reason,
+            )
     if incomplete is None:
         range_start = safe_end - required * _ONE_MINUTE_MS + 1
         range_reason = (
