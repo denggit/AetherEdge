@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, replace
 from decimal import Decimal
@@ -259,6 +260,7 @@ class Strategy:
             strategy_id=self.config.strategy_id,
             symbol=self.config.symbol,
             config=self.config.mf,
+            master_exchange=self.config.data_exchange,
         )
         self.mf_feature_observer = MfFeatureObserver(
             self.mf_data_buffer,
@@ -279,7 +281,10 @@ class Strategy:
         self.equity: Decimal | None = None
         self.exchange_equity: dict[str, Decimal] = {}
         self.exchange_available: dict[str, Decimal] = {}
+        self.exchange_leverage: dict[str, Decimal] = {}
+        self.exchange_margin_mode: dict[str, str] = {}
         self.exchange_equity_updated_at_ms: dict[str, int] = {}
+        self._load_configured_account_sizing()
         self.recovery_manual_required = False
         self.recovery_blocking_manual_required = False
         self.pending_entry: PendingEntryPlan | None = None
@@ -289,6 +294,7 @@ class Strategy:
         self.recovery_alerts: list[str] = []
         self.last_recovery_audit: dict[str, Any] | None = None
         self.stop_safety_alerts: list[str] = []
+        self.mf_execution_alerts: list[str] = []
         self.last_stop_reject_reason: str | None = None
         self.last_stop_reject_metadata: dict[str, Any] | None = None
         self.last_structural_stop_audit: dict[str, Any] | None = None
@@ -625,6 +631,10 @@ class Strategy:
             available_equity=self.exchange_available.get(
                 self.config.data_exchange
             ),
+            equity_by_exchange=dict(self.exchange_equity),
+            available_equity_by_exchange=dict(self.exchange_available),
+            leverage_by_exchange=dict(self.exchange_leverage),
+            margin_mode_by_exchange=dict(self.exchange_margin_mode),
         )
 
     def _handle_mf_order_results(
@@ -643,32 +653,79 @@ class Strategy:
             None,
         )
         if signal.action is SignalAction.OPEN_LONG:
+            master_filled = _strict_result_filled_quantity(master)
             if (
                 master is not None
-                and master.ok
-                and master.status is OrderStatus.FILLED
+                and master_filled is not None
                 and master.avg_fill_price is not None
+                and master.avg_fill_price > 0
             ):
                 self.mf_sleeve.confirm_open(
-                    quantity=signal.quantity or Decimal("0"),
+                    quantity=master_filled,
                     average_entry_price=master.avg_fill_price,
                     entry_time_ms=int(
                         signal.metadata.get("entry_execution_time_ms")
                         or event_time_ms
                         or signal.created_time_ms
                     ),
+                    exchange_quantities=_filled_exchange_quantities(
+                        signal=signal,
+                        results=results,
+                        master_exchange=self.config.data_exchange,
+                        master_quantity=master_filled,
+                    ),
+                    master_exchange=self.config.data_exchange,
                 )
-            elif master is not None:
+            else:
+                self.mf_execution_alerts.append(
+                    "mf_open_master_unconfirmed"
+                )
+                logger.error(
+                    "MF open rejected: master fill unconfirmed | "
+                    "position_id=%s master_exchange=%s status=%s "
+                    "filled_quantity=%s avg_fill_price=%s ok=%s error=%s",
+                    signal.metadata.get("position_id"),
+                    self.config.data_exchange,
+                    master.status.value if master is not None and master.status else "missing",
+                    str(master.filled_quantity) if master is not None and master.filled_quantity is not None else "missing",
+                    str(master.avg_fill_price) if master is not None and master.avg_fill_price is not None else "missing",
+                    master.ok if master is not None else False,
+                    master.error if master is not None else "missing result",
+                )
                 self.mf_sleeve.reject_open()
             return
         if signal.action is SignalAction.CLOSE_LONG:
-            if (
-                master is not None
-                and master.ok
-                and master.status is OrderStatus.FILLED
-            ):
-                self.mf_sleeve.confirm_close()
-            elif master is not None:
+            master_filled = _strict_result_filled_quantity(master)
+            if master is not None and master_filled is not None:
+                planned = _signal_exchange_quantities(signal)
+                closed_exchanges = tuple(
+                    sorted(
+                        result.exchange.value
+                        for result in results
+                        if _strict_result_filled_quantity(result) is not None
+                    )
+                )
+                if planned:
+                    self.mf_sleeve.confirm_close(
+                        closed_exchanges=closed_exchanges
+                    )
+                else:
+                    self.mf_sleeve.confirm_close()
+            else:
+                self.mf_execution_alerts.append(
+                    "mf_close_master_unconfirmed"
+                )
+                logger.error(
+                    "MF close unconfirmed: keeping sleeve state | "
+                    "position_id=%s master_exchange=%s status=%s "
+                    "filled_quantity=%s ok=%s error=%s",
+                    signal.metadata.get("position_id"),
+                    self.config.data_exchange,
+                    master.status.value if master is not None and master.status else "missing",
+                    str(master.filled_quantity) if master is not None and master.filled_quantity is not None else "missing",
+                    master.ok if master is not None else False,
+                    master.error if master is not None else "missing result",
+                )
                 self.mf_sleeve.reject_close()
 
     def _entry_has_master_fill_event(self, events: Sequence[AccountEvent]) -> bool:
@@ -3278,7 +3335,40 @@ class Strategy:
                 self.equity = sizing_equity
         if available >= 0:
             self.exchange_available[exchange] = available
+        leverage = snapshot.leverage.leverage
+        if leverage is not None and leverage > 0 and exchange not in self.exchange_leverage:
+            self.exchange_leverage[exchange] = leverage
+        margin_mode = snapshot.leverage.margin_mode
+        if margin_mode is not None and exchange not in self.exchange_margin_mode:
+            self.exchange_margin_mode[exchange] = (
+                margin_mode.value if hasattr(margin_mode, "value") else str(margin_mode)
+            )
         self.exchange_equity_updated_at_ms[exchange] = int(time.time() * 1000)
+
+    def _load_configured_account_sizing(self) -> None:
+        try:
+            from src.runtime.account_config import load_account_config_env
+
+            config = load_account_config_env(
+                exchanges=(ExchangeName.OKX, ExchangeName.BINANCE),
+                symbol=self.config.symbol,
+                env_file=Path(__file__).resolve().parents[2] / ".env",
+                environ=os.environ,
+                require_leverage=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                "MF account sizing config unavailable | error=%s",
+                exc,
+            )
+            return
+        for target in config.targets:
+            self.exchange_leverage[target.exchange.value] = target.leverage
+            self.exchange_margin_mode[target.exchange.value] = (
+                target.margin_mode.value
+                if hasattr(target.margin_mode, "value")
+                else str(target.margin_mode)
+            )
 
     def _sizing_equity_metadata(self, exchange_quantities: Mapping[str, Decimal]) -> dict[str, Mapping[str, str]]:
         exchanges = sorted(exchange_quantities)
@@ -3513,6 +3603,65 @@ def _target_exchanges(signal: TradeSignal) -> tuple[str, ...]:
         except TypeError:
             items = (raw,)
     return tuple(str(item.value if hasattr(item, "value") else item).strip().lower() for item in items if str(item).strip())
+
+
+def _signal_exchange_quantities(signal: TradeSignal) -> dict[str, Decimal]:
+    raw = signal.metadata.get("exchange_quantities_base") if signal.metadata else None
+    if not isinstance(raw, Mapping):
+        return {}
+    quantities: dict[str, Decimal] = {}
+    for key, value in raw.items():
+        exchange = str(key.value if hasattr(key, "value") else key).strip().lower()
+        if not exchange:
+            continue
+        try:
+            quantity = Decimal(str(value))
+        except Exception:
+            continue
+        if quantity > 0:
+            quantities[exchange] = quantity
+    return quantities
+
+
+def _strict_result_filled_quantity(
+    result: ExchangeOrderResult | None,
+) -> Decimal | None:
+    if (
+        result is None
+        or not result.ok
+        or result.status is not OrderStatus.FILLED
+        or result.filled_quantity is None
+        or result.filled_quantity <= 0
+    ):
+        return None
+    return result.filled_quantity
+
+
+def _filled_exchange_quantities(
+    *,
+    signal: TradeSignal,
+    results: Sequence[ExchangeOrderResult],
+    master_exchange: str,
+    master_quantity: Decimal,
+) -> dict[str, Decimal]:
+    planned = _signal_exchange_quantities(signal)
+    quantities: dict[str, Decimal] = {}
+    for result in results:
+        exchange = result.exchange.value
+        filled = _strict_result_filled_quantity(result)
+        if filled is None:
+            if (
+                result.ok
+                and result.status is OrderStatus.FILLED
+                and exchange in planned
+            ):
+                filled = planned[exchange]
+            else:
+                continue
+        quantities[exchange] = filled
+    if master_quantity > 0:
+        quantities[str(master_exchange).strip().lower()] = master_quantity
+    return quantities
 
 
 def _side_from_plan(value: Any) -> Side:

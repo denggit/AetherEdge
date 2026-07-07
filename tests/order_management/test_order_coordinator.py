@@ -93,3 +93,64 @@ async def test_multi_exchange_order_coordinator_records_partial_failure(tmp_path
     assert [result.ok for result in results] == [True, False]
     assert repo.get_intent("intent-2").status is OrderIntentStatus.PARTIALLY_SUBMITTED  # type: ignore[union-attr]
     assert "failed" in (results[1].error or "")
+
+
+@pytest.mark.asyncio
+async def test_exchange_quantities_override_open_and_close_requests(tmp_path):
+    repo = SqliteOrderJournalStore(tmp_path / "journal.sqlite3")
+    okx = FakeExecutionClient(ExchangeName.OKX)
+    binance = FakeExecutionClient(ExchangeName.BINANCE)
+    coordinator = MultiExchangeOrderCoordinator(
+        clients=[okx, binance],
+        repository=repo,
+    )
+
+    open_signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.OPEN_LONG,
+        quantity=Decimal("0.5"),
+        created_time_ms=100,
+        metadata={
+            "exchange_quantities_base": {
+                "okx": "0.5",
+                "binance": "0.25",
+            }
+        },
+    )
+    await coordinator.execute(
+        OrderIntent(
+            intent_id="intent-open-override",
+            strategy_id="v8",
+            signal=open_signal,
+            target_exchanges=(ExchangeName.OKX, ExchangeName.BINANCE),
+        )
+    )
+
+    assert okx.orders[-1].quantity == Decimal("0.5")
+    assert binance.orders[-1].quantity == Decimal("0.25")
+
+    close_signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.CLOSE_LONG,
+        quantity=Decimal("0.5"),
+        created_time_ms=200,
+        metadata={
+            "exchange_quantities_base": {
+                "okx": "0.5",
+                "binance": "0.25",
+            }
+        },
+    )
+    await coordinator.execute(
+        OrderIntent(
+            intent_id="intent-close-override",
+            strategy_id="v8",
+            signal=close_signal,
+            target_exchanges=(ExchangeName.OKX, ExchangeName.BINANCE),
+        )
+    )
+
+    assert okx.orders[-1].quantity == Decimal("0.5")
+    assert binance.orders[-1].quantity == Decimal("0.25")
+    assert okx.orders[-1].reduce_only is True
+    assert binance.orders[-1].reduce_only is True

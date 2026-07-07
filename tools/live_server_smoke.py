@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import sys
 from pathlib import Path
+from typing import Any, Mapping
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -30,6 +31,7 @@ async def run_server_smoke(
     strategy_name: str,
     repo_root: str | Path = REPO_ROOT,
     provider_hook: str = "live_smoke_provider",
+    provider_kwargs: Mapping[str, Any] | None = None,
 ):
     strategy_path = strategy_plugin_path(strategy_name)
     try:
@@ -62,6 +64,7 @@ async def run_server_smoke(
                 if provider_hook == "live_preflight_provider"
                 else "smoke"
             ),
+            **dict(provider_kwargs or {}),
         )
         return await FiniteLiveSmokeRunner(provider).run()
     except Exception as exc:

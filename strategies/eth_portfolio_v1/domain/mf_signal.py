@@ -85,7 +85,9 @@ MF_ENTRY_REQUIRED_FIELDS = (
 @dataclass(frozen=True)
 class MfLowSweepConfig:
     enabled: bool = True
-    position_fraction: Decimal = Decimal("0.10")
+    margin_fraction: Decimal = Decimal("0.10")
+    available_margin_buffer: Decimal = Decimal("0.95")
+    position_fraction: Decimal | None = None
     footprint_abs_delta_threshold: Decimal = (
         MF_FOOTPRINT_ABS_DELTA_THRESHOLD
     )
@@ -110,8 +112,20 @@ class MfLowSweepConfig:
 
     def __post_init__(self) -> None:
         validate_mf_exit_variant(self.exit_variant)
-        if not Decimal("0") < self.position_fraction <= Decimal("1"):
-            raise ValueError("mf.position_fraction must be within (0, 1]")
+        if self.position_fraction is not None:
+            legacy_fraction = Decimal(str(self.position_fraction))
+            if legacy_fraction != self.margin_fraction and self.margin_fraction != Decimal("0.10"):
+                raise ValueError(
+                    "mf.position_fraction and mf.margin_fraction are ambiguous"
+                )
+            object.__setattr__(self, "margin_fraction", legacy_fraction)
+        object.__setattr__(self, "position_fraction", self.margin_fraction)
+        if not Decimal("0") < self.margin_fraction <= Decimal("1"):
+            raise ValueError("mf.margin_fraction must be within (0, 1]")
+        if not Decimal("0") < self.available_margin_buffer <= Decimal("1"):
+            raise ValueError(
+                "mf.available_margin_buffer must be within (0, 1]"
+            )
         if not Decimal("0") <= self.footprint_abs_delta_threshold <= Decimal("1"):
             raise ValueError(
                 "mf.footprint_abs_delta_threshold must be within [0, 1]"
@@ -188,10 +202,15 @@ class MfLowSweepConfig:
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any] | None) -> "MfLowSweepConfig":
         raw = dict(value or {})
+        margin_fraction = raw.get(
+            "margin_fraction",
+            raw.get("position_fraction", "0.10"),
+        )
         return cls(
             enabled=_config_bool(raw.get("enabled"), default=True),
-            position_fraction=Decimal(
-                str(raw.get("position_fraction", "0.10"))
+            margin_fraction=Decimal(str(margin_fraction)),
+            available_margin_buffer=Decimal(
+                str(raw.get("available_margin_buffer", "0.95"))
             ),
             footprint_abs_delta_threshold=Decimal(
                 str(raw.get("footprint_abs_delta_threshold", "0.60"))

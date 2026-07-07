@@ -26,11 +26,20 @@ def _active_sleeve(*, entry_time_ms: int) -> MfSleeveState:
         signal_time_ms=entry_time_ms,
         entry_execution_time_ms=entry_time_ms,
         tradebar_open_time_ms=entry_time_ms,
+        exchange_quantities={
+            "okx": Decimal("0.25"),
+            "binance": Decimal("0.125"),
+        },
     )
     sleeve.confirm_open(
         quantity=Decimal("0.25"),
         average_entry_price=Decimal("100"),
         entry_time_ms=entry_time_ms,
+        exchange_quantities={
+            "okx": Decimal("0.25"),
+            "binance": Decimal("0.125"),
+        },
+        master_exchange="okx",
     )
     return sleeve
 
@@ -72,12 +81,17 @@ def test_holding_48_completed_minutes_generates_close() -> None:
         strategy_id="eth_portfolio_v1",
         symbol="ETH-USDT-PERP",
         config=config(),
+        master_exchange="okx",
     ).map_close(decision, sleeve=sleeve)
     assert signal is not None
     assert signal.action is SignalAction.CLOSE_LONG
     assert signal.metadata["reduce_only"] is True
     assert signal.metadata["position_id"] == sleeve.position_id
     assert signal.quantity == sleeve.quantity
+    assert signal.metadata["exchange_quantities_base"] == {
+        "binance": "0.125",
+        "okx": "0.25",
+    }
     assert audit["exit_reason"] == "mf_time48_exit"
 
 

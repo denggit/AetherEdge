@@ -233,6 +233,9 @@ def _mf_plan_issues(plan_payload: Mapping[str, Any]) -> list[str]:
         or position.get("master_target_qty_base")
     ) is None:
         issues.append("mf_quantity_missing")
+    metadata_quantities = _positive_decimal_mapping(
+        metadata.get("exchange_quantities_base")
+    )
     if metadata.get("protective_stop_required") not in (False, "false", "False", 0):
         issues.append("mf_no_stop_policy_missing")
     legs = tuple(
@@ -242,12 +245,29 @@ def _mf_plan_issues(plan_payload: Mapping[str, Any]) -> list[str]:
     )
     if not legs:
         issues.append("mf_plan_legs_missing")
+    leg_quantities: dict[str, Decimal] = {}
     for leg in legs:
         exchange = str(leg.get("exchange") or "unknown").strip().lower()
         sync_status = str(leg.get("sync_status") or "").strip().lower()
+        leg_quantity = _positive_decimal(
+            leg.get("filled_qty_base") or leg.get("target_qty_base")
+        )
+        if exchange != "unknown" and leg_quantity is not None:
+            leg_quantities[exchange] = leg_quantity
         if sync_status not in {"open", "synced"}:
             issues.append(
                 f"mf_leg_not_recoverable:{exchange}:{sync_status or 'unknown'}"
+            )
+    for exchange, quantity in metadata_quantities.items():
+        leg_quantity = leg_quantities.get(exchange)
+        if leg_quantity is None:
+            issues.append(f"mf_metadata_quantity_leg_missing:{exchange}")
+            continue
+        tolerance = quantity * Decimal("0.05")
+        if abs(leg_quantity - quantity) > tolerance:
+            issues.append(
+                "mf_metadata_quantity_mismatch:"
+                f"{exchange}:metadata={quantity}:leg={leg_quantity}"
             )
     return list(_dedupe(issues))
 
@@ -274,12 +294,18 @@ def _sleeve_audit(
         or position.get("master_target_qty_base")
         or "0"
     )
+    exchange_quantities = _plan_exchange_quantities(payload, metadata=metadata)
     return {
         "active": True,
         "sleeve_id": sleeve_id,
         "position_id": position.get("position_id"),
         "side": position.get("side"),
         "quantity": str(quantity),
+        "exchange_quantities_base": {
+            exchange: str(qty)
+            for exchange, qty in sorted(exchange_quantities.items())
+        },
+        "target_exchanges": sorted(exchange_quantities),
         "entry_price": metadata.get("average_entry_price"),
         "issues": [],
     }
@@ -302,6 +328,39 @@ def _positive_decimal(value: object) -> Decimal | None:
     if not decimal.is_finite() or decimal <= 0:
         return None
     return decimal
+
+
+def _positive_decimal_mapping(value: object) -> dict[str, Decimal]:
+    if not isinstance(value, Mapping):
+        return {}
+    out: dict[str, Decimal] = {}
+    for key, item in value.items():
+        exchange = str(key).strip().lower()
+        decimal = _positive_decimal(item)
+        if exchange and decimal is not None:
+            out[exchange] = decimal
+    return out
+
+
+def _plan_exchange_quantities(
+    payload: Mapping[str, Any],
+    *,
+    metadata: Mapping[str, Any],
+) -> dict[str, Decimal]:
+    quantities: dict[str, Decimal] = {}
+    for raw_leg in payload.get("legs", ()):
+        if not isinstance(raw_leg, Mapping):
+            continue
+        exchange = str(raw_leg.get("exchange") or "").strip().lower()
+        quantity = _positive_decimal(
+            raw_leg.get("filled_qty_base")
+            or raw_leg.get("target_qty_base")
+        )
+        if exchange and quantity is not None:
+            quantities[exchange] = quantity
+    if quantities:
+        return quantities
+    return _positive_decimal_mapping(metadata.get("exchange_quantities_base"))
 
 
 def _integer_or_none(value: object) -> int | None:

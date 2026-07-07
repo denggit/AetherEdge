@@ -1,10 +1,10 @@
 # ETH Portfolio V1 AetherEdge Plugin
 
-ETH Portfolio V1 is an independent portfolio strategy plugin. It is no longer
-modeled as a long-term single-LF strategy, although its only active sleeve in
-R005 is still the existing LF implementation. The LF alpha rules, router,
-sizing, range exit, structural stop, risk scaling, and execution behavior
-remain equivalent to the pre-R005 V1 baseline.
+ETH Portfolio V1 is an independent portfolio strategy plugin with separate LF
+and MF logical sleeves. The LF alpha rules, router, sizing, range exit,
+structural stop, risk scaling, and execution behavior remain equivalent to the
+pre-R005 V1 baseline. The MF Low Sweep sleeve is enabled for the promoted
+time48 live variant.
 
 Plugin path and identity:
 
@@ -17,10 +17,15 @@ strategy_version: V1
 ## Current scope
 
 - V1 composes its sleeves through a plugin-private `SleeveRegistry`.
-- The registry currently contains the active `lf` sleeve followed by an inert
-  `DisabledSleeve("mf")` placeholder.
-- Low Sweep signal/data migration is not part of R005-fix; it remains reserved
-  for R007/R008.
+- The registry contains the active `lf` sleeve and the active `mf` Low Sweep
+  sleeve.
+- MF Low Sweep uses OKX as data/master and Binance as follower when both
+  exchanges are configured.
+- MF sizing uses per-exchange margin intent: `mf.margin_fraction` is multiplied
+  by each exchange's configured leverage from runtime/account config
+  (`OKX_LEVERAGE`, `BINANCE_LEVERAGE`, `MARGIN_MODE`). Each exchange sizes from
+  its own account equity and available balance, with `available_margin_buffer`
+  applied to the available-margin cap.
 - The plugin owns its copied domain, engine, execution, feature, and
   persistence modules and does not import another concrete strategy plugin.
 - V1 regular stop replacement never uses global `cancel_all_stop_orders`.
@@ -35,8 +40,10 @@ position state, while flat LF and disabled MF sleeves return no snapshot.
 The LF sleeve composes its existing snapshot adapter. The adapter preserves the
 existing `position_id` exactly and maps base-asset `qty`, average entry,
 confirmed stop, side, engine, entry time, and active exchanges into
-`StrategyPositionSnapshot`. This provider does not change stop ownership,
-recovery scope, or scoped stop replacement.
+`StrategyPositionSnapshot`. The MF sleeve snapshots include
+`exchange_quantities_base` so recovery and preflight can distinguish master and
+follower leg quantities. This provider does not change stop ownership, recovery
+scope, or scoped stop replacement.
 
 ## Scoped stop replacement
 
@@ -67,9 +74,11 @@ unique string IDs; it has no fixed LF/MF field set. Future sleeves such as
 `mf_low_sweep` or `hf_range` can be registered without changing the public
 `src` architecture. LF signals continue to carry
 `strategy_id=eth_portfolio_v1` and `sleeve_id=lf`, and position-scoped signals
-keep their existing `position_id`. MF remains disabled and inert until a later
-milestone migrates its signal and data behavior. Automatic hedge-mode
-switching is also outside R005-fix.
+keep their existing `position_id`. MF signals carry `sleeve_id=mf`,
+`close_scope=mf_sleeve_only`, and per-exchange `exchange_quantities_base` so
+OKX and Binance open and close their own sized legs. Automatic hedge-mode
+switching is outside the strategy plugin and remains a runtime/account config
+responsibility.
 
 ## Runtime boundary
 

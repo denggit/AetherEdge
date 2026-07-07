@@ -26,7 +26,8 @@ READY = {
 def config(**overrides) -> MfLowSweepConfig:
     base = MfLowSweepConfig(
         enabled=True,
-        position_fraction=Decimal("0.10"),
+        margin_fraction=Decimal("0.10"),
+        available_margin_buffer=Decimal("0.95"),
     )
     return replace(base, **overrides)
 

@@ -591,8 +591,21 @@ class MfFeatureObserver:
                     if sizing.available_equity is None
                     else str(sizing.available_equity)
                 ),
-                "position_fraction": str(
-                    self.config.position_fraction
+                "sizing_equity_by_exchange": _string_decimal_mapping(
+                    sizing.equity_by_exchange
+                ),
+                "available_equity_by_exchange": _string_decimal_mapping(
+                    sizing.available_equity_by_exchange
+                ),
+                "leverage_by_exchange": _string_decimal_mapping(
+                    sizing.leverage_by_exchange
+                ),
+                "margin_mode_by_exchange": dict(
+                    sizing.margin_mode_by_exchange
+                ),
+                "margin_fraction": str(self.config.margin_fraction),
+                "available_margin_buffer": str(
+                    self.config.available_margin_buffer
                 ),
             }
             signal = self._signal_mapper.map_open(
@@ -605,6 +618,18 @@ class MfFeatureObserver:
                 )
                 self.last_mf_signal_audit["reason"] = "sizing_not_ready"
                 return ()
+            exchange_quantities = _exchange_quantities_from_signal(
+                signal.metadata
+            )
+            self.last_mf_signal_audit["sizing_input"] = dict(
+                signal.metadata.get("sizing_input", {})
+            )
+            self.last_mf_signal_audit["target_exchanges"] = list(
+                signal.metadata.get("target_exchanges", ())
+            )
+            self.last_mf_signal_audit["exchange_quantities_base"] = dict(
+                signal.metadata.get("exchange_quantities_base", {})
+            )
             self._sleeve.reserve_open(
                 position_id=decision.position_id,
                 quantity=signal.quantity or Decimal("0"),
@@ -614,6 +639,7 @@ class MfFeatureObserver:
                     decision.audit.get("entry_tradebar_open_time_ms")
                     or bar.open_time_ms + 60_000
                 ),
+                exchange_quantities=exchange_quantities,
             )
             self.last_mf_signal_audit["sleeve_state"] = (
                 self._sleeve.state_label
@@ -978,6 +1004,34 @@ def _json_safe(value: Mapping[str, Any]) -> dict[str, Any]:
         else:
             result[str(key)] = item
     return result
+
+
+def _string_decimal_mapping(values: Mapping[str, Decimal]) -> dict[str, str]:
+    return {
+        str(exchange): str(value)
+        for exchange, value in values.items()
+        if value is not None
+    }
+
+
+def _exchange_quantities_from_signal(
+    metadata: Mapping[str, Any],
+) -> dict[str, Decimal]:
+    raw = metadata.get("exchange_quantities_base")
+    if not isinstance(raw, Mapping):
+        return {}
+    out: dict[str, Decimal] = {}
+    for key, value in raw.items():
+        exchange = str(key).strip().lower()
+        if not exchange:
+            continue
+        try:
+            quantity = Decimal(str(value))
+        except Exception:
+            continue
+        if quantity > 0:
+            out[exchange] = quantity
+    return out
 
 
 __all__ = [

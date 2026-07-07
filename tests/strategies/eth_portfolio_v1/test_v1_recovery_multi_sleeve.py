@@ -30,6 +30,7 @@ def _plan(
     sleeve: str,
     *,
     quantity: str,
+    follower_quantity: str | None = None,
     position_id: str | None = None,
     include_mf_time: bool = True,
 ) -> dict:
@@ -44,6 +45,7 @@ def _plan(
         "engine": MF_ENGINE_NAME if is_mf else "BULL_RECLAIM_V2",
     }
     if is_mf:
+        follower_qty = follower_quantity or quantity
         metadata.update(
             {
                 "signal_time_ms": now_minute - 49 * 60_000,
@@ -53,6 +55,11 @@ def _plan(
                 "quantity_scope": "mf_sleeve_quantity",
                 "protective_stop_required": False,
                 "average_entry_price": "2000",
+                "target_exchanges": ["binance", "okx"],
+                "exchange_quantities_base": {
+                    "okx": quantity,
+                    "binance": follower_qty,
+                },
             }
         )
         if include_mf_time:
@@ -87,8 +94,8 @@ def _plan(
                 "position_id": position_id,
                 "exchange": "binance",
                 "role": "follower",
-                "target_qty_base": quantity,
-                "filled_qty_base": quantity,
+                "target_qty_base": follower_quantity or quantity,
+                "filled_qty_base": follower_quantity or quantity,
                 "sync_status": "open",
                 "stop_order_id": None if is_mf else f"{position_id}-binance-stop",
                 "stop_client_order_id": None,
@@ -311,6 +318,31 @@ def test_mf_only_active_plan_restores_mf_only() -> None:
     assert strategy.mf_sleeve.active is True
     assert strategy.mf_sleeve.quantity == Decimal("0.4")
     assert strategy.mf_sleeve.average_entry_price == Decimal("2000")
+
+
+def test_mf_restore_preserves_per_exchange_quantities() -> None:
+    strategy = Strategy()
+    mf = _plan("mf", quantity="0.5", follower_quantity="0.25")
+
+    _recover(
+        strategy,
+        [mf],
+        quantity="0.5",
+        okx_quantity="0.5",
+        binance_quantity="0.25",
+    )
+
+    assert strategy.mf_sleeve.active is True
+    assert strategy.mf_sleeve.quantity == Decimal("0.5")
+    assert strategy.mf_sleeve.exchange_quantities == {
+        "binance": Decimal("0.25"),
+        "okx": Decimal("0.5"),
+    }
+    mf_snapshot = strategy.position_snapshots()[0]
+    assert mf_snapshot.metadata["exchange_quantities_base"] == {
+        "binance": "0.25",
+        "okx": "0.5",
+    }
 
 
 def test_lf_and_mf_active_plans_restore_both_and_all_snapshots() -> None:

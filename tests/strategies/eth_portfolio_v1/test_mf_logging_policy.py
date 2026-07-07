@@ -55,10 +55,16 @@ def _observer(tmp_path):
             strategy_id="eth_portfolio_v1",
             symbol="ETH-USDT-PERP",
             config=cfg,
+            master_exchange="okx",
         ),
         readiness=READY,
         sizing_provider=lambda: MfSizingInput(
-            Decimal("1000"), Decimal("1000")
+            Decimal("1000"),
+            Decimal("1000"),
+            equity_by_exchange={"okx": Decimal("1000")},
+            available_equity_by_exchange={"okx": Decimal("1000")},
+            leverage_by_exchange={"okx": Decimal("15")},
+            margin_mode_by_exchange={"okx": "isolated"},
         ),
     )
     return observer, bars[-1], sleeve

@@ -48,6 +48,8 @@ class PortfolioV1LiveSmokeProvider:
         repo_root: str | Path,
         project_env: ProjectEnvConfig | None = None,
         report_kind: str = "smoke",
+        skip_api: bool = False,
+        skip_kline: bool = False,
     ) -> None:
         self.strategy = strategy
         self.strategy_path = strategy_path
@@ -60,6 +62,8 @@ class PortfolioV1LiveSmokeProvider:
             else get_project_env_config()
         )
         self.report_kind = str(report_kind)
+        self.skip_api = bool(skip_api)
+        self.skip_kline = bool(skip_kline)
 
     async def run(self) -> PortfolioV1LiveGateReport:
         try:
@@ -129,25 +133,26 @@ class PortfolioV1LiveSmokeProvider:
         try:
             accounts = []
             executions = []
-            for exchange in app_config.exchanges:
-                exchange_config = ExchangeConfig.from_env(
-                    exchange,
-                    env=env,
-                )
-                accounts.append(
-                    create_account_client(
+            if not self.skip_api:
+                for exchange in app_config.exchanges:
+                    exchange_config = ExchangeConfig.from_env(
                         exchange,
-                        exchange_config,
-                        symbol=app_config.symbol,
+                        env=env,
                     )
-                )
-                executions.append(
-                    create_execution_client(
-                        exchange,
-                        exchange_config,
-                        symbol=app_config.symbol,
+                    accounts.append(
+                        create_account_client(
+                            exchange,
+                            exchange_config,
+                            symbol=app_config.symbol,
+                        )
                     )
-                )
+                    executions.append(
+                        create_execution_client(
+                            exchange,
+                            exchange_config,
+                            symbol=app_config.symbol,
+                        )
+                    )
             plan_store = SqlitePositionPlanStore(plan_path)
             journal = SqliteOrderJournalStore(journal_path)
         except Exception as exc:
@@ -212,6 +217,8 @@ class PortfolioV1LiveSmokeProvider:
             startup_feature_backfill_enabled=(
                 resolve_mf_feature_backfill_enabled(env)
             ),
+            skip_api=self.skip_api,
+            skip_kline=self.skip_kline,
             sensitive_values=tuple(
                 str(value)
                 for key, value in env.items()

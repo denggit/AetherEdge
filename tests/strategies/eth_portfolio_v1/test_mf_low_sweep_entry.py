@@ -31,8 +31,14 @@ def _entry_result(
     history_value="0.10",
     equity=Decimal("1000"),
     available_equity=Decimal("500"),
+    equity_by_exchange=None,
+    available_by_exchange=None,
+    leverage_by_exchange=None,
+    margin_mode_by_exchange=None,
+    available_margin_buffer=Decimal("0.95"),
+    next_open_price="90",
 ):
-    cfg = config()
+    cfg = config(available_margin_buffer=available_margin_buffer)
     bars = setup_bars() if bars is None else bars
     buffer = MfDataBuffer(
         symbol="ETH-USDT-PERP",
@@ -66,15 +72,40 @@ def _entry_result(
             strategy_id="eth_portfolio_v1",
             symbol="ETH-USDT-PERP",
             config=cfg,
+            master_exchange="okx",
         ),
         readiness=READY,
         sizing_provider=lambda: MfSizingInput(
             equity=equity,
             available_equity=available_equity,
+            equity_by_exchange=(
+                equity_by_exchange
+                if equity_by_exchange is not None
+                else ({"okx": equity} if equity is not None else {})
+            ),
+            available_equity_by_exchange=(
+                available_by_exchange
+                if available_by_exchange is not None
+                else (
+                    {"okx": available_equity}
+                    if available_equity is not None
+                    else {}
+                )
+            ),
+            leverage_by_exchange=(
+                leverage_by_exchange
+                if leverage_by_exchange is not None
+                else {"okx": Decimal("15")}
+            ),
+            margin_mode_by_exchange=(
+                margin_mode_by_exchange
+                if margin_mode_by_exchange is not None
+                else {"okx": "isolated"}
+            ),
         ),
     )
     signals = observer.on_market_feature(
-        closed_tradebar_event(bars[-1])
+        closed_tradebar_event(bars[-1], next_open_price=next_open_price)
     )
     return signals, observer, sleeve
 
@@ -161,9 +192,18 @@ def test_entry_signal_has_independent_mf_scope(tmp_path) -> None:
     assert signal.metadata["unconfirmed_master_close_policy"] == "manual_required"
     assert signal.metadata["quantity_scope"] == "mf_sleeve_quantity"
     assert signal.metadata["protective_stop_required"] is False
-    assert signal.metadata["sizing_input"]["position_fraction"] == "0.10"
-    assert signal.metadata["sizing_input"]["equity"] == "1000"
-    assert signal.quantity == Decimal("100") / Decimal("90")
+    assert signal.metadata["sizing_input"]["margin_fraction"] == "0.10"
+    assert signal.metadata["sizing_input"]["available_margin_buffer"] == "0.95"
+    assert signal.metadata["sizing_input"]["leverage_by_exchange"] == {
+        "okx": "15"
+    }
+    assert signal.metadata["sizing_input"]["sizing_equity_by_exchange"] == {
+        "okx": "1000"
+    }
+    assert signal.quantity == Decimal("1500") / Decimal("90")
+    assert signal.metadata["exchange_quantities_base"] == {
+        "okx": str(Decimal("1500") / Decimal("90"))
+    }
     assert (
         signal.metadata["entry_execution_time_ms"]
         > causal["used_tradebar_close_time_ms"]
@@ -191,9 +231,57 @@ def test_available_equity_not_ready_blocks_open(tmp_path) -> None:
     )
 
 
+def test_mf_open_sizes_each_exchange_from_own_equity(tmp_path) -> None:
+    signals, _, _ = _entry_result(
+        tmp_path,
+        equity_by_exchange={
+            "okx": Decimal("1000"),
+            "binance": Decimal("500"),
+        },
+        available_by_exchange={
+            "okx": Decimal("1000"),
+            "binance": Decimal("500"),
+        },
+        leverage_by_exchange={
+            "okx": Decimal("15"),
+            "binance": Decimal("15"),
+        },
+        margin_mode_by_exchange={
+            "okx": "isolated",
+            "binance": "isolated",
+        },
+        available_margin_buffer=Decimal("1"),
+        next_open_price="3000",
+    )
+    signal = signals[0]
+    assert signal.quantity == Decimal("0.5")
+    assert signal.metadata["target_exchanges"] == ["binance", "okx"]
+    assert {
+        exchange: Decimal(value)
+        for exchange, value in signal.metadata[
+            "exchange_quantities_base"
+        ].items()
+    } == {
+        "binance": Decimal("0.25"),
+        "okx": Decimal("0.5"),
+    }
+    assert signal.metadata["target_notional_by_exchange"] == {
+        "binance": "750.00",
+        "okx": "1500.00",
+    }
+    assert signal.metadata["leverage_by_exchange"] == {
+        "binance": "15",
+        "okx": "15",
+    }
+
+
 def test_available_equity_caps_mf_target_notional(tmp_path) -> None:
     signals, _, _ = _entry_result(
-        tmp_path, available_equity=Decimal("50")
+        tmp_path,
+        available_equity=Decimal("50"),
+        available_margin_buffer=Decimal("1"),
     )
-    assert signals[0].quantity == Decimal("50") / Decimal("90")
-    assert signals[0].metadata["sizing_input"]["target_notional"] == "50"
+    assert signals[0].quantity == Decimal("750") / Decimal("90")
+    assert signals[0].metadata["sizing_input"][
+        "target_notional_by_exchange"
+    ] == {"okx": "750"}

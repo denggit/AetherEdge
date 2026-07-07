@@ -97,7 +97,8 @@
   },
   "mf": {
     "enabled": true,
-    "position_fraction": "0.10",
+    "margin_fraction": "0.10",
+    "available_margin_buffer": "0.95",
     "exit_variant": "time48",
     "holding_minutes": 48,
     "footprint_abs_delta_threshold": "0.60",

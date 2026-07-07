@@ -182,6 +182,8 @@ class PortfolioV1LiveGate:
         call_strategy_on_start: bool = True,
         report_kind: str = "smoke",
         startup_feature_backfill_enabled: bool = True,
+        skip_api: bool = False,
+        skip_kline: bool = False,
         sensitive_values: Sequence[str] = (),
     ) -> None:
         self.app_config = app_config
@@ -210,6 +212,8 @@ class PortfolioV1LiveGate:
         self.startup_feature_backfill_enabled = bool(
             startup_feature_backfill_enabled
         )
+        self.skip_api = bool(skip_api)
+        self.skip_kline = bool(skip_kline)
         self.sensitive_values = tuple(
             value for value in sensitive_values if value
         )
@@ -279,49 +283,106 @@ class PortfolioV1LiveGate:
                     issues=db_issues,
                 )
 
-            snapshots = await self._fetch_snapshots(report)
-            if snapshots is None:
-                return self._fail(
-                    report,
-                    verdict="fail_api",
-                    exit_code=EXIT_FAIL_API,
-                    issues=["account_snapshot_read_failed"],
+            if self.skip_api:
+                snapshots = ()
+                report.account_snapshot_summary = {
+                    exchange.value: {
+                        "skipped": True,
+                        "reason": "skip_api",
+                    }
+                    for exchange in self.app_config.exchanges
+                }
+                report.add(
+                    "account_api_read",
+                    ok=True,
+                    detail=report.account_snapshot_summary,
+                    status="warn",
                 )
+                report.hedge_mode = {
+                    exchange.value: {
+                        "required": "hedge",
+                        "actual": "unknown",
+                        "ok": None,
+                        "skipped": True,
+                    }
+                    for exchange in self.app_config.exchanges
+                }
+                report.add(
+                    "hedge_mode",
+                    ok=True,
+                    detail=report.hedge_mode,
+                    status="warn",
+                )
+                payloads = tuple(
+                    self.position_plan_store.serialize_active_positions()
+                )
+                report.position_plan_summary = {
+                    "active_count": len(payloads),
+                    "active_position_ids": [
+                        str(
+                            dict(payload.get("position", {})).get(
+                                "position_id", ""
+                            )
+                        )
+                        for payload in payloads
+                    ],
+                    "exchange_reconciliation_skipped": True,
+                }
+                report.recovery_audit_summary = {
+                    "exchange_reconciliation_skipped": True,
+                    "reason": "skip_api",
+                    "issues": [],
+                }
+                report.add(
+                    "portfolio_v1_recovery_audit",
+                    ok=True,
+                    detail=report.recovery_audit_summary,
+                    status="warn",
+                )
+            else:
+                snapshots = await self._fetch_snapshots(report)
+                if snapshots is None:
+                    return self._fail(
+                        report,
+                        verdict="fail_api",
+                        exit_code=EXIT_FAIL_API,
+                        issues=["account_snapshot_read_failed"],
+                    )
 
-            hedge_issues = self._hedge_mode_issues(snapshots)
-            report.hedge_mode = dict(
-                getattr(self, "_last_hedge_audit", {})
-            )
-            report.add(
-                "hedge_mode",
-                ok=not hedge_issues,
-                detail=report.hedge_mode,
-                error="; ".join(hedge_issues) or None,
-            )
-            if hedge_issues:
-                return self._fail(
-                    report,
-                    verdict="fail_config",
-                    exit_code=EXIT_FAIL_CONFIG,
-                    issues=hedge_issues,
+                hedge_issues = self._hedge_mode_issues(snapshots)
+                report.hedge_mode = dict(
+                    getattr(self, "_last_hedge_audit", {})
                 )
+                report.add(
+                    "hedge_mode",
+                    ok=not hedge_issues,
+                    detail=report.hedge_mode,
+                    error="; ".join(hedge_issues) or None,
+                )
+                if hedge_issues:
+                    return self._fail(
+                        report,
+                        verdict="fail_config",
+                        exit_code=EXIT_FAIL_CONFIG,
+                        issues=hedge_issues,
+                    )
 
-            recovery_issues = await self._recovery_audit(
-                snapshots, report
-            )
-            report.add(
-                "portfolio_v1_recovery_audit",
-                ok=not recovery_issues,
-                detail=report.recovery_audit_summary,
-                error="; ".join(recovery_issues) or None,
-            )
-            if recovery_issues:
-                return self._fail(
-                    report,
-                    verdict="fail_recovery",
-                    exit_code=EXIT_FAIL_RECOVERY,
-                    issues=recovery_issues,
+                recovery_issues = await self._recovery_audit(
+                    snapshots, report
                 )
+                report.add(
+                    "portfolio_v1_recovery_audit",
+                    ok=not recovery_issues,
+                    detail=report.recovery_audit_summary,
+                    error="; ".join(recovery_issues) or None,
+                )
+                if recovery_issues:
+                    return self._fail(
+                        report,
+                        verdict="fail_recovery",
+                        exit_code=EXIT_FAIL_RECOVERY,
+                        issues=recovery_issues,
+                    )
 
             readiness = self.readiness_inspector.inspect()
             readiness_audit = readiness.audit()
@@ -439,7 +500,19 @@ class PortfolioV1LiveGate:
                     issues=hard_readiness_issues,
                 )
 
-            if self.call_strategy_on_start:
+            if self.call_strategy_on_start and self.skip_api:
+                report.add(
+                    "strategy_on_start_read_only",
+                    ok=True,
+                    detail={
+                        "skipped": True,
+                        "reason": "skip_api",
+                        "signals_executed": False,
+                        "producers_started": False,
+                    },
+                    status="warn",
+                )
+            elif self.call_strategy_on_start:
                 on_start_issues = await self._call_on_start_read_only(
                     snapshots,
                     report,

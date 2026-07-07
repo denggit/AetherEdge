@@ -188,8 +188,6 @@ async def main() -> int:
         forbidden_flags = [
             name
             for name, active in (
-                ("--skip-api", args.skip_api),
-                ("--skip-kline", args.skip_kline),
                 ("--apply-reconcile", args.apply_reconcile),
             )
             if active
@@ -209,6 +207,10 @@ async def main() -> int:
                 env_file=args.env_file,
                 strategy_name=args.strategy or app_config.strategy,
                 provider_hook="live_preflight_provider",
+                provider_kwargs={
+                    "skip_api": args.skip_api,
+                    "skip_kline": args.skip_kline,
+                },
             )
         write_live_smoke_report(args.report, final_report)
         return int(final_report.exit_code)

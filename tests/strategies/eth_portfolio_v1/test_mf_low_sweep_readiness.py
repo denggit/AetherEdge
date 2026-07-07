@@ -149,10 +149,15 @@ async def test_runtime_readiness_event_enables_exact_setup_without_manual_set(
             strategy_id="eth_portfolio_v1",
             symbol="ETH-USDT-PERP",
             config=cfg,
+            master_exchange="okx",
         ),
         sizing_provider=lambda: MfSizingInput(
             equity=Decimal("1000"),
             available_equity=Decimal("500"),
+            equity_by_exchange={"okx": Decimal("1000")},
+            available_equity_by_exchange={"okx": Decimal("500")},
+            leverage_by_exchange={"okx": Decimal("15")},
+            margin_mode_by_exchange={"okx": "isolated"},
         ),
     )
 
