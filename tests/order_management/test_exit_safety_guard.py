@@ -335,7 +335,8 @@ async def test_okx_close_long_is_reduce_only() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stop_quantity_exceeding_position_is_blocked_before_exchange_submit() -> None:
+async def test_stop_quantity_exceeding_position_is_shrunk_instead_of_blocked() -> None:
+    """stop-loss protective exit above position is now shrunk to position instead of rejected."""
     client = SafetyFakeClient(
         ExchangeName.OKX,
         position_mode=PositionMode.ONE_WAY,
@@ -347,10 +348,16 @@ async def test_stop_quantity_exceeding_position_is_blocked_before_exchange_submi
         TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.PLACE_STOP_LOSS_SHORT, quantity=Decimal("2.82"), trigger_price=Decimal("1719.40")),
     )
 
-    assert results[0].ok is False
-    assert "stop_quantity_exceeds_position" in (results[0].error or "")
-    assert client.stop_orders == []
-    assert any(event.message == "critical_exit_safety_rejected" and event.metadata["severity"] == "CRITICAL" for event in repo.events)
+    # Protective exits no longer rejected — they shrink to actual position.
+    assert results[0].ok is True
+    assert client.stop_orders
+    # The shrunk quantity matches the actual position (2.82 native contracts)
+    assert client.stop_orders[0].quantity == Decimal("2.82")
+    # No critical rejection event — order was shrunk, not rejected
+    assert not any(
+        event.message == "critical_exit_safety_rejected"
+        for event in repo.events
+    )
 
 
 @pytest.mark.asyncio

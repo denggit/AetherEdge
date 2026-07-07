@@ -52,6 +52,14 @@ _SHRINKABLE_EXIT_ACTIONS = {
     "manual_close_signal",
     "manual close signal",
 }
+_PROTECTIVE_EXIT_ACTIONS = {
+    "place_stop_loss_long",
+    "place_stop_loss_short",
+    "take_profit_long",
+    "take_profit_short",
+    "trailing_stop_long",
+    "trailing_stop_short",
+}
 
 
 class ExitSafetyError(ValueError):
@@ -216,6 +224,12 @@ class ExitSafetyGuard:
             market_profile=market_profile,
             close_position=normalized.close_position,
         )
+        if (
+            report is not None
+            and report.metadata.get("quantity_shrunk_to_position")
+            and report.base_quantity is not None
+        ):
+            normalized = replace(normalized, quantity=report.base_quantity)
         return normalized, report
 
     def _validate_exit(
@@ -279,6 +293,7 @@ class ExitSafetyGuard:
         base_quantity = request.quantity
         native_quantity = None
         metadata: dict[str, Any] = {}
+        is_protective = action in _PROTECTIVE_EXIT_ACTIONS
         if base_quantity is not None:
             conversion = self.quantity_converter.convert_quantity(
                 exchange=exchange,
@@ -287,55 +302,87 @@ class ExitSafetyGuard:
                 market_profile=market_profile,
             )
             native_quantity = conversion.native_quantity
-            if (
-                _can_shrink_to_position(action, request)
-                and base_quantity > current_base
-                and base_quantity <= current_base * self.tolerance
-            ):
-                requested_base = base_quantity
-                requested_native = native_quantity
-                shrink_conversion = self.quantity_converter.convert_quantity(
-                    exchange=exchange,
-                    symbol=request.symbol,
-                    base_quantity=current_base,
-                    market_profile=market_profile,
-                )
-                base_quantity = current_base
-                native_quantity = shrink_conversion.native_quantity
-                metadata.update(
-                    {
-                        "quantity_shrunk_to_position": True,
-                        "requested_base_quantity": _decimal_text(
-                            requested_base
-                        ),
-                        "shrunk_base_quantity": _decimal_text(
-                            base_quantity
-                        ),
-                        "requested_native_quantity": _decimal_text(
-                            requested_native
-                        ),
-                        "shrunk_native_quantity": _decimal_text(
-                            native_quantity
-                        ),
-                        "shrink_reason": (
-                            "requested_quantity_slightly_exceeds_position"
-                        ),
-                    }
-                )
-            elif base_quantity > current_base * self.tolerance or native_quantity > current_native * self.tolerance:
-                raise self._error(
-                    _exceeds_reason(action),
-                    exchange=exchange,
-                    action=action,
-                    request=request,
-                    position_mode=position_mode,
-                    target_position_side=target_side.value,
-                    base_quantity=str(base_quantity),
-                    native_quantity=str(native_quantity),
-                    current_position_base_quantity=str(current_base),
-                    current_position_native_quantity=str(current_native),
-                    tolerance=str(self.tolerance),
-                )
+            if base_quantity > current_base:
+                if is_protective:
+                    # Protective exits: always shrink to actual position.
+                    # Rejecting a protective order risks a bare position,
+                    # which is worse than an oversized protective order.
+                    requested_base = base_quantity
+                    requested_native = native_quantity
+                    shrink_conversion = self.quantity_converter.convert_quantity(
+                        exchange=exchange,
+                        symbol=request.symbol,
+                        base_quantity=current_base,
+                        market_profile=market_profile,
+                    )
+                    base_quantity = current_base
+                    native_quantity = shrink_conversion.native_quantity
+                    metadata.update(
+                        {
+                            "quantity_shrunk_to_position": True,
+                            "shrink_reason": "protective_exit_quantity_above_position",
+                            "requested_base_quantity": _decimal_text(requested_base),
+                            "shrunk_base_quantity": _decimal_text(base_quantity),
+                            "requested_native_quantity": _decimal_text(requested_native),
+                            "shrunk_native_quantity": _decimal_text(native_quantity),
+                        }
+                    )
+                    if requested_base > current_base * self.tolerance:
+                        metadata.update(
+                            {
+                                "quantity_shrink_exceeded_tolerance": True,
+                                "tolerance": str(self.tolerance),
+                                "protective_exit_oversized": True,
+                            }
+                        )
+                elif (
+                    _can_shrink_to_position(action, request)
+                    and base_quantity <= current_base * self.tolerance
+                ):
+                    requested_base = base_quantity
+                    requested_native = native_quantity
+                    shrink_conversion = self.quantity_converter.convert_quantity(
+                        exchange=exchange,
+                        symbol=request.symbol,
+                        base_quantity=current_base,
+                        market_profile=market_profile,
+                    )
+                    base_quantity = current_base
+                    native_quantity = shrink_conversion.native_quantity
+                    metadata.update(
+                        {
+                            "quantity_shrunk_to_position": True,
+                            "requested_base_quantity": _decimal_text(
+                                requested_base
+                            ),
+                            "shrunk_base_quantity": _decimal_text(
+                                base_quantity
+                            ),
+                            "requested_native_quantity": _decimal_text(
+                                requested_native
+                            ),
+                            "shrunk_native_quantity": _decimal_text(
+                                native_quantity
+                            ),
+                            "shrink_reason": (
+                                "requested_quantity_slightly_exceeds_position"
+                            ),
+                        }
+                    )
+                elif base_quantity > current_base * self.tolerance or native_quantity > current_native * self.tolerance:
+                    raise self._error(
+                        _exceeds_reason(action),
+                        exchange=exchange,
+                        action=action,
+                        request=request,
+                        position_mode=position_mode,
+                        target_position_side=target_side.value,
+                        base_quantity=str(base_quantity),
+                        native_quantity=str(native_quantity),
+                        current_position_base_quantity=str(current_base),
+                        current_position_native_quantity=str(current_native),
+                        tolerance=str(self.tolerance),
+                    )
         elif not close_position:
             raise self._error(
                 "exit_order_quantity_missing",

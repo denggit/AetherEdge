@@ -145,7 +145,7 @@ def test_close_far_above_position_is_still_rejected() -> None:
     assert exc.value.reason == "exit_order_quantity_exceeding_position"
 
 
-def test_take_profit_slightly_above_position_is_not_shrunk() -> None:
+def test_take_profit_slightly_above_position_is_shrunk_to_position() -> None:
     guard = ExitSafetyGuard()
 
     request, report = guard.normalize_order(
@@ -170,12 +170,16 @@ def test_take_profit_slightly_above_position_is_not_shrunk() -> None:
         market_profile=get_market_profile("ETH-USDT-PERP"),
     )
 
-    assert request.quantity == Decimal("10")
+    assert request.quantity == Decimal("9.9")
     assert report is not None
-    assert "quantity_shrunk_to_position" not in report.metadata
+    assert report.base_quantity == Decimal("9.9")
+    assert report.metadata["quantity_shrunk_to_position"] is True
+    assert report.metadata["shrink_reason"] == "protective_exit_quantity_above_position"
+    assert report.metadata["requested_base_quantity"] == "10"
+    assert report.metadata["shrunk_base_quantity"] == "9.9"
 
 
-def test_stop_loss_slightly_above_position_is_not_shrunk() -> None:
+def test_stop_loss_stop_market_slightly_above_position_is_shrunk_to_position() -> None:
     guard = ExitSafetyGuard()
 
     request, report = guard.normalize_stop_market(
@@ -199,6 +203,10 @@ def test_stop_loss_slightly_above_position_is_not_shrunk() -> None:
         market_profile=get_market_profile("ETH-USDT-PERP"),
     )
 
-    assert request.quantity == Decimal("10")
+    assert request.quantity == Decimal("9.9")
     assert report is not None
-    assert "quantity_shrunk_to_position" not in report.metadata
+    assert report.base_quantity == Decimal("9.9")
+    assert report.metadata["quantity_shrunk_to_position"] is True
+    assert report.metadata["shrink_reason"] == "protective_exit_quantity_above_position"
+    assert report.metadata["requested_base_quantity"] == "10"
+    assert report.metadata["shrunk_base_quantity"] == "9.9"
