@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -18,6 +18,7 @@ from src.market_data.trade_features.coverage import (
 )
 
 _MINUTE = 60_000
+_OKX_TIMEZONE = timezone(timedelta(hours=8))
 
 
 def _base(i: int = 0) -> int:
@@ -35,6 +36,111 @@ def test_safe_okx_archive_end_is_previous_utc8_day() -> None:
         * 1000
     )
     assert safe_okx_archive_end_ms(now_ms) == expected
+
+
+def test_safe_okx_archive_end_applies_publish_lag_at_midnight() -> None:
+    now_ms = int(
+        datetime(
+            2026,
+            7,
+            7,
+            0,
+            30,
+            tzinfo=_OKX_TIMEZONE,
+        ).timestamp()
+        * 1_000
+    )
+    expected = int(
+        datetime(
+            2026,
+            7,
+            5,
+            23,
+            59,
+            59,
+            999_000,
+            tzinfo=_OKX_TIMEZONE,
+        ).timestamp()
+        * 1_000
+    )
+
+    assert (
+        safe_okx_archive_end_ms(
+            now_ms,
+            archive_publish_lag_hours=8.0,
+        )
+        == expected
+    )
+
+
+def test_safe_okx_archive_end_advances_after_publish_lag() -> None:
+    now_ms = int(
+        datetime(
+            2026,
+            7,
+            7,
+            9,
+            0,
+            tzinfo=_OKX_TIMEZONE,
+        ).timestamp()
+        * 1_000
+    )
+    expected = int(
+        datetime(
+            2026,
+            7,
+            6,
+            23,
+            59,
+            59,
+            999_000,
+            tzinfo=_OKX_TIMEZONE,
+        ).timestamp()
+        * 1_000
+    )
+
+    assert (
+        safe_okx_archive_end_ms(
+            now_ms,
+            archive_publish_lag_hours=8.0,
+        )
+        == expected
+    )
+
+
+def test_safe_okx_archive_end_zero_lag_preserves_calendar_behavior() -> None:
+    now_ms = int(
+        datetime(
+            2026,
+            7,
+            7,
+            0,
+            30,
+            tzinfo=_OKX_TIMEZONE,
+        ).timestamp()
+        * 1_000
+    )
+    expected = int(
+        datetime(
+            2026,
+            7,
+            6,
+            23,
+            59,
+            59,
+            999_000,
+            tzinfo=_OKX_TIMEZONE,
+        ).timestamp()
+        * 1_000
+    )
+
+    assert (
+        safe_okx_archive_end_ms(
+            now_ms,
+            archive_publish_lag_hours=0.0,
+        )
+        == expected
+    )
 
 
 def _make_bar(open_time_ms: int, close_time_ms: int | None = None, *, quality: str = "COMPLETE") -> FixedTimeTradeBar:
@@ -261,6 +367,11 @@ def test_audit_has_required_fields(tmp_path: Path) -> None:
         "coverage_ready", "coverage",
         "worker_running", "waiting_for_global_lock",
         "degraded_footprint", "current_day_archive_not_ready",
+        "archive_publish_lag_hours",
+        "calendar_safe_archive_end_ms", "safe_archive_end_ms",
+        "safe_archive_end_okx", "calendar_safe_archive_end_okx",
+        "latest_archive_day_deferred",
+        "latest_archive_day_deferred_reason",
     ):
         assert key in audit
 

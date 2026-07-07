@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -19,6 +20,7 @@ from src.market_data.trade_features.coverage import (
 
 _FOUR_HOURS_MS = 4 * 60 * 60 * 1000
 _MINUTE_MS = 60_000
+_OKX_ARCHIVE_TIMEZONE = timezone(timedelta(hours=8))
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,7 @@ class PortfolioV1ReadinessInspector:
             "historical_preflight",
             "live_freshness",
         ] = "historical_preflight",
+        archive_publish_lag_hours: float = 8.0,
         now_ms: int | None = None,
     ) -> None:
         self.symbol = symbol
@@ -104,6 +107,10 @@ class PortfolioV1ReadinessInspector:
                 f"unsupported MF readiness mode: {readiness_mode}"
             )
         self.readiness_mode = readiness_mode
+        self.archive_publish_lag_hours = max(
+            0.0,
+            float(archive_publish_lag_hours),
+        )
         self.now_ms = (
             int(now_ms) if now_ms is not None else int(time.time() * 1000)
         )
@@ -335,12 +342,44 @@ class PortfolioV1ReadinessInspector:
         return audit
 
     def _inspect_mf(self, issues: list[str]) -> dict[str, Any]:
+        calendar_safe_archive_end = safe_okx_archive_end_ms(
+            self.now_ms,
+            archive_publish_lag_hours=0.0,
+        )
+        safe_archive_end = safe_okx_archive_end_ms(
+            self.now_ms,
+            archive_publish_lag_hours=self.archive_publish_lag_hours,
+        )
+        latest_archive_day_deferred = (
+            calendar_safe_archive_end > safe_archive_end
+        )
         audit: dict[str, Any] = {
             "ok": False,
             "market_data_db_path": str(self.market_data_db_path),
             "required_minutes": self.mf_required_minutes,
             "large_share_min_samples": self.large_share_min_samples,
             "mf_freshness_mode": self.readiness_mode,
+            "archive_publish_lag_hours": (
+                self.archive_publish_lag_hours
+            ),
+            "calendar_safe_archive_end_ms": (
+                calendar_safe_archive_end
+            ),
+            "safe_archive_end_ms": safe_archive_end,
+            "safe_archive_end_okx": _format_okx_time(
+                safe_archive_end
+            ),
+            "calendar_safe_archive_end_okx": _format_okx_time(
+                calendar_safe_archive_end
+            ),
+            "latest_archive_day_deferred": (
+                latest_archive_day_deferred
+            ),
+            "latest_archive_day_deferred_reason": (
+                "archive_publish_lag"
+                if latest_archive_day_deferred
+                else None
+            ),
         }
         if not self.market_data_db_path.is_file():
             issues.append("mf_feature_db_missing")
@@ -349,7 +388,6 @@ class PortfolioV1ReadinessInspector:
             store = SqliteTradeFeatureStore(
                 path=self.market_data_db_path
             )
-            safe_archive_end = safe_okx_archive_end_ms(self.now_ms)
             if self.readiness_mode == "historical_preflight":
                 history_minutes = max(
                     self.mf_required_minutes,
@@ -427,6 +465,9 @@ class PortfolioV1ReadinessInspector:
                 now_ms=self.now_ms,
                 range_pct=self.range_pct,
                 price_step=self.price_step,
+                archive_publish_lag_hours=(
+                    self.archive_publish_lag_hours
+                ),
             )
             readiness_audit = dict(readiness.audit())
             readiness_audit["mf_signal_feature_ready"] = bool(
@@ -747,6 +788,15 @@ def _decimal_text(value: str) -> str:
     from decimal import Decimal
 
     return format(Decimal(str(value)).normalize(), "f")
+
+
+def _format_okx_time(timestamp_ms: int) -> str:
+    return datetime.fromtimestamp(
+        int(timestamp_ms) / 1_000,
+        tz=UTC,
+    ).astimezone(_OKX_ARCHIVE_TIMEZONE).strftime(
+        "%Y-%m-%d %H:%M:%S+08"
+    )
 
 
 __all__ = [

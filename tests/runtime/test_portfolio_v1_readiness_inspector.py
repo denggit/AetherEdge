@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from src.market_data.models import (
@@ -30,6 +31,7 @@ SYMBOL = "ETH-USDT-PERP"
 NOW_MS = 1_800_000_000_000
 MINUTE_MS = 60_000
 FOUR_HOURS_MS = 4 * 60 * MINUTE_MS
+OKX_TIMEZONE = timezone(timedelta(hours=8))
 
 
 def _seed_ready_stores(
@@ -209,6 +211,7 @@ def _inspect(
     now_ms: int = NOW_MS,
     large_share_min_samples: int = 2,
     readiness_mode: str = "live_freshness",
+    archive_publish_lag_hours: float = 8.0,
 ):
     return PortfolioV1ReadinessInspector(
         symbol=SYMBOL,
@@ -219,6 +222,7 @@ def _inspect(
         mf_required_minutes=3,
         large_share_min_samples=large_share_min_samples,
         readiness_mode=readiness_mode,
+        archive_publish_lag_hours=archive_publish_lag_hours,
         now_ms=now_ms,
     ).inspect()
 
@@ -376,3 +380,111 @@ def test_live_freshness_mode_rejects_safe_archive_staleness(
 
     assert "mf_tradebar_stale" in result.issues
     assert result.mf["live_fresh_ready"] is False
+
+
+def test_historical_preflight_midnight_accepts_t2_safe_edge(
+    tmp_path,
+) -> None:
+    now_ms = _okx_timestamp_ms(2026, 7, 7, 0, 30)
+    safe_end = safe_okx_archive_end_ms(
+        now_ms,
+        archive_publish_lag_hours=8.0,
+    )
+    market, checkpoint = _seed_ready_stores(
+        tmp_path,
+        mf_latest_close_ms=safe_end,
+    )
+
+    result = _inspect(
+        market,
+        checkpoint,
+        now_ms=now_ms,
+        readiness_mode="historical_preflight",
+    )
+
+    assert result.mf["ok"] is True
+    assert result.mf["safe_archive_end_okx"] == (
+        "2026-07-05 23:59:59+08"
+    )
+    assert result.mf["calendar_safe_archive_end_okx"] == (
+        "2026-07-06 23:59:59+08"
+    )
+    assert result.mf["latest_archive_day_deferred"] is True
+    for issue in (
+        "mf_tradebar_ready_false",
+        "mf_fixed_time_footprint_ready_false",
+        "mf_range_footprint_ready_false",
+        "mf_mf_signal_feature_ready_false",
+    ):
+        assert issue not in result.issues
+
+
+def test_historical_preflight_midnight_rejects_gap_before_t2(
+    tmp_path,
+) -> None:
+    now_ms = _okx_timestamp_ms(2026, 7, 7, 0, 30)
+    safe_end = safe_okx_archive_end_ms(
+        now_ms,
+        archive_publish_lag_hours=8.0,
+    )
+    market, checkpoint = _seed_ready_stores(
+        tmp_path,
+        mf_latest_close_ms=safe_end - 10 * MINUTE_MS,
+    )
+
+    result = _inspect(
+        market,
+        checkpoint,
+        now_ms=now_ms,
+        readiness_mode="historical_preflight",
+    )
+
+    assert result.mf["ok"] is False
+    assert "mf_tradebar_ready_false" in result.issues
+
+
+def test_historical_preflight_after_lag_requires_t1(
+    tmp_path,
+) -> None:
+    midnight_now_ms = _okx_timestamp_ms(2026, 7, 7, 0, 30)
+    t2_safe_end = safe_okx_archive_end_ms(
+        midnight_now_ms,
+        archive_publish_lag_hours=8.0,
+    )
+    market, checkpoint = _seed_ready_stores(
+        tmp_path,
+        mf_latest_close_ms=t2_safe_end,
+    )
+
+    result = _inspect(
+        market,
+        checkpoint,
+        now_ms=_okx_timestamp_ms(2026, 7, 7, 9, 0),
+        readiness_mode="historical_preflight",
+    )
+
+    assert result.mf["ok"] is False
+    assert result.mf["safe_archive_end_okx"] == (
+        "2026-07-06 23:59:59+08"
+    )
+    assert "mf_tradebar_ready_false" in result.issues
+
+
+def _okx_timestamp_ms(
+    year: int,
+    month: int,
+    day: int,
+    hour: int,
+    minute: int,
+) -> int:
+    return int(
+        datetime(
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            tzinfo=OKX_TIMEZONE,
+        ).timestamp()
+        * 1_000
+    )

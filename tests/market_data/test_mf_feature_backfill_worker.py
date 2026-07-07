@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,6 +19,7 @@ from src.platform.exchanges.models import ExchangeName
 from tools import mf_feature_backfill_worker as worker
 
 _MINUTE = 60_000
+_OKX_TIMEZONE = timezone(timedelta(hours=8))
 
 
 def _trade(price: str, time_ms: int, side: TradeSide) -> MarketTrade:
@@ -61,6 +62,7 @@ def _kwargs(tmp_path: Path) -> dict:
 
 def test_parser_required_minutes_defaults_to_4320() -> None:
     assert worker.parse_args([]).required_minutes == 4320
+    assert worker.parse_args([]).archive_publish_lag_hours == 8.0
 
 
 def test_parser_accepts_required_minutes_override() -> None:
@@ -100,6 +102,7 @@ def test_main_passes_required_minutes_to_run_cycle(
 
     assert result == 0
     assert captured["required_minutes"] == 172800
+    assert captured["archive_publish_lag_hours"] == 8.0
 
 
 class _Archive:
@@ -114,6 +117,10 @@ def test_worker_empty_store_writes_tradebar_and_range_footprint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     safe_end = safe_okx_archive_end_ms()
+    archive_day = datetime.fromtimestamp(
+        safe_end / 1_000,
+        tz=timezone.utc,
+    ).astimezone(_OKX_TIMEZONE).date()
     start = safe_end - 2 * _MINUTE + 1
     trades = [
         _trade("990", start - _MINUTE, TradeSide.BUY),
@@ -127,7 +134,7 @@ def test_worker_empty_store_writes_tradebar_and_range_footprint(
     monkeypatch.setattr(
         worker,
         "iter_okx_archive_dates_for_utc_range",
-        lambda *_: iter((date(2026, 7, 3),)),
+        lambda *_: iter((archive_day,)),
     )
     monkeypatch.setattr(worker, "iter_trade_csv_chunks", lambda *_args, **_kwargs: iter((object(),)))
     monkeypatch.setattr(worker, "normalize_okx_trade_chunk", lambda *_args, **_kwargs: trades)
@@ -195,8 +202,8 @@ def test_worker_clamps_requested_current_day_target_and_reports_partial(
 
     result = worker.run_cycle(**_kwargs(tmp_path))
 
-    assert result["status"] == "partial"
-    assert result["reason"] == "current_day_archive_not_ready"
+    assert result["status"] == "deferred"
+    assert result["reason"] == "archive_not_published_yet"
     assert result["target_end_ms"] == safe_end
     assert result["current_day_gap_unrecoverable_until_archive"] is True
 
@@ -326,3 +333,220 @@ def test_mf_worker_releases_global_lock_on_no_gap(
 
     assert result["status"] == "up_to_date"
     assert not Path(kwargs["global_lock_path"]).exists()
+
+
+def test_prebuild_does_not_attempt_archive_day_inside_publish_lag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lag_safe_end = _okx_day_end_ms(date(2026, 7, 5))
+    calendar_safe_end = _okx_day_end_ms(date(2026, 7, 6))
+    attempted_days = []
+
+    def safe_end(*args, archive_publish_lag_hours=8.0, **kwargs):
+        return (
+            calendar_safe_end
+            if archive_publish_lag_hours == 0
+            else lag_safe_end
+        )
+
+    def archive_dates(start_ms, end_ms):
+        if start_ms == lag_safe_end + 1:
+            return iter((date(2026, 7, 6),))
+        return iter((date(2026, 7, 5),))
+
+    class RecordingArchive(_Archive):
+        def ensure_daily_file(self, **values):
+            attempted_days.append(values["day"])
+            return super().ensure_daily_file(**values)
+
+    kwargs = _kwargs(tmp_path)
+    kwargs.update(mode="prebuild", no_download=False)
+    monkeypatch.setattr(worker, "safe_okx_archive_end_ms", safe_end)
+    monkeypatch.setattr(
+        worker,
+        "iter_okx_archive_dates_for_utc_range",
+        archive_dates,
+    )
+    monkeypatch.setattr(
+        worker,
+        "OkxHistoricalTradeArchive",
+        RecordingArchive,
+    )
+    monkeypatch.setattr(
+        worker,
+        "iter_trade_csv_chunks",
+        lambda *_args, **_kwargs: iter(()),
+    )
+
+    worker.run_cycle(**kwargs)
+
+    assert attempted_days == [date(2026, 7, 5)]
+    assert date(2026, 7, 6) not in attempted_days
+
+
+def test_latest_unpublished_archive_failure_is_deferred(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lag_safe_end = _okx_day_end_ms(date(2026, 7, 5))
+    calendar_safe_end = _okx_day_end_ms(date(2026, 7, 6))
+
+    def safe_end(*args, archive_publish_lag_hours=8.0, **kwargs):
+        return (
+            calendar_safe_end
+            if archive_publish_lag_hours == 0
+            else lag_safe_end
+        )
+
+    class MissingArchive(_Archive):
+        def ensure_daily_file(self, **kwargs):
+            raise FileNotFoundError(kwargs["day"].isoformat())
+
+    kwargs = _kwargs(tmp_path)
+    kwargs.update(mode="prebuild", no_download=False)
+    monkeypatch.setattr(worker, "safe_okx_archive_end_ms", safe_end)
+    monkeypatch.setattr(
+        worker,
+        "compute_backfill_target",
+        lambda **_: TradeFeatureBackfillTarget(
+            start_ms=lag_safe_end - _MINUTE + 1,
+            end_ms=lag_safe_end,
+            reason="test_unpublished",
+        ),
+    )
+    monkeypatch.setattr(
+        worker,
+        "iter_okx_archive_dates_for_utc_range",
+        lambda *_: iter((date(2026, 7, 6),)),
+    )
+    monkeypatch.setattr(
+        worker,
+        "OkxHistoricalTradeArchive",
+        MissingArchive,
+    )
+
+    result = worker.run_cycle(**kwargs)
+
+    assert result["status"] == "deferred"
+    assert result["reason"] == "archive_not_published_yet"
+    assert result["archive_not_published_days"] == ["2026-07-06"]
+    assert result["failed_downloads"] == []
+    assert result["processed_through_ms"] is None
+    assert result["can_finalize_safe_history"] is False
+
+
+def test_older_archive_failure_remains_download_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    safe_end_ms = _okx_day_end_ms(date(2026, 7, 6))
+
+    class MissingArchive(_Archive):
+        def ensure_daily_file(self, **kwargs):
+            raise FileNotFoundError(kwargs["day"].isoformat())
+
+    kwargs = _kwargs(tmp_path)
+    kwargs.update(mode="prebuild", no_download=False)
+    monkeypatch.setattr(
+        worker,
+        "safe_okx_archive_end_ms",
+        lambda *args, **kwargs: safe_end_ms,
+    )
+    monkeypatch.setattr(
+        worker,
+        "compute_backfill_target",
+        lambda **_: TradeFeatureBackfillTarget(
+            start_ms=_okx_day_start_ms(date(2026, 7, 5)),
+            end_ms=safe_end_ms,
+            reason="test_older_failure",
+        ),
+    )
+    monkeypatch.setattr(
+        worker,
+        "iter_okx_archive_dates_for_utc_range",
+        lambda *_: iter((date(2026, 7, 5),)),
+    )
+    monkeypatch.setattr(
+        worker,
+        "OkxHistoricalTradeArchive",
+        MissingArchive,
+    )
+
+    result = worker.run_cycle(**kwargs)
+
+    assert result["status"] == "partial"
+    assert result["reason"] == "download_failures"
+    assert result["failed_downloads"] == ["2026-07-05"]
+    assert result["archive_not_published_days"] == []
+    assert result["can_finalize_safe_history"] is False
+
+
+def test_processed_through_stops_before_failed_later_day(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_day = date(2026, 7, 5)
+    failed_day = date(2026, 7, 6)
+    target_end = _okx_day_end_ms(failed_day)
+
+    class SecondDayMissingArchive(_Archive):
+        def ensure_daily_file(self, **kwargs):
+            if kwargs["day"] == failed_day:
+                raise FileNotFoundError(kwargs["day"].isoformat())
+            return super().ensure_daily_file(**kwargs)
+
+    kwargs = _kwargs(tmp_path)
+    kwargs.update(mode="prebuild", no_download=False)
+    monkeypatch.setattr(
+        worker,
+        "safe_okx_archive_end_ms",
+        lambda *args, **kwargs: target_end,
+    )
+    monkeypatch.setattr(
+        worker,
+        "compute_backfill_target",
+        lambda **_: TradeFeatureBackfillTarget(
+            start_ms=_okx_day_start_ms(first_day),
+            end_ms=target_end,
+            reason="test_later_failure",
+        ),
+    )
+    monkeypatch.setattr(
+        worker,
+        "iter_okx_archive_dates_for_utc_range",
+        lambda *_: iter((first_day, failed_day)),
+    )
+    monkeypatch.setattr(
+        worker,
+        "OkxHistoricalTradeArchive",
+        SecondDayMissingArchive,
+    )
+    monkeypatch.setattr(
+        worker,
+        "iter_trade_csv_chunks",
+        lambda *_args, **_kwargs: iter(()),
+    )
+
+    result = worker.run_cycle(**kwargs)
+
+    assert result["reason"] == "download_failures"
+    assert result["processed_through_ms"] == _okx_day_end_ms(first_day)
+    assert result["processed_through_ms"] < result["target_end_ms"]
+    assert result["can_finalize_safe_history"] is False
+
+
+def _okx_day_start_ms(day: date) -> int:
+    return int(
+        datetime(
+            day.year,
+            day.month,
+            day.day,
+            tzinfo=_OKX_TIMEZONE,
+        ).timestamp()
+        * 1_000
+    )
+
+
+def _okx_day_end_ms(day: date) -> int:
+    return _okx_day_start_ms(day + timedelta(days=1)) - 1

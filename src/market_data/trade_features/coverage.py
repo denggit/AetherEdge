@@ -35,6 +35,11 @@ class TradeFeatureReadiness:
     current_day_archive_not_ready: bool = False
 
     def audit(self) -> Mapping[str, Any]:
+        coverage_extra = (
+            dict(self.coverage.extra or {})
+            if self.coverage is not None
+            else {}
+        )
         return {
             "tradebar_ready": self.tradebar_ready,
             "fixed_time_footprint_ready": self.fixed_time_footprint_ready,
@@ -48,17 +53,44 @@ class TradeFeatureReadiness:
             "waiting_for_global_lock": self.waiting_for_global_lock,
             "degraded_footprint": self.degraded_footprint,
             "current_day_archive_not_ready": self.current_day_archive_not_ready,
+            "archive_publish_lag_hours": coverage_extra.get(
+                "archive_publish_lag_hours"
+            ),
+            "calendar_safe_archive_end_ms": coverage_extra.get(
+                "calendar_safe_archive_end_ms"
+            ),
+            "safe_archive_end_ms": coverage_extra.get(
+                "safe_archive_end_ms"
+            ),
+            "safe_archive_end_okx": coverage_extra.get(
+                "safe_archive_end_okx"
+            ),
+            "calendar_safe_archive_end_okx": coverage_extra.get(
+                "calendar_safe_archive_end_okx"
+            ),
+            "latest_archive_day_deferred": coverage_extra.get(
+                "latest_archive_day_deferred", False
+            ),
+            "latest_archive_day_deferred_reason": coverage_extra.get(
+                "latest_archive_day_deferred_reason"
+            ),
         }
 
 
-def safe_okx_archive_end_ms(now_ms: int | None = None) -> int:
-    """Return the last millisecond of the previous complete OKX UTC+8 day."""
+def safe_okx_archive_end_ms(
+    now_ms: int | None = None,
+    *,
+    archive_publish_lag_hours: float = 8.0,
+) -> int:
+    """Return the last published-safe millisecond of an OKX UTC+8 day."""
     now = (
         datetime.now(UTC)
         if now_ms is None
         else datetime.fromtimestamp(int(now_ms) / 1000, tz=UTC)
     )
-    okx_now = now.astimezone(_OKX_ARCHIVE_TIMEZONE)
+    lag_hours = max(0.0, float(archive_publish_lag_hours))
+    effective_now = now - timedelta(hours=lag_hours)
+    okx_now = effective_now.astimezone(_OKX_ARCHIVE_TIMEZONE)
     current_day_start = datetime(
         okx_now.year,
         okx_now.month,
@@ -80,12 +112,34 @@ def trade_feature_coverage_scan(
     now_ms: int | None = None,
     range_pct: str = "0.002",
     price_step: str = "1",
+    archive_publish_lag_hours: float = 8.0,
 ) -> TradeDerivedFeatureCoverage:
     """Scan 1m and range-footprint coverage at a safe archive edge."""
-    safe_end = safe_okx_archive_end_ms(now_ms)
+    lag_hours = max(0.0, float(archive_publish_lag_hours))
+    calendar_safe_end = safe_okx_archive_end_ms(
+        now_ms,
+        archive_publish_lag_hours=0.0,
+    )
+    safe_end = safe_okx_archive_end_ms(
+        now_ms,
+        archive_publish_lag_hours=lag_hours,
+    )
+    latest_archive_day_deferred = calendar_safe_end > safe_end
     extra: dict[str, Any] = {
         "current_day_archive_ready": False,
+        "archive_publish_lag_hours": lag_hours,
+        "calendar_safe_archive_end_ms": calendar_safe_end,
         "safe_archive_end_ms": safe_end,
+        "safe_archive_end_okx": _format_okx_time(safe_end),
+        "calendar_safe_archive_end_okx": _format_okx_time(
+            calendar_safe_end
+        ),
+        "latest_archive_day_deferred": latest_archive_day_deferred,
+        "latest_archive_day_deferred_reason": (
+            "archive_publish_lag"
+            if latest_archive_day_deferred
+            else None
+        ),
     }
     if worker_status_path:
         extra["worker_status_path"] = worker_status_path
@@ -117,6 +171,7 @@ def resolve_trade_feature_readiness(
     now_ms: int | None = None,
     range_pct: str = "0.002",
     price_step: str = "1",
+    archive_publish_lag_hours: float = 8.0,
 ) -> TradeFeatureReadiness:
     """Resolve independent price, order-flow, and footprint readiness gates."""
     coverage = trade_feature_coverage_scan(
@@ -130,6 +185,7 @@ def resolve_trade_feature_readiness(
         now_ms=now_ms,
         range_pct=range_pct,
         price_step=price_step,
+        archive_publish_lag_hours=archive_publish_lag_hours,
     )
     extra = dict(coverage.extra or {})
     required = coverage.required_minutes
@@ -372,6 +428,15 @@ def _check_worker_running(status_path: str | None) -> bool:
 
 def _check_lock_exists(lock_path: str | None) -> bool:
     return bool(lock_path and Path(lock_path).exists())
+
+
+def _format_okx_time(timestamp_ms: int) -> str:
+    return datetime.fromtimestamp(
+        int(timestamp_ms) / 1_000,
+        tz=UTC,
+    ).astimezone(_OKX_ARCHIVE_TIMEZONE).strftime(
+        "%Y-%m-%d %H:%M:%S+08"
+    )
 
 
 def _coverage_audit(

@@ -118,6 +118,14 @@ class _Inspector:
                 "mf_freshness_mode": "historical_preflight",
                 "historical_coverage_ready": mf_ok,
                 "live_fresh_ready": False,
+                "archive_publish_lag_hours": 8.0,
+                "safe_archive_end_ms": 1_782_927_999_999,
+                "calendar_safe_archive_end_ms": 1_783_014_399_999,
+                "safe_archive_end_okx": "2026-07-05 23:59:59+08",
+                "calendar_safe_archive_end_okx": (
+                    "2026-07-06 23:59:59+08"
+                ),
+                "latest_archive_day_deferred": True,
             },
             causal={"ok": causal_ok},
             issues=tuple(
@@ -711,6 +719,15 @@ async def test_report_has_required_sections_and_no_secrets(tmp_path) -> None:
     assert payload["mf_data_readiness"]["mf_freshness_mode"] == (
         "historical_preflight"
     )
+    assert payload["mf_data_readiness"][
+        "archive_publish_lag_hours"
+    ] == 8.0
+    assert payload["mf_data_readiness"]["safe_archive_end_okx"] == (
+        "2026-07-05 23:59:59+08"
+    )
+    assert payload["mf_data_readiness"][
+        "calendar_safe_archive_end_okx"
+    ] == "2026-07-06 23:59:59+08"
     assert "should-not-leak" not in text
     for sensitive_name in (
         "API_KEY",

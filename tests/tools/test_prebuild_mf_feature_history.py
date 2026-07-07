@@ -188,6 +188,7 @@ def test_no_download_passes_true_to_worker(
 
     assert result == 0
     assert captured["no_download"] is True
+    assert captured["archive_publish_lag_hours"] == 8.0
 
 
 def test_effective_required_minutes_covers_large_share_window(
@@ -239,6 +240,7 @@ def test_default_command_arguments() -> None:
     assert args.download is True
     assert args.large_share_min_samples == 43_200
     assert args.large_share_window_days == 90
+    assert args.archive_publish_lag_hours == 8.0
 
 
 def test_format_okx_time_uses_utc_plus_8() -> None:
@@ -297,6 +299,28 @@ def test_progress_snapshot_calculates_days_percentage_and_eta() -> None:
     assert progress["eta"] != "unknown"
     assert progress["coverage_complete_minutes"] == 14_400
     assert progress["coverage_missing_minutes"] == 122_400
+
+
+def test_progress_never_reports_100_percent_with_missing_coverage() -> None:
+    safe_end_ms = 1_700_000_000_000 + 95 * 86_400_000 - 1
+
+    progress = tool._progress_snapshot(
+        result={
+            "target_end_ms": safe_end_ms,
+            "safe_archive_end_ms": safe_end_ms,
+            "processed_through_ms": safe_end_ms,
+            "coverage_after": {
+                "complete_minutes": 95 * 1_440,
+                "missing_minutes": 1,
+            },
+        },
+        readiness=_readiness(False),
+        target_days=95,
+        elapsed_seconds=10.0,
+    )
+
+    assert progress["progress_pct"] < 100.0
+    assert progress["remaining_days"] > 0
 
 
 def test_progress_summary_contains_cycle_status_and_ready(
@@ -433,7 +457,11 @@ def test_resolve_trade_feature_readiness_with_insufficient_sqlite_data(
     ref_end = 1_749_999_960_000
 
     import src.market_data.trade_features.coverage as cov
-    monkeypatch.setattr(cov, "safe_okx_archive_end_ms", lambda now_ms=None: ref_end)
+    monkeypatch.setattr(
+        cov,
+        "safe_okx_archive_end_ms",
+        lambda now_ms=None, **kwargs: ref_end,
+    )
 
     # Write only 10 bars, but require 100
     bars = []
@@ -606,7 +634,7 @@ def test_run_prebuild_reaches_ready_with_real_sqlite_feature_coverage(
     monkeypatch.setattr(
         coverage_module,
         "safe_okx_archive_end_ms",
-        lambda now_ms=None: safe_end_ms,
+        lambda now_ms=None, **kwargs: safe_end_ms,
     )
 
     def data_writing_run_cycle(**kwargs) -> dict[str, object]:
@@ -784,3 +812,79 @@ def test_run_prebuild_status_json_ready_false_on_incomplete(
     )
     assert status["ready"] is False
     assert status["error"] is True
+
+
+def test_deferred_archive_does_not_trigger_max_failures(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    calls = []
+    monkeypatch.setattr(
+        tool,
+        "_readiness_audit",
+        lambda *args, **kwargs: _readiness(False),
+    )
+
+    def deferred_cycle(**kwargs):
+        calls.append(kwargs)
+        return {
+            "status": "deferred",
+            "reason": "archive_not_published_yet",
+            "archive_not_published_days": ["2026-07-06"],
+        }
+
+    monkeypatch.setattr(tool, "run_cycle", deferred_cycle)
+
+    result = tool.run_prebuild(
+        _args(
+            tmp_path,
+            "--max-failures",
+            "1",
+            "--max-cycles",
+            "2",
+        )
+    )
+
+    assert result != 0
+    assert len(calls) == 2
+    status = json.loads(
+        (tmp_path / "status.json").read_text(encoding="utf-8")
+    )
+    assert status["error_detail"] == "max_cycles_reached"
+    assert status["error_detail"] != "max_failures_reached"
+
+
+def test_status_includes_archive_lag_and_both_safe_edges(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    safe_end = 1_700_000_000_000
+    calendar_safe_end = safe_end + 86_400_000
+    readiness = {
+        **_readiness(True),
+        "archive_publish_lag_hours": 8.0,
+        "coverage": {
+            "latest_complete_close_time_ms": safe_end,
+            "complete_minutes": 1_440,
+            "missing_minutes": 0,
+            "extra": {
+                "archive_publish_lag_hours": 8.0,
+                "safe_archive_end_ms": safe_end,
+                "calendar_safe_archive_end_ms": calendar_safe_end,
+            },
+        },
+    }
+    monkeypatch.setattr(
+        tool,
+        "_readiness_audit",
+        lambda *args, **kwargs: readiness,
+    )
+
+    assert tool.run_prebuild(_args(tmp_path)) == 0
+
+    status = json.loads(
+        (tmp_path / "status.json").read_text(encoding="utf-8")
+    )
+    assert status["archive_publish_lag_hours"] == 8.0
+    assert status["safe_end_okx"] != "unknown"
+    assert status["calendar_safe_end_okx"] != "unknown"

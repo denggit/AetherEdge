@@ -296,6 +296,7 @@ class MfDataReadiness:
         price_step: str = "1",
         large_share_min_samples: int = 43_200,
         large_share_window_days: int = 90,
+        archive_publish_lag_hours: float = 8.0,
     ) -> None:
         self.symbol = symbol
         self.exchange = exchange
@@ -311,6 +312,10 @@ class MfDataReadiness:
         self._large_share_window_days = max(
             1, int(large_share_window_days)
         )
+        self._archive_publish_lag_hours = max(
+            0.0,
+            float(archive_publish_lag_hours),
+        )
         self._last: dict[str, Any] | None = None
 
     def readiness(self) -> Mapping[str, Any]:
@@ -323,6 +328,9 @@ class MfDataReadiness:
             global_lock_path=self._global_lock_path,
             range_pct=self._range_pct,
             price_step=self._price_step,
+            archive_publish_lag_hours=(
+                self._archive_publish_lag_hours
+            ),
         )
         audit = dict(result.audit())
         coverage = audit.get("coverage")

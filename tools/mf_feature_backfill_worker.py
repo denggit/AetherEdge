@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 import time
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Sequence
@@ -62,6 +63,7 @@ from src.platform.exchanges.models import ExchangeName  # noqa: E402
 
 logger = logging.getLogger(__name__)
 _ONE_MINUTE_MS = 60_000
+_OKX_ARCHIVE_TIMEZONE = timezone(timedelta(hours=8))
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -74,6 +76,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     # Limits
     parser.add_argument("--max-minutes-per-cycle", type=int, default=1440)
     parser.add_argument("--required-minutes", type=int, default=4320)
+    parser.add_argument(
+        "--archive-publish-lag-hours",
+        type=float,
+        default=8.0,
+    )
     parser.add_argument("--max-days-per-cycle", type=int, default=1)
     parser.add_argument("--max-trades-per-cycle", type=int, default=500_000)
     parser.add_argument("--max-seconds-per-cycle", type=float, default=60.0)
@@ -127,6 +134,7 @@ def run_cycle(
     range_footprint_price_step: Decimal = Decimal("1"),
     range_footprint_warmup_days: int = 1,
     required_minutes: int = 4320,
+    archive_publish_lag_hours: float = 8.0,
 ) -> dict:
     # -------- guard --------
     normalized_mode = str(mode).strip().lower()
@@ -173,7 +181,23 @@ def run_cycle(
 
     try:
         # -------- gap-driven target --------
-        safe_archive_end = safe_okx_archive_end_ms()
+        lag_hours = max(0.0, float(archive_publish_lag_hours))
+        calendar_safe_archive_end = safe_okx_archive_end_ms(
+            archive_publish_lag_hours=0.0,
+        )
+        safe_archive_end = safe_okx_archive_end_ms(
+            archive_publish_lag_hours=lag_hours,
+        )
+        protected_archive_dates = (
+            set(
+                iter_okx_archive_dates_for_utc_range(
+                    safe_archive_end + 1,
+                    calendar_safe_archive_end,
+                )
+            )
+            if calendar_safe_archive_end > safe_archive_end
+            else set()
+        )
         target = compute_backfill_target(
             symbol=symbol,
             exchange=exchange,
@@ -193,6 +217,10 @@ def run_cycle(
             return {
                 "status": "up_to_date",
                 "reason": "no_gap_found",
+                "archive_publish_lag_hours": lag_hours,
+                "calendar_safe_archive_end_ms": (
+                    calendar_safe_archive_end
+                ),
                 "safe_archive_end_ms": safe_archive_end,
             }
 
@@ -203,12 +231,20 @@ def run_cycle(
         current_day_gap = requested_end_ms > safe_archive_end
         if start_ms > safe_archive_end:
             return {
-                "status": "not_ready",
-                "reason": "current_day_archive_not_ready",
+                "status": "deferred",
+                "reason": "archive_not_published_yet",
+                "archive_not_published_days": sorted(
+                    day.isoformat() for day in protected_archive_dates
+                ),
                 "target_start_ms": start_ms,
                 "requested_target_end_ms": requested_end_ms,
                 "target_end_ms": safe_archive_end,
+                "archive_publish_lag_hours": lag_hours,
+                "calendar_safe_archive_end_ms": (
+                    calendar_safe_archive_end
+                ),
                 "safe_archive_end_ms": safe_archive_end,
+                "processed_through_ms": None,
                 "current_day_gap_unrecoverable_until_archive": True,
             }
 
@@ -220,8 +256,17 @@ def run_cycle(
             iter_okx_archive_dates_for_utc_range(effective_start_ms, end_ms)
         )
         if not archive_dates:
-            return {"status": "no_archive_dates", "target_start_ms": start_ms,
-                    "target_end_ms": end_ms, "reason": reason}
+            return {
+                "status": "no_archive_dates",
+                "target_start_ms": start_ms,
+                "target_end_ms": end_ms,
+                "reason": reason,
+                "archive_publish_lag_hours": lag_hours,
+                "calendar_safe_archive_end_ms": (
+                    calendar_safe_archive_end
+                ),
+                "safe_archive_end_ms": safe_archive_end,
+            }
 
         archive = OkxHistoricalTradeArchive(
             root=Path(raw_root),
@@ -259,6 +304,7 @@ def run_cycle(
         latest_range_seed: RangeFootprintFeature | None = None
         downloaded = 0
         failed_downloads: list[str] = []
+        archive_not_published_days: list[str] = []
         missing_raw_days: list[str] = []
         processed_through_ms: int | None = None
         cycle_truncated = False
@@ -285,9 +331,12 @@ def run_cycle(
                     downloaded += 1
             except Exception as exc:
                 logger.warning("Failed to get archive for %s: %s", day, exc)
-                failed_downloads.append(day.isoformat())
+                if day in protected_archive_dates:
+                    archive_not_published_days.append(day.isoformat())
+                else:
+                    failed_downloads.append(day.isoformat())
                 missing_raw_days.append(day.isoformat())
-                continue
+                break
 
             # Process chunks
             for chunk in iter_trade_csv_chunks(hf.path, chunksize=50_000):
@@ -358,7 +407,9 @@ def run_cycle(
                 break
 
             # Track safe end after processing each day
-            processed_through_ms = end_ms
+            day_end_ms = _okx_archive_day_end_ms(day)
+            if day_end_ms >= start_ms:
+                processed_through_ms = min(day_end_ms, end_ms)
             coordinator.heartbeat()
 
         # A fully read safe archive proves the final historical minute closed.
@@ -366,6 +417,7 @@ def run_cycle(
         can_finalize_safe_history = (
             not cycle_truncated
             and not failed_downloads
+            and not archive_not_published_days
             and not missing_raw_days
             and processed_through_ms == end_ms
         )
@@ -426,6 +478,7 @@ def run_cycle(
             reference_end_ms=end_ms,
             range_pct=str(range_footprint_range_pct),
             price_step=str(range_footprint_price_step),
+            archive_publish_lag_hours=lag_hours,
         )
         coverage_after = readiness_after.coverage
         if coverage_after is None:
@@ -448,9 +501,9 @@ def run_cycle(
         }
 
         # Determine status
-        if current_day_gap:
-            actual_status = "partial"
-            status_reason = "current_day_archive_not_ready"
+        if archive_not_published_days or current_day_gap:
+            actual_status = "deferred"
+            status_reason = "archive_not_published_yet"
         elif failed_downloads:
             actual_status = "partial"
             status_reason = "download_failures"
@@ -475,14 +528,31 @@ def run_cycle(
             "range_footprints_written": total_range_footprints,
             "downloaded_files": downloaded,
             "failed_downloads": failed_downloads,
+            "archive_not_published_days": (
+                archive_not_published_days
+                if archive_not_published_days
+                else (
+                    sorted(
+                        day.isoformat()
+                        for day in protected_archive_dates
+                    )
+                    if current_day_gap
+                    else []
+                )
+            ),
             "missing_raw_days": missing_raw_days,
             "target_start_ms": start_ms,
             "target_end_ms": end_ms,
             "requested_target_end_ms": requested_end_ms,
             "safe_end_ms": safe_archive_end,
             "safe_archive_end_ms": safe_archive_end,
+            "calendar_safe_archive_end_ms": (
+                calendar_safe_archive_end
+            ),
+            "archive_publish_lag_hours": lag_hours,
             "processed_through_ms": processed_through_ms,
             "cycle_truncated": cycle_truncated,
+            "can_finalize_safe_history": can_finalize_safe_history,
             "coverage_after": {
                 "complete_minutes": coverage_after.complete_minutes,
                 "missing_minutes": coverage_after.missing_minutes,
@@ -503,6 +573,16 @@ def run_cycle(
 
     finally:
         coordinator.release()
+
+
+def _okx_archive_day_end_ms(day: date) -> int:
+    next_day_start = datetime(
+        day.year,
+        day.month,
+        day.day,
+        tzinfo=_OKX_ARCHIVE_TIMEZONE,
+    ) + timedelta(days=1)
+    return int(next_day_start.timestamp() * 1_000) - 1
 
 
 def _update_status(status_path: str, **kwargs: object) -> None:
@@ -548,6 +628,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         mode=args.mode,
         symbol=args.symbol,
         no_download=bool(args.no_download),
+        archive_publish_lag_hours=args.archive_publish_lag_hours,
     )
 
     try:
@@ -579,6 +660,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             range_footprint_warmup_days=args.range_footprint_warmup_days,
             required_minutes=args.required_minutes,
+            archive_publish_lag_hours=args.archive_publish_lag_hours,
         )
         result.setdefault("mode", args.mode)
         result.setdefault("no_download", bool(args.no_download))
@@ -590,6 +672,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             mode=args.mode,
             symbol=args.symbol,
             no_download=bool(args.no_download),
+            archive_publish_lag_hours=args.archive_publish_lag_hours,
         )
         logger.info("Cycle result: %s", json.dumps(result, default=str))
         return 0
@@ -602,6 +685,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             mode=args.mode,
             symbol=args.symbol,
             no_download=bool(args.no_download),
+            archive_publish_lag_hours=args.archive_publish_lag_hours,
         )
         return 1
 

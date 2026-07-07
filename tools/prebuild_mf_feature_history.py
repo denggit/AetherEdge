@@ -101,6 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-cycles", type=int, default=200)
     parser.add_argument("--max-seconds", type=float, default=0.0)
     parser.add_argument("--max-failures", type=int, default=3)
+    parser.add_argument(
+        "--archive-publish-lag-hours",
+        type=float,
+        default=8.0,
+    )
     parser.add_argument("--sleep-seconds", type=float, default=1.0)
     parser.add_argument("--chunk-sleep-seconds", type=float, default=0.0)
     parser.add_argument(
@@ -136,6 +141,9 @@ def run_prebuild(args: argparse.Namespace) -> int:
         "large_share_window_days": int(
             args.large_share_window_days
         ),
+        "archive_publish_lag_hours": float(
+            args.archive_publish_lag_hours
+        ),
         "cycles": 0,
         "ready": False,
         "last_result": None,
@@ -148,6 +156,10 @@ def run_prebuild(args: argparse.Namespace) -> int:
             elapsed_seconds=0.0,
         ),
     }
+    status["archive_publish_lag_hours"] = max(
+        0.0,
+        float(args.archive_publish_lag_hours),
+    )
     _write_status(status_path, status)
 
     try:
@@ -164,6 +176,10 @@ def run_prebuild(args: argparse.Namespace) -> int:
                     time.monotonic() - started_monotonic
                 ),
             )
+        )
+        status["archive_publish_lag_hours"] = max(
+            0.0,
+            float(args.archive_publish_lag_hours),
         )
         _write_status(status_path, status)
         if _is_ready(last_readiness):
@@ -240,6 +256,10 @@ def run_prebuild(args: argparse.Namespace) -> int:
                             int(args.range_footprint_warmup_days),
                         ),
                         required_minutes=required_minutes,
+                        archive_publish_lag_hours=max(
+                            0.0,
+                            float(args.archive_publish_lag_hours),
+                        ),
                     )
                 )
             except Exception as exc:
@@ -282,6 +302,10 @@ def run_prebuild(args: argparse.Namespace) -> int:
                     "last_readiness": last_readiness,
                     "error": False,
                     **progress,
+                    "archive_publish_lag_hours": max(
+                        0.0,
+                        float(args.archive_publish_lag_hours),
+                    ),
                 }
             )
             _write_status(status_path, status)
@@ -398,16 +422,34 @@ def _progress_snapshot(
         if isinstance(result_coverage_value, Mapping)
         else {}
     )
+    coverage_complete_minutes = _first_int(
+        coverage.get("complete_minutes"),
+        result_coverage.get("complete_minutes"),
+    )
+    coverage_missing_minutes = _first_int(
+        coverage.get("missing_minutes"),
+        result_coverage.get("missing_minutes"),
+    )
     safe_end_ms = _first_int(
         result.get("safe_archive_end_ms"),
         result.get("safe_end_ms"),
         coverage_extra.get("safe_archive_end_ms"),
         coverage_extra.get("reference_end_ms"),
     )
+    calendar_safe_end_ms = _first_int(
+        result.get("calendar_safe_archive_end_ms"),
+        coverage_extra.get("calendar_safe_archive_end_ms"),
+    )
+    archive_publish_lag_hours = _first_float(
+        result.get("archive_publish_lag_hours")
+    )
+    if archive_publish_lag_hours is None:
+        archive_publish_lag_hours = _first_float(
+            coverage_extra.get("archive_publish_lag_hours")
+        )
     processed_through_ms = _first_int(
         result.get("processed_through_ms"),
         coverage.get("latest_complete_close_time_ms"),
-        result.get("target_end_ms"),
     )
     target_end_ms = _first_int(
         result.get("target_end_ms"),
@@ -436,8 +478,21 @@ def _progress_snapshot(
                 / _DAY_MS,
             ),
         )
+    if coverage_complete_minutes is not None:
+        completed_days = min(
+            total_days,
+            max(0.0, coverage_complete_minutes / 1_440),
+        )
     remaining_days = max(0.0, total_days - completed_days)
     progress_pct = completed_days / total_days * 100.0
+    if (
+        coverage_missing_minutes is not None
+        and coverage_missing_minutes > 0
+        and progress_pct >= 100.0
+    ):
+        progress_pct = 99.9
+        completed_days = total_days * progress_pct / 100.0
+        remaining_days = total_days - completed_days
     avg_seconds_per_day = (
         None
         if completed_days <= 0
@@ -449,14 +504,6 @@ def _progress_snapshot(
         else remaining_days * avg_seconds_per_day
     )
     cycle_elapsed = _first_float(result.get("elapsed_seconds"))
-    coverage_complete_minutes = _first_int(
-        result_coverage.get("complete_minutes"),
-        coverage.get("complete_minutes"),
-    )
-    coverage_missing_minutes = _first_int(
-        result_coverage.get("missing_minutes"),
-        coverage.get("missing_minutes"),
-    )
     return {
         "progress": (
             f"{completed_days:.2f}/{total_days:.2f}d"
@@ -469,6 +516,10 @@ def _progress_snapshot(
         "eta_seconds": eta_seconds,
         "target_okx": _format_okx_time(target_end_ms),
         "safe_end_okx": _format_okx_time(safe_end_ms),
+        "calendar_safe_end_okx": _format_okx_time(
+            calendar_safe_end_ms
+        ),
+        "archive_publish_lag_hours": archive_publish_lag_hours,
         "required_start_okx": _format_okx_time(required_start_ms),
         "avg_seconds_per_day": avg_seconds_per_day,
         "cycle_elapsed": cycle_elapsed,
@@ -525,6 +576,10 @@ def _readiness_audit(
         required_minutes=required_minutes,
         range_pct=args.range_footprint_range_pct,
         price_step=args.range_footprint_price_step,
+        archive_publish_lag_hours=max(
+            0.0,
+            float(args.archive_publish_lag_hours),
+        ),
     )
     audit = dict(readiness.audit())
     audit["ready"] = _is_ready(audit)
@@ -542,6 +597,12 @@ def _is_ready(readiness: Mapping[str, Any]) -> bool:
 
 
 def _cycle_failed(result: Mapping[str, Any]) -> bool:
+    if (
+        str(result.get("status", "")).lower() == "deferred"
+        and str(result.get("reason", "")).lower()
+        == "archive_not_published_yet"
+    ):
+        return False
     if str(result.get("status", "")).lower() in {
         "error",
         "failed",
@@ -580,6 +641,10 @@ def _print_progress(
         f"target={result.get('target_end_ms', 'pending')} "
         f"target_okx={progress['target_okx']} "
         f"safe_end_okx={progress['safe_end_okx']} "
+        "calendar_safe_end_okx="
+        f"{progress['calendar_safe_end_okx']} "
+        "archive_publish_lag_hours="
+        f"{progress['archive_publish_lag_hours']} "
         f"required_start_okx={progress['required_start_okx']} "
         f"completed_days={progress['completed_days']:.2f} "
         f"total_days={progress['total_days']:.2f} "
@@ -601,6 +666,8 @@ def _print_progress(
         f"{progress['coverage_missing_minutes']} "
         f"processed_through_ms={progress['processed_through_ms']} "
         f"cycle_truncated={progress['cycle_truncated']} "
+        "archive_not_published_days="
+        f"{result.get('archive_not_published_days', [])} "
         f"elapsed={elapsed:.1f}",
         flush=True,
     )
