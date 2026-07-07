@@ -131,12 +131,72 @@ class _Inspector:
             issues=tuple(
                 issue
                 for ok, issue in (
-                    (lf_ok, "lf_closed_kline_stale"),
+                    (lf_ok, "lf_range_aggregate_stale"),
                     (mf_ok, "mf_tradebar_stale"),
                     (causal_ok, "causal_future_violation"),
                 )
                 if not ok
             ),
+        )
+
+    def inspect(self):
+        return self.result
+
+
+class _LfRangeAggregateFailInspector:
+    """Simulates LF range aggregate missing — a hard blocker."""
+
+    def __init__(self) -> None:
+        self.result = PortfolioV1ReadinessResult(
+            lf={"ok": False, "warnings": []},
+            mf={
+                "ok": True,
+                "mf_freshness_mode": "historical_preflight",
+                "historical_coverage_ready": True,
+                "live_fresh_ready": False,
+                "archive_publish_lag_hours": 8.0,
+                "safe_archive_end_ms": 1_782_927_999_999,
+                "calendar_safe_archive_end_ms": 1_783_014_399_999,
+                "safe_archive_end_okx": "2026-07-05 23:59:59+08",
+                "calendar_safe_archive_end_okx": (
+                    "2026-07-06 23:59:59+08"
+                ),
+                "latest_archive_day_deferred": True,
+            },
+            causal={"ok": True},
+            issues=("lf_range_aggregate_missing",),
+        )
+
+    def inspect(self):
+        return self.result
+
+
+class _LfKlineStaleWarningInspector:
+    """Simulates LF closed-kline stale only — non-blocking warning."""
+
+    def __init__(self) -> None:
+        self.result = PortfolioV1ReadinessResult(
+            lf={
+                "ok": True,
+                "closed_kline_stale": True,
+                "warnings": ["lf_closed_kline_stale"],
+            },
+            mf={
+                "ok": True,
+                "mf_freshness_mode": "historical_preflight",
+                "historical_coverage_ready": True,
+                "live_fresh_ready": False,
+                "archive_publish_lag_hours": 8.0,
+                "safe_archive_end_ms": 1_782_927_999_999,
+                "calendar_safe_archive_end_ms": 1_783_014_399_999,
+                "safe_archive_end_okx": "2026-07-05 23:59:59+08",
+                "calendar_safe_archive_end_okx": (
+                    "2026-07-06 23:59:59+08"
+                ),
+                "latest_archive_day_deferred": True,
+            },
+            causal={"ok": True},
+            issues=(),
         )
 
     def inspect(self):
@@ -644,18 +704,45 @@ async def test_mf_not_ready_without_backfill_is_market_data_failure(
 
 @pytest.mark.asyncio
 async def test_lf_not_ready_remains_market_data_failure(tmp_path) -> None:
-    gate, _ = _gate(tmp_path, inspector=_Inspector(lf_ok=False))
+    """LF range aggregate missing is still a hard market-data failure."""
+    gate, _ = _gate(
+        tmp_path, inspector=_LfRangeAggregateFailInspector()
+    )
 
     report = await gate.run()
 
     assert report.exit_code == EXIT_FAIL_MARKET_DATA
-    assert "lf_closed_kline_stale" in report.issues
+    assert "lf_range_aggregate_missing" in report.issues
+
+
+@pytest.mark.asyncio
+async def test_lf_closed_kline_stale_alone_passes(tmp_path) -> None:
+    """When the only LF issue is closed-kline stale, the preflight gate
+    passes (ok=true, verdict=pass, exit_code=0).  Runner warmup handles
+    kline backfill at startup."""
+    gate, _ = _gate(
+        tmp_path, inspector=_LfKlineStaleWarningInspector()
+    )
+
+    report = await gate.run()
+
+    assert report.exit_code == EXIT_PASS
+    assert report.ok is True
+    assert report.verdict == "pass"
+    assert "lf_closed_kline_stale" not in report.issues
+    # The stale kline should be visible in the LF readiness detail.
+    assert report.lf_data_readiness["closed_kline_stale"] is True
+    assert "lf_closed_kline_stale" in report.lf_data_readiness.get(
+        "warnings", []
+    )
 
 
 @pytest.mark.asyncio
 async def test_lf_and_mf_not_ready_keeps_lf_hard_and_mf_warning(
     tmp_path,
 ) -> None:
+    """LF range aggregate stale is hard-blocking; MF tradebar stale is
+    a warning when backfill is enabled."""
     gate, _ = _gate(
         tmp_path,
         inspector=_Inspector(lf_ok=False, mf_ok=False),
@@ -665,7 +752,7 @@ async def test_lf_and_mf_not_ready_keeps_lf_hard_and_mf_warning(
     report = await gate.run()
 
     assert report.exit_code == EXIT_FAIL_MARKET_DATA
-    assert "lf_closed_kline_stale" in report.issues
+    assert "lf_range_aggregate_stale" in report.issues
     assert "mf_tradebar_stale" not in report.issues
     assert report.warnings == [
         "mf_data_not_ready_sleeve_disabled_until_ready"

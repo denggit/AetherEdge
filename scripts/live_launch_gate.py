@@ -78,21 +78,22 @@ def live_reports_required(
 ) -> bool:
     """Return True when live launch reports must be validated before startup.
 
-    Reports are always required when:
-    - ``is_direct_live`` is True (AETHER_LIVE_TRADING=true + DRY_RUN=false).
-    - ``AETHER_REQUIRE_LIVE_GATE_REPORTS`` is explicitly enabled.
-    - The strategy is ``eth_portfolio_v1``.
+    Reports are opt-in via ``AETHER_REQUIRE_LIVE_GATE_REPORTS=true`` in
+    ``.env``.  When enabled the preflight / smoke report files must exist,
+    be fresh, and have ``ok=true``, ``verdict=pass``, ``exit_code=0``.
+
+    By default (flag absent or false) the live runner starts without a
+    report gate — runtime warmup, data backfill, risk controls, and
+    recovery logic are responsible for readiness.
+
+    ``is_direct_live`` and strategy identity are intentionally NOT used
+    to force the gate; the only path that requires reports is an explicit
+    opt-in via the env flag.
     """
     mode = getattr(runtime_mode, "value", runtime_mode)
     if str(mode).strip().lower() != "live_runtime":
         return False
-    if is_direct_live:
-        return True
-    if configured:
-        return True
-    if strategy_identity(strategy) == "eth_portfolio_v1":
-        return True
-    return False
+    return bool(configured)
 
 
 def _read_report(path: Path) -> Mapping[str, Any] | None:

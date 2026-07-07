@@ -140,6 +140,7 @@ class PortfolioV1ReadinessInspector:
             "min_records": self.lf_min_records,
             "range_speed_min_periods": self.range_speed_min_periods,
         }
+        lf_warnings: list[str] = []
         if not self.market_data_db_path.is_file():
             issues.append("lf_market_data_db_missing")
             return audit
@@ -212,14 +213,19 @@ class PortfolioV1ReadinessInspector:
             latest_close is None
             or self.now_ms - latest_close > self.lf_max_staleness_ms
         )
+        # Local closed-kline staleness / insufficiency is NOT blocking:
+        # the runner's closed-kline warmup + REST backfill handles this
+        # during startup.  These go into warnings so they are still
+        # visible in the report.
         if kline_count < self.lf_min_records:
-            issues.append("lf_closed_kline_warmup_insufficient")
+            lf_warnings.append("lf_closed_kline_warmup_insufficient")
         if latest_kline is None:
-            issues.append("lf_closed_kline_missing")
+            lf_warnings.append("lf_closed_kline_missing")
         elif str(latest_kline[0]).lower() != self.exchange:
-            issues.append("lf_closed_kline_noncanonical_exchange")
+            lf_warnings.append("lf_closed_kline_noncanonical_exchange")
         if stale:
-            issues.append("lf_closed_kline_stale")
+            lf_warnings.append("lf_closed_kline_stale")
+        # Future klines are still a hard blocker — no warmup can fix that.
         if future_klines:
             issues.append("lf_future_closed_kline")
 
@@ -335,6 +341,7 @@ class PortfolioV1ReadinessInspector:
                 ),
                 "range_aggregate_causal_ok": aggregate_causal,
                 "future_range_aggregate_count": future_range_aggregates,
+                "warnings": lf_warnings,
             }
         )
         audit["ok"] = not any(
@@ -696,7 +703,7 @@ class PortfolioV1ReadinessInspector:
         )
         checks = {
             "lf_closed_bar_not_future": bool(
-                lf_close is not None and int(lf_close) <= self.now_ms
+                lf_close is None or int(lf_close) <= self.now_ms
             ),
             "lf_range_available_not_future": bool(
                 range_available is not None

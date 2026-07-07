@@ -156,11 +156,15 @@ def test_non_live_mode_does_not_require_reports() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Direct-live gate tests (R011-live-blocker-fix2)
+# Opt-in live report gate tests
 # ---------------------------------------------------------------------------
+# live_reports_required() is now opt-in via AETHER_REQUIRE_LIVE_GATE_REPORTS.
+# is_direct_live and strategy identity no longer force the gate.
 
-def test_direct_live_always_requires_reports_even_without_config_flag() -> None:
-    """live_runtime + is_direct_live=True forces reports regardless of configured."""
+
+def test_direct_live_without_configured_does_not_require_reports() -> None:
+    """live_runtime + is_direct_live=True without configured flag
+    does *not* force reports — the gate is opt-in."""
     assert (
         live_reports_required(
             runtime_mode="live_runtime",
@@ -168,12 +172,12 @@ def test_direct_live_always_requires_reports_even_without_config_flag() -> None:
             configured=False,
             is_direct_live=True,
         )
-        is True
+        is False
     )
 
 
-def test_direct_live_requires_reports_for_any_strategy() -> None:
-    """is_direct_live=True forces reports even for non-portfolio_v1 strategies."""
+def test_any_strategy_without_configured_does_not_require_reports() -> None:
+    """Without AETHER_REQUIRE_LIVE_GATE_REPORTS, no strategy forces reports."""
     assert (
         live_reports_required(
             runtime_mode="live_runtime",
@@ -181,13 +185,51 @@ def test_direct_live_requires_reports_for_any_strategy() -> None:
             configured=False,
             is_direct_live=True,
         )
+        is False
+    )
+
+
+def test_eth_portfolio_v1_without_configured_does_not_require_reports() -> None:
+    """eth_portfolio_v1 no longer auto-forces reports — opt-in only."""
+    assert (
+        live_reports_required(
+            runtime_mode="live_runtime",
+            strategy="strategies.eth_portfolio_v1:Strategy",
+            configured=False,
+            is_direct_live=False,
+        )
+        is False
+    )
+
+
+def test_configured_flag_enables_reports_for_direct_live() -> None:
+    """AETHER_REQUIRE_LIVE_GATE_REPORTS=true enables the report gate."""
+    assert (
+        live_reports_required(
+            runtime_mode="live_runtime",
+            strategy="strategies.eth_portfolio_v1:Strategy",
+            configured=True,
+            is_direct_live=True,
+        )
         is True
     )
 
 
-def test_dry_run_live_runtime_does_not_force_reports_unless_portfolio_v1() -> None:
-    """Non-direct-live (dry_run=True or live_trading=False) does not force reports
-    unless strategy is eth_portfolio_v1 or configured flag is set."""
+def test_configured_flag_enables_reports_for_any_live_runtime() -> None:
+    """configured=True enables reports regardless of is_direct_live."""
+    assert (
+        live_reports_required(
+            runtime_mode="live_runtime",
+            strategy="strategies.eth_lf_portfolio_v10b:Strategy",
+            configured=True,
+            is_direct_live=False,
+        )
+        is True
+    )
+
+
+def test_dry_run_live_runtime_without_configured_does_not_require_reports() -> None:
+    """Non-direct-live without configured flag does not require reports."""
     assert (
         live_reports_required(
             runtime_mode="live_runtime",
@@ -196,19 +238,6 @@ def test_dry_run_live_runtime_does_not_force_reports_unless_portfolio_v1() -> No
             is_direct_live=False,
         )
         is False
-    )
-
-
-def test_eth_portfolio_v1_always_requires_reports_even_when_not_direct_live() -> None:
-    """eth_portfolio_v1 always requires reports regardless of direct-live flags."""
-    assert (
-        live_reports_required(
-            runtime_mode="live_runtime",
-            strategy="strategies.eth_portfolio_v1:Strategy",
-            configured=False,
-            is_direct_live=False,
-        )
-        is True
     )
 
 

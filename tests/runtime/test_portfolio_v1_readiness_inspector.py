@@ -239,16 +239,94 @@ def test_lf_closed_kline_enough_warmup_is_ready(tmp_path) -> None:
     assert result.lf["ok"] is True
 
 
-def test_lf_closed_kline_stale_fails(tmp_path) -> None:
+def test_lf_closed_kline_stale_is_nonblocking_warning(tmp_path) -> None:
+    """Local 4H closed-kline staleness is a warning, not a blocker —
+    runner warmup + REST backfill handles this at startup."""
     market, checkpoint = _seed_ready_stores(tmp_path)
+    now_stale = NOW_MS + 2 * FOUR_HOURS_MS
+    # Make the range aggregate recent so it is NOT stale -- only the
+    # kline should be stale.
+    with sqlite3.connect(checkpoint) as conn:
+        # Make each existing aggregate row recent (not stale) by
+        # shifting its bucket_end_ms forward.  Use the old value as
+        # the lookup key to avoid the UNIQUE constraint.
+        rows = conn.execute(
+            "SELECT bucket_end_ms FROM completed_range_aggregates ORDER BY bucket_end_ms"
+        ).fetchall()
+        for i, (old_end,) in enumerate(rows):
+            conn.execute(
+                "UPDATE completed_range_aggregates "
+                "SET bucket_end_ms=?, completed_at_ms=? "
+                "WHERE bucket_end_ms=?",
+                (
+                    now_stale - (i + 1) * MINUTE_MS,
+                    now_stale - (i + 1) * MINUTE_MS,
+                    old_end,
+                ),
+            )
 
     result = _inspect(
         market,
         checkpoint,
-        now_ms=NOW_MS + 2 * FOUR_HOURS_MS,
+        now_ms=now_stale,
     )
 
-    assert "lf_closed_kline_stale" in result.issues
+    assert "lf_closed_kline_stale" not in result.issues
+    assert result.lf["closed_kline_stale"] is True
+    assert "lf_closed_kline_stale" in result.lf["warnings"]
+    # Range speed + aggregate are still healthy, so LF readiness is ok.
+    assert result.lf["ok"] is True
+    # MF tradebar may be stale at this shifted timestamp --
+    # that is a separate concern from LF kline staleness.
+
+
+def test_lf_future_closed_kline_still_blocks(tmp_path) -> None:
+    """Future closed klines are still a hard blocker — warmup cannot fix
+    data that claims to be from the future."""
+    market, checkpoint = _seed_ready_stores(tmp_path)
+    # Insert a future kline
+    with sqlite3.connect(market) as conn:
+        conn.execute(
+            """
+            INSERT INTO klines (exchange, symbol, raw_symbol, interval, open_time_ms,
+                                close_time_ms, open, high, low, close,
+                                volume, source, is_closed, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "okx",
+                SYMBOL,
+                "ETH-USDT-SWAP",
+                "4h",
+                NOW_MS + FOUR_HOURS_MS,
+                NOW_MS + 2 * FOUR_HOURS_MS,
+                "3000",
+                "3010",
+                "2990",
+                "3005",
+                "100",
+                "rest",
+                1,
+                "{}",
+            ),
+        )
+
+    result = _inspect(market, checkpoint)
+
+    assert "lf_future_closed_kline" in result.issues
+    assert result.lf["ok"] is False
+
+
+def test_lf_range_aggregate_missing_still_blocks(tmp_path) -> None:
+    """Range aggregate missing is still a hard blocker."""
+    market, checkpoint = _seed_ready_stores(tmp_path)
+    with sqlite3.connect(checkpoint) as conn:
+        conn.execute("DELETE FROM completed_range_aggregates")
+
+    result = _inspect(market, checkpoint)
+
+    assert "lf_range_aggregate_missing" in result.issues
+    assert result.lf["ok"] is False
 
 
 def test_range_aggregate_complete_is_ready(tmp_path) -> None:
