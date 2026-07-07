@@ -74,6 +74,14 @@ class PortfolioV1MfFeatureBackfillProvider:
                 "coverage": {},
             }
         try:
+            coverage = dict(self._readiness_reader())
+            if coverage.get("mf_signal_feature_ready"):
+                return {
+                    "enabled": True,
+                    "action": "none",
+                    "reason": "mf_signal_ready",
+                    "coverage": coverage,
+                }
             return {
                 "enabled": True,
                 **dict(self.supervisor.check_and_launch()),
@@ -98,7 +106,7 @@ class PortfolioV1MfFeatureBackfillProvider:
                 # launch a backfill worker.  check_and_launch() already
                 # guards against duplicate launches, cooldown
                 # violations, and global-lock contention.
-                if not coverage.get("coverage_ready"):
+                if not coverage.get("mf_signal_feature_ready"):
                     return self.check_and_launch()
             else:
                 coverage = dict(self._readiness_reader())
@@ -131,6 +139,9 @@ class PortfolioV1MfFeatureBackfillProvider:
             "range_footprint_ready": bool(
                 coverage.get("range_footprint_ready", False)
             ),
+            "range_footprint_context_ready": bool(
+                coverage.get("range_footprint_context_ready", False)
+            ),
             "tradebar_ready": bool(
                 coverage.get("tradebar_ready", False)
             ),
@@ -159,11 +170,9 @@ class PortfolioV1MfFeatureBackfillProvider:
             readiness[field]
             for field in (
                 "mf_signal_feature_ready",
-                "range_footprint_ready",
                 "tradebar_ready",
-                "fixed_time_footprint_ready",
-                "coverage_ready",
                 "large_share_samples_ready",
+                "range_footprint_context_ready",
             )
         )
         return (
@@ -317,6 +326,7 @@ class PortfolioV1MfFeatureBackfillProvider:
             price_step=str(config.mf.range_price_step),
             large_share_min_samples=config.mf.large_share_min_samples,
             large_share_window_days=config.mf.large_share_window_days,
+            decision_buffer_minutes=config.mf.decision_buffer_minutes,
         )
         return readiness.readiness
 

@@ -11,7 +11,12 @@ from src.market_data.backfill.coordinator import (
     BACKGROUND_BACKFILL_PRIORITY,
     RawTradeBackfillCoordinator,
 )
-from src.market_data.models import TimeRange, TradeFeatureBackfillTarget
+from src.market_data.models import (
+    FixedTimeTradeBar,
+    RangeFootprintFeature,
+    TimeRange,
+    TradeFeatureBackfillTarget,
+)
 from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
 from src.market_data.trade_features.coverage import safe_okx_archive_end_ms
 from src.platform.data.models import MarketTrade, TradeSide
@@ -185,7 +190,7 @@ def test_worker_clamps_requested_current_day_target_and_reports_partial(
     start = safe_end - _MINUTE + 1
     monkeypatch.setattr(
         worker,
-        "compute_backfill_target",
+        "compute_mf_signal_backfill_target",
         lambda **_: TradeFeatureBackfillTarget(
             start_ms=start,
             end_ms=safe_end + _MINUTE,
@@ -237,7 +242,7 @@ def test_worker_does_not_write_active_range_footprint_complete(
     result = worker.run_cycle(**_kwargs(tmp_path))
 
     assert result["status"] == "partial"
-    assert result["reason"] == "feature_coverage_incomplete"
+    assert result["reason"] == "mf_signal_feature_incomplete"
     assert result["range_footprints_written"] == 0
     assert result["mf_signal_feature_ready"] is False
     store = SqliteTradeFeatureStore(path=tmp_path / "market.sqlite3")
@@ -327,11 +332,81 @@ def test_mf_worker_releases_global_lock_on_no_gap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     kwargs = _kwargs(tmp_path)
-    monkeypatch.setattr(worker, "compute_backfill_target", lambda **_: None)
+    monkeypatch.setattr(
+        worker, "compute_mf_signal_backfill_target", lambda **_: None
+    )
 
     result = worker.run_cycle(**kwargs)
 
     assert result["status"] == "up_to_date"
+    assert not Path(kwargs["global_lock_path"]).exists()
+
+
+def test_worker_does_not_backfill_historical_footprint_coverage_when_mf_signal_ready(
+    tmp_path: Path,
+) -> None:
+    kwargs = _kwargs(tmp_path)
+    kwargs["required_minutes"] = 3
+    safe_end = safe_okx_archive_end_ms()
+    start = safe_end - 3 * _MINUTE + 1
+    store = SqliteTradeFeatureStore(path=kwargs["market_db"])
+    bars = []
+    for index in range(3):
+        open_ms = start + index * _MINUTE
+        close_ms = open_ms + _MINUTE - 1
+        bars.append(
+            FixedTimeTradeBar(
+                exchange="okx",
+                symbol="ETH-USDT-PERP",
+                timeframe="1m",
+                open_time_ms=open_ms,
+                close_time_ms=close_ms,
+                available_time_ms=close_ms,
+                open=Decimal("3000"),
+                high=Decimal("3005"),
+                low=Decimal("2995"),
+                close=Decimal("3002"),
+                volume=Decimal("10"),
+                buy_volume=Decimal("6"),
+                sell_volume=Decimal("4"),
+                buy_notional=Decimal("18000"),
+                sell_notional=Decimal("12000"),
+                delta_volume=Decimal("2"),
+                delta_notional=Decimal("6000"),
+                abs_delta_notional=Decimal("6000"),
+                trade_count=5,
+                large_trade_share=Decimal("0.05"),
+                quality="COMPLETE",
+            )
+        )
+    store.upsert_tradebars_many(bars)
+    store.upsert_range_footprints_many(
+        [
+            RangeFootprintFeature(
+                exchange="okx",
+                symbol="ETH-USDT-PERP",
+                range_pct=Decimal("0.002"),
+                price_step=Decimal("1"),
+                range_bar_id=1,
+                range_start_ms=bars[-1].open_time_ms - 30_000,
+                range_end_ms=bars[-1].open_time_ms - 1,
+                available_time_ms=bars[-1].open_time_ms - 1,
+                fp_max_bucket_abs_delta_pressure=Decimal("0.8"),
+                fp_low_bucket_delta_pressure=Decimal("-0.2"),
+                fp_high_bucket_delta_pressure=Decimal("0.4"),
+                fp_delta_pressure=Decimal("0.1"),
+                bucket_count=5,
+                trade_count=20,
+                context_available=True,
+                quality="COMPLETE",
+            )
+        ]
+    )
+
+    result = worker.run_cycle(**kwargs)
+
+    assert result["status"] == "up_to_date"
+    assert result["reason"] == "no_gap_found"
     assert not Path(kwargs["global_lock_path"]).exists()
 
 
@@ -408,7 +483,7 @@ def test_latest_unpublished_archive_failure_is_deferred(
     monkeypatch.setattr(worker, "safe_okx_archive_end_ms", safe_end)
     monkeypatch.setattr(
         worker,
-        "compute_backfill_target",
+        "compute_mf_signal_backfill_target",
         lambda **_: TradeFeatureBackfillTarget(
             start_ms=lag_safe_end - _MINUTE + 1,
             end_ms=lag_safe_end,
@@ -455,7 +530,7 @@ def test_older_archive_failure_remains_download_failure(
     )
     monkeypatch.setattr(
         worker,
-        "compute_backfill_target",
+        "compute_mf_signal_backfill_target",
         lambda **_: TradeFeatureBackfillTarget(
             start_ms=_okx_day_start_ms(date(2026, 7, 5)),
             end_ms=safe_end_ms,
@@ -505,7 +580,7 @@ def test_processed_through_stops_before_failed_later_day(
     )
     monkeypatch.setattr(
         worker,
-        "compute_backfill_target",
+        "compute_mf_signal_backfill_target",
         lambda **_: TradeFeatureBackfillTarget(
             start_ms=_okx_day_start_ms(first_day),
             end_ms=target_end,

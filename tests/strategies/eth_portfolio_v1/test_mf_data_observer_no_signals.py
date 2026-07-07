@@ -203,7 +203,9 @@ def test_stale_live_tradebar_is_blocked_before_signal_evaluation(
         readiness={
             "mf_signal_feature_ready": True,
             "range_footprint_ready": True,
+            "range_footprint_context_ready": True,
             "tradebar_ready": True,
+            "large_share_samples_ready": True,
             "live_freshness_required": True,
             "live_freshness_max_age_ms": 300_000,
         },
@@ -231,6 +233,7 @@ def _ready_state() -> dict[str, object]:
     return {
         "mf_signal_feature_ready": True,
         "range_footprint_ready": True,
+        "range_footprint_context_ready": True,
         "tradebar_ready": True,
         "fixed_time_footprint_ready": True,
         "coverage_ready": True,
@@ -281,9 +284,9 @@ def _evaluate_fresh_tradebar(
     "missing_gate",
     (
         "mf_signal_feature_ready",
-        "fixed_time_footprint_ready",
-        "coverage_ready",
+        "tradebar_ready",
         "large_share_samples_ready",
+        "range_footprint_context_ready",
     ),
 )
 def test_observer_real_evaluation_blocks_missing_readiness_gate(
@@ -311,3 +314,18 @@ def test_observer_real_evaluation_passes_all_readiness_gates(
     assert audit["missing_readiness_gates"] == []
     assert audit["blocked_reason"] != "data_not_ready"
     assert audit["live_fresh_ready"] is True
+
+
+def test_observer_ignores_historical_coverage_fields_for_data_gate(
+    tmp_path: Path,
+) -> None:
+    readiness = _ready_state()
+    readiness["fixed_time_footprint_ready"] = False
+    readiness["coverage_ready"] = False
+    readiness["range_footprint_ready"] = False
+
+    result, audit = _evaluate_fresh_tradebar(tmp_path, readiness)
+
+    assert result == ()
+    assert audit["data_ready"] is True
+    assert audit["blocked_reason"] != "data_not_ready"

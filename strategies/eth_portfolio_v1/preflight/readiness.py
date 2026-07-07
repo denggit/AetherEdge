@@ -13,6 +13,7 @@ from src.market_data.storage.trade_feature_store import (
     SqliteTradeFeatureStore,
 )
 from src.market_data.trade_features.coverage import (
+    latest_range_footprint_context_audit,
     resolve_trade_feature_readiness,
     safe_okx_archive_end_ms,
 )
@@ -447,9 +448,23 @@ class PortfolioV1ReadinessInspector:
             )
         )
         range_feature = None
+        range_context_audit: dict[str, Any] = {
+            "range_footprint_context_ready": False,
+            "latest_range_footprint_context_available_time_ms": None,
+        }
         if latest_bar is not None:
             range_feature = self._latest_range_footprint_probe(
                 cutoff_ms=latest_bar.open_time_ms
+            )
+            range_context_audit = dict(
+                latest_range_footprint_context_audit(
+                    symbol=self.symbol,
+                    exchange=self.exchange,
+                    store=store,
+                    cutoff_ms=latest_bar.open_time_ms,
+                    range_pct=self.range_pct,
+                    price_step=self.price_step,
+                )
             )
 
         if latest_bar is None:
@@ -470,21 +485,22 @@ class PortfolioV1ReadinessInspector:
                 ),
             )
             readiness_audit = dict(readiness.audit())
-            readiness_audit["mf_signal_feature_ready"] = bool(
+            readiness_audit["historical_tradebar_ready"] = bool(
                 readiness_audit.get("tradebar_ready", False)
-                and readiness_audit.get(
-                    "range_footprint_ready",
-                    False,
-                )
             )
-            for field in (
-                "tradebar_ready",
-                "fixed_time_footprint_ready",
-                "range_footprint_ready",
-                "mf_signal_feature_ready",
-            ):
-                if not readiness_audit.get(field, False):
-                    issues.append(f"mf_{field}_false")
+            readiness_audit[
+                "historical_fixed_time_footprint_ready"
+            ] = bool(
+                readiness_audit.get("fixed_time_footprint_ready", False)
+            )
+            readiness_audit["historical_range_footprint_ready"] = bool(
+                readiness_audit.get("range_footprint_ready", False)
+            )
+            readiness_audit["historical_coverage_ready"] = bool(
+                readiness_audit.get("coverage_ready", False)
+            )
+            if not readiness_audit.get("tradebar_ready", False):
+                issues.append("mf_tradebar_ready_false")
 
         tradebar_stale = bool(
             latest_bar is None
@@ -499,32 +515,18 @@ class PortfolioV1ReadinessInspector:
             issues.append("mf_tradebar_stale")
         if latest_bar is not None and latest_bar.quality != "COMPLETE":
             issues.append("mf_tradebar_degraded")
-        if (
-            latest_footprint is None
-            or latest_bar is None
-            or latest_footprint.open_time_ms != latest_bar.open_time_ms
-        ):
-            issues.append("mf_fixed_time_footprint_missing_latest")
-        elif (
-            latest_footprint.quality != "COMPLETE"
-            or not latest_footprint.context_available
-        ):
-            issues.append("mf_fixed_time_footprint_degraded")
         fixed_footprint_causal = bool(
             latest_footprint is not None
             and signal_time_ms is not None
             and latest_footprint.available_time_ms <= signal_time_ms
             and latest_footprint.available_time_ms <= self.now_ms
         )
-        if latest_footprint is not None and not fixed_footprint_causal:
-            issues.append("mf_fixed_time_footprint_future_available")
-        if range_feature is None:
-            issues.append("mf_range_footprint_missing")
-        elif (
-            range_feature.quality != "COMPLETE"
-            or not range_feature.context_available
-        ):
-            issues.append("mf_range_footprint_degraded")
+        range_context_ready = bool(
+            range_context_audit.get("range_footprint_context_ready")
+        )
+        if not range_context_ready:
+            issues.append("mf_range_footprint_context_ready_false")
+            issues.append("mf_range_footprint_ready_false")
 
         latest_open = (
             None if latest_bar is None else latest_bar.open_time_ms
@@ -559,12 +561,11 @@ class PortfolioV1ReadinessInspector:
             ):
                 if getattr(latest_bar, field, None) is None:
                     missing_fields.append(field)
-        if latest_footprint is not None and (
-            latest_footprint.fp_max_bucket_abs_delta_pressure is None
-        ):
-            missing_fields.append("fp_max_bucket_abs_delta_pressure")
-        if range_feature is not None and (
-            range_feature.fp_max_bucket_abs_delta_pressure is None
+        if range_context_ready and (
+            range_context_audit.get(
+                "latest_range_footprint_context_pressure"
+            )
+            is None
         ):
             missing_fields.append(
                 "range_fp_max_bucket_abs_delta_pressure"
@@ -576,18 +577,49 @@ class PortfolioV1ReadinessInspector:
         if future_rows:
             issues.append("mf_future_feature_rows")
         range_causal = bool(
-            range_feature is not None
+            range_context_ready
             and latest_bar is not None
             and signal_time_ms is not None
-            and range_feature.available_time_ms <= latest_bar.open_time_ms
-            and range_feature.available_time_ms <= signal_time_ms
+            and int(
+                range_context_audit.get(
+                    "latest_range_footprint_context_available_time_ms"
+                )
+                or 0
+            )
+            <= latest_bar.open_time_ms
+            and int(
+                range_context_audit.get(
+                    "latest_range_footprint_context_available_time_ms"
+                )
+                or 0
+            )
+            <= signal_time_ms
         )
-        if range_feature is not None and not range_causal:
+        if range_context_ready and not range_causal:
             issues.append("mf_range_footprint_future_available")
+        large_share_ready = (
+            large_share_samples >= self.large_share_min_samples
+        )
+        mf_signal_feature_ready = bool(
+            readiness_audit.get("tradebar_ready", False)
+            and large_share_ready
+            and range_context_ready
+        )
+        readiness_audit["mf_signal_feature_ready"] = (
+            mf_signal_feature_ready
+        )
+        readiness_audit["range_footprint_context_ready"] = (
+            range_context_ready
+        )
+        readiness_audit["range_footprint_ready"] = range_context_ready
+        readiness_audit["coverage_ready"] = mf_signal_feature_ready
+        if not mf_signal_feature_ready:
+            issues.append("mf_mf_signal_feature_ready_false")
 
         audit.update(
             {
                 **readiness_audit,
+                **range_context_audit,
                 "latest_tradebar_open_time_ms": latest_open,
                 "latest_tradebar_close_time_ms": (
                     None
@@ -609,12 +641,14 @@ class PortfolioV1ReadinessInspector:
                     if range_feature is None
                     else range_feature.available_time_ms
                 ),
+                "latest_range_footprint_context_available_time_ms": (
+                    range_context_audit.get(
+                        "latest_range_footprint_context_available_time_ms"
+                    )
+                ),
                 "latest_signal_time_ms": signal_time_ms,
                 "tradebar_stale": tradebar_stale,
                 "live_fresh_ready": live_fresh_ready,
-                "historical_coverage_ready": bool(
-                    readiness_audit.get("coverage_ready", False)
-                ),
                 "safe_archive_end_ms": safe_archive_end,
                 "latest_tradebar_age_ms": (
                     None
@@ -625,6 +659,7 @@ class PortfolioV1ReadinessInspector:
                     )
                 ),
                 "large_share_sample_count": large_share_samples,
+                "large_share_samples_ready": large_share_ready,
                 "missing_required_fields": missing_fields,
                 "future_feature_row_count": future_rows,
                 "range_footprint_causal_ok": range_causal,
@@ -654,7 +689,7 @@ class PortfolioV1ReadinessInspector:
             "latest_tradebar_available_time_ms"
         )
         footprint_available = mf.get(
-            "latest_range_footprint_available_time_ms"
+            "latest_range_footprint_context_available_time_ms"
         )
         fixed_footprint_available = mf.get(
             "latest_fixed_time_footprint_available_time_ms"
@@ -677,13 +712,15 @@ class PortfolioV1ReadinessInspector:
                 and signal_time is not None
                 and int(footprint_available) <= int(signal_time)
             ),
+            "no_future_feature_rows": (
+                int(mf.get("future_feature_row_count") or 0) == 0
+            ),
+        }
+        diagnostic_checks = {
             "mf_fixed_time_footprint_available_by_signal": bool(
                 fixed_footprint_available is not None
                 and signal_time is not None
                 and int(fixed_footprint_available) <= int(signal_time)
-            ),
-            "no_future_feature_rows": (
-                int(mf.get("future_feature_row_count") or 0) == 0
             ),
         }
         if not all(checks.values()):
@@ -692,6 +729,7 @@ class PortfolioV1ReadinessInspector:
             "ok": all(checks.values()),
             "decision_time_ms": self.now_ms,
             **checks,
+            **diagnostic_checks,
         }
 
     def _mf_future_row_count(self) -> int:

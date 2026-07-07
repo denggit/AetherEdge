@@ -74,23 +74,42 @@ def test_data_not_ready_produces_no_mf_signal() -> None:
         readiness={
             "mf_signal_feature_ready": False,
             "range_footprint_ready": True,
+            "range_footprint_context_ready": True,
             "tradebar_ready": True,
+            "large_share_samples_ready": True,
         }
     )
     assert decision is None
     assert audit["blocked_reason"] == "data_not_ready"
 
 
-def test_range_footprint_not_ready_produces_no_mf_signal() -> None:
+def test_range_footprint_context_not_ready_produces_no_mf_signal() -> None:
     decision, audit = _evaluate(
         readiness={
             "mf_signal_feature_ready": True,
-            "range_footprint_ready": False,
+            "range_footprint_context_ready": False,
             "tradebar_ready": True,
+            "large_share_samples_ready": True,
         }
     )
     assert decision is None
     assert audit["data_ready"] is False
+
+
+def test_historical_coverage_gap_does_not_block_ready_mf_signal() -> None:
+    decision, audit = _evaluate(
+        readiness={
+            **READY,
+            "range_footprint_ready": False,
+            "fixed_time_footprint_ready": False,
+            "coverage_ready": False,
+            "range_footprint_context_ready": True,
+        }
+    )
+
+    assert audit["data_ready"] is True
+    assert audit["blocked_reason"] != "data_not_ready"
+    assert decision is not None
 
 
 def test_missing_large_share_threshold_produces_no_mf_signal() -> None:

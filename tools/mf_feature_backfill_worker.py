@@ -54,7 +54,7 @@ from src.market_data.models import (  # noqa: E402
 )
 from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore  # noqa: E402
 from src.market_data.trade_features.coverage import (  # noqa: E402
-    compute_backfill_target,
+    compute_mf_signal_backfill_target,
     resolve_trade_feature_readiness,
     safe_okx_archive_end_ms,
 )
@@ -198,7 +198,7 @@ def run_cycle(
             if calendar_safe_archive_end > safe_archive_end
             else set()
         )
-        target = compute_backfill_target(
+        target = compute_mf_signal_backfill_target(
             symbol=symbol,
             exchange=exchange,
             store=store,
@@ -499,6 +499,18 @@ def run_cycle(
                 "price_step",
             }
         }
+        next_signal_gap = compute_mf_signal_backfill_target(
+            symbol=symbol,
+            exchange=exchange,
+            store=store,
+            max_minutes_per_cycle=target_minutes,
+            required_minutes=target_minutes,
+            direction=direction,
+            safe_archive_end_ms=end_ms,
+            range_pct=str(range_footprint_range_pct),
+            price_step=str(range_footprint_price_step),
+        )
+        mf_signal_feature_ready = next_signal_gap is None
 
         # Determine status
         if archive_not_published_days or current_day_gap:
@@ -510,9 +522,9 @@ def run_cycle(
         elif cycle_truncated:
             actual_status = "partial"
             status_reason = "cycle_limit_reached"
-        elif not coverage_after.available:
+        elif not mf_signal_feature_ready:
             actual_status = "partial"
-            status_reason = "feature_coverage_incomplete"
+            status_reason = "mf_signal_feature_incomplete"
         else:
             actual_status = "ok"
             status_reason = "cycle_complete"
@@ -561,10 +573,7 @@ def run_cycle(
                 "reason": coverage_after.reason,
             },
             "range_footprint_coverage_after": range_coverage_after,
-            "mf_signal_feature_ready": bool(
-                readiness_after.tradebar_ready
-                and readiness_after.range_footprint_ready
-            ),
+            "mf_signal_feature_ready": bool(mf_signal_feature_ready),
             "current_day_gap_unrecoverable_until_archive": current_day_gap,
             "elapsed_seconds": time.time() - cycle_start,
             "mode": normalized_mode,

@@ -22,21 +22,27 @@ from strategies.eth_portfolio_v1.domain.mf_sleeve import MfSleeveState
 _MINUTE_MS = 60_000
 MF_READINESS_GATE_FIELDS = (
     "mf_signal_feature_ready",
-    "range_footprint_ready",
     "tradebar_ready",
-    "fixed_time_footprint_ready",
-    "coverage_ready",
     "large_share_samples_ready",
+    "range_footprint_context_ready",
 )
 
 
 def mf_readiness_gates(
     readiness: Mapping[str, Any],
 ) -> dict[str, bool]:
-    return {
-        field: bool(readiness.get(field, False))
-        for field in MF_READINESS_GATE_FIELDS
-    }
+    gates: dict[str, bool] = {}
+    for field in MF_READINESS_GATE_FIELDS:
+        if field == "range_footprint_context_ready":
+            gates[field] = bool(
+                readiness.get(
+                    field,
+                    readiness.get("range_footprint_ready", False),
+                )
+            )
+        else:
+            gates[field] = bool(readiness.get(field, False))
+    return gates
 
 
 def evaluate_mf_low_sweep(

@@ -14,7 +14,10 @@ def _readiness(ready: bool) -> dict[str, bool]:
         "tradebar_ready": ready,
         "fixed_time_footprint_ready": ready,
         "range_footprint_ready": ready,
+        "range_footprint_context_ready": ready,
         "coverage_ready": ready,
+        "mf_signal_feature_ready": ready,
+        "large_share_samples_ready": ready,
         "degraded_footprint": False,
         "ready": ready,
     }
@@ -42,6 +45,38 @@ def test_already_ready_exits_without_run_cycle(
         tool,
         "_readiness_audit",
         lambda *args, **kwargs: _readiness(True),
+    )
+    calls = []
+    monkeypatch.setattr(
+        tool,
+        "run_cycle",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    result = tool.run_prebuild(_args(tmp_path))
+
+    assert result == 0
+    assert calls == []
+
+
+def test_historical_range_coverage_gap_does_not_trigger_prebuild_cycle(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    readiness = {
+        **_readiness(True),
+        "fixed_time_footprint_ready": False,
+        "range_footprint_ready": False,
+        "coverage_ready": True,
+        "historical_coverage_ready": False,
+        "historical_range_footprint_ready": False,
+        "range_footprint_context_ready": True,
+        "mf_signal_feature_ready": True,
+    }
+    monkeypatch.setattr(
+        tool,
+        "_readiness_audit",
+        lambda *args, **kwargs: readiness,
     )
     calls = []
     monkeypatch.setattr(

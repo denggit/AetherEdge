@@ -30,7 +30,6 @@ from strategies.eth_portfolio_v1.preflight.readiness import (
     PortfolioV1ReadinessInspector,
 )
 from strategies.eth_portfolio_v1.preflight.mf_feature_backfill import (
-    effective_mf_required_minutes,
     resolve_mf_feature_backfill_enabled,
 )
 
@@ -190,7 +189,7 @@ class PortfolioV1LiveSmokeProvider:
             range_speed_min_periods=(
                 config.entry_filters.range_speed_min_periods
             ),
-            mf_required_minutes=effective_mf_required_minutes(config),
+            mf_required_minutes=config.mf.decision_buffer_minutes,
             readiness_mode="historical_preflight",
             large_share_min_samples=(
                 config.mf.large_share_min_samples

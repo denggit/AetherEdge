@@ -19,6 +19,7 @@ from src.market_data.storage.trade_feature_store import (
     SqliteTradeFeatureStore,
 )
 from src.market_data.trade_features.coverage import (
+    latest_range_footprint_context_audit,
     resolve_trade_feature_readiness,
 )
 from strategies.eth_portfolio_v1.domain.mf_low_sweep import (
@@ -296,6 +297,7 @@ class MfDataReadiness:
         price_step: str = "1",
         large_share_min_samples: int = 43_200,
         large_share_window_days: int = 90,
+        decision_buffer_minutes: int | None = None,
         archive_publish_lag_hours: float = 8.0,
     ) -> None:
         self.symbol = symbol
@@ -311,6 +313,14 @@ class MfDataReadiness:
         )
         self._large_share_window_days = max(
             1, int(large_share_window_days)
+        )
+        self._decision_required_minutes = max(
+            1,
+            int(
+                decision_buffer_minutes
+                if decision_buffer_minutes is not None
+                else min(int(required_minutes), 4_320)
+            ),
         )
         self._archive_publish_lag_hours = max(
             0.0,
@@ -333,26 +343,123 @@ class MfDataReadiness:
             ),
         )
         audit = dict(result.audit())
-        coverage = audit.get("coverage")
-        coverage_extra = (
-            dict(coverage.get("extra", {}))
-            if isinstance(coverage, Mapping)
-            else {}
+        audit["historical_tradebar_ready"] = bool(
+            audit.get("tradebar_ready", False)
         )
-        large_share_sample_count = int(
-            coverage_extra.get("tradebar_complete_minutes", 0) or 0
+        audit["historical_fixed_time_footprint_ready"] = bool(
+            audit.get("fixed_time_footprint_ready", False)
+        )
+        audit["historical_range_footprint_ready"] = bool(
+            audit.get("range_footprint_ready", False)
+        )
+        audit["historical_coverage_ready"] = bool(
+            audit.get("coverage_ready", False)
+        )
+        recent_bars = self._store.load_recent_tradebars(
+            symbol=self.symbol,
+            exchange=self.exchange,
+            limit=self._decision_required_minutes,
+        )
+        latest_bar = recent_bars[-1] if recent_bars else None
+        decision_complete_minutes = _complete_contiguous_tradebars(
+            recent_bars
+        )
+        now_ms = int(time.time() * 1000)
+        latest_tradebar_causal = bool(
+            latest_bar is not None
+            and latest_bar.close_time_ms <= now_ms
+            and latest_bar.available_time_ms <= now_ms
+        )
+        latest_tradebar_complete = bool(
+            latest_bar is not None
+            and latest_bar.quality == TradeFeatureQuality.COMPLETE.value
+            and latest_tradebar_causal
+        )
+        tradebar_ready = bool(
+            latest_tradebar_complete
+            and decision_complete_minutes
+            >= self._decision_required_minutes
+        )
+
+        large_share_samples = self._store.load_recent_large_trade_shares(
+            symbol=self.symbol,
+            exchange=self.exchange,
+            limit=self._large_share_window_days * 1_440 + 1,
+        )
+        large_share_reference_ms = (
+            latest_bar.open_time_ms
+            if latest_bar is not None
+            else (
+                large_share_samples[-1].open_time_ms
+                if large_share_samples
+                else None
+            )
+        )
+        window_start_ms = (
+            None
+            if large_share_reference_ms is None
+            else large_share_reference_ms
+            - self._large_share_window_days * 1_440 * 60_000
+        )
+        large_share_sample_count = sum(
+            1
+            for sample in large_share_samples
+            if large_share_reference_ms is not None
+            and window_start_ms is not None
+            and window_start_ms <= sample.open_time_ms
+            and sample.open_time_ms < large_share_reference_ms
+            and sample.quality == TradeFeatureQuality.COMPLETE.value
+            and sample.large_trade_share is not None
+            and sample.large_trade_share.is_finite()
         )
         large_share_samples_ready = (
-            large_share_sample_count
-            >= self._large_share_min_samples
-            and int(result.coverage.required_minutes)
-            >= min(
-                self._large_share_window_days * 1_440,
-                self._large_share_min_samples,
-            )
-            if result.coverage is not None
-            else False
+            large_share_sample_count >= self._large_share_min_samples
         )
+
+        context_audit = latest_range_footprint_context_audit(
+            symbol=self.symbol,
+            exchange=self.exchange,
+            store=self._store,
+            cutoff_ms=(
+                latest_bar.open_time_ms if latest_bar is not None else 0
+            ),
+            range_pct=self._range_pct,
+            price_step=self._price_step,
+        )
+        range_context_ready = bool(
+            context_audit.get("range_footprint_context_ready", False)
+        )
+        mf_signal_feature_ready = bool(
+            tradebar_ready
+            and large_share_samples_ready
+            and range_context_ready
+        )
+
+        audit.update(context_audit)
+        audit["decision_buffer_required_minutes"] = (
+            self._decision_required_minutes
+        )
+        audit["decision_tradebar_complete_minutes"] = (
+            decision_complete_minutes
+        )
+        audit["latest_tradebar_open_time_ms"] = (
+            None if latest_bar is None else latest_bar.open_time_ms
+        )
+        audit["latest_tradebar_close_time_ms"] = (
+            None if latest_bar is None else latest_bar.close_time_ms
+        )
+        audit["latest_tradebar_available_time_ms"] = (
+            None if latest_bar is None else latest_bar.available_time_ms
+        )
+        audit["latest_tradebar_causal_ok"] = latest_tradebar_causal
+        audit["latest_tradebar_complete"] = latest_tradebar_complete
+        audit["tradebar_ready"] = tradebar_ready
+        audit["range_footprint_context_ready"] = range_context_ready
+        # Backward-compatible MF field: in strategy readiness events this
+        # now reflects the actual context gate, while historical coverage is
+        # retained under historical_range_footprint_ready.
+        audit["range_footprint_ready"] = range_context_ready
+        audit["coverage_ready"] = mf_signal_feature_ready
         audit["large_share_sample_count"] = large_share_sample_count
         audit["large_share_min_samples"] = (
             self._large_share_min_samples
@@ -363,23 +470,12 @@ class MfDataReadiness:
         audit["large_share_samples_ready"] = (
             large_share_samples_ready
         )
-        audit["mf_signal_feature_ready"] = bool(
-            audit.get("tradebar_ready", False)
-            and audit.get("range_footprint_ready", False)
-            and audit.get("fixed_time_footprint_ready", False)
-            and audit.get("coverage_ready", False)
+        audit["mf_signal_feature_ready"] = mf_signal_feature_ready
+        signal_ready = bool(
+            mf_signal_feature_ready
+            and tradebar_ready
             and large_share_samples_ready
-        )
-        signal_ready = all(
-            bool(audit.get(field, False))
-            for field in (
-                "mf_signal_feature_ready",
-                "range_footprint_ready",
-                "tradebar_ready",
-                "fixed_time_footprint_ready",
-                "coverage_ready",
-                "large_share_samples_ready",
-            )
+            and range_context_ready
         )
         self._last = {
             **audit,
@@ -755,37 +851,20 @@ class MfFeatureObserver:
         return None
 
     def _log_readiness_transition(self) -> None:
-        state = (
-            bool(self._readiness.get("mf_signal_feature_ready", False)),
-            bool(self._readiness.get("range_footprint_ready", False)),
-            bool(self._readiness.get("tradebar_ready", False)),
-            bool(self._readiness.get("fixed_time_footprint_ready", False)),
-            bool(self._readiness.get("coverage_ready", False)),
-            bool(self._readiness.get("large_share_samples_ready", False)),
-        )
+        gates = mf_readiness_gates(self._readiness)
+        state = tuple(gates.values())
         if state == self._last_readiness_state:
             return
         self._last_readiness_state = state
         missing = [
             name
-            for name, ok in zip(
-                (
-                    "signal_feature",
-                    "range_footprint",
-                    "tradebar",
-                    "fixed_time_footprint",
-                    "coverage",
-                    "large_share_samples",
-                ),
-                state,
-            )
+            for name, ok in gates.items()
             if not ok
         ]
         logger.info(
             "MF data readiness changed | signal_feature_ready=%s "
-            "range_footprint_ready=%s tradebar_ready=%s "
-            "fixed_time_footprint_ready=%s coverage_ready=%s "
-            "large_share_samples_ready=%s source=%s "
+            "tradebar_ready=%s large_share_samples_ready=%s "
+            "range_footprint_context_ready=%s source=%s "
             "missing_gates=%s",
             *state,
             self._readiness.get("source", "unavailable"),
@@ -987,6 +1066,35 @@ def _quantile(values: Sequence[Decimal], q: Decimal) -> Decimal:
     upper = min(len(ordered) - 1, lower + 1)
     weight = position - Decimal(lower)
     return ordered[lower] + (ordered[upper] - ordered[lower]) * weight
+
+
+def _complete_contiguous_tradebars(
+    bars: Sequence[FixedTimeTradeBar],
+) -> int:
+    count = 0
+    previous_open: int | None = None
+    for bar in reversed(bars):
+        if previous_open is not None and (
+            previous_open - int(bar.open_time_ms) != 60_000
+        ):
+            break
+        if str(bar.quality).upper() != TradeFeatureQuality.COMPLETE.value:
+            break
+        if any(
+            value is None
+            for value in (
+                bar.open,
+                bar.high,
+                bar.low,
+                bar.close,
+                bar.large_trade_share,
+                bar.available_time_ms,
+            )
+        ):
+            break
+        previous_open = int(bar.open_time_ms)
+        count += 1
+    return count
 
 
 def _json_safe(value: Mapping[str, Any]) -> dict[str, Any]:

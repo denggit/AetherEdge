@@ -39,6 +39,7 @@ def _seed_ready_stores(
     *,
     degraded_range_footprint: bool = False,
     mf_latest_close_ms: int | None = None,
+    mark_range_coverage: bool = True,
 ) -> tuple[str, str]:
     market_path = str(tmp_path / "market.sqlite3")
     checkpoint_path = str(tmp_path / "checkpoint.sqlite3")
@@ -192,15 +193,16 @@ def _seed_ready_stores(
             ),
         )
     )
-    feature_store.mark_range_footprint_coverage(
-        symbol=SYMBOL,
-        exchange="okx",
-        range_pct="0.002",
-        price_step="1",
-        start_ms=coverage_start,
-        end_ms=coverage_end,
-        complete=True,
-    )
+    if mark_range_coverage:
+        feature_store.mark_range_footprint_coverage(
+            symbol=SYMBOL,
+            exchange="okx",
+            range_pct="0.002",
+            price_step="1",
+            start_ms=coverage_start,
+            end_ms=coverage_end,
+            complete=True,
+        )
     return market_path, checkpoint_path
 
 
@@ -212,13 +214,14 @@ def _inspect(
     large_share_min_samples: int = 2,
     readiness_mode: str = "live_freshness",
     archive_publish_lag_hours: float = 8.0,
+    range_speed_min_periods: int = 2,
 ):
     return PortfolioV1ReadinessInspector(
         symbol=SYMBOL,
         market_data_db_path=market_path,
         range_checkpoint_db_path=checkpoint_path,
         lf_min_records=2,
-        range_speed_min_periods=2,
+        range_speed_min_periods=range_speed_min_periods,
         mf_required_minutes=3,
         large_share_min_samples=large_share_min_samples,
         readiness_mode=readiness_mode,
@@ -267,6 +270,31 @@ def test_range_aggregate_missing_fails(tmp_path) -> None:
     assert "lf_range_aggregate_missing" in result.issues
 
 
+def test_lf_range_speed_warmup_insufficient_fails(tmp_path) -> None:
+    market, checkpoint = _seed_ready_stores(tmp_path)
+
+    result = _inspect(
+        market,
+        checkpoint,
+        range_speed_min_periods=3,
+    )
+
+    assert "lf_range_speed_warmup_insufficient" in result.issues
+
+
+def test_lf_range_aggregate_not_complete_fails(tmp_path) -> None:
+    market, checkpoint = _seed_ready_stores(tmp_path)
+    with sqlite3.connect(checkpoint) as conn:
+        conn.execute(
+            "UPDATE completed_range_aggregates SET coverage_status=?",
+            ("PARTIAL",),
+        )
+
+    result = _inspect(market, checkpoint)
+
+    assert "lf_range_aggregate_not_complete" in result.issues
+
+
 def test_mf_tradebar_and_range_footprint_are_ready(tmp_path) -> None:
     market, checkpoint = _seed_ready_stores(tmp_path)
 
@@ -274,7 +302,23 @@ def test_mf_tradebar_and_range_footprint_are_ready(tmp_path) -> None:
 
     assert result.mf["tradebar_ready"] is True
     assert result.mf["range_footprint_ready"] is True
+    assert result.mf["range_footprint_context_ready"] is True
     assert result.mf["ok"] is True
+
+
+def test_mf_signal_ready_without_historical_range_coverage(tmp_path) -> None:
+    market, checkpoint = _seed_ready_stores(
+        tmp_path,
+        mark_range_coverage=False,
+    )
+
+    result = _inspect(market, checkpoint)
+
+    assert result.mf["historical_coverage_ready"] is False
+    assert result.mf["range_footprint_context_ready"] is True
+    assert result.mf["mf_signal_feature_ready"] is True
+    assert result.mf["ok"] is True
+    assert "mf_range_footprint_ready_false" not in result.issues
 
 
 def test_mf_missing_large_share_samples_fails(tmp_path) -> None:
@@ -306,7 +350,8 @@ def test_available_time_after_decision_boundary_fails(tmp_path) -> None:
 
     result = _inspect(market, checkpoint)
 
-    assert "mf_fixed_time_footprint_future_available" in result.issues
+    assert "mf_fixed_time_footprint_future_available" not in result.issues
+    assert "mf_future_feature_rows" in result.issues
     assert result.causal["ok"] is False
 
 
@@ -318,7 +363,7 @@ def test_degraded_range_footprint_fails(tmp_path) -> None:
 
     result = _inspect(market, checkpoint)
 
-    assert "mf_range_footprint_degraded" in result.issues
+    assert "mf_range_footprint_context_ready_false" in result.issues
 
 
 def test_historical_preflight_accepts_safe_archive_edge(

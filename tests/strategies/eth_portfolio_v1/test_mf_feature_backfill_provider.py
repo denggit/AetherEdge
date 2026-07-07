@@ -60,6 +60,7 @@ def _coverage(ready: bool) -> dict[str, bool]:
     return {
         "mf_signal_feature_ready": ready,
         "range_footprint_ready": ready,
+        "range_footprint_context_ready": ready,
         "tradebar_ready": ready,
         "fixed_time_footprint_ready": ready,
         "coverage_ready": ready,
@@ -307,6 +308,49 @@ def test_poll_readiness_skips_launch_when_coverage_ready(
 
     assert result["action"] == "none"
     assert result["reason"] == "periodic_coverage_scan"
+    assert supervisor.launch_calls == 0
+
+
+def test_poll_readiness_skips_launch_when_mf_signal_ready_despite_historical_gap(
+    tmp_path,
+) -> None:
+    class _SignalReadySupervisor:
+        def __init__(self):
+            self.scan_calls = 0
+            self.launch_calls = 0
+
+        def scan_coverage(self):
+            self.scan_calls += 1
+            return {
+                **_coverage(True),
+                "coverage_ready": False,
+                "fixed_time_footprint_ready": False,
+                "range_footprint_ready": False,
+                "range_footprint_context_ready": True,
+                "mf_signal_feature_ready": True,
+            }
+
+        def check_and_launch(self):
+            self.launch_calls += 1
+            return {
+                "action": "launched",
+                "reason": "coverage_gap",
+                "coverage": _coverage(False),
+            }
+
+    supervisor = _SignalReadySupervisor()
+    provider = PortfolioV1MfFeatureBackfillProvider(
+        strategy=Strategy(),
+        project_env=_env(tmp_path),
+        supervisor=supervisor,
+        readiness_reader=lambda: _coverage(False),
+    )
+
+    result = provider.poll_readiness()
+
+    assert result["action"] == "none"
+    assert result["reason"] == "periodic_coverage_scan"
+    assert supervisor.scan_calls == 1
     assert supervisor.launch_calls == 0
 
 

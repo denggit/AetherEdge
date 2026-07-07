@@ -19,6 +19,7 @@ from src.market_data.storage.trade_feature_store import (  # noqa: E402
     SqliteTradeFeatureStore,
 )
 from src.market_data.trade_features.coverage import (  # noqa: E402
+    latest_range_footprint_context_audit,
     resolve_trade_feature_readiness,
 )
 from src.market_data.backfill.status_store import now_ms  # noqa: E402
@@ -582,6 +583,62 @@ def _readiness_audit(
         ),
     )
     audit = dict(readiness.audit())
+    coverage = audit.get("coverage")
+    coverage_extra = (
+        dict(coverage.get("extra", {}))
+        if isinstance(coverage, Mapping)
+        else {}
+    )
+    audit["historical_fixed_time_footprint_ready"] = bool(
+        audit.get("fixed_time_footprint_ready", False)
+    )
+    audit["historical_range_footprint_ready"] = bool(
+        audit.get("range_footprint_ready", False)
+    )
+    audit["historical_coverage_ready"] = bool(
+        audit.get("coverage_ready", False)
+    )
+    large_share_sample_count = int(
+        coverage_extra.get("tradebar_complete_minutes", 0) or 0
+    )
+    large_share_ready = (
+        large_share_sample_count
+        >= max(1, int(args.large_share_min_samples))
+    )
+    reference_end_ms = _first_int(
+        coverage_extra.get("reference_end_ms"),
+        coverage_extra.get("safe_archive_end_ms"),
+    )
+    context_audit = latest_range_footprint_context_audit(
+        symbol=args.symbol,
+        exchange=args.exchange,
+        store=store,
+        cutoff_ms=(
+            0
+            if reference_end_ms is None
+            else (reference_end_ms // 60_000) * 60_000
+        ),
+        range_pct=args.range_footprint_range_pct,
+        price_step=args.range_footprint_price_step,
+    )
+    range_context_ready = bool(
+        context_audit.get("range_footprint_context_ready", False)
+    )
+    mf_signal_feature_ready = bool(
+        audit.get("tradebar_ready", False)
+        and large_share_ready
+        and range_context_ready
+    )
+    audit.update(context_audit)
+    audit["large_share_sample_count"] = large_share_sample_count
+    audit["large_share_min_samples"] = max(
+        1, int(args.large_share_min_samples)
+    )
+    audit["large_share_samples_ready"] = large_share_ready
+    audit["range_footprint_context_ready"] = range_context_ready
+    audit["range_footprint_ready"] = range_context_ready
+    audit["mf_signal_feature_ready"] = mf_signal_feature_ready
+    audit["coverage_ready"] = mf_signal_feature_ready
     audit["ready"] = _is_ready(audit)
     return audit
 
@@ -589,10 +646,9 @@ def _readiness_audit(
 def _is_ready(readiness: Mapping[str, Any]) -> bool:
     return bool(
         readiness.get("tradebar_ready", False)
-        and readiness.get("fixed_time_footprint_ready", False)
-        and readiness.get("range_footprint_ready", False)
-        and readiness.get("coverage_ready", False)
-        and not readiness.get("degraded_footprint", False)
+        and readiness.get("large_share_samples_ready", False)
+        and readiness.get("range_footprint_context_ready", False)
+        and readiness.get("mf_signal_feature_ready", False)
     )
 
 

@@ -4,16 +4,14 @@ import json
 import time
 from decimal import Decimal
 from pathlib import Path
-from types import SimpleNamespace
 
-from src.market_data.models import FixedTimeTradeBar
+from src.market_data.models import FixedTimeTradeBar, RangeFootprintFeature
 from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
 from strategies.eth_portfolio_v1.domain.mf_data import (
     MfDataBuffer,
     MfDataReadiness,
     MfFeatureObserver,
 )
-import strategies.eth_portfolio_v1.domain.mf_data as mf_data_module
 
 
 def _make_bar(open_time_ms: int, close_time_ms: int, *, large_share: str = "0.05") -> FixedTimeTradeBar:
@@ -39,6 +37,41 @@ def _make_bar(open_time_ms: int, close_time_ms: int, *, large_share: str = "0.05
         trade_count=5,
         large_trade_share=Decimal(large_share),
     )
+
+
+def _make_range_context(available_time_ms: int) -> RangeFootprintFeature:
+    return RangeFootprintFeature(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct=Decimal("0.002"),
+        price_step=Decimal("1"),
+        range_bar_id=available_time_ms,
+        range_start_ms=available_time_ms - 30_000,
+        range_end_ms=available_time_ms,
+        available_time_ms=available_time_ms,
+        fp_max_bucket_abs_delta_pressure=Decimal("0.8"),
+        fp_low_bucket_delta_pressure=Decimal("-0.2"),
+        fp_high_bucket_delta_pressure=Decimal("0.4"),
+        fp_delta_pressure=Decimal("0.1"),
+        bucket_count=5,
+        trade_count=20,
+        context_available=True,
+        quality="COMPLETE",
+    )
+
+
+def _seed_tradebars(
+    store: SqliteTradeFeatureStore,
+    *,
+    base: int,
+    count: int,
+) -> list[FixedTimeTradeBar]:
+    bars = [
+        _make_bar(base + i * 60_000, base + (i + 1) * 60_000 - 1)
+        for i in range(count)
+    ]
+    store.upsert_many(bars)
+    return bars
 
 
 # ---------------------------------------------------------------------------
@@ -172,33 +205,22 @@ def test_readiness_has_full_audit_info(tmp_path: Path) -> None:
 
 def test_readiness_blocks_when_large_share_samples_are_insufficient(
     tmp_path: Path,
-    monkeypatch,
 ) -> None:
-    coverage = SimpleNamespace(required_minutes=4_320)
-    monkeypatch.setattr(
-        mf_data_module,
-        "resolve_trade_feature_readiness",
-        lambda **_: SimpleNamespace(
-            coverage=coverage,
-            audit=lambda: {
-                "tradebar_ready": True,
-                "fixed_time_footprint_ready": True,
-                "range_footprint_ready": True,
-                "coverage_ready": True,
-                "coverage": {
-                    "extra": {
-                        "tradebar_complete_minutes": 4_320,
-                    }
-                },
-            },
-        ),
+    store_path = tmp_path / "test.sqlite3"
+    store = SqliteTradeFeatureStore(path=store_path)
+    base = int(time.time() * 1000) - 3600_000
+    bars = _seed_tradebars(store, base=base, count=5)
+    store.upsert_range_footprints_many(
+        [_make_range_context(bars[-1].open_time_ms - 1)]
     )
     readiness = MfDataReadiness(
         symbol="ETH-USDT-PERP",
         exchange="okx",
-        store_path=str(tmp_path / "test.sqlite3"),
-        required_minutes=4_320,
-        large_share_min_samples=43_200,
+        store_path=str(store_path),
+        required_minutes=3,
+        decision_buffer_minutes=3,
+        large_share_min_samples=10,
+        large_share_window_days=1,
     )
 
     audit = readiness.readiness()
@@ -209,40 +231,54 @@ def test_readiness_blocks_when_large_share_samples_are_insufficient(
 
 def test_readiness_passes_large_share_sample_gate(
     tmp_path: Path,
-    monkeypatch,
 ) -> None:
-    coverage = SimpleNamespace(required_minutes=129_600)
-    monkeypatch.setattr(
-        mf_data_module,
-        "resolve_trade_feature_readiness",
-        lambda **_: SimpleNamespace(
-            coverage=coverage,
-            audit=lambda: {
-                "tradebar_ready": True,
-                "fixed_time_footprint_ready": True,
-                "range_footprint_ready": True,
-                "coverage_ready": True,
-                "coverage": {
-                    "extra": {
-                        "tradebar_complete_minutes": 129_600,
-                    }
-                },
-            },
-        ),
+    store_path = tmp_path / "test.sqlite3"
+    store = SqliteTradeFeatureStore(path=store_path)
+    base = int(time.time() * 1000) - 3600_000
+    bars = _seed_tradebars(store, base=base, count=6)
+    store.upsert_range_footprints_many(
+        [_make_range_context(bars[-1].open_time_ms - 1)]
     )
     readiness = MfDataReadiness(
         symbol="ETH-USDT-PERP",
         exchange="okx",
-        store_path=str(tmp_path / "test.sqlite3"),
-        required_minutes=129_600,
-        large_share_min_samples=43_200,
-        large_share_window_days=90,
+        store_path=str(store_path),
+        required_minutes=6,
+        decision_buffer_minutes=3,
+        large_share_min_samples=4,
+        large_share_window_days=1,
     )
 
     audit = readiness.readiness()
 
     assert audit["large_share_samples_ready"] is True
+    assert audit["range_footprint_context_ready"] is True
+    assert audit["historical_coverage_ready"] is False
     assert audit["mf_signal_ready"] is True
+
+
+def test_readiness_blocks_when_latest_range_context_is_missing(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "test.sqlite3"
+    store = SqliteTradeFeatureStore(path=store_path)
+    base = int(time.time() * 1000) - 3600_000
+    _seed_tradebars(store, base=base, count=6)
+    readiness = MfDataReadiness(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        store_path=str(store_path),
+        required_minutes=6,
+        decision_buffer_minutes=3,
+        large_share_min_samples=4,
+        large_share_window_days=1,
+    )
+
+    audit = readiness.readiness()
+
+    assert audit["large_share_samples_ready"] is True
+    assert audit["range_footprint_context_ready"] is False
+    assert audit["mf_signal_ready"] is False
 
 
 # ---------------------------------------------------------------------------
