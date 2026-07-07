@@ -218,3 +218,149 @@ def test_default_supervisor_launches_live_recent_to_oldest_no_once(
     assert parsed.global_lock_priority == BACKGROUND_BACKFILL_PRIORITY
     assert "--no-once" in command
     assert "--no-download" not in command
+
+
+# ---------------------------------------------------------------------------
+# Persisted retry cooldown tests
+# ---------------------------------------------------------------------------
+
+
+def test_persisted_retry_deferred_prevents_launch(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """When status file has running=False and next_retry_after_ms in the
+    future, check_and_launch must return retry_deferred, not launch."""
+    future_ms = int(time.time() * 1000) + 3_600_000  # 1 hour from now
+    config = _config(tmp_path)
+    config.status_path.write_text(
+        json.dumps(
+            {
+                "pid": None,
+                "running": False,
+                "next_retry_after_ms": future_ms,
+            }
+        ),
+        encoding="utf-8",
+    )
+    supervisor = TradeFeatureBackfillSupervisor(
+        config=config,
+        coverage_reader=lambda: {"coverage_ready": False},
+    )
+    launches = []
+    monkeypatch.setattr(
+        supervisor,
+        "_launch_worker",
+        lambda: launches.append(True),
+    )
+
+    result = supervisor.check_and_launch()
+
+    assert result["action"] == "none"
+    assert result["reason"] == "retry_deferred"
+    assert launches == []
+
+
+def test_expired_retry_allows_launch(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """When status file has next_retry_after_ms in the past,
+    check_and_launch must allow a new launch."""
+    past_ms = int(time.time() * 1000) - 60_000  # 1 minute ago
+    config = _config(tmp_path)
+    config.status_path.write_text(
+        json.dumps(
+            {
+                "pid": None,
+                "running": False,
+                "next_retry_after_ms": past_ms,
+            }
+        ),
+        encoding="utf-8",
+    )
+    supervisor = TradeFeatureBackfillSupervisor(
+        config=config,
+        coverage_reader=lambda: {"coverage_ready": False},
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_launch_worker",
+        lambda: True,
+    )
+
+    result = supervisor.check_and_launch()
+
+    assert result["action"] == "launched"
+    assert result["reason"] == "coverage_gap"
+
+
+def test_worker_command_includes_failure_cooldown_seconds(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """_launch_worker must pass --failure-cooldown-seconds to the worker."""
+    config = replace(
+        _config(tmp_path),
+        failure_cooldown_seconds=7200,
+    )
+    supervisor = TradeFeatureBackfillSupervisor(
+        config=config,
+        coverage_reader=lambda: {"coverage_ready": False},
+    )
+    captured = {}
+
+    def capture_popen(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(
+        supervisor_module.subprocess,
+        "Popen",
+        capture_popen,
+    )
+
+    assert supervisor._launch_worker() is True
+    command = captured["command"]
+    assert "--failure-cooldown-seconds" in command
+
+    parsed = worker.parse_args(command[2:])
+    assert parsed.failure_cooldown_seconds == 7200
+
+
+def test_running_worker_with_retry_deferred_is_ignored(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """When status has running=True, next_retry_after_ms is ignored
+    (the worker is still running)."""
+    future_ms = int(time.time() * 1000) + 3_600_000
+    config = _config(tmp_path)
+    config.status_path.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "running": True,
+                "worker_heartbeat_ms": int(time.time() * 1000),
+                "next_retry_after_ms": future_ms,
+            }
+        ),
+        encoding="utf-8",
+    )
+    supervisor = TradeFeatureBackfillSupervisor(
+        config=config,
+        coverage_reader=lambda: {"coverage_ready": False},
+    )
+    launches = []
+    monkeypatch.setattr(
+        supervisor,
+        "_launch_worker",
+        lambda: launches.append(True),
+    )
+
+    result = supervisor.check_and_launch()
+
+    # Worker is running → worker_already_running, not retry_deferred
+    assert result["reason"] == "worker_already_running"
+    assert launches == []

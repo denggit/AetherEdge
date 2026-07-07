@@ -101,6 +101,13 @@ class TradeFeatureBackfillSupervisor:
                 "coverage": coverage,
             }
 
+        if self._persisted_retry_is_deferred():
+            return {
+                "action": "none",
+                "reason": "retry_deferred",
+                "coverage": coverage,
+            }
+
         current_ms = now_ms()
         if (
             current_ms - self._state.last_restart_ms
@@ -162,6 +169,24 @@ class TradeFeatureBackfillSupervisor:
             status,
             stale_after_seconds=self.config.stale_after_seconds,
         )
+
+    def _persisted_retry_is_deferred(self) -> bool:
+        """Honour a retry cooldown written by the worker (e.g. after
+        persistent download failures on old archives)."""
+        status = RangeBackfillStatusStore(
+            self.config.status_path
+        ).read()
+        if not status:
+            return False
+        if status.get("running"):
+            return False
+        retry_after_ms = status.get("next_retry_after_ms")
+        if retry_after_ms is None:
+            return False
+        try:
+            return int(retry_after_ms) > now_ms()
+        except (TypeError, ValueError):
+            return False
 
     def _launch_worker(self) -> bool:
         self.config.worker_log_path.parent.mkdir(
@@ -228,6 +253,8 @@ class TradeFeatureBackfillSupervisor:
             str(max(1, int(self.config.required_minutes))),
             "--global-lock-priority",
             str(self.config.global_lock_priority),
+            "--failure-cooldown-seconds",
+            str(self.config.failure_cooldown_seconds),
             "--contract-value",
             self.config.contract_value,
             "--price-bucket-size",
