@@ -147,12 +147,16 @@ def test_worker_empty_store_writes_tradebar_and_range_footprint(
 
     result = worker.run_cycle(**_kwargs(tmp_path))
 
-    assert result["status"] == "ok"
+    # Chunk completes (2 minutes written) but full required window (4320 min)
+    # is not satisfied → partial, not ok.
+    assert result["status"] == "partial"
+    assert result["reason"] == "mf_signal_feature_incomplete"
     assert result["target_end_ms"] <= result["safe_archive_end_ms"]
     assert result["total_bars_written"] == 2
     assert result["total_footprints_written"] == 2
     assert result["range_footprints_written"] == 2
-    assert result["mf_signal_feature_ready"] is True
+    assert result["mf_signal_feature_ready"] is False
+    assert result["full_window_required_minutes"] == 4320
     store = SqliteTradeFeatureStore(path=tmp_path / "market.sqlite3")
     bars = store.load_range_tradebars(
         symbol="ETH-USDT-PERP",
@@ -182,6 +186,141 @@ def test_worker_empty_store_writes_tradebar_and_range_footprint(
         < start
     )
     assert result["coverage_after"]["available"] is True
+
+
+def test_large_required_window_not_satisfied_by_single_chunk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """required_minutes=5 > max_minutes_per_cycle=2: first chunk fills
+    only 2 of 5 required minutes. Full-window mf_signal_feature_ready
+    must be False; status must be partial, not ok."""
+    safe_end = safe_okx_archive_end_ms()
+    archive_day = datetime.fromtimestamp(
+        safe_end / 1_000, tz=timezone.utc,
+    ).astimezone(_OKX_TIMEZONE).date()
+    start = safe_end - 2 * _MINUTE + 1
+    trades = [
+        _trade("990", start - _MINUTE, TradeSide.BUY),
+        _trade("992", start - 30_000, TradeSide.SELL),
+        _trade("1000.2", start + 1_000, TradeSide.BUY),
+        _trade("1000.8", start + 2_000, TradeSide.SELL),
+        _trade("1001.2", start + _MINUTE + 1_000, TradeSide.BUY),
+        _trade("1002.3", start + _MINUTE + 2_000, TradeSide.SELL),
+    ]
+    monkeypatch.setattr(worker, "OkxHistoricalTradeArchive", _Archive)
+    monkeypatch.setattr(
+        worker,
+        "iter_okx_archive_dates_for_utc_range",
+        lambda *_: iter((archive_day,)),
+    )
+    monkeypatch.setattr(
+        worker, "iter_trade_csv_chunks", lambda *_args, **_kwargs: iter((object(),))
+    )
+    monkeypatch.setattr(
+        worker, "normalize_okx_trade_chunk", lambda *_args, **_kwargs: trades
+    )
+
+    kwargs = _kwargs(tmp_path)
+    kwargs["required_minutes"] = 5
+
+    result = worker.run_cycle(**kwargs)
+
+    assert result["status"] == "partial"
+    assert result["reason"] == "mf_signal_feature_incomplete"
+    assert result["mf_signal_feature_ready"] is False
+    assert result["full_window_required_minutes"] == 5
+    # Chunk bars were written
+    assert result["total_bars_written"] == 2
+
+
+def test_full_window_ready_when_required_minutes_matches_chunk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """required_minutes == max_minutes_per_cycle == 2: after filling the
+    chunk the full window must be ready (mf_signal_feature_ready=True)."""
+    safe_end = safe_okx_archive_end_ms()
+    archive_day = datetime.fromtimestamp(
+        safe_end / 1_000, tz=timezone.utc,
+    ).astimezone(_OKX_TIMEZONE).date()
+    start = safe_end - 2 * _MINUTE + 1
+    trades = [
+        _trade("990", start - _MINUTE, TradeSide.BUY),
+        _trade("992", start - 30_000, TradeSide.SELL),
+        _trade("1000.2", start + 1_000, TradeSide.BUY),
+        _trade("1000.8", start + 2_000, TradeSide.SELL),
+        _trade("1001.2", start + _MINUTE + 1_000, TradeSide.BUY),
+        _trade("1002.3", start + _MINUTE + 2_000, TradeSide.SELL),
+    ]
+    monkeypatch.setattr(worker, "OkxHistoricalTradeArchive", _Archive)
+    monkeypatch.setattr(
+        worker,
+        "iter_okx_archive_dates_for_utc_range",
+        lambda *_: iter((archive_day,)),
+    )
+    monkeypatch.setattr(
+        worker, "iter_trade_csv_chunks", lambda *_args, **_kwargs: iter((object(),))
+    )
+    monkeypatch.setattr(
+        worker, "normalize_okx_trade_chunk", lambda *_args, **_kwargs: trades
+    )
+
+    kwargs = _kwargs(tmp_path)
+    kwargs["required_minutes"] = 2
+
+    result = worker.run_cycle(**kwargs)
+
+    assert result["status"] == "ok"
+    assert result["reason"] == "cycle_complete"
+    assert result["mf_signal_feature_ready"] is True
+    assert result["full_window_required_minutes"] == 2
+
+
+def test_main_download_failure_exits_with_cooldown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When run_cycle returns download_failures for old archives,
+    main() must exit with retry cooldown, not sleep + retry."""
+    cycle_results = [
+        {
+            "status": "partial",
+            "reason": "download_failures",
+            "failed_downloads": ["2026-07-01"],
+            "archive_not_published_days": [],
+            "mf_signal_feature_ready": False,
+        },
+    ]
+    call_count = [0]
+    status_writes = []
+
+    def fake_cycle(**kwargs):
+        idx = min(call_count[0], len(cycle_results) - 1)
+        call_count[0] += 1
+        return dict(cycle_results[idx])
+
+    monkeypatch.setattr(worker, "run_cycle", fake_cycle)
+    monkeypatch.setattr(
+        worker,
+        "_update_status",
+        lambda status_path, **kw: status_writes.append(kw),
+    )
+
+    exit_code = worker.main(
+        [
+            "--no-once",
+            "--mode", "live",
+            "--status-path", str(tmp_path / "status.json"),
+            "--failure-cooldown-seconds", "7200",
+            "--no-download",
+        ]
+    )
+
+    assert exit_code == 0
+    assert call_count[0] == 1  # only one cycle, then exit
+    # Final status write should be running=False with next_retry_after_ms
+    final = [w for w in status_writes if w.get("running") is False]
+    assert len(final) == 1
+    assert final[0].get("next_retry_after_ms") is not None
 
 
 def test_worker_clamps_requested_current_day_target_and_reports_partial(

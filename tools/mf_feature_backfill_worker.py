@@ -94,6 +94,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-seconds-per-cycle", type=float, default=60.0)
     parser.add_argument("--chunk-sleep-seconds", type=float, default=0.0)
     parser.add_argument("--sleep-seconds", type=float, default=30.0)
+    parser.add_argument("--failure-cooldown-seconds", type=int, default=3600)
     # Symbol
     parser.add_argument("--symbol", default="ETH-USDT-PERP")
     parser.add_argument("--exchange", default="okx")
@@ -480,6 +481,7 @@ def run_cycle(
                 end_ms=end_ms,
                 complete=True,
             )
+        # -------- slice-level coverage stats (informational) --------
         readiness_after = resolve_trade_feature_readiness(
             symbol=symbol,
             exchange=exchange,
@@ -509,20 +511,24 @@ def run_cycle(
                 "price_step",
             }
         }
-        next_signal_gap = compute_mf_signal_backfill_target(
+        # -------- full-window readiness check (exit decision) --------
+        full_gap_check = compute_mf_signal_backfill_target(
             symbol=symbol,
             exchange=exchange,
             store=store,
-            max_minutes_per_cycle=target_minutes,
-            required_minutes=target_minutes,
+            max_minutes_per_cycle=min(
+                max(1, int(max_minutes_per_cycle)),
+                max(1, int(max_days_per_cycle)) * 1_440,
+            ),
+            required_minutes=max(1, int(required_minutes)),
             direction=direction,
-            safe_archive_end_ms=end_ms,
+            safe_archive_end_ms=safe_archive_end,
             range_pct=str(range_footprint_range_pct),
             price_step=str(range_footprint_price_step),
         )
-        mf_signal_feature_ready = next_signal_gap is None
+        full_window_mf_signal_feature_ready = full_gap_check is None
 
-        # Determine status
+        # Determine status (full-window mf_signal_feature_ready drives exit)
         if archive_not_published_days or current_day_gap:
             actual_status = "deferred"
             status_reason = "archive_not_published_yet"
@@ -532,7 +538,7 @@ def run_cycle(
         elif cycle_truncated:
             actual_status = "partial"
             status_reason = "cycle_limit_reached"
-        elif not mf_signal_feature_ready:
+        elif not full_window_mf_signal_feature_ready:
             actual_status = "partial"
             status_reason = "mf_signal_feature_incomplete"
         else:
@@ -583,7 +589,10 @@ def run_cycle(
                 "reason": coverage_after.reason,
             },
             "range_footprint_coverage_after": range_coverage_after,
-            "mf_signal_feature_ready": bool(mf_signal_feature_ready),
+            "mf_signal_feature_ready": bool(
+                full_window_mf_signal_feature_ready
+            ),
+            "full_window_required_minutes": max(1, int(required_minutes)),
             "current_day_gap_unrecoverable_until_archive": current_day_gap,
             "elapsed_seconds": time.time() - cycle_start,
             "mode": normalized_mode,
@@ -777,6 +786,39 @@ def main(argv: Sequence[str] | None = None) -> int:
                     running=False,
                     last_result=result,
                     worker_heartbeat_ms=now_ms(),
+                    mode=args.mode,
+                    symbol=args.symbol,
+                    no_download=bool(args.no_download),
+                    archive_publish_lag_hours=args.archive_publish_lag_hours,
+                    sleep_seconds=args.sleep_seconds,
+                    global_lock_priority=args.global_lock_priority,
+                )
+                return 0
+
+            # Old-archive download failures: exit with cooldown instead
+            # of retrying every sleep_seconds.  Mirrors range_backfill_worker's
+            # no-progress / retry-cooldown semantics.
+            if (
+                status == "partial"
+                and result.get("reason") == "download_failures"
+                and result.get("failed_downloads")
+                and not result.get("archive_not_published_days")
+            ):
+                next_retry = now_ms() + max(
+                    0, int(args.failure_cooldown_seconds)
+                ) * 1000
+                logger.warning(
+                    "MF backfill exiting with download-failure cooldown | "
+                    "failed_downloads=%s next_retry_after_ms=%s",
+                    result.get("failed_downloads"),
+                    next_retry,
+                )
+                _update_status(
+                    args.status_path,
+                    running=False,
+                    last_result=result,
+                    worker_heartbeat_ms=now_ms(),
+                    next_retry_after_ms=next_retry,
                     mode=args.mode,
                     symbol=args.symbol,
                     no_download=bool(args.no_download),
