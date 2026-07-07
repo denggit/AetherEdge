@@ -246,6 +246,8 @@ class PortfolioV1MfFeatureBackfillProvider:
                     self.required_minutes,
                 ),
             ),
+            worker_mode="live",
+            no_download=True,
             max_seconds_per_cycle=self.project_env.get_float(
                 "AETHER_MF_FEATURE_BACKFILL_MAX_SECONDS_PER_CYCLE",
                 60.0,

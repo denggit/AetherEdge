@@ -33,6 +33,8 @@ class TradeFeatureBackfillConfig:
     global_status_path: Path
     worker_log_path: Path
     required_minutes: int = 4320
+    worker_mode: str = "prebuild"
+    no_download: bool = False
     stale_after_seconds: int = 180
     restart_cooldown_seconds: int = 300
     failure_cooldown_seconds: int = 3600
@@ -157,12 +159,19 @@ class TradeFeatureBackfillSupervisor:
             parents=True,
             exist_ok=True,
         )
+        worker_mode = str(self.config.worker_mode).strip().lower()
+        if worker_mode not in {"live", "prebuild"}:
+            logger.error(
+                "Unsupported trade-feature backfill worker mode: %s",
+                self.config.worker_mode,
+            )
+            return False
         command = [
             sys.executable,
             str(self.config.worker_script),
             "--once",
             "--mode",
-            "prebuild",
+            worker_mode,
             "--symbol",
             self.config.symbol,
             "--exchange",
@@ -196,6 +205,8 @@ class TradeFeatureBackfillSupervisor:
             "--log-file",
             str(self.config.worker_log_path),
         ]
+        if self.config.no_download:
+            command.append("--no-download")
         try:
             with self.config.worker_log_path.open(
                 "a",

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 from src.market_data.models import TradeFeatureBackfillTarget
 from src.market_data.storage.trade_feature_store import (
     SqliteTradeFeatureStore,
@@ -111,6 +113,26 @@ def compute_mf_signal_backfill_target(
             reason="degraded_tradebar_recompute",
         )
 
+    large_share_gap = _large_trade_share_gap(
+        store=store,
+        symbol=symbol,
+        exchange=exchange,
+        start_ms=range_start,
+        end_ms=safe_end,
+        direction=normalized_direction,
+    )
+    if large_share_gap is not None:
+        start_ms, end_ms = _bounded_window(
+            large_share_gap,
+            max_minutes=max_minutes,
+            direction=normalized_direction,
+        )
+        return TradeFeatureBackfillTarget(
+            start_ms=start_ms,
+            end_ms=min(safe_end, end_ms),
+            reason="large_trade_share_recompute",
+        )
+
     latest_signal_open_ms = (safe_end // _ONE_MINUTE_MS) * _ONE_MINUTE_MS
     context = latest_range_footprint_context_audit(
         symbol=symbol,
@@ -174,6 +196,45 @@ def _tradebar_quality_gap(
         return None
     open_ms = int(row[0])
     return open_ms, open_ms + _ONE_MINUTE_MS - 1
+
+
+def _large_trade_share_gap(
+    *,
+    store: SqliteTradeFeatureStore,
+    symbol: str,
+    exchange: str,
+    start_ms: int,
+    end_ms: int,
+    direction: str,
+) -> tuple[int, int] | None:
+    order = "ASC" if direction == "oldest-to-recent" else "DESC"
+    try:
+        with store._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT open_time_ms, large_trade_share
+                FROM tradebar_1m_features
+                WHERE symbol=? AND exchange=?
+                  AND open_time_ms>=? AND open_time_ms<=?
+                  AND quality='COMPLETE'
+                ORDER BY open_time_ms {order}
+                """,
+                (symbol, exchange, int(start_ms), int(end_ms)),
+            ).fetchall()
+    except Exception:
+        return None
+    for row in rows:
+        open_ms = int(row[0])
+        raw_share = row[1]
+        if raw_share is None:
+            return open_ms, open_ms + _ONE_MINUTE_MS - 1
+        try:
+            share = Decimal(str(raw_share))
+        except Exception:
+            return open_ms, open_ms + _ONE_MINUTE_MS - 1
+        if not share.is_finite() or share < 0 or share > 1:
+            return open_ms, open_ms + _ONE_MINUTE_MS - 1
+    return None
 
 
 __all__ = ["compute_mf_signal_backfill_target"]

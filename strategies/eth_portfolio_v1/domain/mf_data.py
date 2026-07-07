@@ -10,7 +10,6 @@ from src.market_data.events import MarketFeatureEventType
 from src.market_data.models import (
     FixedTimeTradeBar,
     RangeFootprintFeature,
-    TimeRange,
     TradeFeatureQuality,
     TradeFootprintFeature,
 )
@@ -108,23 +107,17 @@ class MfDataBuffer:
         for bar in recent_bars:
             self._bars.append(bar)
 
-        latest_range_ms = (
-            self._store.latest_any_range_footprint_available_time_ms(
+        latest_bar = recent_bars[-1] if recent_bars else None
+        if latest_bar is not None:
+            context = self._store.load_latest_range_footprint_context(
                 symbol=self.symbol,
                 exchange=self.exchange,
+                cutoff_ms=int(latest_bar.open_time_ms),
                 range_pct=self._range_pct,
                 price_step=self._range_price_step,
             )
-        )
-        if latest_range_ms is not None:
-            for feature in self._store.load_range_footprint_features(
-                symbol=self.symbol,
-                exchange=self.exchange,
-                range_pct=self._range_pct,
-                price_step=self._range_price_step,
-                time_range=TimeRange(latest_range_ms, latest_range_ms),
-            ):
-                self.append_range_footprint(feature)
+            if context is not None:
+                self.append_range_footprint(context)
         self._loaded_initial = True
         return len(self._bars)
 

@@ -12,6 +12,7 @@ from strategies.eth_portfolio_v1.domain.mf_data import (
     MfDataReadiness,
     MfFeatureObserver,
 )
+from strategies.eth_portfolio_v1 import strategy as strategy_module
 
 
 def _make_bar(open_time_ms: int, close_time_ms: int, *, large_share: str = "0.05") -> FixedTimeTradeBar:
@@ -255,6 +256,29 @@ def test_readiness_passes_large_share_sample_gate(
     assert audit["range_footprint_context_ready"] is True
     assert audit["historical_coverage_ready"] is False
     assert audit["mf_signal_ready"] is True
+
+
+def test_strategy_readiness_uses_configured_decision_buffer(
+    tmp_path: Path,
+) -> None:
+    config_data = json.loads(
+        strategy_module.DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
+    )
+    config_data["mf"] = {
+        **config_data.get("mf", {}),
+        "decision_buffer_minutes": 2_000,
+    }
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(config_data),
+        encoding="utf-8",
+    )
+
+    strategy = strategy_module.Strategy(config_path)
+
+    assert strategy.config.mf.decision_buffer_minutes == 2_000
+    assert strategy.mf_data_buffer._decision_default_minutes == 2_000
+    assert strategy.mf_data_readiness._decision_required_minutes == 2_000
 
 
 def test_readiness_blocks_when_latest_range_context_is_missing(

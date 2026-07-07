@@ -254,6 +254,7 @@ class Strategy:
             large_share_window_days=(
                 self.config.mf.large_share_window_days
             ),
+            decision_buffer_minutes=self.config.mf.decision_buffer_minutes,
         )
         self.mf_signal_mapper = MfSignalMapper(
             strategy_id=self.config.strategy_id,

@@ -144,3 +144,37 @@ def test_worker_command_required_minutes_is_parser_compatible(
     parsed = worker.parse_args(command[2:])
 
     assert parsed.required_minutes == 172800
+
+
+def test_worker_command_uses_configured_mode_and_no_download(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config = replace(
+        _config(tmp_path),
+        worker_mode="live",
+        no_download=True,
+    )
+    supervisor = TradeFeatureBackfillSupervisor(
+        config=config,
+        coverage_reader=lambda: {"coverage_ready": False},
+    )
+    captured = {}
+
+    def capture_popen(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(
+        supervisor_module.subprocess,
+        "Popen",
+        capture_popen,
+    )
+
+    assert supervisor._launch_worker() is True
+    command = captured["command"]
+    parsed = worker.parse_args(command[2:])
+
+    assert parsed.mode == "live"
+    assert parsed.no_download is True

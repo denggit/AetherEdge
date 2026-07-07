@@ -144,6 +144,8 @@ def test_provider_builds_generic_supervisor_with_worker_config(
     )
     assert config.market_db == str(tmp_path / "market.sqlite3")
     assert config.required_minutes == 129_600
+    assert config.worker_mode == "live"
+    assert config.no_download is True
 
 
 def test_coverage_ready_emits_true_readiness(tmp_path) -> None:

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from src.market_data.storage.trade_feature_store import (
     LargeTradeShareSample,
+    SqliteTradeFeatureStore,
 )
 from strategies.eth_portfolio_v1.domain.mf_data import MfDataBuffer
 from strategies.eth_portfolio_v1.domain.mf_low_sweep import (
@@ -54,7 +55,7 @@ def _stub_initial_load(
     )
     monkeypatch.setattr(
         buffer._store,
-        "latest_any_range_footprint_available_time_ms",
+        "load_latest_range_footprint_context",
         lambda **kwargs: None,
     )
     return limits
@@ -107,6 +108,85 @@ def test_load_initial_separates_large_share_and_decision_queries(
         Decimal("0.30"),
     )
     assert buffer.audit()["large_share_samples"] == 2
+
+
+def test_load_initial_uses_latest_causal_range_context(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "features.sqlite3"
+    store = SqliteTradeFeatureStore(path=store_path)
+    bars = setup_bars()
+    store.upsert_tradebars_many(bars)
+    latest = bars[-1]
+    causal = replace(
+        range_footprint(available_time_ms=latest.open_time_ms - 1),
+        range_bar_id=1,
+    )
+    non_causal = replace(
+        range_footprint(
+            available_time_ms=latest.open_time_ms + MINUTE_MS
+        ),
+        range_bar_id=2,
+    )
+    store.upsert_range_footprints_many([causal, non_causal])
+    buffer = MfDataBuffer(
+        symbol="ETH-USDT-PERP",
+        store_path=str(store_path),
+        decision_buffer_minutes=len(bars),
+        decision_buffer_max_minutes=len(bars),
+    )
+
+    assert buffer.load_initial() == len(bars)
+
+    contexts = buffer.range_footprints()
+    assert contexts == (causal,)
+    assert contexts[0].available_time_ms <= latest.open_time_ms
+
+
+def test_load_initial_skips_non_causal_range_context(
+    tmp_path: Path,
+) -> None:
+    store_path = tmp_path / "features.sqlite3"
+    store = SqliteTradeFeatureStore(path=store_path)
+    bars = setup_bars()
+    store.upsert_tradebars_many(bars)
+    latest = bars[-1]
+    non_causal = replace(
+        range_footprint(
+            available_time_ms=latest.open_time_ms + MINUTE_MS
+        ),
+        range_bar_id=3,
+    )
+    store.upsert_range_footprints_many([non_causal])
+    buffer = MfDataBuffer(
+        symbol="ETH-USDT-PERP",
+        store_path=str(store_path),
+        decision_buffer_minutes=len(bars),
+        decision_buffer_max_minutes=len(bars),
+    )
+
+    buffer.load_initial()
+    decision, audit = evaluate_mf_low_sweep(
+        config=config(),
+        bars=buffer.recent_bars(),
+        range_footprints=buffer.range_footprints(),
+        large_share_history=historical_large_shares(),
+        readiness={
+            **READY,
+            "mf_signal_feature_ready": False,
+            "range_footprint_context_ready": False,
+        },
+        sleeve=MfSleeveState(
+            strategy_id="eth_portfolio_v1",
+            symbol="ETH-USDT-PERP",
+        ),
+        next_open_price=Decimal("90"),
+        next_open_time_ms=latest.close_time_ms + 1,
+    )
+
+    assert buffer.range_footprints() == ()
+    assert decision is None
+    assert audit["reason"] == "data_not_ready"
 
 
 def test_realtime_large_share_samples_filter_quality_and_expire(

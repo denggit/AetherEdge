@@ -477,6 +477,47 @@ class SqliteTradeFeatureStore:
             rows = conn.execute(sql, params).fetchall()
         return [_row_to_range_footprint(row) for row in rows]
 
+    def load_latest_range_footprint_context(
+        self,
+        *,
+        symbol: str,
+        exchange: str,
+        cutoff_ms: int,
+        range_pct: Decimal | str | float = Decimal("0.002"),
+        price_step: Decimal | str | float = Decimal("1"),
+    ) -> RangeFootprintFeature | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT exchange, symbol, range_pct, price_step, range_bar_id,
+                       range_start_ms, range_end_ms, available_time_ms,
+                       fp_max_bucket_abs_delta_pressure,
+                       fp_low_bucket_delta_pressure,
+                       fp_high_bucket_delta_pressure,
+                       fp_delta_pressure,
+                       bucket_count, trade_count,
+                       context_available, quality, source
+                FROM range_footprint_features
+                WHERE exchange = ? AND symbol = ?
+                  AND range_pct = ? AND price_step = ?
+                  AND available_time_ms <= ?
+                  AND quality = 'COMPLETE'
+                  AND context_available = 1
+                ORDER BY available_time_ms DESC, range_bar_id DESC
+                LIMIT 1
+                """,
+                (
+                    exchange,
+                    symbol,
+                    _decimal_key(range_pct),
+                    _decimal_key(price_step),
+                    int(cutoff_ms),
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        return _row_to_range_footprint(row)
+
     # ==================================================================
     # Common
     # ==================================================================
