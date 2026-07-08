@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import queue
 from pathlib import Path
+import threading
 import time
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from src.app import AppConfig, AppContext
 from src.app.alerts import AppAlert
@@ -156,6 +158,122 @@ class MarketQueueDrainResult:
     hit_time_limit: bool
 
 
+@dataclass(frozen=True)
+class _BackgroundWriteItem:
+    description: str
+    write: Callable[[], None]
+    on_error: Callable[[BaseException], None] | None = None
+
+
+class _BackgroundWriteQueue:
+    """Small bounded thread writer for live non-critical persistence."""
+
+    _STOP = object()
+
+    def __init__(self, *, name: str, max_pending: int = 1000) -> None:
+        if max_pending <= 0:
+            raise ValueError("max_pending must be positive")
+        self.name = name
+        self.max_pending = int(max_pending)
+        self._queue: queue.Queue[object] = queue.Queue(maxsize=self.max_pending)
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._stopping = False
+        self.submitted = 0
+        self.written = 0
+        self.dropped = 0
+        self.failures = 0
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stopping = False
+            self._thread = threading.Thread(
+                target=self._run,
+                name=self.name,
+                daemon=True,
+            )
+            self._thread.start()
+
+    def submit(self, item: _BackgroundWriteItem) -> bool:
+        self.start()
+        with self._lock:
+            if self._stopping:
+                self.dropped += 1
+                return False
+        try:
+            self._queue.put_nowait(item)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+                self._queue.task_done()
+                self.dropped += 1
+            except queue.Empty:
+                pass
+            try:
+                self._queue.put_nowait(item)
+            except queue.Full:
+                self.dropped += 1
+                return False
+        self.submitted += 1
+        return True
+
+    def stop(self, *, flush: bool = True, timeout: float = 5.0) -> None:
+        with self._lock:
+            if not flush:
+                while True:
+                    try:
+                        self._queue.get_nowait()
+                        self._queue.task_done()
+                    except queue.Empty:
+                        break
+            self._stopping = True
+            thread = self._thread
+        if thread is None:
+            return
+        if not thread.is_alive():
+            with self._lock:
+                if self._thread is thread:
+                    self._thread = None
+            return
+        try:
+            self._queue.put(self._STOP, timeout=max(0.1, timeout))
+        except queue.Full:
+            return
+        thread.join(timeout=max(0.0, timeout))
+        if not thread.is_alive():
+            with self._lock:
+                if self._thread is thread:
+                    self._thread = None
+
+    @property
+    def pending_count(self) -> int:
+        return self._queue.qsize()
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            try:
+                if item is self._STOP:
+                    return
+                if not isinstance(item, _BackgroundWriteItem):
+                    self.dropped += 1
+                    continue
+                try:
+                    item.write()
+                    self.written += 1
+                except BaseException as exc:
+                    self.failures += 1
+                    if item.on_error is not None:
+                        try:
+                            item.on_error(exc)
+                        except BaseException:
+                            pass
+            finally:
+                self._queue.task_done()
+
+
 class LiveRuntimeError(RuntimeError):
     pass
 
@@ -232,6 +350,8 @@ class LiveRuntimeRunner:
         self._range_bar_store = self.services.get("range_bar_store")
         self._range_bar_builder = self.services.get("range_bar_builder")
         self._range_bar_aggregator = self.services.get("range_bar_aggregator")
+        self._live_persistence_writer = self.services.get("live_persistence_writer")
+        self._persistence_alert_loop: asyncio.AbstractEventLoop | None = None
         self._fixed_time_trade_bar_builder = self.services.get(
             "fixed_time_trade_bar_builder"
         )
@@ -296,6 +416,8 @@ class LiveRuntimeRunner:
         self._last_market_queue_full_log_ms = 0
         self._last_market_queue_full_alert_ms = 0
         self._last_market_queue_backlog_log_ms = 0
+        self._last_live_data_path_log_ms = 0
+        self._latest_fixed_time_trade_bar_open_time_ms: int | None = None
         self._market_queue_backlog_warn_threshold = self._project_env.get_int("AETHER_MARKET_QUEUE_BACKLOG_WARN_THRESHOLD", 500)
         self._market_queue_drain_batch_size = self._project_env.get_int("AETHER_MARKET_QUEUE_DRAIN_BATCH_SIZE", 1000)
         self._last_trade_health_update_ms = 0
@@ -361,6 +483,7 @@ class LiveRuntimeRunner:
             await self._stop_range_speed_background_services()
             await self._stop_sync_tasks()
             await self._stop_producers()
+            await self._stop_live_persistence_writer()
             await self._stop_range_repair_journal_writer()
             await self._stop_range_checkpoint_writer()
             await self.context.alerts.stop()
@@ -373,6 +496,7 @@ class LiveRuntimeRunner:
         self._stop_event.set()
         await self._stop_range_speed_background_services()
         await self._stop_producers()
+        await self._stop_live_persistence_writer()
         await self._stop_range_repair_journal_writer()
         self._set_health(RuntimePhase.STOPPED, healthy=True)
         return self._health
@@ -406,12 +530,18 @@ class LiveRuntimeRunner:
         if is_trade:
             await self._process_trade(event)  # type: ignore[arg-type]
             if self._trade_events_are_range_only():
+                self._maybe_log_live_data_path_stats()
                 return
         signals = await self._call_strategy_market_event(event)
         await self._execute_signals(signals, source=event.event_type.value, event_time_ms=event_ms)
+        self._maybe_log_live_data_path_stats()
 
     async def process_market_feature(self, event: MarketFeatureEvent) -> None:
         self.stats.feature_events_seen += 1
+        if event.type_value == "fixed_time_trade_bar" and isinstance(event.data, dict):
+            open_ms = event.data.get("open_time_ms")
+            if isinstance(open_ms, int):
+                self._latest_fixed_time_trade_bar_open_time_ms = open_ms
         # Track closed bar open times for heartbeat diagnostics.
         hb = getattr(self, "_heartbeat_service", None)
         if hb is not None and event.type_value == "closed_kline":
@@ -420,6 +550,7 @@ class LiveRuntimeRunner:
                 hb.note_closed_bar(open_ms)
         signals = await dispatch_market_feature_event(self.context.strategy, event)
         await self._execute_signals(signals, source=event.type_value, event_time_ms=event.event_time_ms, metadata={"feature_type": event.type_value})
+        self._maybe_log_live_data_path_stats()
 
     async def process_account_event(self, event: AccountEvent) -> None:
         await self._process_account_event(event)
@@ -533,7 +664,6 @@ class LiveRuntimeRunner:
                 )
             return []
         closed_kline = closed_rows[-1]
-        self._persist_closed_kline(closed_kline)
         drain_result = await self._drain_market_events_before_closed_bar(
             closed_bar_close_time_ms=closed_kline.close_time_ms,
         )
@@ -601,6 +731,7 @@ class LiveRuntimeRunner:
                 await self.process_market_feature(unavailable)
                 features.append(unavailable)
                 self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_kline)
+                self._persist_closed_kline(closed_kline)
                 return features
 
         best_range_bar_count = 0
@@ -628,6 +759,7 @@ class LiveRuntimeRunner:
                     )
                 features.extend(await self._emit_range_aggregates(range_aggregates))
                 self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_kline)
+                self._persist_closed_kline(closed_kline)
                 return features
 
         if is_mid_bucket_restart:
@@ -676,6 +808,7 @@ class LiveRuntimeRunner:
             await self.process_market_feature(unavailable)
             features.append(unavailable)
             self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_kline)
+            self._persist_closed_kline(closed_kline)
             return features
 
         if (
@@ -705,11 +838,13 @@ class LiveRuntimeRunner:
             features.append(unavailable)
 
         self._log_4h_decision_summary(open_time_ms=open_time_ms, closed_kline=closed_kline)
+        self._persist_closed_kline(closed_kline)
         return features
 
     def _persist_closed_kline(self, kline: MarketKline) -> None:
-        """Upsert one confirmed live closed kline without blocking its decision."""
-        try:
+        """Queue one confirmed live closed kline after decisions complete."""
+
+        def write() -> None:
             repository = self.services.get("kline_store")
             if repository is None:
                 repository = SqliteKlineStore(
@@ -717,7 +852,19 @@ class LiveRuntimeRunner:
                 )
                 self.services["kline_store"] = repository
             repository.save([kline])
-        except Exception as exc:
+
+        self._submit_live_persistence_write(
+            description="closed_kline",
+            write=write,
+            on_error=lambda exc: self._on_closed_kline_persist_error(
+                kline, exc
+            ),
+        )
+
+    def _on_closed_kline_persist_error(
+        self, kline: MarketKline, exc: BaseException
+    ) -> None:
+        try:
             logger.exception(
                 "Failed to persist live closed kline | symbol=%s interval=%s open_time_ms=%s close_time_ms=%s",
                 kline.symbol,
@@ -725,39 +872,141 @@ class LiveRuntimeRunner:
                 kline.open_time_ms,
                 kline.close_time_ms,
             )
-            try:
-                self.context.alerts.emit(
-                    AppAlert(
-                        subject="AetherEdge closed kline persistence failed",
-                        severity="error",
-                        content=(
-                            f"symbol={kline.symbol}\n"
-                            f"interval={kline.interval}\n"
-                            f"open_time_ms={kline.open_time_ms}\n"
-                            f"close_time_ms={kline.close_time_ms}\n"
-                            f"error={type(exc).__name__}:{exc}\n"
-                        ),
-                    )
+            self._emit_alert_threadsafe(
+                AppAlert(
+                    subject="AetherEdge closed kline persistence failed",
+                    severity="error",
+                    content=(
+                        f"symbol={kline.symbol}\n"
+                        f"interval={kline.interval}\n"
+                        f"open_time_ms={kline.open_time_ms}\n"
+                        f"close_time_ms={kline.close_time_ms}\n"
+                        f"error={type(exc).__name__}:{exc}\n"
+                    ),
                 )
-            except Exception:
-                logger.exception(
-                    "Failed to emit closed kline persistence alert | symbol=%s interval=%s open_time_ms=%s",
-                    kline.symbol,
-                    kline.interval,
-                    kline.open_time_ms,
-                )
+            )
+        except Exception:
+            logger.exception(
+                "Failed to emit closed kline persistence alert | symbol=%s interval=%s open_time_ms=%s",
+                kline.symbol,
+                kline.interval,
+                kline.open_time_ms,
+            )
+
+    def _persist_range_bar(self, bar: RangeBar) -> None:
+        """Queue one closed range bar after feature dispatch."""
+
+        def write() -> None:
+            self._get_range_bar_store().save([bar])
+
+        self._submit_live_persistence_write(
+            description="range_bar",
+            write=write,
+            on_error=lambda exc: self._on_range_bar_persist_error(bar, exc),
+        )
+
+    def _on_range_bar_persist_error(
+        self, bar: RangeBar, exc: BaseException
+    ) -> None:
+        logger.exception(
+            "Failed to persist live range bar | symbol=%s range_pct=%s bar_id=%s start_time_ms=%s end_time_ms=%s",
+            bar.symbol,
+            bar.range_pct,
+            bar.bar_id,
+            bar.start_time_ms,
+            bar.end_time_ms,
+        )
+        self._emit_alert_threadsafe(
+            AppAlert(
+                subject="AetherEdge range bar persistence failed",
+                severity="warning",
+                content=(
+                    f"symbol={bar.symbol}\n"
+                    f"range_pct={bar.range_pct}\n"
+                    f"bar_id={bar.bar_id}\n"
+                    f"start_time_ms={bar.start_time_ms}\n"
+                    f"end_time_ms={bar.end_time_ms}\n"
+                    f"error={type(exc).__name__}:{exc}\n"
+                ),
+            )
+        )
+
+    def _persist_completed_range_aggregate(
+        self,
+        aggregate: RangeBarAggregate,
+        *,
+        coverage_status: str,
+        missing_gap_ms: int,
+    ) -> None:
+        def write() -> None:
+            self._get_range_checkpoint_store().save_completed_aggregate(
+                exchange=self.app_config.data_exchange.value,
+                aggregate=aggregate,
+                coverage_status=coverage_status,
+                missing_gap_ms=missing_gap_ms,
+                completed_at_ms=int(time.time() * 1000),
+            )
+
+        self._submit_live_persistence_write(
+            description="completed_range_aggregate",
+            write=write,
+            on_error=lambda exc: self._on_completed_range_aggregate_persist_error(
+                aggregate, exc
+            ),
+        )
+
+    def _on_completed_range_aggregate_persist_error(
+        self, aggregate: RangeBarAggregate, exc: BaseException
+    ) -> None:
+        logger.warning(
+            "Failed to persist completed range aggregate | symbol=%s range_pct=%s bucket_start_ms=%s error=%s",
+            aggregate.symbol,
+            aggregate.range_pct,
+            aggregate.bucket_start_ms,
+            exc,
+        )
 
     def _load_range_aggregates_for_bucket(self, bucket_start_ms: int) -> list[RangeBarAggregate]:
-        store = self._get_range_bar_store()
-        rows = store.load(
-            symbol=self.app_config.symbol,
-            range_pct=str(self._range_pct),
-            time_range=TimeRange(bucket_start_ms, bucket_start_ms + self._closed_bar_interval_ms - 1),
-        )
+        rows = self._range_bar_rows_for_bucket(bucket_start_ms)
         if not rows:
             return []
         aggregates = self._get_range_bar_aggregator().aggregate(rows, bucket_ms=self._closed_bar_interval_ms)
         return [aggregate for aggregate in aggregates if aggregate.bucket_start_ms == bucket_start_ms]
+
+    def _range_bar_rows_for_bucket(
+        self, bucket_start_ms: int
+    ) -> list[RangeBar]:
+        range_bars_by_bucket = getattr(self, "_range_bars_by_bucket", {})
+        if bucket_start_ms in range_bars_by_bucket:
+            memory_rows = list(range_bars_by_bucket[bucket_start_ms])
+            if memory_rows or not self._range_store_fallback_allowed(
+                bucket_start_ms
+            ):
+                return memory_rows
+
+        rows = self._get_range_bar_store().load(
+            symbol=self.app_config.symbol,
+            range_pct=str(self._range_pct),
+            time_range=TimeRange(
+                bucket_start_ms,
+                bucket_start_ms + self._closed_bar_interval_ms - 1,
+            ),
+        )
+        if rows:
+            if not hasattr(self, "_range_bars_by_bucket"):
+                self._range_bars_by_bucket = {}
+            self._range_bars_by_bucket[bucket_start_ms] = list(rows)
+            self._prune_range_bars_by_bucket(current_bucket=bucket_start_ms)
+        return list(rows)
+
+    def _range_store_fallback_allowed(self, bucket_start_ms: int) -> bool:
+        if bucket_start_ms not in getattr(self, "_range_bars_by_bucket", {}):
+            return True
+        return (
+            getattr(self, "_initial_range_bucket_ms", None)
+            == bucket_start_ms
+            and getattr(self, "_initial_range_recovery", None) is not None
+        )
 
     async def _emit_range_aggregates(self, aggregates: Sequence[RangeBarAggregate]) -> list[MarketFeatureEvent]:
         events: list[MarketFeatureEvent] = []
@@ -784,17 +1033,14 @@ class LiveRuntimeRunner:
                 range_recovered_from_checkpoint=coverage.recovered_from_checkpoint,
                 range_checkpoint_age_ms=coverage.checkpoint_age_ms,
             )
-            await asyncio.to_thread(
-                self._get_range_checkpoint_store().save_completed_aggregate,
-                exchange=self.app_config.data_exchange.value,
-                aggregate=aggregate,
-                coverage_status=coverage.coverage_status,
-                missing_gap_ms=coverage.missing_gap_ms,
-                completed_at_ms=int(time.time() * 1000),
-            )
             self.stats.range_aggregates_created += 1
             await self.process_market_feature(event)
             events.append(event)
+            self._persist_completed_range_aggregate(
+                aggregate,
+                coverage_status=coverage.coverage_status,
+                missing_gap_ms=coverage.missing_gap_ms,
+            )
         return events
 
     async def emit_range_aggregate_for_bucket(self, bucket_start_ms: int) -> list[MarketFeatureEvent]:
@@ -2046,15 +2292,7 @@ class LiveRuntimeRunner:
         Also enforces ``min_range_bars`` from strategy config so that
         buckets with too few range bars are treated as unavailable.
         """
-        store = self._get_range_bar_store()
-        rows = store.load(
-            symbol=self.app_config.symbol,
-            range_pct=str(self._range_pct),
-            time_range=TimeRange(
-                bucket_start_ms,
-                bucket_start_ms + self._closed_bar_interval_ms - 1,
-            ),
-        )
+        rows = self._range_bar_rows_for_bucket(bucket_start_ms)
         if not rows:
             return []
         aggregates = self._get_range_bar_aggregator().aggregate(
@@ -2085,13 +2323,10 @@ class LiveRuntimeRunner:
             coverage = self._range_coverage_for_bucket(
                 aggregate.bucket_start_ms
             )
-            await asyncio.to_thread(
-                self._get_range_checkpoint_store().save_completed_aggregate,
-                exchange=self.app_config.data_exchange.value,
-                aggregate=aggregate,
+            self._persist_completed_range_aggregate(
+                aggregate,
                 coverage_status=coverage.coverage_status,
                 missing_gap_ms=coverage.missing_gap_ms,
-                completed_at_ms=int(time.time() * 1000),
             )
             events.append(event)
         return events
@@ -2970,9 +3205,7 @@ class LiveRuntimeRunner:
             self._range_builder_reset_at_bucket_ms = None
         closed = builder.on_trade(trade)
         if closed:
-            store = self._get_range_bar_store()
             for bar in closed:
-                await asyncio.to_thread(store.save, [bar])
                 bucket_start = (
                     bar.end_time_ms // self._closed_bar_interval_ms
                 ) * self._closed_bar_interval_ms
@@ -2983,6 +3216,7 @@ class LiveRuntimeRunner:
                 self.stats.range_bars_closed += 1
                 self._prune_range_bars_by_bucket(current_bucket=bucket_start)
                 await self.process_market_feature(range_bar_closed_feature(bar, exchange=trade.exchange))
+                self._persist_range_bar(bar)
         self._submit_range_checkpoint_if_due(trade)
         self._append_range_repair_trade(trade)
 
@@ -3989,6 +4223,146 @@ class LiveRuntimeRunner:
             legacy_symbol=self.app_config.symbol,
             legacy_base_quantity=Decimal("0"),
         )
+
+    def _get_live_persistence_writer(self) -> _BackgroundWriteQueue:
+        if self._live_persistence_writer is None:
+            max_pending = int(
+                getattr(
+                    getattr(self, "runtime_config", None),
+                    "background_queue_maxsize",
+                    1000,
+                )
+            )
+            self._live_persistence_writer = _BackgroundWriteQueue(
+                name="live-persistence-writer",
+                max_pending=max_pending,
+            )
+            self.services["live_persistence_writer"] = (
+                self._live_persistence_writer
+            )
+        return self._live_persistence_writer
+
+    def _submit_live_persistence_write(
+        self,
+        *,
+        description: str,
+        write: Callable[[], None],
+        on_error: Callable[[BaseException], None] | None = None,
+    ) -> bool:
+        try:
+            self._persistence_alert_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        writer = self._get_live_persistence_writer()
+        accepted = writer.submit(
+            _BackgroundWriteItem(
+                description=description,
+                write=write,
+                on_error=on_error,
+            )
+        )
+        if not accepted:
+            logger.warning(
+                "Live persistence write dropped | description=%s pending=%s dropped=%s",
+                description,
+                writer.pending_count,
+                writer.dropped,
+            )
+        return accepted
+
+    async def _stop_live_persistence_writer(
+        self, *, flush: bool = True
+    ) -> None:
+        writer = getattr(self, "_live_persistence_writer", None)
+        if writer is None:
+            return
+        stop = getattr(writer, "stop", None)
+        if not callable(stop):
+            return
+        if isinstance(writer, _BackgroundWriteQueue):
+            await asyncio.to_thread(stop, flush=flush)
+            return
+        result = stop(flush=flush)
+        if inspect.isawaitable(result):
+            await result
+
+    def _emit_alert_threadsafe(self, alert: AppAlert) -> None:
+        try:
+            loop = getattr(self, "_persistence_alert_loop", None)
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(self.context.alerts.emit, alert)
+                return
+            self.context.alerts.emit(alert)
+        except Exception:
+            logger.exception(
+                "Failed to emit background persistence alert | subject=%s",
+                alert.subject,
+            )
+
+    def _maybe_log_live_data_path_stats(self) -> None:
+        now_ms = int(time.time() * 1000)
+        last_ms = int(getattr(self, "_last_live_data_path_log_ms", 0) or 0)
+        if last_ms and now_ms - last_ms < 30 * 60_000:
+            return
+        self._last_live_data_path_log_ms = now_ms
+        interval_ms = int(getattr(self, "_closed_bar_interval_ms", 0) or 0)
+        current_bucket = (
+            (now_ms // interval_ms) * interval_ms
+            if interval_ms > 0
+            else None
+        )
+        range_bars_by_bucket = getattr(self, "_range_bars_by_bucket", {})
+        current_bucket_count = (
+            len(range_bars_by_bucket.get(current_bucket, ()))
+            if current_bucket is not None
+            else None
+        )
+        mf_audit = self._mf_observer_audit()
+        writer = getattr(self, "_live_persistence_writer", None)
+        pending = (
+            writer.pending_count
+            if isinstance(writer, _BackgroundWriteQueue)
+            else None
+        )
+        logger.info(
+            "Live data path stats | market_events_seen=%s feature_events_seen=%s latest_fixed_time_trade_bar_open_time_ms=%s mf_tradebar_count=%s mf_range_footprint_count=%s current_range_bucket_start_ms=%s range_bars_by_bucket_current_count=%s live_persistence_pending=%s",
+            getattr(getattr(self, "stats", None), "market_events_seen", None),
+            getattr(getattr(self, "stats", None), "feature_events_seen", None),
+            getattr(
+                self,
+                "_latest_fixed_time_trade_bar_open_time_ms",
+                None,
+            ),
+            mf_audit.get("tradebar_count"),
+            mf_audit.get("range_footprint_count"),
+            current_bucket,
+            current_bucket_count,
+            pending,
+        )
+
+    def _mf_observer_audit(self) -> Mapping[str, Any]:
+        try:
+            observers = resolve_market_feature_observers(
+                self.context.strategy
+            )
+        except Exception as exc:
+            logger.debug("MF observer audit unavailable | error=%s", exc)
+            return {}
+        for observer in observers:
+            audit = getattr(observer, "audit", None)
+            if not callable(audit):
+                continue
+            try:
+                data = audit()
+            except Exception as exc:
+                logger.debug("MF observer audit failed | error=%s", exc)
+                continue
+            if isinstance(data, Mapping) and (
+                "tradebar_count" in data
+                or "range_footprint_count" in data
+            ):
+                return data
+        return {}
 
     def _get_position_plan_store(self):
         if self._position_plan_store is None:

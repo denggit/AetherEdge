@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 
 import pytest
@@ -109,6 +110,7 @@ async def test_closed_bar_retry_starts_at_05s_alerts_once_and_emits_once() -> No
     assert alerts.items[0].subject == "AetherEdge closed bar missing"
 
     events = await runner.poll_closed_bar_once(now_ms=H4 + 125_000)
+    await runner._stop_live_persistence_writer()
     assert [event.type_value for event in events] == ["closed_kline"]
     assert len(strategy.events) == 1
 
@@ -141,7 +143,9 @@ async def test_closed_bar_poll_upserts_same_open_time_without_duplicate(
     )
 
     assert await first.poll_closed_bar_once(now_ms=H4 + 5_000)
+    await first._stop_live_persistence_writer()
     assert await second.poll_closed_bar_once(now_ms=H4 + 5_000)
+    await second._stop_live_persistence_writer()
     rows = store.load(
         symbol="ETH-USDT-PERP",
         interval="4h",
@@ -168,6 +172,8 @@ async def test_closed_bar_store_failure_alerts_and_still_processes_feature(
     )
 
     events = await runner.poll_closed_bar_once(now_ms=H4 + 5_000)
+    await runner._stop_live_persistence_writer()
+    await asyncio.sleep(0)
 
     assert [event.type_value for event in events] == ["closed_kline"]
     assert len(strategy.events) == 1

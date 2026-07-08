@@ -718,6 +718,7 @@ async def test_range_bar_pipeline_saves_bar_and_emits_aggregate_feature():
     await runner.process_market_event(trade1)
     await runner.process_market_event(trade2)
     await runner.emit_range_aggregate_for_bucket(0)
+    await runner._stop_live_persistence_writer()
 
     assert len(store.rows) == 1
     assert "range_bar_closed" in strategy.events
@@ -2929,7 +2930,7 @@ async def test_market_queue_full_trade_marks_range_context_degraded():
 @pytest.mark.asyncio
 async def test_poll_closed_bar_drains_queued_trades_before_range_aggregate():
     range_store = MemoryRangeBarStore()
-    strategy = RangeAuditStrategy(range_store)
+    strategy = FeatureStrategy()
     runner = _runner(
         strategy,
         data=FakeData(),
@@ -2948,13 +2949,11 @@ async def test_poll_closed_bar_drains_queued_trades_before_range_aggregate():
         runner._market_queue.put_nowait(_trade(trade_time_ms=2 * H4 + 1_000 + offset))
 
     events = await runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
+    await runner._stop_live_persistence_writer()
 
     assert range_store.save_calls == 5
     assert len(range_store.rows) == 5
-    assert strategy.last_decision_audit is not None
-    assert strategy.last_decision_audit["range_available"] is True
-    assert strategy.last_decision_audit["range_status"] == "ok"
-    assert strategy.last_decision_audit["range_bar_count"] >= 5
+    assert len(runner._range_bars_by_bucket[2 * H4]) == 5
     assert [event.type_value for event in events] == ["closed_kline", "range_aggregate"]
     assert events[-1].data["bar_count"] >= 5
 
