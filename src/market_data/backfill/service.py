@@ -58,6 +58,15 @@ class _BuildWindowResult:
     candidate_range_bars: int = 0
     candidate_aggregates: int = 0
     filtered_reason_if_zero: str | None = None
+    repair_method: str = ""
+    target_window_reached: bool = False
+    target_bucket_proven_complete: bool = False
+    anchor_last_trade_ts_ms: int | None = None
+    replay_start_ms: int | None = None
+    replay_end_ms: int | None = None
+    pre_replay_existing_range_bars: int = 0
+    generated_range_bars: int = 0
+    combined_range_bars: int = 0
 
 
 class RangeBackfillService:
@@ -262,27 +271,56 @@ class RangeBackfillService:
             last_bucket_end_ms=target_gaps[-1].bucket_end_ms,
         )
         results: list[_BuildWindowResult] = []
-        first = self._run_build_window(
-            gaps=target_gaps,
-            raw_symbol=raw_symbol,
-            started=started,
-            coverage_before=coverage_before,
-        )
-        if self._live_archive_is_not_ready(first):
-            results.append(first)
-        elif first.missing_raw_days and len(target_gaps) > 1:
-            for gap in target_gaps:
-                result = self._run_build_window(
-                    gaps=(gap,),
-                    raw_symbol=raw_symbol,
-                    started=started,
-                    coverage_before=coverage_before,
+        # ── Single-gap live mode: try fast paths before full replay ──
+        if len(target_gaps) == 1:
+            gap = target_gaps[0]
+            # Phase 1: existing range_bars fast path
+            fast = self._try_complete_from_existing_range_bars(
+                gap, coverage_before
+            )
+            if fast is not None:
+                results.append(fast)
+            else:
+                # Phase 2: checkpoint-anchored targeted replay
+                checkpoint_result = (
+                    self._try_repair_from_bucket_checkpoint(
+                        gap, raw_symbol, started, coverage_before
+                    )
                 )
-                results.append(result)
-                if result.resource_limited:
-                    break
+                if checkpoint_result is not None:
+                    results.append(checkpoint_result)
+                else:
+                    # Phase 3: full replay fallback
+                    results.append(
+                        self._run_build_window(
+                            gaps=(gap,),
+                            raw_symbol=raw_symbol,
+                            started=started,
+                            coverage_before=coverage_before,
+                        )
+                    )
         else:
-            results.append(first)
+            first = self._run_build_window(
+                gaps=target_gaps,
+                raw_symbol=raw_symbol,
+                started=started,
+                coverage_before=coverage_before,
+            )
+            if self._live_archive_is_not_ready(first):
+                results.append(first)
+            elif first.missing_raw_days and len(target_gaps) > 1:
+                for gap in target_gaps:
+                    result = self._run_build_window(
+                        gaps=(gap,),
+                        raw_symbol=raw_symbol,
+                        started=started,
+                        coverage_before=coverage_before,
+                    )
+                    results.append(result)
+                    if result.resource_limited:
+                        break
+            else:
+                results.append(first)
 
         downloaded = sum(result.downloaded_files for result in results)
         raw_rows = sum(result.raw_rows for result in results)
@@ -333,6 +371,54 @@ class RangeBackfillService:
         target_trade_count = sum(result.target_trade_count for result in results)
         candidate_range_bars = sum(result.candidate_range_bars for result in results)
         candidate_aggregates = sum(result.candidate_aggregates for result in results)
+        # ── Aggregate new diagnostic fields ──────────────────────────
+        repair_method = next(
+            (
+                result.repair_method
+                for result in reversed(results)
+                if result.repair_method
+            ),
+            "",
+        )
+        target_window_reached = any(
+            result.target_window_reached for result in results
+        )
+        target_bucket_proven_complete = any(
+            result.target_bucket_proven_complete for result in results
+        )
+        anchor_last_trade_ts_ms = next(
+            (
+                result.anchor_last_trade_ts_ms
+                for result in reversed(results)
+                if result.anchor_last_trade_ts_ms is not None
+            ),
+            None,
+        )
+        replay_start_ms = next(
+            (
+                result.replay_start_ms
+                for result in reversed(results)
+                if result.replay_start_ms is not None
+            ),
+            None,
+        )
+        replay_end_ms = next(
+            (
+                result.replay_end_ms
+                for result in reversed(results)
+                if result.replay_end_ms is not None
+            ),
+            None,
+        )
+        pre_replay_existing_range_bars = sum(
+            result.pre_replay_existing_range_bars for result in results
+        )
+        generated_range_bars = sum(
+            result.generated_range_bars for result in results
+        )
+        combined_range_bars = sum(
+            result.combined_range_bars for result in results
+        )
         filtered_reason_if_zero = next(
             (
                 result.filtered_reason_if_zero
@@ -386,7 +472,398 @@ class RangeBackfillService:
             candidate_range_bars=candidate_range_bars,
             candidate_aggregates=candidate_aggregates,
             filtered_reason_if_zero=filtered_reason_if_zero,
+            repair_method=repair_method,
+            target_window_reached=target_window_reached,
+            target_bucket_proven_complete=target_bucket_proven_complete,
+            anchor_last_trade_ts_ms=anchor_last_trade_ts_ms,
+            replay_start_ms=replay_start_ms,
+            replay_end_ms=replay_end_ms,
+            pre_replay_existing_range_bars=pre_replay_existing_range_bars,
+            generated_range_bars=generated_range_bars,
+            combined_range_bars=combined_range_bars,
         )
+
+    # ── Phase 1: existing range_bars fast path ──────────────────────────
+
+    def _try_complete_from_existing_range_bars(
+        self,
+        gap: BucketGap,
+        coverage_before,
+    ) -> _BuildWindowResult | None:
+        """If range bars already exist in the DB for this bucket AND we can
+        prove they are complete (via a checkpoint with COMPLETE coverage),
+        write the completed aggregate directly without any archive scan."""
+        bucket_ms = interval_to_ms(self.request.bucket_interval)
+        rows = self.range_bar_store.load(
+            symbol=self.request.symbol,
+            range_pct=self.request.range_pct,
+            time_range=TimeRange(gap.bucket_start_ms, gap.bucket_end_ms),
+        )
+        if not rows:
+            return None
+
+        # Completeness proof: we need a checkpoint that says COMPLETE and
+        # whose last_trade_ts extends to or past the bucket end.
+        checkpoint = self.checkpoint_store.load_checkpoint(
+            exchange=self.request.exchange,
+            symbol=self.request.symbol,
+            range_pct=self.request.range_pct,
+            bucket_start_ms=gap.bucket_start_ms,
+        )
+        proven_complete = (
+            checkpoint is not None
+            and checkpoint.coverage_status == RangeCoverageStatus.COMPLETE.value
+            and checkpoint.last_trade_ts_ms is not None
+            and (
+                checkpoint.last_trade_ts_ms >= gap.bucket_end_ms
+                or (
+                    checkpoint.checkpoint_updated_at_ms > gap.bucket_end_ms
+                )
+            )
+        )
+        if not proven_complete:
+            return None
+
+        aggregates = RangeBarAggregator().aggregate(rows, bucket_ms=bucket_ms)
+        target_aggregate = next(
+            (
+                a
+                for a in aggregates
+                if a.bucket_start_ms == gap.bucket_start_ms
+                and a.bucket_end_ms == gap.bucket_end_ms
+            ),
+            None,
+        )
+        if target_aggregate is None:
+            return None
+
+        completed_at = now_ms()
+        self.checkpoint_store.save_completed_aggregate(
+            exchange=self.request.exchange,
+            aggregate=target_aggregate,
+            coverage_status=RangeCoverageStatus.COMPLETE.value,
+            missing_gap_ms=0,
+            completed_at_ms=completed_at,
+        )
+        self._emit(
+            "existing_range_bars_completed",
+            bucket_start_ms=gap.bucket_start_ms,
+            bucket_end_ms=gap.bucket_end_ms,
+            range_bar_count=len(rows),
+            aggregate_bar_count=target_aggregate.bar_count,
+        )
+        return _BuildWindowResult(
+            aggregates_written=1,
+            repair_method="existing_range_bars",
+            target_window_reached=True,
+            target_bucket_proven_complete=True,
+            target_bucket_start_ms=gap.bucket_start_ms,
+            target_bucket_end_ms=gap.bucket_end_ms,
+            candidate_range_bars=len(rows),
+            candidate_aggregates=1,
+            selected_archive_dates=(),
+            raw_rows=0,
+            filtered_rows=0,
+            trades_loaded=0,
+        )
+
+    # ── Phase 2: checkpoint-anchored targeted replay ────────────────────
+
+    def _try_repair_from_bucket_checkpoint(
+        self,
+        gap: BucketGap,
+        raw_symbol: str,
+        started: float,
+        coverage_before,
+    ) -> _BuildWindowResult | None:
+        """Restore the RangeBarBuilder from a saved checkpoint and replay
+        only the trades between checkpoint.last_trade_ts_ms+1 and the bucket
+        end.  This avoids scanning entire archive days before the target."""
+        checkpoint = self.checkpoint_store.load_checkpoint(
+            exchange=self.request.exchange,
+            symbol=self.request.symbol,
+            range_pct=self.request.range_pct,
+            bucket_start_ms=gap.bucket_start_ms,
+        )
+        if checkpoint is None:
+            return None
+        builder_state = getattr(checkpoint, "builder_state", None)
+        if not isinstance(builder_state, Mapping) or not builder_state:
+            return None
+        if checkpoint.last_trade_ts_ms is None:
+            return None
+
+        # Checkpoint already covers the entire bucket → try existing bars.
+        if checkpoint.last_trade_ts_ms >= gap.bucket_end_ms:
+            return self._try_complete_from_existing_range_bars(
+                gap, coverage_before
+            )
+
+        # Restore builder and compute the replay window.
+        try:
+            builder = RangeBarBuilder.restore_state(builder_state)
+        except (KeyError, TypeError, ValueError) as exc:
+            self._emit(
+                "checkpoint_restore_failed",
+                bucket_start_ms=gap.bucket_start_ms,
+                error=str(exc),
+            )
+            return None
+
+        replay_start_ms = int(checkpoint.last_trade_ts_ms) + 1
+        replay_end_ms = gap.bucket_end_ms
+        if replay_start_ms > replay_end_ms:
+            return None
+
+        # Archive days ONLY for the replay window (no previous-day anchor).
+        raw_days = (
+            tuple(
+                iter_okx_archive_dates_for_utc_range(
+                    replay_start_ms, replay_end_ms
+                )
+            )
+            if str(self.request.exchange).strip().lower() == "okx"
+            else tuple(iter_utc_dates(replay_start_ms, replay_end_ms))
+        )
+        selected_archive_dates = tuple(day.isoformat() for day in raw_days)
+
+        self._emit(
+            "checkpoint_replay_started",
+            bucket_start_ms=gap.bucket_start_ms,
+            bucket_end_ms=gap.bucket_end_ms,
+            anchor_last_trade_ts_ms=checkpoint.last_trade_ts_ms,
+            replay_start_ms=replay_start_ms,
+            replay_end_ms=replay_end_ms,
+            selected_archive_dates=list(selected_archive_dates),
+        )
+
+        # Load existing bars from before the replay window.
+        existing_rows = self.range_bar_store.load(
+            symbol=self.request.symbol,
+            range_pct=self.request.range_pct,
+            time_range=TimeRange(gap.bucket_start_ms, gap.bucket_end_ms),
+        )
+        before_rows = [
+            r for r in existing_rows if r.end_time_ms < replay_start_ms
+        ]
+        before_rows.sort(key=lambda item: (item.end_time_ms, item.bar_id))
+
+        # Ensure raw files for the replay window.
+        raw_result = self._ensure_raw_days(
+            raw_symbol=raw_symbol,
+            days=raw_days,
+            skipped_buckets=1,
+        )
+        if raw_result.missing_raw_days:
+            return replace(
+                raw_result,
+                target_bucket_start_ms=gap.bucket_start_ms,
+                target_bucket_end_ms=gap.bucket_end_ms,
+                selected_archive_dates=selected_archive_dates,
+                repair_method="checkpoint_anchored_replay",
+                anchor_last_trade_ts_ms=checkpoint.last_trade_ts_ms,
+                replay_start_ms=replay_start_ms,
+                replay_end_ms=replay_end_ms,
+                pre_replay_existing_range_bars=len(before_rows),
+                filtered_reason_if_zero=(
+                    "archive_not_ready"
+                    if self._live_archive_is_not_ready(raw_result)
+                    else "selected_archive_file_missing"
+                ),
+            )
+
+        # Stream and feed trades from the replay window only.
+        replay_time = TimeRange(replay_start_ms, replay_end_ms)
+        generated_rows: list = []
+        raw_rows = 0
+        filtered_rows = 0
+        dropped_rows = 0
+        trades_loaded = 0
+        processed_through_ms: int | None = None
+        resource_limited = False
+        chunk_index = 0
+        per_file_min: dict[str, int | None] = {}
+        per_file_max: dict[str, int | None] = {}
+        target_trade_count = 0
+        max_valid_trade_time_ms = (
+            self._now_ms_value if self._now_ms_value is not None else now_ms()
+        ) + 86_400_000
+
+        for day in raw_days:
+            day_iso = day.isoformat()
+            file_path = self.archive.local_path(
+                raw_symbol=raw_symbol, day=day
+            )
+            for chunk in iter_trade_csv_chunks(
+                file_path, chunksize=self.request.chunksize
+            ):
+                chunk_index += 1
+                filtered = filter_okx_trade_chunk_by_time(
+                    chunk,
+                    start_time_ms=replay_start_ms,
+                    end_time_ms=replay_end_ms,
+                    max_valid_trade_time_ms=max_valid_trade_time_ms,
+                )
+                raw_rows += filtered.raw_rows
+                filtered_rows += filtered.filtered_rows
+                observed_times = [
+                    v
+                    for v in (
+                        filtered.first_trade_time_ms,
+                        filtered.last_trade_time_ms,
+                    )
+                    if v is not None
+                ]
+                if observed_times:
+                    chunk_min = min(observed_times)
+                    chunk_max = max(observed_times)
+                    per_file_min[day_iso] = min(
+                        chunk_min,
+                        per_file_min.get(day_iso, chunk_min) or chunk_min,
+                    )
+                    per_file_max[day_iso] = max(
+                        chunk_max,
+                        per_file_max.get(day_iso, chunk_max) or chunk_max,
+                    )
+                trades = normalize_okx_trade_chunk(
+                    filtered.rows,
+                    symbol=self.request.symbol,
+                    raw_symbol=raw_symbol,
+                    exchange=self.request.exchange,
+                    max_valid_trade_time_ms=max_valid_trade_time_ms,
+                )
+                dropped_rows += filtered.raw_rows - len(trades)
+                if trades:
+                    trades_loaded += len(trades)
+                    target_trade_count += sum(
+                        1
+                        for t in trades
+                        if replay_time.start_time_ms
+                        <= int(t.trade_time_ms or t.event_time_ms or -1)
+                        <= replay_time.end_time_ms
+                    )
+                    processed_through_ms = (
+                        trades[-1].trade_time_ms
+                        or trades[-1].event_time_ms
+                        or processed_through_ms
+                    )
+                for trade in trades:
+                    for bar in builder.on_trade(trade):
+                        if (
+                            replay_time.start_time_ms
+                            <= bar.end_time_ms
+                            <= replay_time.end_time_ms
+                        ):
+                            generated_rows.append(bar)
+
+                if (
+                    self.request.max_trades_per_cycle > 0
+                    and trades_loaded >= self.request.max_trades_per_cycle
+                ):
+                    resource_limited = True
+                    break
+                if (
+                    self.request.max_seconds_per_cycle > 0
+                    and time.monotonic() - started
+                    >= self.request.max_seconds_per_cycle
+                ):
+                    resource_limited = True
+                    break
+                if self.request.chunk_sleep_seconds > 0:
+                    time.sleep(float(self.request.chunk_sleep_seconds))
+            if resource_limited:
+                break
+
+        # Combine and determine completeness.
+        generated_rows.sort(key=lambda item: (item.end_time_ms, item.bar_id))
+        combined_rows = before_rows + generated_rows
+        combined_rows.sort(key=lambda item: (item.end_time_ms, item.bar_id))
+
+        replay_complete = not resource_limited or (
+            processed_through_ms is not None
+            and processed_through_ms >= replay_end_ms
+        )
+        bucket_ms = interval_to_ms(self.request.bucket_interval)
+        aggregates = [
+            a
+            for a in RangeBarAggregator().aggregate(
+                combined_rows, bucket_ms=bucket_ms
+            )
+            if a.bucket_start_ms == gap.bucket_start_ms
+            and a.bucket_end_ms == gap.bucket_end_ms
+        ]
+        aggregates_written = 0
+        if aggregates and replay_complete:
+            completed_at = now_ms()
+            for aggregate in aggregates:
+                self.checkpoint_store.save_completed_aggregate(
+                    exchange=self.request.exchange,
+                    aggregate=aggregate,
+                    coverage_status=RangeCoverageStatus.COMPLETE.value,
+                    missing_gap_ms=0,
+                    completed_at_ms=completed_at,
+                )
+            aggregates_written = len(aggregates)
+            # Write the generated rows to the range bar store.
+            if generated_rows:
+                self.range_bar_store.replace_range(
+                    symbol=self.request.symbol,
+                    range_pct=self.request.range_pct,
+                    time_range=TimeRange(replay_start_ms, replay_end_ms),
+                    rows=generated_rows,
+                )
+
+        filtered_reason = (
+            _aggregate_zero_reason(
+                aggregates=aggregates,
+                candidate_aggregates=aggregates,
+                bars=combined_rows,
+                trades_loaded=trades_loaded,
+                target_trade_count=target_trade_count,
+                resource_limited=resource_limited,
+            )
+            if not aggregates
+            else None
+        )
+
+        self._emit(
+            "checkpoint_replay_finished",
+            bucket_start_ms=gap.bucket_start_ms,
+            bucket_end_ms=gap.bucket_end_ms,
+            replay_complete=replay_complete,
+            aggregates_written=aggregates_written,
+            pre_replay_bars=len(before_rows),
+            generated_bars=len(generated_rows),
+            combined_bars=len(combined_rows),
+        )
+        return _BuildWindowResult(
+            raw_rows=raw_rows,
+            filtered_rows=filtered_rows,
+            dropped_rows=dropped_rows,
+            trades_loaded=trades_loaded,
+            aggregates_written=aggregates_written,
+            resource_limited=resource_limited,
+            repair_method="checkpoint_anchored_replay",
+            target_window_reached=replay_complete or target_trade_count > 0,
+            target_bucket_proven_complete=aggregates_written > 0,
+            anchor_last_trade_ts_ms=checkpoint.last_trade_ts_ms,
+            replay_start_ms=replay_start_ms,
+            replay_end_ms=replay_end_ms,
+            pre_replay_existing_range_bars=len(before_rows),
+            generated_range_bars=len(generated_rows),
+            combined_range_bars=len(combined_rows),
+            target_bucket_start_ms=gap.bucket_start_ms,
+            target_bucket_end_ms=gap.bucket_end_ms,
+            selected_archive_dates=selected_archive_dates,
+            per_file_min_trade_time_ms=tuple(per_file_min.items()),
+            per_file_max_trade_time_ms=tuple(per_file_max.items()),
+            target_trade_count=target_trade_count,
+            candidate_range_bars=len(combined_rows),
+            candidate_aggregates=len(aggregates),
+            filtered_reason_if_zero=filtered_reason,
+        )
+
+    # ── Phase 3: full replay fallback ──────────────────────────────────
 
     def _run_build_window(
         self,
@@ -693,6 +1170,7 @@ class RangeBackfillService:
             rows=len(aggregates),
             filtered_reason_if_zero=filtered_reason_if_zero,
         )
+        target_window_reached = target_trade_count > 0
         return _BuildWindowResult(
             downloaded_files=downloaded,
             raw_rows=raw_rows,
@@ -711,6 +1189,12 @@ class RangeBackfillService:
             candidate_range_bars=len(bars),
             candidate_aggregates=len(candidate_aggregate_rows),
             filtered_reason_if_zero=filtered_reason_if_zero,
+            repair_method="full_replay_fallback",
+            target_window_reached=target_window_reached,
+            target_bucket_proven_complete=(
+                len(aggregates) > 0
+                and not resource_limited
+            ),
         )
 
     def _ensure_raw_days(
@@ -896,6 +1380,15 @@ class RangeBackfillService:
         candidate_range_bars: int = 0,
         candidate_aggregates: int = 0,
         filtered_reason_if_zero: str | None = None,
+        repair_method: str = "",
+        target_window_reached: bool = False,
+        target_bucket_proven_complete: bool = False,
+        anchor_last_trade_ts_ms: int | None = None,
+        replay_start_ms: int | None = None,
+        replay_end_ms: int | None = None,
+        pre_replay_existing_range_bars: int = 0,
+        generated_range_bars: int = 0,
+        combined_range_bars: int = 0,
     ) -> RangeBackfillSummary:
         after = self.check_coverage(now_ms_value=self._now_ms_value, direction=self.request.direction)
         summary = RangeBackfillSummary(
@@ -931,6 +1424,15 @@ class RangeBackfillService:
             candidate_range_bars=candidate_range_bars,
             candidate_aggregates=candidate_aggregates,
             filtered_reason_if_zero=filtered_reason_if_zero,
+            repair_method=repair_method,
+            target_window_reached=target_window_reached,
+            target_bucket_proven_complete=target_bucket_proven_complete,
+            anchor_last_trade_ts_ms=anchor_last_trade_ts_ms,
+            replay_start_ms=replay_start_ms,
+            replay_end_ms=replay_end_ms,
+            pre_replay_existing_range_bars=pre_replay_existing_range_bars,
+            generated_range_bars=generated_range_bars,
+            combined_range_bars=combined_range_bars,
         )
         if update_status:
             if status == "error":
@@ -984,6 +1486,15 @@ class RangeBackfillService:
                 candidate_range_bars=summary.candidate_range_bars,
                 candidate_aggregates=summary.candidate_aggregates,
                 filtered_reason_if_zero=summary.filtered_reason_if_zero,
+                repair_method=summary.repair_method,
+                target_window_reached=summary.target_window_reached,
+                target_bucket_proven_complete=summary.target_bucket_proven_complete,
+                anchor_last_trade_ts_ms=summary.anchor_last_trade_ts_ms,
+                replay_start_ms=summary.replay_start_ms,
+                replay_end_ms=summary.replay_end_ms,
+                pre_replay_existing_range_bars=summary.pre_replay_existing_range_bars,
+                generated_range_bars=summary.generated_range_bars,
+                combined_range_bars=summary.combined_range_bars,
                 exit_code=0 if status in {"ok", "dry_run", "partial", "no_progress", "archive_not_ready"} else 1,
                 finished_at_ms=now_ms() if mark_process_finished else None,
             )
@@ -1007,6 +1518,9 @@ class RangeBackfillService:
             candidate_range_bars=summary.candidate_range_bars,
             candidate_aggregates=summary.candidate_aggregates,
             filtered_reason_if_zero=summary.filtered_reason_if_zero,
+            repair_method=summary.repair_method,
+            target_window_reached=summary.target_window_reached,
+            target_bucket_proven_complete=summary.target_bucket_proven_complete,
             elapsed_seconds=summary.elapsed_seconds,
         )
         return summary
@@ -1024,11 +1538,13 @@ def _aggregate_zero_reason(
     if aggregates:
         return None
     if resource_limited:
+        if target_trade_count <= 0:
+            return "target_window_not_reached_due_resource_limit"
         return "resource_limit_before_target_complete"
     if trades_loaded <= 0:
         return "no_valid_trades_in_selected_archives"
     if target_trade_count <= 0:
-        return "no_trades_in_target_bucket"
+        return "target_window_reached_but_no_trades"
     if not bars:
         return "no_range_bar_closed_in_target_window"
     if not candidate_aggregates:
