@@ -20,11 +20,20 @@ from src.runtime.range_backfill_supervisor import (
 
 def test_archive_complete_boundary_uses_okx_utc_plus_8_day() -> None:
     assert _archive_complete_max_target_end_ms(
-        1782835199999, exchange="okx"
+        1782835199999, exchange="okx", archive_publish_lag_hours=0.0
     ) == 1782748799999
     assert _archive_complete_max_target_end_ms(
-        1782835200000, exchange="okx"
+        1782835200000, exchange="okx", archive_publish_lag_hours=0.0
     ) == 1782835199999
+
+
+def test_archive_complete_boundary_applies_okx_publish_lag() -> None:
+    assert _archive_complete_max_target_end_ms(
+        1783464603854, exchange="okx", archive_publish_lag_hours=8.0
+    ) == 1783353599999
+    assert _archive_complete_max_target_end_ms(
+        1783464603854, exchange="okx", archive_publish_lag_hours=0.0
+    ) == 1783439999999
 
 
 def test_archive_complete_boundary_keeps_non_okx_utc_behavior() -> None:

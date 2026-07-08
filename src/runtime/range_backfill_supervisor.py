@@ -34,6 +34,7 @@ REASON_REPAIR_FAILED_COOLDOWN = "repair_failed_cooldown"
 REASON_STALE_WORKER_MISSING = "stale_worker_missing"
 DAILY_ARCHIVE_BACKFILL_RUNNING = "daily_archive_backfill_running"
 DAILY_ARCHIVE_BACKFILL_FAILED = "daily_archive_backfill_failed"
+DEFAULT_OKX_ARCHIVE_PUBLISH_LAG_HOURS = 8.0
 DEFERRED_REPAIR_REASONS = frozenset(
     {
         REASON_ARCHIVE_GAP_NO_PROGRESS,
@@ -57,6 +58,7 @@ class RangeBackfillSupervisorConfig:
     failure_cooldown_seconds: int = 3600
     archive_not_ready_cooldown_seconds: int = 21600
     daily_retry_after_utc_hour: int = 1
+    archive_publish_lag_hours: float = DEFAULT_OKX_ARCHIVE_PUBLISH_LAG_HOURS
     monitor_seconds: float = 60.0
     status_path: Path = Path("data/state/range_backfill_status.json")
     lock_path: Path = Path("data/state/range_backfill.lock")
@@ -215,7 +217,8 @@ class RangeBackfillSupervisor:
                     bucket_interval=bucket_interval,
                 )
                 archive_max_target_end_ms = _archive_complete_max_target_end_ms(
-                    exchange=exchange
+                    exchange=exchange,
+                    archive_publish_lag_hours=self.config.archive_publish_lag_hours,
                 )
                 reason = self._coverage_reason(
                     coverage,
@@ -488,13 +491,15 @@ def _archive_complete_max_target_end_ms(
     now_ms_value: int | None = None,
     *,
     exchange: str = "okx",
+    archive_publish_lag_hours: float = DEFAULT_OKX_ARCHIVE_PUBLISH_LAG_HOURS,
 ) -> int:
     now = datetime.now(UTC) if now_ms_value is None else datetime.fromtimestamp(int(now_ms_value) / 1000, tz=UTC)
     if str(exchange).strip().lower() != "okx":
         today_start = datetime(now.year, now.month, now.day, tzinfo=UTC)
         return int(today_start.timestamp() * 1000) - 1
     okx_tz = timezone(timedelta(hours=8))
-    okx_now = now.astimezone(okx_tz)
+    archive_safe_now = now - timedelta(hours=float(archive_publish_lag_hours))
+    okx_now = archive_safe_now.astimezone(okx_tz)
     current_archive_start = datetime(
         okx_now.year,
         okx_now.month,

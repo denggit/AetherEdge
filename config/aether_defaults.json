@@ -54,6 +54,7 @@
   "range_backfill_sleep_seconds": 30,
   "range_backfill_heartbeat_stale_seconds": 180,
   "range_backfill_restart_cooldown_seconds": 300,
+  "range_backfill_archive_publish_lag_hours": 8,
   "range_repair_failure_cooldown_seconds": 3600,
   "range_repair_archive_not_ready_cooldown_seconds": 21600,
   "range_repair_daily_retry_after_utc_hour": 1,

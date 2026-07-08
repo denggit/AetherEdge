@@ -49,12 +49,14 @@ def test_live_runtime_config_loads_range_repair_cooldowns(tmp_path):
             "AETHER_RANGE_REPAIR_FAILURE_COOLDOWN_SECONDS": "1234",
             "AETHER_RANGE_REPAIR_ARCHIVE_NOT_READY_COOLDOWN_SECONDS": "5678",
             "AETHER_RANGE_REPAIR_DAILY_RETRY_AFTER_UTC_HOUR": "2",
+            "AETHER_RANGE_ARCHIVE_PUBLISH_LAG_HOURS": "9.5",
         },
     )
 
     assert cfg.range_repair_failure_cooldown_seconds == 1234
     assert cfg.range_repair_archive_not_ready_cooldown_seconds == 5678
     assert cfg.range_repair_daily_retry_after_utc_hour == 2
+    assert cfg.range_backfill_archive_publish_lag_hours == 9.5
 
 
 def test_live_runtime_config_loads_micro_repair_limits(tmp_path):

@@ -4265,6 +4265,7 @@ class LiveRuntimeRunner:
                     sleep_seconds=self.runtime_config.range_backfill_sleep_seconds,
                     heartbeat_stale_seconds=self.runtime_config.range_backfill_heartbeat_stale_seconds,
                     restart_cooldown_seconds=self.runtime_config.range_backfill_restart_cooldown_seconds,
+                    archive_publish_lag_hours=self.runtime_config.range_backfill_archive_publish_lag_hours,
                     failure_cooldown_seconds=self.runtime_config.range_repair_failure_cooldown_seconds,
                     archive_not_ready_cooldown_seconds=self.runtime_config.range_repair_archive_not_ready_cooldown_seconds,
                     daily_retry_after_utc_hour=self.runtime_config.range_repair_daily_retry_after_utc_hour,
