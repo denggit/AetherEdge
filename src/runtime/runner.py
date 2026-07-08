@@ -183,6 +183,8 @@ class _BackgroundWriteQueue:
         self.written = 0
         self.dropped = 0
         self.failures = 0
+        self._drop_warn_every = 100
+        self._last_drop_warned_at = 0
 
     def start(self) -> None:
         with self._lock:
@@ -201,6 +203,7 @@ class _BackgroundWriteQueue:
         with self._lock:
             if self._stopping:
                 self.dropped += 1
+                self._warn_drop(reason="stopping")
                 return False
         try:
             self._queue.put_nowait(item)
@@ -209,15 +212,33 @@ class _BackgroundWriteQueue:
                 self._queue.get_nowait()
                 self._queue.task_done()
                 self.dropped += 1
+                self._warn_drop(reason="queue_full_evicted_oldest")
             except queue.Empty:
                 pass
             try:
                 self._queue.put_nowait(item)
             except queue.Full:
                 self.dropped += 1
+                self._warn_drop(reason="queue_full_double_fail")
                 return False
         self.submitted += 1
         return True
+
+    def _warn_drop(self, *, reason: str) -> None:
+        """Log a warning on first drop and every Nth drop thereafter."""
+        if self.dropped == 1 or self.dropped - self._last_drop_warned_at >= self._drop_warn_every:
+            self._last_drop_warned_at = self.dropped
+            logger.warning(
+                "Background write queue dropped item | name=%s reason=%s "
+                "dropped=%s submitted=%s written=%s failures=%s pending=%s",
+                self.name,
+                reason,
+                self.dropped,
+                self.submitted,
+                self.written,
+                self.failures,
+                self.pending_count,
+            )
 
     def stop(self, *, flush: bool = True, timeout: float = 5.0) -> None:
         with self._lock:
@@ -399,6 +420,7 @@ class LiveRuntimeRunner:
         self._initial_range_bucket_ms: int | None = None
         self._initial_range_recovery: RangeCheckpointRecovery | None = None
         self._range_bars_by_bucket: dict[int, list[RangeBar]] = {}
+        self._range_repaired_complete_buckets: set[int] = set()
         self._range_bars_bucket_prune_count: int = 3
         self._last_range_checkpoint_submit_ms = 0
         self._range_bars_since_checkpoint = 0
@@ -976,6 +998,36 @@ class LiveRuntimeRunner:
     def _range_bar_rows_for_bucket(
         self, bucket_start_ms: int
     ) -> list[RangeBar]:
+        # ── Micro-repair complete: force DB load, ignore partial memory ──
+        if bucket_start_ms in getattr(self, "_range_repaired_complete_buckets", set()):
+            rows = self._get_range_bar_store().load(
+                symbol=self.app_config.symbol,
+                range_pct=str(self._range_pct),
+                time_range=TimeRange(
+                    bucket_start_ms,
+                    bucket_start_ms + self._closed_bar_interval_ms - 1,
+                ),
+            )
+            if rows:
+                if not hasattr(self, "_range_bars_by_bucket"):
+                    self._range_bars_by_bucket = {}
+                self._range_bars_by_bucket[bucket_start_ms] = list(rows)
+                self._prune_range_bars_by_bucket(current_bucket=bucket_start_ms)
+                logger.info(
+                    "Range bar rows loaded from repaired DB | bucket_start_ms=%s "
+                    "row_count=%s",
+                    bucket_start_ms,
+                    len(rows),
+                )
+                return list(rows)
+            # DB load returned empty — do NOT fall back to partial memory.
+            logger.warning(
+                "Range repaired complete bucket has no DB rows | "
+                "bucket_start_ms=%s repaired_complete=True fallback=unavailable",
+                bucket_start_ms,
+            )
+            return []
+
         range_bars_by_bucket = getattr(self, "_range_bars_by_bucket", {})
         if bucket_start_ms in range_bars_by_bucket:
             memory_rows = list(range_bars_by_bucket[bucket_start_ms])
@@ -3322,7 +3374,7 @@ class LiveRuntimeRunner:
         bucket_end_ms = (
             bucket_start_ms + self._closed_bar_interval_ms - 1
         )
-        bars = self._range_bars_by_bucket.get(bucket_start_ms, [])
+        bars = self._range_bar_rows_for_bucket(bucket_start_ms)
         aggregates = self._get_range_bar_aggregator().aggregate(
             bars, bucket_ms=self._closed_bar_interval_ms
         )
@@ -4302,7 +4354,13 @@ class LiveRuntimeRunner:
     def _maybe_log_live_data_path_stats(self) -> None:
         now_ms = int(time.time() * 1000)
         last_ms = int(getattr(self, "_last_live_data_path_log_ms", 0) or 0)
-        if last_ms and now_ms - last_ms < 30 * 60_000:
+        interval_seconds = (
+            getattr(self, "_project_env", None)
+            and self._project_env.get_int(
+                "AETHER_LIVE_DATA_PATH_STATS_INTERVAL_SECONDS", 1800
+            )
+        ) or 1800
+        if last_ms and now_ms - last_ms < interval_seconds * 1000:
             return
         self._last_live_data_path_log_ms = now_ms
         interval_ms = int(getattr(self, "_closed_bar_interval_ms", 0) or 0)
@@ -4324,8 +4382,28 @@ class LiveRuntimeRunner:
             if isinstance(writer, _BackgroundWriteQueue)
             else None
         )
+        writer_dropped = (
+            writer.dropped
+            if isinstance(writer, _BackgroundWriteQueue)
+            else None
+        )
+        writer_failures = (
+            writer.failures
+            if isinstance(writer, _BackgroundWriteQueue)
+            else None
+        )
+        writer_written = (
+            writer.written
+            if isinstance(writer, _BackgroundWriteQueue)
+            else None
+        )
+        writer_submitted = (
+            writer.submitted
+            if isinstance(writer, _BackgroundWriteQueue)
+            else None
+        )
         logger.info(
-            "Live data path stats | market_events_seen=%s feature_events_seen=%s latest_fixed_time_trade_bar_open_time_ms=%s mf_tradebar_count=%s mf_range_footprint_count=%s current_range_bucket_start_ms=%s range_bars_by_bucket_current_count=%s live_persistence_pending=%s",
+            "Live data path stats | market_events_seen=%s feature_events_seen=%s latest_fixed_time_trade_bar_open_time_ms=%s mf_tradebar_count=%s mf_range_footprint_count=%s current_range_bucket_start_ms=%s range_bars_by_bucket_current_count=%s live_persistence_pending=%s live_persistence_dropped=%s live_persistence_failures=%s live_persistence_written=%s live_persistence_submitted=%s",
             getattr(getattr(self, "stats", None), "market_events_seen", None),
             getattr(getattr(self, "stats", None), "feature_events_seen", None),
             getattr(
@@ -4338,6 +4416,10 @@ class LiveRuntimeRunner:
             current_bucket,
             current_bucket_count,
             pending,
+            writer_dropped,
+            writer_failures,
+            writer_written,
+            writer_submitted,
         )
 
     def _mf_observer_audit(self) -> Mapping[str, Any]:
@@ -4777,9 +4859,14 @@ class LiveRuntimeRunner:
         )
         self._rangebar_trust_start_bucket_ms = bucket_start_ms
         self._range_context_degraded_buckets.pop(bucket_start_ms, None)
+        # ── Force canonical rows to come from repaired DB, not partial
+        #     in-memory rows that were collected before micro repair finished.
+        self._range_repaired_complete_buckets.add(bucket_start_ms)
+        self._range_bars_by_bucket.pop(bucket_start_ms, None)
         logger.info(
             "Range micro repair COMPLETE aggregate adopted | symbol=%s "
-            "exchange=%s bucket_start_ms=%s bucket_end_ms=%s",
+            "exchange=%s bucket_start_ms=%s bucket_end_ms=%s "
+            "cleared_partial_memory_rows=True repaired_complete=True",
             self.app_config.symbol,
             self.app_config.data_exchange.value,
             bucket_start_ms,
