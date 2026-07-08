@@ -329,23 +329,6 @@ def _write_process_status(
     summary=None,
 ) -> None:
     heartbeat = now_ms()
-    if summary is not None and not running:
-        aggregates_written = int(getattr(summary, "aggregates_written", 0) or 0)
-        complete_improved = int(getattr(summary, "complete_after", 0) or 0) > int(
-            getattr(summary, "complete_before", 0) or 0
-        )
-        if exit_code not in (None, 0):
-            repair_status = DAILY_ARCHIVE_BACKFILL_FAILED
-        elif aggregates_written > 0 or complete_improved:
-            repair_status = DAILY_ARCHIVE_BACKFILL_SUCCESS
-        else:
-            repair_status = DAILY_ARCHIVE_BACKFILL_FAILED
-    elif running:
-        repair_status = DAILY_ARCHIVE_BACKFILL_RUNNING
-    elif exit_code not in (None, 0):
-        repair_status = DAILY_ARCHIVE_BACKFILL_FAILED
-    else:
-        repair_status = DAILY_ARCHIVE_BACKFILL_SUCCESS
     payload = {
         "mode": request.mode,
         "direction": request.direction,
@@ -361,7 +344,15 @@ def _write_process_status(
         "required_buckets": request.required_buckets,
         "lookback_buckets": request.lookback_buckets,
         "exit_code": exit_code,
-        "repair_status": repair_status,
+        "repair_status": (
+            DAILY_ARCHIVE_BACKFILL_RUNNING
+            if running
+            else (
+                DAILY_ARCHIVE_BACKFILL_FAILED
+                if exit_code not in (None, 0)
+                else DAILY_ARCHIVE_BACKFILL_SUCCESS
+            )
+        ),
         "finished_at_ms": now_ms() if not running else None,
     }
     if range_speed_reason is not None:
@@ -389,15 +380,6 @@ def _write_process_status(
             candidate_aggregates=int(summary.candidate_aggregates),
             aggregates_written=int(summary.aggregates_written),
             filtered_reason_if_zero=summary.filtered_reason_if_zero,
-            repair_method=getattr(summary, "repair_method", ""),
-            target_window_reached=bool(getattr(summary, "target_window_reached", False)),
-            target_bucket_proven_complete=bool(getattr(summary, "target_bucket_proven_complete", False)),
-            anchor_last_trade_ts_ms=getattr(summary, "anchor_last_trade_ts_ms", None),
-            replay_start_ms=getattr(summary, "replay_start_ms", None),
-            replay_end_ms=getattr(summary, "replay_end_ms", None),
-            pre_replay_existing_range_bars=int(getattr(summary, "pre_replay_existing_range_bars", 0)),
-            generated_range_bars=int(getattr(summary, "generated_range_bars", 0)),
-            combined_range_bars=int(getattr(summary, "combined_range_bars", 0)),
         )
     status_store.patch(**payload)
 

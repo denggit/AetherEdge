@@ -107,12 +107,3 @@ class RangeBackfillSummary:
     candidate_range_bars: int = 0
     candidate_aggregates: int = 0
     filtered_reason_if_zero: str | None = None
-    repair_method: str = ""
-    target_window_reached: bool = False
-    target_bucket_proven_complete: bool = False
-    anchor_last_trade_ts_ms: int | None = None
-    replay_start_ms: int | None = None
-    replay_end_ms: int | None = None
-    pre_replay_existing_range_bars: int = 0
-    generated_range_bars: int = 0
-    combined_range_bars: int = 0
