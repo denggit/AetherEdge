@@ -18,6 +18,7 @@ from src.market_data.backfill.status_store import RangeBackfillStatusStore, now_
 from src.market_data.micro_repair import (
     RangeMicroRepairError,
     RangeMicroRepairRebuildService,
+    RangeMicroRepairStagingService,
 )
 from src.market_data.models import RangeCoverageStatus
 from src.market_data.range_repair import (
@@ -27,11 +28,15 @@ from src.market_data.range_repair import (
 )
 from src.market_data.range_checkpoint import (
     MICRO_REPAIR_FAILED,
+    MICRO_REPAIR_PARTIAL,
+    MICRO_REPAIR_PENDING,
     MICRO_REPAIR_QUEUED,
     MICRO_REPAIR_RUNNING,
     MICRO_REPAIR_SKIPPED,
     MICRO_REPAIR_SUCCESS,
     RangeMicroRepairJob,
+    RangeMicroRepairStagingState,
+    RangeMicroRepairStagingTrade,
     SqliteRangeCheckpointStore,
 )
 from src.market_data.storage import SqliteRangeBarStore
@@ -209,11 +214,18 @@ def main(argv: list[str] | None = None) -> int:
             enable_trade_stream=False,
             enable_order_book_stream=False,
         )
-        service = RangeMicroRepairRebuildService(
+        rebuild_service = RangeMicroRepairRebuildService(
             provider=provider,
             range_bar_store=SqliteRangeBarStore(args.market_db),
             checkpoint_store=checkpoint_store,
             contract_value=contract_value,
+            page_limit=args.page_limit,
+            max_pages=args.max_pages,
+            max_seconds=args.max_seconds,
+        )
+        staging_service = RangeMicroRepairStagingService(
+            provider=provider,
+            checkpoint_store=checkpoint_store,
             page_limit=args.page_limit,
             max_pages=args.max_pages,
             max_seconds=args.max_seconds,
@@ -229,13 +241,67 @@ def main(argv: list[str] | None = None) -> int:
         journal_trades = tuple(
             _market_trade_from_journal(row) for row in journal_records
         )
+
+        # Check for existing staging (resume) or start fresh
+        existing_staging = checkpoint_store.load_staging(
+            exchange=job.exchange,
+            symbol=job.symbol,
+            range_pct=job.range_pct,
+            bucket_start_ms=job.bucket_start_ms,
+        )
+
         result = asyncio.run(
-            service.rebuild(
-                job,
+            _run_chunked_repair_async(
+                staging_service=staging_service,
+                rebuild_service=rebuild_service,
+                checkpoint_store=checkpoint_store,
+                job=job,
                 journal_trades=journal_trades,
-                completed_at_ms=now_ms(),
+                staging=existing_staging,
             )
         )
+
+        if result is None:
+            # Partial coverage – save cursor and exit cleanly for next round
+            checkpoint_store.mark_micro_repair_status(
+                exchange=job.exchange,
+                symbol=job.symbol,
+                range_pct=job.range_pct,
+                bucket_start_ms=job.bucket_start_ms,
+                status=MICRO_REPAIR_PARTIAL,
+                updated_at_ms=now_ms(),
+            )
+            updated_staging = checkpoint_store.load_staging(
+                exchange=job.exchange,
+                symbol=job.symbol,
+                range_pct=job.range_pct,
+                bucket_start_ms=job.bucket_start_ms,
+            )
+            _write_status(
+                status_store,
+                status=MICRO_REPAIR_PARTIAL,
+                args=args,
+                running=False,
+                job=job,
+                journal_state=journal_state,
+                staging_state=updated_staging,
+            )
+            print(
+                "range_micro_repair_partial | "
+                f"symbol={job.symbol} exchange={job.exchange} "
+                f"range_pct={job.range_pct} "
+                f"bucket_start_ms={job.bucket_start_ms} "
+                f"bucket_end_ms={job.bucket_end_ms} "
+                f"checkpoint_last_trade_id={job.checkpoint_last_trade_id} "
+                f"cursor_trade_id="
+                f"{updated_staging.current_oldest_fetched_trade_id if updated_staging else 'unknown'} "
+                f"coverage_before={job.coverage_status} "
+                "coverage_after=PARTIAL failure_reason=None",
+                flush=True,
+            )
+            return 0
+
+        # Coverage complete – verify journal stability then persist
         post_repair_journal_state = journal_store.load_state(
             exchange=job.exchange,
             symbol=job.symbol,
@@ -658,6 +724,7 @@ def _write_status(
     journal_state: RangeRepairJournalState | None = None,
     waiting_reason: str | None = None,
     failure_reason: str | None = None,
+    staging_state: RangeMicroRepairStagingState | None = None,
 ) -> None:
     timestamp = now_ms()
     payload = _base_status_payload(
@@ -674,6 +741,8 @@ def _write_status(
         payload.update(_status_fields_from_journal_state(journal_state))
     if result is not None:
         payload.update(_status_fields_from_result(result))
+    if staging_state is not None:
+        payload.update(_status_fields_from_staging(staging_state))
     store.write(payload)
 
 
@@ -800,6 +869,19 @@ def _status_fields_from_result(result) -> dict[str, object]:
     }
 
 
+def _status_fields_from_staging(
+    staging: RangeMicroRepairStagingState,
+) -> dict[str, object]:
+    return {
+        "staging_status": staging.status,
+        "staging_fetched_trade_count": staging.fetched_trade_count,
+        "staging_rest_pages_total": staging.rest_pages_total,
+        "staging_cursor_trade_id": staging.current_oldest_fetched_trade_id,
+        "staging_cursor_ts_ms": staging.current_oldest_fetched_ts_ms,
+        "staging_coverage_complete": staging.coverage_complete,
+    }
+
+
 def _market_trade_from_journal(row) -> MarketTrade:
     try:
         side = TradeSide(str(row.side))
@@ -813,6 +895,138 @@ def _market_trade_from_journal(row) -> MarketTrade:
         exchange=ExchangeName(str(row.exchange).lower()),
         symbol=row.symbol,
         raw_symbol=row.raw_symbol,
+        price=Decimal(str(row.price)),
+        quantity=Decimal(str(row.quantity)),
+        side=side,
+        trade_id=row.trade_id,
+        event_time_ms=row.event_time_ms,
+        trade_time_ms=row.trade_time_ms,
+        source=source,
+    )
+
+
+async def _run_chunked_repair_async(
+    *,
+    staging_service: RangeMicroRepairStagingService,
+    rebuild_service: RangeMicroRepairRebuildService,
+    checkpoint_store: SqliteRangeCheckpointStore,
+    job: RangeMicroRepairJob,
+    journal_trades: tuple[MarketTrade, ...],
+    staging: RangeMicroRepairStagingState | None,
+):
+    """Fetch one chunk via staging; if coverage complete, replay and return result.
+
+    Returns ``None`` when coverage is not yet complete (partial progress saved to
+    staging).  Returns the rebuild result when the gap is fully covered.
+    """
+
+    chunk_trades, _new_staging, coverage_complete = (
+        await staging_service.fetch_chunk(job, staging=staging)
+    )
+
+    if not coverage_complete:
+        return None
+
+    # Load all accumulated staging trades
+    staging_rows = checkpoint_store.load_staging_trades(
+        exchange=job.exchange,
+        symbol=job.symbol,
+        range_pct=job.range_pct,
+        bucket_start_ms=job.bucket_start_ms,
+    )
+    all_staging_trades = tuple(
+        _market_trade_from_staging(row) for row in staging_rows
+    )
+
+    # Strict coverage verification before writing COMPLETE
+    _assert_full_staging_coverage(all_staging_trades, job)
+
+    result = await rebuild_service.rebuild(
+        job,
+        journal_trades=journal_trades,
+        completed_at_ms=now_ms(),
+        rest_gap_trades=all_staging_trades,
+    )
+
+    # Clear staging now that repair is complete
+    checkpoint_store.clear_staging(
+        exchange=job.exchange,
+        symbol=job.symbol,
+        range_pct=job.range_pct,
+        bucket_start_ms=job.bucket_start_ms,
+    )
+
+    return result
+
+
+def _assert_full_staging_coverage(
+    trades: tuple[MarketTrade, ...],
+    job: RangeMicroRepairJob,
+) -> None:
+    """Verify staging trades cover the entire gap from checkpoint to first_live.
+
+    The fetch service already verified that all available REST trades in the
+    gap were returned (pagination was not exhausted).  This function performs
+    a defence-in-depth sanity check: every staging trade must fall within the
+    repair gap time bounds, and the trade closest to the checkpoint must not
+    leave an unreasonable ID gap.
+    """
+    if not trades:
+        raise RangeMicroRepairError("no staging trades to verify coverage")
+
+    repair_gap_start = int(job.checkpoint_last_trade_ts_ms or 0) + 1
+    repair_gap_end = int(job.first_live_trade_ts_ms or 0) - 1
+
+    for trade in trades:
+        ts = int(trade.trade_time_ms or 0)
+        if not (repair_gap_start <= ts <= repair_gap_end):
+            raise RangeMicroRepairError(
+                f"staging trade {trade.trade_id} at ts={ts} outside "
+                f"gap [{repair_gap_start}, {repair_gap_end}]"
+            )
+
+    # Verify the earliest trade timestamp reaches the gap start boundary.
+    earliest_ts = min(int(t.trade_time_ms or 0) for t in trades)
+    if earliest_ts > repair_gap_start:
+        raise RangeMicroRepairError(
+            f"staging earliest trade at ts={earliest_ts} > "
+            f"gap_start={repair_gap_start}"
+        )
+
+    # If trade IDs are numeric, verify the oldest fetched ID does not leave
+    # an unreasonable gap vs the checkpoint.  A gap of 1 ID is expected (the
+    # checkpoint trade itself is not part of the repair gap).
+    if job.checkpoint_last_trade_id is not None:
+        try:
+            checkpoint_id = int(job.checkpoint_last_trade_id)
+            min_id = min(
+                int(str(t.trade_id or "0"))
+                for t in trades
+                if str(t.trade_id or "").isdigit()
+            )
+            if min_id - checkpoint_id > 100:
+                raise RangeMicroRepairError(
+                    f"staging coverage gap too large: min_trade_id={min_id} "
+                    f"checkpoint_last_trade_id={checkpoint_id} "
+                    f"gap={min_id - checkpoint_id}"
+                )
+        except (ValueError, TypeError):
+            pass
+
+
+def _market_trade_from_staging(row: RangeMicroRepairStagingTrade) -> MarketTrade:
+    try:
+        side = TradeSide(str(row.side))
+    except ValueError:
+        side = TradeSide.UNKNOWN
+    try:
+        source = MarketDataSource(str(row.source))
+    except ValueError:
+        source = MarketDataSource.REST
+    return MarketTrade(
+        exchange=ExchangeName(str(row.exchange).lower()),
+        symbol=row.symbol,
+        raw_symbol=row.raw_symbol or row.symbol,
         price=Decimal(str(row.price)),
         quantity=Decimal(str(row.quantity)),
         side=side,

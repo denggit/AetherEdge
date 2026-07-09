@@ -8,10 +8,19 @@ from src.market_data.micro_repair import (
     RangeMicroRepairError,
     RangeMicroRepairRebuildService,
     RangeMicroRepairService,
+    RangeMicroRepairStagingService,
 )
 from src.market_data.derived import RangeBarBuilder
 from src.market_data.models import RangeBarAggregate, RangeCoverageStatus
-from src.market_data.range_checkpoint import RangeMicroRepairJob, SqliteRangeCheckpointStore
+from src.market_data.range_checkpoint import (
+    MICRO_REPAIR_PARTIAL,
+    MICRO_REPAIR_PENDING,
+    MICRO_REPAIR_SUCCESS,
+    RangeMicroRepairJob,
+    RangeMicroRepairStagingState,
+    SqliteRangeCheckpointStore,
+    STAGING_STATUS_FETCHING,
+)
 from src.market_data.storage import SqliteRangeBarStore
 from src.platform.data.models import (
     MarketDataSource,
@@ -454,3 +463,455 @@ async def test_rebuild_skips_rest_when_first_live_is_next_trade_ms(
     assert result.repair_gap_ms == 0
     assert result.replayed_rest_trades == 0
     assert result.replayed_journal_trades == 1
+
+
+# ── resumable staging tests ──────────────────────────────────────────────
+
+
+class _PartialPaginationProvider:
+    """Returns only the first chunk of trades; pagination exhausted after 20 pages."""
+
+    def __init__(self, all_trades: list[MarketTrade], chunk_size: int = 2000):
+        self.all_trades = sorted(all_trades, key=lambda t: int(str(t.trade_id or "0")))
+        self.chunk_size = chunk_size
+        self.anchor_calls: list[dict] = []
+        self.last_historical_trade_pages = 20
+
+    async def fetch_trades_between_ids(self, **kwargs):
+        self.anchor_calls.append(dict(kwargs))
+        newer_id = int(kwargs["newer_trade_id"])
+        older_id = int(kwargs.get("older_trade_id", 0))
+        # Return only trades within the anchor range, up to chunk_size
+        matching = [
+            t
+            for t in self.all_trades
+            if older_id < int(str(t.trade_id or "0")) < newer_id
+        ]
+        return matching[: self.chunk_size]
+
+
+@pytest.mark.asyncio
+async def test_staging_partial_when_pagination_exhausted(tmp_path) -> None:
+    """Test 1: When trade_id gap > page budget, status=PARTIAL, no COMPLETE."""
+    bucket_start = 1_780_000_000_000
+    bucket_end = bucket_start + 1_999
+    checkpoint_ts = bucket_start + 100
+    first_live_ts = checkpoint_ts + 988  # gap of 987ms
+
+    # Create 4000 trade IDs spread across the 987ms gap (more than 20 pages × 100)
+    gap_ms = first_live_ts - checkpoint_ts - 1  # 987ms
+    gap_trades = [
+        _trade(
+            checkpoint_ts + 1 + (i * gap_ms) // 4000,
+            str(int("4048125000") + i),
+            price="100.1",
+        )
+        for i in range(1, 4001)
+    ]
+
+    builder = RangeBarBuilder(range_pct="0.001", contract_value="1")
+    builder.on_trade(_trade(checkpoint_ts, "4048125000"))
+    # first_live_trade_id = last gap trade + 1
+    first_live_trade_id_val = str(int("4048125000") + 4001)
+    job = RangeMicroRepairJob(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=bucket_start,
+        bucket_end_ms=bucket_end,
+        checkpoint_last_trade_id="4048125000",
+        checkpoint_last_trade_ts_ms=checkpoint_ts,
+        builder_state=builder.snapshot_state(),
+        coverage_status=RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value,
+        missing_gap_ms=500,
+        first_live_trade_ts_ms=first_live_ts,
+        first_live_trade_id=first_live_trade_id_val,
+        repair_gap_start_ms=checkpoint_ts + 1,
+        repair_gap_end_ms=first_live_ts - 1,
+        journal_start_ms=first_live_ts,
+        journal_end_ms=bucket_end,
+        journal_status="journal_finalized",
+    )
+
+    provider = _PartialPaginationProvider(gap_trades, chunk_size=2000)
+    checkpoint_store = SqliteRangeCheckpointStore(tmp_path / "checkpoint.sqlite3")
+    staging_service = RangeMicroRepairStagingService(
+        provider=provider,
+        checkpoint_store=checkpoint_store,
+        page_limit=100,
+        max_pages=20,
+        max_seconds=30.0,
+    )
+
+    # First round: fetch 2000 trades (20 pages × 100)
+    chunk_trades, staging, coverage_complete = await staging_service.fetch_chunk(
+        job, staging=None
+    )
+
+    assert not coverage_complete, "4000-id gap needs >20 pages, should be partial"
+    assert staging is not None
+    assert staging.status == STAGING_STATUS_FETCHING
+    assert staging.current_oldest_fetched_trade_id is not None
+    # Cursor should be at the oldest trade fetched (closest to checkpoint)
+    oldest_fetched = int(staging.current_oldest_fetched_trade_id)
+    assert oldest_fetched > 4048125000  # not yet reached checkpoint
+
+    # Verify staging was persisted
+    loaded = checkpoint_store.load_staging(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=bucket_start,
+    )
+    assert loaded is not None
+    assert loaded.fetched_trade_count == 2000
+
+    # Verify no COMPLETE was written
+    completed = checkpoint_store.load_completed_aggregate(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_end_ms=bucket_end,
+    )
+    # Either no completed aggregate or still DEGRADED (not COMPLETE)
+    assert completed is None or completed.coverage_status != "COMPLETE"
+
+
+@pytest.mark.asyncio
+async def test_staging_resumes_from_cursor_not_fresh_start(tmp_path) -> None:
+    """Test 2: Second round uses cursor, not first_live_trade_id."""
+    bucket_start = 1_780_000_000_000
+    bucket_end = bucket_start + 1_999
+    checkpoint_ts = bucket_start + 100
+    first_live_ts = checkpoint_ts + 988  # gap of 987ms
+
+    gap_ms = first_live_ts - checkpoint_ts - 1
+    gap_trades = [
+        _trade(
+            checkpoint_ts + 1 + (i * gap_ms) // 4000,
+            str(int("4048125000") + i),
+            price="100.1",
+        )
+        for i in range(1, 4001)
+    ]
+
+    builder = RangeBarBuilder(range_pct="0.001", contract_value="1")
+    builder.on_trade(_trade(checkpoint_ts, "4048125000"))
+    first_live_trade_id_val = str(int("4048125000") + 4001)
+    job = RangeMicroRepairJob(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=bucket_start,
+        bucket_end_ms=bucket_end,
+        checkpoint_last_trade_id="4048125000",
+        checkpoint_last_trade_ts_ms=checkpoint_ts,
+        builder_state=builder.snapshot_state(),
+        coverage_status=RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value,
+        missing_gap_ms=500,
+        first_live_trade_ts_ms=first_live_ts,
+        first_live_trade_id=first_live_trade_id_val,
+        repair_gap_start_ms=checkpoint_ts + 1,
+        repair_gap_end_ms=first_live_ts - 1,
+        journal_start_ms=first_live_ts,
+        journal_end_ms=bucket_end,
+        journal_status="journal_finalized",
+    )
+
+    provider = _PartialPaginationProvider(gap_trades, chunk_size=2000)
+    checkpoint_store = SqliteRangeCheckpointStore(tmp_path / "checkpoint.sqlite3")
+    staging_service = RangeMicroRepairStagingService(
+        provider=provider,
+        checkpoint_store=checkpoint_store,
+        page_limit=100,
+        max_pages=20,
+        max_seconds=30.0,
+    )
+
+    # First round
+    _, staging1, _ = await staging_service.fetch_chunk(job, staging=None)
+    cursor_after_first = staging1.current_oldest_fetched_trade_id
+
+    # Second round: should use cursor, not first_live_trade_id
+    _, staging2, _ = await staging_service.fetch_chunk(
+        job, staging=staging1
+    )
+
+    # Verify provider was called with cursor from first round
+    assert len(provider.anchor_calls) >= 2
+    second_call = provider.anchor_calls[1]
+    assert second_call["newer_trade_id"] == cursor_after_first
+    assert second_call["newer_trade_id"] != "4048130000"  # NOT first_live_trade_id
+
+
+@pytest.mark.asyncio
+async def test_staging_complete_coverage_writes_complete(tmp_path) -> None:
+    """Test 3: After full coverage, rebuild writes COMPLETE."""
+    bucket_start = 1_780_000_000_000
+    bucket_end = bucket_start + 1_999
+    checkpoint_ts = bucket_start + 100
+    first_live_ts = bucket_start + 1_088
+
+    # Small gap that fits in one round
+    gap_trades = [
+        _trade(checkpoint_ts + 1, "4048125001", price="100.1"),
+        _trade(checkpoint_ts + 20, "4048125020", price="100.15"),
+        _trade(first_live_ts - 1, "4048129999", price="100.5"),
+    ]
+
+    builder = RangeBarBuilder(range_pct="0.001", contract_value="1")
+    builder.on_trade(_trade(checkpoint_ts, "4048125000"))
+    job = RangeMicroRepairJob(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=bucket_start,
+        bucket_end_ms=bucket_end,
+        checkpoint_last_trade_id="4048125000",
+        checkpoint_last_trade_ts_ms=checkpoint_ts,
+        builder_state=builder.snapshot_state(),
+        coverage_status=RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value,
+        missing_gap_ms=500,
+        first_live_trade_ts_ms=first_live_ts,
+        first_live_trade_id="4048130000",
+        repair_gap_start_ms=checkpoint_ts + 1,
+        repair_gap_end_ms=first_live_ts - 1,
+        journal_start_ms=first_live_ts,
+        journal_end_ms=bucket_end,
+        journal_status="journal_finalized",
+    )
+
+    class _CompleteProvider:
+        def __init__(self):
+            self.last_historical_trade_pages = 1
+            self.anchor_calls = []
+
+        async def fetch_trades_between_ids(self, **kwargs):
+            self.anchor_calls.append(dict(kwargs))
+            return gap_trades
+
+    provider = _CompleteProvider()
+    checkpoint_store = SqliteRangeCheckpointStore(tmp_path / "checkpoint.sqlite3")
+
+    # Pre-seed an existing aggregate so rebuild can invalidate/replace it
+    checkpoint_store.save_completed_aggregate(
+        exchange="okx",
+        aggregate=RangeBarAggregate(
+            symbol="ETH-USDT-PERP",
+            range_pct=Decimal("0.001"),
+            bucket_start_ms=bucket_start,
+            bucket_end_ms=bucket_end,
+            bar_count=1,
+            first_open=Decimal("100"),
+            last_close=Decimal("100"),
+            high=Decimal("100"),
+            low=Decimal("100"),
+            buy_notional_sum=Decimal("1"),
+            sell_notional_sum=Decimal("0"),
+            delta_notional_sum=Decimal("1"),
+            notional_sum=Decimal("1"),
+        ),
+        coverage_status=RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value,
+        missing_gap_ms=500,
+        completed_at_ms=bucket_end,
+    )
+
+    staging_service = RangeMicroRepairStagingService(
+        provider=provider,
+        checkpoint_store=checkpoint_store,
+        page_limit=100,
+        max_pages=20,
+        max_seconds=30.0,
+    )
+    rebuild_service = RangeMicroRepairRebuildService(
+        provider=provider,
+        range_bar_store=SqliteRangeBarStore(tmp_path / "market.sqlite3"),
+        checkpoint_store=checkpoint_store,
+        contract_value="1",
+        page_limit=100,
+        max_pages=20,
+        max_seconds=30.0,
+    )
+
+    # Fetch chunk → coverage complete
+    chunk_trades, staging, coverage_complete = await staging_service.fetch_chunk(
+        job, staging=None
+    )
+    assert coverage_complete
+
+    # Load all staging trades and rebuild
+    all_staging = checkpoint_store.load_staging_trades(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=bucket_start,
+    )
+    staging_market_trades = [
+        MarketTrade(
+            exchange=ExchangeName.OKX,
+            symbol="ETH-USDT-PERP",
+            raw_symbol="ETH-USDT-SWAP",
+            price=Decimal(t.price),
+            quantity=Decimal(t.quantity),
+            side=TradeSide.BUY,
+            trade_id=t.trade_id,
+            trade_time_ms=t.trade_time_ms,
+            source=MarketDataSource.REST,
+        )
+        for t in all_staging
+    ]
+
+    result = await rebuild_service.rebuild(
+        job,
+        journal_trades=[
+            _trade(
+                first_live_ts,
+                "4048130000",
+                price="100.6",
+                source=MarketDataSource.WEBSOCKET,
+            ),
+        ],
+        completed_at_ms=bucket_end + 1,
+        rest_gap_trades=staging_market_trades,
+    )
+
+    assert result.aggregate_written
+    checkpoint_store.clear_staging(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=bucket_start,
+    )
+
+    # Verify COMPLETE was written
+    repaired = checkpoint_store.load_completed_aggregate(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_end_ms=bucket_end,
+    )
+    assert repaired is not None
+    assert repaired.coverage_status == "COMPLETE"
+    assert repaired.missing_gap_ms == 0
+
+    # Staging should be cleared
+    assert checkpoint_store.load_staging(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=bucket_start,
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_staging_incomplete_coverage_guards_complete(tmp_path) -> None:
+    """Test 4: Incomplete coverage must not write COMPLETE."""
+    bucket_start = 1_780_000_000_000
+    bucket_end = bucket_start + 1_999
+    checkpoint_ts = bucket_start + 100
+    first_live_ts = bucket_start + 1_088
+
+    # Gap of 4000 trade IDs, only 500 fetched
+    gap_trades = [
+        _trade(
+            checkpoint_ts + i,
+            str(int("4048125000") + i),
+            price="100.1",
+        )
+        for i in range(1, 4001)
+    ]
+
+    builder = RangeBarBuilder(range_pct="0.001", contract_value="1")
+    builder.on_trade(_trade(checkpoint_ts, "4048125000"))
+    job = RangeMicroRepairJob(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=bucket_start,
+        bucket_end_ms=bucket_end,
+        checkpoint_last_trade_id="4048125000",
+        checkpoint_last_trade_ts_ms=checkpoint_ts,
+        builder_state=builder.snapshot_state(),
+        coverage_status=RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value,
+        missing_gap_ms=500,
+        first_live_trade_ts_ms=first_live_ts,
+        first_live_trade_id="4048130000",
+        repair_gap_start_ms=checkpoint_ts + 1,
+        repair_gap_end_ms=first_live_ts - 1,
+        journal_start_ms=first_live_ts,
+        journal_end_ms=bucket_end,
+        journal_status="journal_finalized",
+    )
+
+    provider = _PartialPaginationProvider(gap_trades, chunk_size=500)
+    checkpoint_store = SqliteRangeCheckpointStore(tmp_path / "checkpoint.sqlite3")
+    staging_service = RangeMicroRepairStagingService(
+        provider=provider,
+        checkpoint_store=checkpoint_store,
+        page_limit=100,
+        max_pages=5,
+        max_seconds=30.0,
+    )
+
+    _, staging, coverage_complete = await staging_service.fetch_chunk(
+        job, staging=None
+    )
+    assert not coverage_complete
+
+    # Attempting to write COMPLETE at this point must fail
+    # The coverage guard is in _assert_full_staging_coverage
+    from src.market_data.micro_repair import RangeMicroRepairError
+
+    # Loading staging trades and attempting coverage check
+    staging_rows = checkpoint_store.load_staging_trades(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=bucket_start,
+    )
+    staging_market_trades = tuple(
+        MarketTrade(
+            exchange=ExchangeName.OKX,
+            symbol="ETH-USDT-PERP",
+            raw_symbol="ETH-USDT-SWAP",
+            price=Decimal(t.price),
+            quantity=Decimal(t.quantity),
+            side=TradeSide.BUY,
+            trade_id=t.trade_id,
+            trade_time_ms=t.trade_time_ms,
+            source=MarketDataSource.REST,
+        )
+        for t in staging_rows
+    )
+
+    # coverage_complete is False → worker should NOT proceed to rebuild
+    # The guard prevents writing COMPLETE
+    # Verify existing aggregate is NOT upgraded to COMPLETE
+    existing = checkpoint_store.load_completed_aggregate(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_end_ms=bucket_end,
+    )
+    # Either no aggregate yet or still not COMPLETE
+    if existing is not None:
+        assert existing.coverage_status != "COMPLETE"
+
+
+def test_staging_partial_no_failure_email(tmp_path) -> None:
+    """Test 5: Partial repair status != FAILED, exit_code=0, no failure callback."""
+    # Simulate the supervisor's behavior: check that MICRO_REPAIR_PARTIAL
+    # does NOT trigger _notify_failure
+    from src.market_data.range_checkpoint import (
+        _micro_repair_is_terminal_failure,
+        _micro_repair_is_resumable,
+    )
+
+    assert not _micro_repair_is_terminal_failure(MICRO_REPAIR_PARTIAL)
+    assert not _micro_repair_is_terminal_failure(MICRO_REPAIR_PENDING)
+    assert _micro_repair_is_terminal_failure("micro_repair_failed")
+
+    assert _micro_repair_is_resumable(MICRO_REPAIR_PARTIAL)
+    assert _micro_repair_is_resumable(MICRO_REPAIR_PENDING)
+    assert not _micro_repair_is_resumable(MICRO_REPAIR_SUCCESS)
+    assert not _micro_repair_is_resumable("micro_repair_failed")

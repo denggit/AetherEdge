@@ -8,7 +8,13 @@ import sys
 from typing import Callable
 
 from src.market_data.backfill.status_store import RangeBackfillStatusStore
-from src.market_data.range_checkpoint import MICRO_REPAIR_FAILED
+from src.market_data.range_checkpoint import (
+    MICRO_REPAIR_FAILED,
+    MICRO_REPAIR_PARTIAL,
+    MICRO_REPAIR_PENDING,
+    _micro_repair_is_terminal_failure,
+    _micro_repair_is_resumable,
+)
 from src.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -81,6 +87,15 @@ class RangeMicroRepairSupervisor:
             except Exception as exc:
                 logger.warning(
                     "Range micro repair supervisor monitor failed | error=%s",
+                    exc,
+                )
+            try:
+                self._retry_partial_jobs()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Range micro repair supervisor retry check failed | error=%s",
                     exc,
                 )
             try:
@@ -163,7 +178,7 @@ class RangeMicroRepairSupervisor:
         exit_code = int(self.process.returncode or 0)
         status = self.status_store.read() or {}
         repair_status = str(status.get("repair_status") or "")
-        if exit_code != 0 or repair_status == MICRO_REPAIR_FAILED:
+        if exit_code != 0 or _micro_repair_is_terminal_failure(repair_status):
             reason = str(
                 status.get("failure_reason")
                 or status.get("last_error")
@@ -176,6 +191,13 @@ class RangeMicroRepairSupervisor:
                 reason,
             )
             self._notify_failure(reason)
+        elif _micro_repair_is_resumable(repair_status):
+            logger.info(
+                "Range micro repair worker completed partial chunk | "
+                "status=%s exit_code=%s",
+                repair_status,
+                exit_code,
+            )
         self.process = None
         self._close_stdout()
 
@@ -229,6 +251,54 @@ class RangeMicroRepairSupervisor:
             "--missing-bucket-grace-seconds",
             str(self.config.missing_bucket_grace_seconds),
         ]
+
+    def _retry_partial_jobs(self) -> None:
+        """Check for partial/pending micro repair jobs and re-launch workers."""
+        if self.running:
+            return
+        status = self.status_store.read() or {}
+        repair_status = str(status.get("repair_status") or "")
+        if not _micro_repair_is_resumable(repair_status):
+            return
+        exchange = str(status.get("exchange") or "")
+        symbol = str(status.get("symbol") or "")
+        range_pct = str(status.get("range_pct") or "")
+        bucket_start_ms = status.get("bucket_start_ms")
+        bucket_end_ms = status.get("bucket_end_ms")
+        coverage_status = str(status.get("coverage_before") or "")
+        missing_gap_ms = status.get("missing_gap_ms")
+        if (
+            not exchange
+            or not symbol
+            or not range_pct
+            or bucket_start_ms is None
+            or bucket_end_ms is None
+        ):
+            logger.warning(
+                "Range micro repair partial retry skipped: "
+                "incomplete job parameters in status | status=%s",
+                {k: status.get(k) for k in (
+                    "exchange", "symbol", "range_pct",
+                    "bucket_start_ms", "bucket_end_ms",
+                )},
+            )
+            return
+        logger.info(
+            "Range micro repair retrying partial job | "
+            "symbol=%s exchange=%s bucket_start_ms=%s",
+            symbol,
+            exchange,
+            bucket_start_ms,
+        )
+        self.start_startup_recovery(
+            exchange=exchange,
+            symbol=symbol,
+            range_pct=range_pct,
+            bucket_start_ms=int(bucket_start_ms),
+            bucket_end_ms=int(bucket_end_ms),
+            coverage_status=coverage_status,
+            missing_gap_ms=int(missing_gap_ms or 0),
+        )
 
     def _close_stdout(self) -> None:
         handle = self._stdout_handle

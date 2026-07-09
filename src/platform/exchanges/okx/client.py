@@ -276,6 +276,7 @@ class OkxExchangeClient:
         limit: int = 100,
         max_pages: int = 20,
         oldest_first: bool = True,
+        partial_on_pagination: bool = False,
     ) -> list[Trade]:
         """Fetch trades strictly between two OKX trade IDs.
 
@@ -415,6 +416,19 @@ class OkxExchangeClient:
                 await asyncio.sleep(page_sleep_seconds)
 
         if not coverage_proven:
+            if partial_on_pagination:
+                trades = [
+                    _map_okx_trade(row, symbol=symbol, raw_symbol=raw_symbol)
+                    for row in rows_by_id.values()
+                ]
+                trades.sort(
+                    key=lambda row: (
+                        row.trade_time_ms or row.event_time_ms or 0,
+                        int(str(row.trade_id)),
+                    ),
+                    reverse=not oldest_first,
+                )
+                return trades
             raise ExchangeApiError(
                 "OKX history-trades pagination limit reached before older_trade_id coverage",
                 payload={

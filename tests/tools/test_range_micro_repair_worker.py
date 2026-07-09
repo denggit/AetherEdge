@@ -10,6 +10,7 @@ from src.market_data.derived import RangeBarBuilder
 from src.market_data.models import RangeBarAggregate, RangeCoverageStatus
 from src.market_data.range_checkpoint import (
     MICRO_REPAIR_FAILED,
+    MICRO_REPAIR_PARTIAL,
     MICRO_REPAIR_SUCCESS,
     RangeBuilderCheckpoint,
     RangeMicroRepairJob,
@@ -623,3 +624,333 @@ def test_worker_invalid_journal_never_overwrites_complete(
     assert aggregate.coverage_status == (
         RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value
     )
+
+
+# ── resumable staging worker helpers ─────────────────────────────────────
+
+STAGING_CHECKPOINT_ID = "4048125000"
+STAGING_FIRST_LIVE_ID = "4048129000"
+
+
+def _seed_staging_numeric(checkpoint_db) -> SqliteRangeCheckpointStore:
+    """Seed with numeric trade IDs for trade_id_anchor staging tests."""
+    store = SqliteRangeCheckpointStore(checkpoint_db)
+    builder = RangeBarBuilder(range_pct="0.001", contract_value="0.01")
+    builder.on_trade(
+        MarketTrade(
+            exchange=ExchangeName.OKX,
+            symbol="ETH-USDT-PERP",
+            raw_symbol="ETH-USDT-SWAP",
+            price=Decimal("100"),
+            quantity=Decimal("1"),
+            side=TradeSide.BUY,
+            trade_id=STAGING_CHECKPOINT_ID,
+            trade_time_ms=CHECKPOINT_TS,
+        )
+    )
+    store.save_checkpoint(
+        RangeBuilderCheckpoint(
+            exchange="okx",
+            symbol="ETH-USDT-PERP",
+            range_pct="0.001",
+            bucket_start_ms=BUCKET_START,
+            bucket_end_ms=BUCKET_END,
+            last_trade_id=STAGING_CHECKPOINT_ID,
+            last_trade_ts_ms=CHECKPOINT_TS,
+            last_ws_recv_ts_ms=CHECKPOINT_TS,
+            range_bar_count=0,
+            aggregate={},
+            builder_state=builder.snapshot_state(),
+            coverage_status=RangeCoverageStatus.COMPLETE.value,
+            missing_gap_ms=500,
+            checkpoint_updated_at_ms=CHECKPOINT_TS,
+        )
+    )
+    store.save_completed_aggregate(
+        exchange="okx",
+        aggregate=RangeBarAggregate(
+            symbol="ETH-USDT-PERP",
+            range_pct=Decimal("0.001"),
+            bucket_start_ms=BUCKET_START,
+            bucket_end_ms=BUCKET_END,
+            bar_count=1,
+            first_open=Decimal("100"),
+            last_close=Decimal("100"),
+            high=Decimal("100"),
+            low=Decimal("100"),
+            buy_notional_sum=Decimal("1"),
+            sell_notional_sum=Decimal("0"),
+            delta_notional_sum=Decimal("1"),
+            notional_sum=Decimal("1"),
+        ),
+        coverage_status=RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value,
+        missing_gap_ms=500,
+        completed_at_ms=BUCKET_END,
+    )
+    return store
+
+
+def _seed_staging_journal(tmp_path):
+    journal = SqliteRangeRepairJournalStore(tmp_path / "journal.sqlite3")
+    journal.open_bucket(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=BUCKET_START,
+        bucket_end_ms=BUCKET_END,
+        checkpoint_last_trade_ts_ms=CHECKPOINT_TS,
+        checkpoint_last_trade_id=STAGING_CHECKPOINT_ID,
+        updated_at_ms=CHECKPOINT_TS,
+    )
+    journal.record_first_live_trade(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=BUCKET_START,
+        trade_time_ms=FIRST_LIVE_TS,
+        trade_id=STAGING_FIRST_LIVE_ID,
+        recorded_at_ms=FIRST_LIVE_TS,
+    )
+    journal.append_trades(
+        [
+            RangeRepairTrade(
+                exchange="okx",
+                symbol="ETH-USDT-PERP",
+                range_pct="0.001",
+                bucket_start_ms=BUCKET_START,
+                trade_time_ms=FIRST_LIVE_TS,
+                event_time_ms=FIRST_LIVE_TS,
+                trade_id=STAGING_FIRST_LIVE_ID,
+                raw_symbol="ETH-USDT-SWAP",
+                side="buy",
+                price="100.4",
+                quantity="1",
+                source="websocket",
+                created_at_ms=FIRST_LIVE_TS,
+            )
+        ]
+    )
+    journal.finalize(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=BUCKET_START,
+        finalized_at_ms=BUCKET_END + 1,
+    )
+    return journal
+
+
+def _args_staging(tmp_path) -> list[str]:
+    return [
+        "--exchange", "okx",
+        "--symbol", "ETH-USDT-PERP",
+        "--range-pct", "0.001",
+        "--bucket-start-ms", str(BUCKET_START),
+        "--bucket-end-ms", str(BUCKET_END),
+        "--coverage-status", RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value,
+        "--missing-gap-ms", "500",
+        "--checkpoint-db", str(tmp_path / "checkpoint.sqlite3"),
+        "--market-db", str(tmp_path / "market.sqlite3"),
+        "--journal-db", str(tmp_path / "journal.sqlite3"),
+        "--status-path", str(tmp_path / "status.json"),
+        "--lock-path", str(tmp_path / "repair.lock"),
+        "--max-seconds", "30",
+        "--max-pages", "20",
+        "--wait-poll-seconds", "0.01",
+    ]
+
+
+# ── resumable staging worker tests ───────────────────────────────────────
+
+
+def test_worker_partial_chunk_then_resume_completes(tmp_path, monkeypatch) -> None:
+    """Worker exits PARTIAL on first run, then SUCCESS on second run with cursor resume."""
+    store = _seed_staging_numeric(tmp_path / "checkpoint.sqlite3")
+    _seed_staging_journal(tmp_path)
+
+    # Gap is [CHECKPOINT_TS+1, FIRST_LIVE_TS-1] = [1780000000101, 1780000000187]
+    GAP_START = CHECKPOINT_TS + 1
+    GAP_END = FIRST_LIVE_TS - 1
+
+    call_count = [0]
+
+    class ChunkedProvider:
+        def __init__(self):
+            self.last_historical_trade_pages = 0
+
+        async def fetch_trades_between_ids(self, **kwargs):
+            call_count[0] += 1
+            newer_id = int(kwargs["newer_trade_id"])
+            older_id = int(kwargs.get("older_trade_id", 0))
+            if call_count[0] == 1:
+                # First round: pagination exhausted with 20 pages
+                self.last_historical_trade_pages = 20
+                return [
+                    MarketTrade(
+                        exchange=ExchangeName.OKX,
+                        symbol="ETH-USDT-PERP",
+                        raw_symbol="ETH-USDT-SWAP",
+                        price=Decimal("100.2"),
+                        quantity=Decimal("1"),
+                        side=TradeSide.BUY,
+                        trade_id=str(newer_id - 100 + i),
+                        trade_time_ms=GAP_END - 30 + i,
+                        source=MarketDataSource.REST,
+                    )
+                    for i in range(25)
+                ]
+            else:
+                # Second round: all available trades fetched (1 page)
+                self.last_historical_trade_pages = 1
+                return [
+                    MarketTrade(
+                        exchange=ExchangeName.OKX,
+                        symbol="ETH-USDT-PERP",
+                        raw_symbol="ETH-USDT-SWAP",
+                        price=Decimal("100.2"),
+                        quantity=Decimal("1"),
+                        side=TradeSide.BUY,
+                        trade_id=str(older_id + 1 + i),
+                        trade_time_ms=GAP_START + i,
+                        source=MarketDataSource.REST,
+                    )
+                    for i in range(5)
+                ]
+
+        async def fetch_trades(self, **kwargs):
+            raise AssertionError("time-range fallback must not be used")
+
+    monkeypatch.setattr(
+        worker, "create_market_data_feed", lambda *args, **kwargs: ChunkedProvider()
+    )
+
+    assert worker.main(_args_staging(tmp_path)) == 0
+
+    job = store.load_micro_repair_job(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=BUCKET_START,
+    )
+    assert job is not None
+    assert job.status == MICRO_REPAIR_PARTIAL
+
+    staging = store.load_staging(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=BUCKET_START,
+    )
+    assert staging is not None
+    assert staging.fetched_trade_count > 0
+
+    completed = store.load_completed_aggregate(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_end_ms=BUCKET_END,
+    )
+    assert completed is None or completed.coverage_status != "COMPLETE"
+
+    assert worker.main(_args_staging(tmp_path)) == 0
+
+    job2 = store.load_micro_repair_job(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=BUCKET_START,
+    )
+    assert job2 is not None
+    assert job2.status == MICRO_REPAIR_SUCCESS
+
+
+def test_worker_partial_releases_lock(tmp_path, monkeypatch) -> None:
+    """Worker must not hold the lock between PARTIAL chunks."""
+    _seed_staging_numeric(tmp_path / "checkpoint.sqlite3")
+    _seed_staging_journal(tmp_path)
+
+    GAP_START = CHECKPOINT_TS + 1
+    GAP_END = FIRST_LIVE_TS - 1
+
+    class PartialProvider:
+        def __init__(self):
+            self.last_historical_trade_pages = 20
+
+        async def fetch_trades_between_ids(self, **kwargs):
+            newer_id = int(kwargs["newer_trade_id"])
+            return [
+                MarketTrade(
+                    exchange=ExchangeName.OKX,
+                    symbol="ETH-USDT-PERP",
+                    raw_symbol="ETH-USDT-SWAP",
+                    price=Decimal("100.2"),
+                    quantity=Decimal("1"),
+                    side=TradeSide.BUY,
+                    trade_id=str(newer_id - 10 + i),
+                    trade_time_ms=GAP_END - 5 + (i % 5),
+                    source=MarketDataSource.REST,
+                )
+                for i in range(10)
+            ]
+
+        async def fetch_trades(self, **kwargs):
+            raise AssertionError("time-range fallback must not be used")
+
+    monkeypatch.setattr(
+        worker, "create_market_data_feed", lambda *args, **kwargs: PartialProvider()
+    )
+
+    worker.main(_args_staging(tmp_path))
+    lock_path = tmp_path / "repair.lock"
+    assert not lock_path.exists(), "lock must be released between partial chunks"
+
+
+def test_worker_partial_exit_code_zero(tmp_path, monkeypatch) -> None:
+    """PARTIAL exit must have exit_code=0, not 1."""
+    _seed_staging_numeric(tmp_path / "checkpoint.sqlite3")
+    _seed_staging_journal(tmp_path)
+
+    GAP_START = CHECKPOINT_TS + 1
+    GAP_END = FIRST_LIVE_TS - 1
+
+    class PartialExitProvider:
+        def __init__(self):
+            self.last_historical_trade_pages = 20
+
+        async def fetch_trades_between_ids(self, **kwargs):
+            newer_id = int(kwargs["newer_trade_id"])
+            return [
+                MarketTrade(
+                    exchange=ExchangeName.OKX,
+                    symbol="ETH-USDT-PERP",
+                    raw_symbol="ETH-USDT-SWAP",
+                    price=Decimal("100.2"),
+                    quantity=Decimal("1"),
+                    side=TradeSide.BUY,
+                    trade_id=str(newer_id - 10 + i),
+                    trade_time_ms=GAP_END - 5 + (i % 5),
+                    source=MarketDataSource.REST,
+                )
+                for i in range(10)
+            ]
+
+        async def fetch_trades(self, **kwargs):
+            raise AssertionError("time-range fallback must not be used")
+
+    monkeypatch.setattr(
+        worker, "create_market_data_feed", lambda *args, **kwargs: PartialExitProvider()
+    )
+
+    exit_code = worker.main(_args_staging(tmp_path))
+    assert exit_code == 0, f"PARTIAL exit should be 0, got {exit_code}"
+
+    store = SqliteRangeCheckpointStore(tmp_path / "checkpoint.sqlite3")
+    job = store.load_micro_repair_job(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=BUCKET_START,
+    )
+    assert job is not None
+    assert job.status == MICRO_REPAIR_PARTIAL
+    assert job.status != MICRO_REPAIR_FAILED

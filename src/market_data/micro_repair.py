@@ -11,9 +11,16 @@ from src.market_data.derived import RangeBarAggregator, RangeBarBuilder
 from src.market_data.models import RangeCoverageStatus, TimeRange
 from src.market_data.ports import HistoricalTradeProvider
 from src.market_data.range_checkpoint import (
+    MICRO_REPAIR_PARTIAL,
     RangeMicroRepairJob,
+    RangeMicroRepairStagingState,
+    RangeMicroRepairStagingTrade,
     SqliteRangeCheckpointStore,
+    STAGING_STATUS_FETCH_COMPLETE,
+    STAGING_STATUS_FETCHING,
+    STAGING_STATUS_PENDING,
 )
+from src.market_data.backfill.status_store import now_ms as _now_ms
 from src.market_data.range_repair import JOURNAL_FINALIZED
 from src.market_data.storage import SqliteRangeBarStore
 # Legacy compatibility: normalized MarketTrade still lives under platform.
@@ -36,6 +43,7 @@ class RangeMicroRepairFetchResult:
     rest_deduped_trades: int
     fetch_mode: str
     fallback_reason: str | None
+    coverage_complete: bool = True
 
 
 @dataclass(frozen=True)
@@ -130,6 +138,12 @@ class RangeMicroRepairService:
             return "not_required", None
         if not older_trade_id or not newer_trade_id:
             return "time_range_fallback", "missing_trade_ids"
+        # Validate numeric trade IDs before attempting anchored fetch
+        try:
+            int(str(older_trade_id))
+            int(str(newer_trade_id))
+        except (ValueError, TypeError):
+            return "time_range_fallback", "non_numeric_trade_ids"
         anchored_fetch = getattr(
             self.provider,
             "fetch_trades_between_ids",
@@ -167,18 +181,21 @@ class RangeMicroRepairService:
             self.provider,
             "fetch_trades_between_ids",
         )
+        fetch_kwargs = {
+            "symbol": symbol,
+            "newer_trade_id": newer_trade_id,
+            "older_trade_id": older_trade_id,
+            "start_time_ms": int(start_time_ms),
+            "end_time_ms": int(end_time_ms),
+            "limit": self.page_limit,
+            "max_pages": self.max_pages,
+            "oldest_first": True,
+        }
+        if _accepts_keyword(anchored_fetch, "partial_on_pagination"):
+            fetch_kwargs["partial_on_pagination"] = True
         try:
             page = await asyncio.wait_for(
-                anchored_fetch(
-                    symbol=symbol,
-                    newer_trade_id=newer_trade_id,
-                    older_trade_id=older_trade_id,
-                    start_time_ms=int(start_time_ms),
-                    end_time_ms=int(end_time_ms),
-                    limit=self.page_limit,
-                    max_pages=self.max_pages,
-                    oldest_first=True,
-                ),
+                anchored_fetch(**fetch_kwargs),
                 timeout=self.max_seconds,
             )
         except asyncio.TimeoutError as exc:
@@ -189,14 +206,14 @@ class RangeMicroRepairService:
         raw_rows = tuple(page)
         by_identity: dict[tuple[object, ...], MarketTrade] = {}
         for trade in raw_rows:
-            trade_id = str(trade.trade_id or "")
+            trade_id_str = str(trade.trade_id or "")
             try:
-                numeric_trade_id = int(trade_id)
+                numeric_trade_id = int(trade_id_str)
             except ValueError as exc:
                 raise RangeMicroRepairError(
                     "trade-id anchored provider returned a trade without a numeric ID"
                 ) from exc
-            if not older_id < numeric_trade_id < newer_id:
+            if not (numeric_trade_id < newer_id):
                 raise RangeMicroRepairError(
                     "trade-id anchored provider returned a trade outside anchor bounds"
                 )
@@ -224,10 +241,26 @@ class RangeMicroRepairService:
                 or 1
             ),
         )
-        if pages > self.max_pages:
-            raise RangeMicroRepairError(
-                f"REST pagination limit exceeded: pages={pages} max_pages={self.max_pages}"
-            )
+
+        # Determine if coverage is complete:
+        # 1. Oldest fetched trade ID reaches or passes the checkpoint anchor, OR
+        # 2. Provider did not exhaust its pagination budget (all available data
+        #    in the range has been fetched)
+        oldest_fetched_id: int | None = None
+        for trade in trades:
+            tid_str = str(trade.trade_id or "")
+            try:
+                tid = int(tid_str)
+            except ValueError:
+                continue
+            if oldest_fetched_id is None or tid < oldest_fetched_id:
+                oldest_fetched_id = tid
+        reached_checkpoint = (
+            oldest_fetched_id is not None and oldest_fetched_id <= older_id
+        )
+        pagination_not_exhausted = pages < self.max_pages
+        coverage_complete = reached_checkpoint or pagination_not_exhausted
+
         return RangeMicroRepairFetchResult(
             trades=trades,
             rest_pages=pages,
@@ -235,6 +268,7 @@ class RangeMicroRepairService:
             rest_deduped_trades=len(trades),
             fetch_mode="trade_id_anchor",
             fallback_reason=None,
+            coverage_complete=coverage_complete,
         )
 
     async def _fetch_time_range(
@@ -348,6 +382,186 @@ class RangeMicroRepairService:
         )
 
 
+class RangeMicroRepairStagingService:
+    """Fetch REST gap trades in bounded chunks, persisting progress to staging.
+
+    Each call to :meth:`fetch_chunk` runs for at most *max_seconds* and
+    *max_pages*.  When the provider cannot prove full coverage in one chunk the
+    service saves partial trades and a cursor so the next invocation can resume
+    without re-fetching from the beginning.
+    """
+
+    def __init__(
+        self,
+        provider: HistoricalTradeProvider,
+        checkpoint_store: SqliteRangeCheckpointStore,
+        *,
+        page_limit: int = 100,
+        max_pages: int = 20,
+        max_seconds: float = 30.0,
+    ) -> None:
+        self.fetcher = RangeMicroRepairService(
+            provider,
+            page_limit=page_limit,
+            max_pages=max_pages,
+            max_seconds=max_seconds,
+        )
+        self.checkpoint_store = checkpoint_store
+
+    async def fetch_chunk(
+        self,
+        job: RangeMicroRepairJob,
+        *,
+        staging: RangeMicroRepairStagingState | None = None,
+        now_ms_value: int | None = None,
+    ) -> tuple[list[MarketTrade], RangeMicroRepairStagingState, bool]:
+        """Fetch one bounded chunk and persist progress.
+
+        Returns ``(trades, new_staging, coverage_complete)``.
+        """
+        ts = _now_ms() if now_ms_value is None else int(now_ms_value)
+
+        # Determine anchors: resume from cursor or start from first_live
+        if staging is not None and staging.current_oldest_fetched_trade_id is not None:
+            newer_anchor = staging.current_oldest_fetched_trade_id
+        else:
+            newer_anchor = job.first_live_trade_id
+        older_anchor = job.checkpoint_last_trade_id
+
+        repair_gap_start_ms = int(job.checkpoint_last_trade_ts_ms or 0) + 1
+        repair_gap_end_ms = int(job.first_live_trade_ts_ms or 0) - 1
+
+        fetch_result = await self.fetcher.fetch(
+            symbol=job.symbol,
+            start_time_ms=repair_gap_start_ms,
+            end_time_ms=repair_gap_end_ms,
+            newer_trade_id=newer_anchor,
+            older_trade_id=older_anchor,
+        )
+
+        # Build or update staging state
+        if staging is None:
+            staging = RangeMicroRepairStagingState(
+                exchange=job.exchange,
+                symbol=job.symbol,
+                range_pct=job.range_pct,
+                bucket_start_ms=job.bucket_start_ms,
+                bucket_end_ms=job.bucket_end_ms,
+                checkpoint_last_trade_id=job.checkpoint_last_trade_id,
+                checkpoint_last_trade_ts_ms=job.checkpoint_last_trade_ts_ms,
+                first_live_trade_id=job.first_live_trade_id,
+                first_live_trade_ts_ms=job.first_live_trade_ts_ms,
+                repair_gap_start_ms=repair_gap_start_ms,
+                repair_gap_end_ms=repair_gap_end_ms,
+                status=STAGING_STATUS_FETCHING,
+                created_at_ms=ts,
+                updated_at_ms=ts,
+            )
+
+        # Determine the oldest trade we fetched
+        oldest_fetched_id: str | None = staging.current_oldest_fetched_trade_id
+        oldest_fetched_ts: int | None = staging.current_oldest_fetched_ts_ms
+        newest_fetched_id: str | None = staging.current_newest_fetched_trade_id
+        for trade in fetch_result.trades:
+            tid = str(trade.trade_id or "")
+            tts = _trade_time_ms(trade)
+            try:
+                numeric_tid = int(tid)
+            except ValueError:
+                continue
+            if oldest_fetched_id is None:
+                oldest_fetched_id = tid
+                oldest_fetched_ts = tts
+                newest_fetched_id = tid
+            else:
+                try:
+                    if int(tid) < int(oldest_fetched_id):
+                        oldest_fetched_id = tid
+                        oldest_fetched_ts = tts
+                except ValueError:
+                    pass
+                try:
+                    if newest_fetched_id is None or int(tid) > int(newest_fetched_id):
+                        newest_fetched_id = tid
+                except ValueError:
+                    pass
+
+        # Coalesce coverage: complete if fetch_result says so OR cursor reached checkpoint
+        coverage_complete = fetch_result.coverage_complete
+        if not coverage_complete and oldest_fetched_id is not None:
+            try:
+                if (
+                    job.checkpoint_last_trade_id is not None
+                    and int(oldest_fetched_id) <= int(job.checkpoint_last_trade_id)
+                ):
+                    coverage_complete = True
+            except (ValueError, TypeError):
+                # Non-numeric trade IDs → rely on fetch_result.coverage_complete
+                pass
+
+        # Convert MarketTrade → RangeMicroRepairStagingTrade for persistence
+        staging_trades: list[RangeMicroRepairStagingTrade] = []
+        for trade in fetch_result.trades:
+            staging_trades.append(
+                RangeMicroRepairStagingTrade(
+                    exchange=str(job.exchange),
+                    symbol=job.symbol,
+                    range_pct=job.range_pct,
+                    bucket_start_ms=job.bucket_start_ms,
+                    trade_id=str(trade.trade_id or ""),
+                    trade_time_ms=int(_trade_time_ms(trade) or 0),
+                    price=str(trade.price),
+                    quantity=str(trade.quantity),
+                    side=getattr(trade.side, "value", str(trade.side)),
+                    source=getattr(trade.source, "value", str(trade.source)),
+                    raw_symbol=getattr(trade, "raw_symbol", None),
+                    event_time_ms=trade.event_time_ms,
+                    created_at_ms=ts,
+                )
+            )
+
+        # Persist
+        new_staging = RangeMicroRepairStagingState(
+            exchange=staging.exchange,
+            symbol=staging.symbol,
+            range_pct=staging.range_pct,
+            bucket_start_ms=staging.bucket_start_ms,
+            bucket_end_ms=staging.bucket_end_ms,
+            checkpoint_last_trade_id=staging.checkpoint_last_trade_id,
+            checkpoint_last_trade_ts_ms=staging.checkpoint_last_trade_ts_ms,
+            first_live_trade_id=staging.first_live_trade_id,
+            first_live_trade_ts_ms=staging.first_live_trade_ts_ms,
+            repair_gap_start_ms=staging.repair_gap_start_ms,
+            repair_gap_end_ms=staging.repair_gap_end_ms,
+            current_oldest_fetched_trade_id=oldest_fetched_id,
+            current_oldest_fetched_ts_ms=oldest_fetched_ts,
+            current_newest_fetched_trade_id=newest_fetched_id or (
+                staging.current_newest_fetched_trade_id
+            ),
+            fetched_trade_count=(
+                staging.fetched_trade_count + len(staging_trades)
+            ),
+            rest_pages_total=(
+                staging.rest_pages_total + fetch_result.rest_pages
+            ),
+            status=(
+                STAGING_STATUS_FETCH_COMPLETE
+                if coverage_complete
+                else STAGING_STATUS_FETCHING
+            ),
+            created_at_ms=staging.created_at_ms or ts,
+            updated_at_ms=ts,
+        )
+        self.checkpoint_store.save_staging(
+            new_staging,
+            trades=staging_trades if staging_trades else None,
+        )
+
+        # Return fetched trades (for the caller to potentially replay now)
+        trades_list = list(fetch_result.trades)
+        return trades_list, new_staging, coverage_complete
+
+
 class RangeMicroRepairRebuildService:
     """Rebuild one closed degraded bucket without touching live memory."""
 
@@ -379,6 +593,7 @@ class RangeMicroRepairRebuildService:
         *,
         journal_trades: Sequence[MarketTrade],
         completed_at_ms: int,
+        rest_gap_trades: Sequence[MarketTrade] | None = None,
     ) -> RangeMicroRepairRebuildResult:
         if job.checkpoint_last_trade_ts_ms is None or not job.builder_state:
             raise RangeMicroRepairError(
@@ -414,7 +629,8 @@ class RangeMicroRepairRebuildService:
             "checkpoint_last_trade_ts_ms=%s checkpoint_last_trade_id=%s "
             "first_live_trade_ts_ms=%s first_live_trade_id=%s "
             "repair_gap_start_ms=%s repair_gap_end_ms=%s repair_gap_ms=%s "
-            "fetch_mode=%s fallback_reason=%s coverage_before=%s",
+            "fetch_mode=%s fallback_reason=%s coverage_before=%s "
+            "rest_gap_trades_provided=%s",
             job.symbol,
             job.exchange,
             job.range_pct,
@@ -430,20 +646,34 @@ class RangeMicroRepairRebuildService:
             fetch_mode,
             fallback_reason,
             job.coverage_status,
+            rest_gap_trades is not None,
         )
-        fetch = await self.fetcher.fetch(
-            symbol=job.symbol,
-            start_time_ms=repair_gap_start_ms,
-            end_time_ms=repair_gap_end_ms,
-            newer_trade_id=job.first_live_trade_id,
-            older_trade_id=job.checkpoint_last_trade_id,
-        )
+        if rest_gap_trades is not None:
+            rest_deduped = dedupe_and_sort_trades(rest_gap_trades)
+            fetch = RangeMicroRepairFetchResult(
+                trades=rest_deduped,
+                rest_pages=0,
+                rest_raw_trades=len(rest_gap_trades),
+                rest_deduped_trades=len(rest_deduped),
+                fetch_mode=fetch_mode,
+                fallback_reason=fallback_reason,
+                coverage_complete=True,
+            )
+        else:
+            fetch = await self.fetcher.fetch(
+                symbol=job.symbol,
+                start_time_ms=repair_gap_start_ms,
+                end_time_ms=repair_gap_end_ms,
+                newer_trade_id=job.first_live_trade_id,
+                older_trade_id=job.checkpoint_last_trade_id,
+            )
         logger.info(
             "range_micro_repair_rest_gap_fetch_completed | symbol=%s "
             "exchange=%s bucket_start_ms=%s bucket_end_ms=%s "
             "repair_gap_start_ms=%s repair_gap_end_ms=%s repair_gap_ms=%s "
             "fetch_mode=%s fallback_reason=%s rest_pages=%s "
-            "rest_raw_trades=%s rest_deduped_trades=%s",
+            "rest_raw_trades=%s rest_deduped_trades=%s "
+            "coverage_complete=%s",
             job.symbol,
             job.exchange,
             job.bucket_start_ms,
@@ -456,6 +686,7 @@ class RangeMicroRepairRebuildService:
             fetch.rest_pages,
             fetch.rest_raw_trades,
             fetch.rest_deduped_trades,
+            fetch.coverage_complete,
         )
 
         journal_rows = tuple(journal_trades)

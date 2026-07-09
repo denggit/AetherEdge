@@ -18,6 +18,20 @@ MICRO_REPAIR_RUNNING = "micro_repair_running"
 MICRO_REPAIR_SUCCESS = "micro_repair_success"
 MICRO_REPAIR_FAILED = "micro_repair_failed"
 MICRO_REPAIR_SKIPPED = "micro_repair_skipped"
+MICRO_REPAIR_PARTIAL = "micro_repair_partial"
+MICRO_REPAIR_PENDING = "micro_repair_pending"
+
+STAGING_STATUS_PENDING = "pending"
+STAGING_STATUS_FETCHING = "fetching"
+STAGING_STATUS_FETCH_COMPLETE = "fetch_complete"
+
+
+def _micro_repair_is_terminal_failure(status: str) -> bool:
+    return str(status) in {MICRO_REPAIR_FAILED}
+
+
+def _micro_repair_is_resumable(status: str) -> bool:
+    return str(status) in {MICRO_REPAIR_PARTIAL, MICRO_REPAIR_PENDING}
 
 
 @dataclass(frozen=True)
@@ -89,6 +103,69 @@ class RangeMicroRepairJob:
             _decimal_text(self.range_pct),
             self.bucket_start_ms,
         )
+
+
+@dataclass(frozen=True)
+class RangeMicroRepairStagingState:
+    exchange: str
+    symbol: str
+    range_pct: str
+    bucket_start_ms: int
+    bucket_end_ms: int
+    checkpoint_last_trade_id: str | None
+    checkpoint_last_trade_ts_ms: int | None
+    first_live_trade_id: str | None
+    first_live_trade_ts_ms: int | None
+    repair_gap_start_ms: int
+    repair_gap_end_ms: int
+    current_oldest_fetched_trade_id: str | None = None
+    current_oldest_fetched_ts_ms: int | None = None
+    current_newest_fetched_trade_id: str | None = None
+    fetched_trade_count: int = 0
+    rest_pages_total: int = 0
+    status: str = STAGING_STATUS_PENDING
+    created_at_ms: int = 0
+    updated_at_ms: int = 0
+
+    @property
+    def key(self) -> tuple[str, str, str, int]:
+        return (
+            str(self.exchange).lower(),
+            self.symbol,
+            _decimal_text(self.range_pct),
+            self.bucket_start_ms,
+        )
+
+    @property
+    def coverage_complete(self) -> bool:
+        """True when the cursor has reached or passed the checkpoint trade ID."""
+        if self.current_oldest_fetched_trade_id is None:
+            return False
+        if self.checkpoint_last_trade_id is None:
+            return False
+        try:
+            return int(self.current_oldest_fetched_trade_id) <= int(
+                self.checkpoint_last_trade_id
+            )
+        except (TypeError, ValueError):
+            return False
+
+
+@dataclass(frozen=True)
+class RangeMicroRepairStagingTrade:
+    exchange: str
+    symbol: str
+    range_pct: str
+    bucket_start_ms: int
+    trade_id: str
+    trade_time_ms: int
+    price: str
+    quantity: str
+    side: str
+    source: str = "rest"
+    raw_symbol: str | None = None
+    event_time_ms: int | None = None
+    created_at_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -718,6 +795,243 @@ class SqliteRangeCheckpointStore:
             ).fetchone()
         return int(row[0] or 0), int(row[1] or 0)
 
+    # ── micro repair staging ───────────────────────────────────────────
+
+    def save_staging(
+        self,
+        staging: RangeMicroRepairStagingState,
+        *,
+        trades: Sequence[RangeMicroRepairStagingTrade] | None = None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO range_micro_repair_staging (
+                    exchange, symbol, range_pct, bucket_start_ms, bucket_end_ms,
+                    checkpoint_last_trade_id, checkpoint_last_trade_ts_ms,
+                    first_live_trade_id, first_live_trade_ts_ms,
+                    repair_gap_start_ms, repair_gap_end_ms,
+                    current_oldest_fetched_trade_id, current_oldest_fetched_ts_ms,
+                    current_newest_fetched_trade_id,
+                    fetched_trade_count, rest_pages_total,
+                    status, created_at_ms, updated_at_ms
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                ON CONFLICT(exchange, symbol, range_pct, bucket_start_ms)
+                DO UPDATE SET
+                    bucket_end_ms=excluded.bucket_end_ms,
+                    checkpoint_last_trade_id=excluded.checkpoint_last_trade_id,
+                    checkpoint_last_trade_ts_ms=excluded.checkpoint_last_trade_ts_ms,
+                    first_live_trade_id=excluded.first_live_trade_id,
+                    first_live_trade_ts_ms=excluded.first_live_trade_ts_ms,
+                    repair_gap_start_ms=excluded.repair_gap_start_ms,
+                    repair_gap_end_ms=excluded.repair_gap_end_ms,
+                    current_oldest_fetched_trade_id=excluded.current_oldest_fetched_trade_id,
+                    current_oldest_fetched_ts_ms=excluded.current_oldest_fetched_ts_ms,
+                    current_newest_fetched_trade_id=excluded.current_newest_fetched_trade_id,
+                    fetched_trade_count=excluded.fetched_trade_count,
+                    rest_pages_total=excluded.rest_pages_total,
+                    status=excluded.status,
+                    updated_at_ms=excluded.updated_at_ms
+                """,
+                (
+                    str(staging.exchange).lower(),
+                    staging.symbol,
+                    _decimal_text(staging.range_pct),
+                    int(staging.bucket_start_ms),
+                    int(staging.bucket_end_ms),
+                    staging.checkpoint_last_trade_id,
+                    staging.checkpoint_last_trade_ts_ms,
+                    staging.first_live_trade_id,
+                    staging.first_live_trade_ts_ms,
+                    int(staging.repair_gap_start_ms),
+                    int(staging.repair_gap_end_ms),
+                    staging.current_oldest_fetched_trade_id,
+                    staging.current_oldest_fetched_ts_ms,
+                    staging.current_newest_fetched_trade_id,
+                    int(staging.fetched_trade_count),
+                    int(staging.rest_pages_total),
+                    str(staging.status),
+                    int(staging.created_at_ms),
+                    int(staging.updated_at_ms),
+                ),
+            )
+            if trades:
+                conn.executemany(
+                    """
+                    INSERT OR IGNORE INTO range_micro_repair_staging_trades (
+                        exchange, symbol, range_pct, bucket_start_ms,
+                        trade_id, trade_time_ms, price, quantity, side,
+                        source, raw_symbol, event_time_ms, created_at_ms
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            str(t.exchange).lower(),
+                            t.symbol,
+                            _decimal_text(t.range_pct),
+                            int(t.bucket_start_ms),
+                            str(t.trade_id or ""),
+                            int(t.trade_time_ms),
+                            t.price,
+                            t.quantity,
+                            t.side,
+                            str(t.source),
+                            t.raw_symbol,
+                            t.event_time_ms,
+                            int(t.created_at_ms),
+                        )
+                        for t in trades
+                    ],
+                )
+
+    def load_staging(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        range_pct: str,
+        bucket_start_ms: int,
+    ) -> RangeMicroRepairStagingState | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT exchange, symbol, range_pct, bucket_start_ms, bucket_end_ms,
+                       checkpoint_last_trade_id, checkpoint_last_trade_ts_ms,
+                       first_live_trade_id, first_live_trade_ts_ms,
+                       repair_gap_start_ms, repair_gap_end_ms,
+                       current_oldest_fetched_trade_id, current_oldest_fetched_ts_ms,
+                       current_newest_fetched_trade_id,
+                       fetched_trade_count, rest_pages_total,
+                       status, created_at_ms, updated_at_ms
+                FROM range_micro_repair_staging
+                WHERE exchange = ? AND symbol = ? AND range_pct = ?
+                  AND bucket_start_ms = ?
+                """,
+                (
+                    str(exchange).lower(),
+                    symbol,
+                    _decimal_text(range_pct),
+                    int(bucket_start_ms),
+                ),
+            ).fetchone()
+        return None if row is None else _staging_state_from_row(row)
+
+    def load_staging_trades(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        range_pct: str,
+        bucket_start_ms: int,
+    ) -> list[RangeMicroRepairStagingTrade]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT exchange, symbol, range_pct, bucket_start_ms,
+                       trade_id, trade_time_ms, price, quantity, side,
+                       source, raw_symbol, event_time_ms, created_at_ms
+                FROM range_micro_repair_staging_trades
+                WHERE exchange = ? AND symbol = ? AND range_pct = ?
+                  AND bucket_start_ms = ?
+                ORDER BY trade_time_ms ASC, trade_id ASC
+                """,
+                (
+                    str(exchange).lower(),
+                    symbol,
+                    _decimal_text(range_pct),
+                    int(bucket_start_ms),
+                ),
+            ).fetchall()
+        return [_staging_trade_from_row(row) for row in rows]
+
+    def staging_trade_count(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        range_pct: str,
+        bucket_start_ms: int,
+    ) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) FROM range_micro_repair_staging_trades
+                WHERE exchange = ? AND symbol = ? AND range_pct = ?
+                  AND bucket_start_ms = ?
+                """,
+                (
+                    str(exchange).lower(),
+                    symbol,
+                    _decimal_text(range_pct),
+                    int(bucket_start_ms),
+                ),
+            ).fetchone()
+        return int(row[0] or 0)
+
+    def clear_staging(
+        self,
+        *,
+        exchange: str,
+        symbol: str,
+        range_pct: str,
+        bucket_start_ms: int,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                DELETE FROM range_micro_repair_staging_trades
+                WHERE exchange = ? AND symbol = ? AND range_pct = ?
+                  AND bucket_start_ms = ?
+                """,
+                (
+                    str(exchange).lower(),
+                    symbol,
+                    _decimal_text(range_pct),
+                    int(bucket_start_ms),
+                ),
+            )
+            conn.execute(
+                """
+                DELETE FROM range_micro_repair_staging
+                WHERE exchange = ? AND symbol = ? AND range_pct = ?
+                  AND bucket_start_ms = ?
+                """,
+                (
+                    str(exchange).lower(),
+                    symbol,
+                    _decimal_text(range_pct),
+                    int(bucket_start_ms),
+                ),
+            )
+
+    def cleanup_staging_older_than(self, *, older_than_ms: int) -> tuple[int, int]:
+        with self._connect() as conn:
+            before = conn.total_changes
+            conn.execute(
+                """
+                DELETE FROM range_micro_repair_staging_trades
+                WHERE (exchange, symbol, range_pct, bucket_start_ms) IN (
+                    SELECT exchange, symbol, range_pct, bucket_start_ms
+                    FROM range_micro_repair_staging
+                    WHERE updated_at_ms < ?
+                )
+                """,
+                (int(older_than_ms),),
+            )
+            trades_deleted = conn.total_changes - before
+            before = conn.total_changes
+            conn.execute(
+                """
+                DELETE FROM range_micro_repair_staging
+                WHERE updated_at_ms < ?
+                """,
+                (int(older_than_ms),),
+            )
+            states_deleted = conn.total_changes - before
+        return trades_deleted, states_deleted
+
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -852,6 +1166,60 @@ class SqliteRangeCheckpointStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_range_micro_repair_due
                 ON range_micro_repair_jobs(status, bucket_end_ms)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS range_micro_repair_staging (
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    range_pct TEXT NOT NULL,
+                    bucket_start_ms INTEGER NOT NULL,
+                    bucket_end_ms INTEGER NOT NULL,
+                    checkpoint_last_trade_id TEXT,
+                    checkpoint_last_trade_ts_ms INTEGER,
+                    first_live_trade_id TEXT,
+                    first_live_trade_ts_ms INTEGER,
+                    repair_gap_start_ms INTEGER NOT NULL,
+                    repair_gap_end_ms INTEGER NOT NULL,
+                    current_oldest_fetched_trade_id TEXT,
+                    current_oldest_fetched_ts_ms INTEGER,
+                    current_newest_fetched_trade_id TEXT,
+                    fetched_trade_count INTEGER NOT NULL DEFAULT 0,
+                    rest_pages_total INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (exchange, symbol, range_pct, bucket_start_ms)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS range_micro_repair_staging_trades (
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    range_pct TEXT NOT NULL,
+                    bucket_start_ms INTEGER NOT NULL,
+                    trade_id TEXT NOT NULL,
+                    trade_time_ms INTEGER NOT NULL,
+                    price TEXT NOT NULL,
+                    quantity TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'rest',
+                    raw_symbol TEXT,
+                    event_time_ms INTEGER,
+                    created_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (exchange, symbol, range_pct, bucket_start_ms, trade_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_micro_repair_staging_trades_time
+                ON range_micro_repair_staging_trades(
+                    exchange, symbol, range_pct, bucket_start_ms, trade_time_ms
+                )
                 """
             )
 
@@ -1055,6 +1423,58 @@ def _micro_repair_job_from_row(row: Sequence[object]) -> RangeMicroRepairJob:
         created_at_ms=int(row[19]),
         updated_at_ms=int(row[20]),
         last_error=None if row[21] is None else str(row[21]),
+    )
+
+
+def _staging_state_from_row(
+    row: Sequence[object],
+) -> RangeMicroRepairStagingState:
+    return RangeMicroRepairStagingState(
+        exchange=str(row[0]),
+        symbol=str(row[1]),
+        range_pct=str(row[2]),
+        bucket_start_ms=int(row[3]),
+        bucket_end_ms=int(row[4]),
+        checkpoint_last_trade_id=None if row[5] is None else str(row[5]),
+        checkpoint_last_trade_ts_ms=None if row[6] is None else int(row[6]),
+        first_live_trade_id=None if row[7] is None else str(row[7]),
+        first_live_trade_ts_ms=None if row[8] is None else int(row[8]),
+        repair_gap_start_ms=int(row[9]),
+        repair_gap_end_ms=int(row[10]),
+        current_oldest_fetched_trade_id=(
+            None if row[11] is None else str(row[11])
+        ),
+        current_oldest_fetched_ts_ms=(
+            None if row[12] is None else int(row[12])
+        ),
+        current_newest_fetched_trade_id=(
+            None if row[13] is None else str(row[13])
+        ),
+        fetched_trade_count=int(row[14]),
+        rest_pages_total=int(row[15]),
+        status=str(row[16]),
+        created_at_ms=int(row[17]),
+        updated_at_ms=int(row[18]),
+    )
+
+
+def _staging_trade_from_row(
+    row: Sequence[object],
+) -> RangeMicroRepairStagingTrade:
+    return RangeMicroRepairStagingTrade(
+        exchange=str(row[0]),
+        symbol=str(row[1]),
+        range_pct=str(row[2]),
+        bucket_start_ms=int(row[3]),
+        trade_id=str(row[4] or ""),
+        trade_time_ms=int(row[5]),
+        price=str(row[6]),
+        quantity=str(row[7]),
+        side=str(row[8]),
+        source=str(row[9] or "rest"),
+        raw_symbol=None if row[10] is None else str(row[10]),
+        event_time_ms=None if row[11] is None else int(row[11]),
+        created_at_ms=int(row[12]),
     )
 
 
