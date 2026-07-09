@@ -207,7 +207,10 @@ class RangeMicroRepairSupervisor:
                 exit_code,
                 reason,
             )
-            if not failure_reason_is_recoverable(reason):
+            if failure_reason_is_recoverable(reason) and RETRY_MARKER not in reason:
+                # first recoverable pagination failure: allow retry without email
+                pass
+            else:
                 self._notify_failure(reason)
         elif _micro_repair_is_resumable(repair_status):
             logger.info(

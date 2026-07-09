@@ -130,6 +130,7 @@ async def test_monitor_only_reads_worker_status_and_never_launches_repair(
 
 from src.market_data.range_checkpoint import (
     MICRO_REPAIR_FAILED,
+    MICRO_REPAIR_PARTIAL,
     MICRO_REPAIR_PENDING,
     MIN_VALID_COMPLETED_AGGREGATE_MS,
     RETRY_MARKER,
@@ -518,10 +519,10 @@ def test_journal_not_valid_for_repair_skips_retry(
     )
 
 
-def test_supervisor_suppresses_notification_for_recoverable_failure(
+def test_supervisor_suppresses_notification_for_first_recoverable_failure(
     tmp_path,
 ) -> None:
-    """Recoverable failure in _refresh_finished_process → no callback."""
+    """Recoverable failure WITHOUT retry marker → no callback (first attempt)."""
     failures = []
     supervisor = RangeMicroRepairSupervisor(
         RangeMicroRepairSupervisorConfig(
@@ -546,7 +547,7 @@ def test_supervisor_suppresses_notification_for_recoverable_failure(
     supervisor._refresh_finished_process()
 
     assert failures == [], (
-        "recoverable failure must not trigger on_failure callback"
+        "first recoverable failure (no retry marker) must not trigger callback"
     )
     assert supervisor.process is None
 
@@ -580,6 +581,109 @@ def test_supervisor_still_notifies_for_non_recoverable_failure(
 
     assert failures == ["RuntimeError:database connection lost"], (
         "non-recoverable failure must still trigger on_failure callback"
+    )
+    assert supervisor.process is None
+
+
+def test_supervisor_notifies_for_recoverable_failure_with_retry_marker(
+    tmp_path,
+) -> None:
+    """Recoverable failure WITH retry marker → callback fires (already retried)."""
+    failures = []
+    supervisor = RangeMicroRepairSupervisor(
+        RangeMicroRepairSupervisorConfig(
+            status_path=tmp_path / "status.json",
+            checkpoint_db_path=tmp_path / "checkpoint.sqlite3",
+            market_db_path=tmp_path / "market.sqlite3",
+            repo_root=tmp_path,
+        ),
+        on_failure=failures.append,
+    )
+    process = _Process([])
+    process.returncode = 1
+    supervisor.process = process
+    supervisor.status_store.write(
+        {
+            "running": False,
+            "repair_status": MICRO_REPAIR_FAILED,
+            "failure_reason": (
+                "[micro_repair_retried] ExchangeApiError:OKX history-trades "
+                "pagination limit reached before older_trade_id coverage"
+            ),
+        }
+    )
+
+    supervisor._refresh_finished_process()
+
+    assert len(failures) == 1, (
+        "recoverable failure WITH retry marker must trigger on_failure callback"
+    )
+    assert "pagination limit" in failures[0]
+    assert supervisor.process is None
+
+
+def test_supervisor_suppresses_notification_for_partial_status(
+    tmp_path,
+) -> None:
+    """PARTIAL repair status → no failure callback (resumable, not failed)."""
+    failures = []
+    supervisor = RangeMicroRepairSupervisor(
+        RangeMicroRepairSupervisorConfig(
+            status_path=tmp_path / "status.json",
+            checkpoint_db_path=tmp_path / "checkpoint.sqlite3",
+            market_db_path=tmp_path / "market.sqlite3",
+            repo_root=tmp_path,
+        ),
+        on_failure=failures.append,
+    )
+    process = _Process([])
+    process.returncode = 0
+    supervisor.process = process
+    supervisor.status_store.write(
+        {
+            "running": False,
+            "repair_status": MICRO_REPAIR_PARTIAL,
+            "failure_reason": None,
+        }
+    )
+
+    supervisor._refresh_finished_process()
+
+    assert failures == [], (
+        "PARTIAL status must not trigger on_failure callback"
+    )
+    assert supervisor.process is None
+
+
+def test_supervisor_suppresses_notification_for_pending_status(
+    tmp_path,
+) -> None:
+    """PENDING repair status → no failure callback (resumable, not failed)."""
+    failures = []
+    supervisor = RangeMicroRepairSupervisor(
+        RangeMicroRepairSupervisorConfig(
+            status_path=tmp_path / "status.json",
+            checkpoint_db_path=tmp_path / "checkpoint.sqlite3",
+            market_db_path=tmp_path / "market.sqlite3",
+            repo_root=tmp_path,
+        ),
+        on_failure=failures.append,
+    )
+    process = _Process([])
+    process.returncode = 0
+    supervisor.process = process
+    supervisor.status_store.write(
+        {
+            "running": False,
+            "repair_status": MICRO_REPAIR_PENDING,
+            "failure_reason": None,
+        }
+    )
+
+    supervisor._refresh_finished_process()
+
+    assert failures == [], (
+        "PENDING status must not trigger on_failure callback"
     )
     assert supervisor.process is None
 
