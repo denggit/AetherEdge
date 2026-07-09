@@ -149,7 +149,7 @@ def test_provider_builds_generic_supervisor_with_worker_config(
     assert config.required_minutes == 129_600
     assert config.worker_mode == "live"
     assert config.direction == "recent-to-oldest"
-    assert config.run_once is True
+    assert config.run_once is False
     assert config.no_download is False
     assert config.global_lock_priority == BACKGROUND_BACKFILL_PRIORITY
 
