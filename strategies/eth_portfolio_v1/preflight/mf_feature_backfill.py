@@ -275,9 +275,12 @@ class PortfolioV1MfFeatureBackfillProvider:
                 "AETHER_MF_FEATURE_BACKFILL_DIRECTION",
                 "recent-to-oldest",
             ),
+            # The runtime already polls readiness periodically.  Keep each worker
+            # launch bounded so MF feature repair does not hold the shared raw-trade
+            # backfill lock and starve LF range-speed repair.
             run_once=self.project_env.get_bool(
                 "AETHER_MF_FEATURE_BACKFILL_RUN_ONCE",
-                False,
+                True,
             ),
             no_download=self.project_env.get_bool(
                 "AETHER_MF_FEATURE_BACKFILL_NO_DOWNLOAD",
