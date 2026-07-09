@@ -324,3 +324,108 @@ def test_invalid_journal_can_revoke_repaired_complete_aggregate(
     assert repaired is not None
     assert repaired.coverage_status == "RECOVERED_INCOMPLETE"
     assert repaired.missing_gap_ms == 1
+
+
+# ── load_resumable_failed_micro_repair_jobs ────────────────────────────
+
+def test_load_resumable_failed_jobs_returns_recoverable_pagination_errors(
+    tmp_path,
+) -> None:
+    store = SqliteRangeCheckpointStore(tmp_path / "range.sqlite3")
+    start = MIN_VALID_COMPLETED_AGGREGATE_MS + 200_000
+
+    recoverable = RangeMicroRepairJob(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+        bucket_start_ms=start,
+        bucket_end_ms=start + 9_999,
+        checkpoint_last_trade_id="10",
+        checkpoint_last_trade_ts_ms=start + 100,
+        builder_state={"version": 1},
+        coverage_status="RECOVERED_DEGRADED_MINOR",
+        missing_gap_ms=500,
+        status=MICRO_REPAIR_FAILED,
+        created_at_ms=start,
+        updated_at_ms=start,
+        last_error="ExchangeApiError:OKX history-trades pagination limit reached before older_trade_id coverage",
+    )
+    non_recoverable = RangeMicroRepairJob(
+        exchange="okx",
+        symbol="BTC-USDT-PERP",
+        range_pct="0.002",
+        bucket_start_ms=start + 10_000,
+        bucket_end_ms=start + 19_999,
+        checkpoint_last_trade_id="20",
+        checkpoint_last_trade_ts_ms=start + 200,
+        builder_state={"version": 1},
+        coverage_status="RECOVERED_DEGRADED_MINOR",
+        missing_gap_ms=300,
+        status=MICRO_REPAIR_FAILED,
+        created_at_ms=start,
+        updated_at_ms=start,
+        last_error="RuntimeError:REST unavailable",
+    )
+    store.enqueue_micro_repair(recoverable)
+    store.enqueue_micro_repair(non_recoverable)
+
+    resumable = store.load_resumable_failed_micro_repair_jobs()
+    assert len(resumable) == 1
+    assert resumable[0].symbol == "ETH-USDT-PERP"
+    assert "pagination limit" in (resumable[0].last_error or "")
+
+
+def test_load_resumable_failed_jobs_excludes_already_retried(
+    tmp_path,
+) -> None:
+    store = SqliteRangeCheckpointStore(tmp_path / "range.sqlite3")
+    start = MIN_VALID_COMPLETED_AGGREGATE_MS + 300_000
+
+    already_retried = RangeMicroRepairJob(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+        bucket_start_ms=start,
+        bucket_end_ms=start + 9_999,
+        checkpoint_last_trade_id="10",
+        checkpoint_last_trade_ts_ms=start + 100,
+        builder_state={"version": 1},
+        coverage_status="RECOVERED_DEGRADED_MINOR",
+        missing_gap_ms=500,
+        status=MICRO_REPAIR_FAILED,
+        created_at_ms=start,
+        updated_at_ms=start,
+        last_error="[micro_repair_retried] ExchangeApiError:OKX history-trades pagination limit reached",
+    )
+    store.enqueue_micro_repair(already_retried)
+
+    resumable = store.load_resumable_failed_micro_repair_jobs()
+    assert len(resumable) == 0
+
+
+def test_load_resumable_failed_jobs_filters_null_error(
+    tmp_path,
+) -> None:
+    store = SqliteRangeCheckpointStore(tmp_path / "range.sqlite3")
+    start = MIN_VALID_COMPLETED_AGGREGATE_MS + 400_000
+
+    no_error = RangeMicroRepairJob(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+        bucket_start_ms=start,
+        bucket_end_ms=start + 9_999,
+        checkpoint_last_trade_id="10",
+        checkpoint_last_trade_ts_ms=start + 100,
+        builder_state={"version": 1},
+        coverage_status="RECOVERED_DEGRADED_MINOR",
+        missing_gap_ms=500,
+        status=MICRO_REPAIR_FAILED,
+        created_at_ms=start,
+        updated_at_ms=start,
+        last_error=None,
+    )
+    store.enqueue_micro_repair(no_error)
+
+    resumable = store.load_resumable_failed_micro_repair_jobs()
+    assert len(resumable) == 0

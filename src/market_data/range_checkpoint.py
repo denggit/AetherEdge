@@ -25,6 +25,24 @@ STAGING_STATUS_PENDING = "pending"
 STAGING_STATUS_FETCHING = "fetching"
 STAGING_STATUS_FETCH_COMPLETE = "fetch_complete"
 
+RECOVERABLE_FAILURE_PATTERNS = (
+    "pagination limit",
+    "older_trade_id coverage",
+    "REST pagination",
+)
+
+RETRY_MARKER = "[micro_repair_retried]"
+
+
+def failure_reason_is_recoverable(error: str | None) -> bool:
+    """True when *error* matches a known recoverable REST-pagination pattern."""
+    if not error:
+        return False
+    error_lower = error.lower()
+    return any(
+        pattern.lower() in error_lower for pattern in RECOVERABLE_FAILURE_PATTERNS
+    )
+
 
 def _micro_repair_is_terminal_failure(status: str) -> bool:
     return str(status) in {MICRO_REPAIR_FAILED}
@@ -663,6 +681,38 @@ class SqliteRangeCheckpointStore:
                 ),
             )
         return int(cursor.rowcount or 0) > 0
+
+    def load_resumable_failed_micro_repair_jobs(
+        self,
+    ) -> list[RangeMicroRepairJob]:
+        """Return FAILED jobs whose *last_error* matches a recoverable pattern.
+
+        Jobs that have already been retried once (marked with
+        ``RETRY_MARKER``) are excluded to prevent tight retry loops.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT exchange, symbol, range_pct, bucket_start_ms, bucket_end_ms,
+                       checkpoint_last_trade_id, checkpoint_last_trade_ts_ms,
+                       builder_state_json, coverage_status, missing_gap_ms,
+                       first_live_trade_ts_ms, first_live_trade_id,
+                       repair_gap_start_ms, repair_gap_end_ms,
+                       journal_start_ms, journal_end_ms, journal_required,
+                       journal_status,
+                       status, created_at_ms, updated_at_ms, last_error
+                FROM range_micro_repair_jobs
+                WHERE status = ?
+                """,
+                (MICRO_REPAIR_FAILED,),
+            ).fetchall()
+        jobs = [_micro_repair_job_from_row(row) for row in rows]
+        return [
+            j
+            for j in jobs
+            if failure_reason_is_recoverable(j.last_error)
+            and RETRY_MARKER not in (j.last_error or "")
+        ]
 
     def load_complete_history(
         self,
