@@ -146,6 +146,7 @@ class RestMarketDataFeed:
         limit: int = 100,
         max_pages: int = 20,
         oldest_first: bool = True,
+        partial_on_pagination: bool = False,
     ) -> list[MarketTrade]:
         if symbol is not None and symbol != self._symbol:
             raise ValueError(
@@ -160,16 +161,25 @@ class RestMarketDataFeed:
             raise NotImplementedError(
                 f"Trade-id anchored history is not supported for {self.exchange.value}"
             )
-        rows = await fetch(
-            self._symbol,
-            newer_trade_id=str(newer_trade_id),
-            older_trade_id=str(older_trade_id),
-            start_time_ms=start_time_ms,
-            end_time_ms=end_time_ms,
-            limit=int(limit),
-            max_pages=int(max_pages),
-            oldest_first=bool(oldest_first),
-        )
+        try:
+            accepts_partial = (
+                "partial_on_pagination"
+                in inspect.signature(fetch).parameters
+            )
+        except (TypeError, ValueError):
+            accepts_partial = False
+        fetch_kwargs: dict[str, object] = {
+            "newer_trade_id": str(newer_trade_id),
+            "older_trade_id": str(older_trade_id),
+            "start_time_ms": start_time_ms,
+            "end_time_ms": end_time_ms,
+            "limit": int(limit),
+            "max_pages": int(max_pages),
+            "oldest_first": bool(oldest_first),
+        }
+        if accepts_partial:
+            fetch_kwargs["partial_on_pagination"] = partial_on_pagination
+        rows = await fetch(self._symbol, **fetch_kwargs)
         self.last_historical_trade_pages = max(
             1,
             int(

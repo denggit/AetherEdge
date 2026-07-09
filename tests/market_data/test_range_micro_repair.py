@@ -1039,3 +1039,211 @@ async def test_staging_empty_gap_still_replays_complete(tmp_path) -> None:
     assert repaired is not None
     assert repaired.coverage_status == "COMPLETE"
     assert repaired.missing_gap_ms == 0
+
+
+# ── partial_on_pagination passthrough through RestMarketDataFeed ─────
+
+
+from src.platform.data.rest_feed import RestMarketDataFeed
+from src.platform.exchanges.models import Trade as ExchangeTrade
+from src.platform.markets.models import MarketProfile
+
+
+_MINI_PROFILE = MarketProfile(
+    symbol="ETH-USDT-PERP",
+    base_asset="ETH",
+    quote_asset="USDT",
+    contract_type="perp",
+)
+
+
+def _exchange_trade(ts: int, trade_id: str) -> ExchangeTrade:
+    return ExchangeTrade(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP",
+        price=Decimal("100"),
+        quantity=Decimal("1"),
+        trade_id=trade_id,
+        trade_time_ms=ts,
+    )
+
+
+class _RecordingExchangeClient:
+    """Fake exchange client that records all kwargs to fetch_trades_between_ids."""
+
+    def __init__(self) -> None:
+        self._calls: list[dict] = []
+        self.last_historical_trade_pages = 1
+
+    @property
+    def exchange(self) -> ExchangeName:
+        return ExchangeName.OKX
+
+    @property
+    def calls(self) -> list[dict]:
+        return self._calls
+
+    async def fetch_trades_between_ids(
+        self,
+        symbol: str,
+        *,
+        newer_trade_id: str,
+        older_trade_id: str,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 100,
+        max_pages: int = 20,
+        oldest_first: bool = True,
+        partial_on_pagination: bool = False,
+    ) -> list[ExchangeTrade]:
+        self._calls.append(
+            {
+                "symbol": symbol,
+                "newer_trade_id": newer_trade_id,
+                "older_trade_id": older_trade_id,
+                "partial_on_pagination": partial_on_pagination,
+            }
+        )
+        return [
+            _exchange_trade(1001, "10"),
+            _exchange_trade(1002, "11"),
+        ]
+
+
+class _NonPartialExchangeClient:
+    """Fake exchange client WITHOUT partial_on_pagination parameter."""
+
+    def __init__(self) -> None:
+        self.last_historical_trade_pages = 1
+        self.called = False
+
+    @property
+    def exchange(self) -> ExchangeName:
+        return ExchangeName.OKX
+
+    async def fetch_trades_between_ids(
+        self,
+        symbol: str,
+        *,
+        newer_trade_id: str,
+        older_trade_id: str,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 100,
+        max_pages: int = 20,
+        oldest_first: bool = True,
+    ) -> list[ExchangeTrade]:
+        self.called = True
+        return [_exchange_trade(1001, "10")]
+
+
+@pytest.mark.asyncio
+async def test_rest_feed_passes_partial_on_pagination_to_exchange_client() -> None:
+    """RestMarketDataFeed passes partial_on_pagination=True through to the client."""
+    client = _RecordingExchangeClient()
+    feed = RestMarketDataFeed(
+        exchange_client=client,
+        symbol="ETH-USDT-PERP",
+        market_profile=_MINI_PROFILE,
+    )
+
+    await feed.fetch_trades_between_ids(
+        newer_trade_id="100",
+        older_trade_id="1",
+        partial_on_pagination=True,
+    )
+
+    assert len(client.calls) == 1
+    assert client.calls[0]["partial_on_pagination"] is True
+
+
+@pytest.mark.asyncio
+async def test_rest_feed_default_partial_on_pagination_is_false() -> None:
+    """Default partial_on_pagination=False should not enable partial mode."""
+    client = _RecordingExchangeClient()
+    feed = RestMarketDataFeed(
+        exchange_client=client,
+        symbol="ETH-USDT-PERP",
+        market_profile=_MINI_PROFILE,
+    )
+
+    await feed.fetch_trades_between_ids(
+        newer_trade_id="100",
+        older_trade_id="1",
+    )
+
+    assert len(client.calls) == 1
+    assert client.calls[0]["partial_on_pagination"] is False
+
+
+@pytest.mark.asyncio
+async def test_rest_feed_compatible_without_partial_on_pagination() -> None:
+    """RestMarketDataFeed works when exchange client lacks partial_on_pagination."""
+    client = _NonPartialExchangeClient()
+    feed = RestMarketDataFeed(
+        exchange_client=client,
+        symbol="ETH-USDT-PERP",
+        market_profile=_MINI_PROFILE,
+    )
+
+    # Must not raise
+    result = await feed.fetch_trades_between_ids(
+        newer_trade_id="100",
+        older_trade_id="1",
+        partial_on_pagination=True,
+    )
+
+    assert client.called is True
+    assert len(result) == 1
+
+
+@pytest.mark.asyncio
+async def test_micro_repair_staging_passes_partial_on_pagination_through_rest_feed(
+    tmp_path,
+) -> None:
+    """Full integration: staging service → RestMarketDataFeed → exchange client."""
+    client = _RecordingExchangeClient()
+    feed = RestMarketDataFeed(
+        exchange_client=client,
+        symbol="ETH-USDT-PERP",
+        market_profile=_MINI_PROFILE,
+    )
+    checkpoint_store = SqliteRangeCheckpointStore(
+        tmp_path / "checkpoint.sqlite3"
+    )
+
+    builder = RangeBarBuilder(range_pct="0.001", contract_value="1")
+    builder.on_trade(_trade(1000, "1000"))
+    job = RangeMicroRepairJob(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=1_780_000_000_000,
+        bucket_end_ms=1_780_000_009_999,
+        checkpoint_last_trade_id="1000",
+        checkpoint_last_trade_ts_ms=1000,
+        builder_state=builder.snapshot_state(),
+        coverage_status=RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value,
+        missing_gap_ms=500,
+        first_live_trade_ts_ms=1100,
+        first_live_trade_id="2000",
+        repair_gap_start_ms=1001,
+        repair_gap_end_ms=1099,
+    )
+
+    staging_service = RangeMicroRepairStagingService(
+        provider=feed,
+        checkpoint_store=checkpoint_store,
+        page_limit=100,
+        max_pages=20,
+        max_seconds=1.0,
+    )
+
+    await staging_service.fetch_chunk(job)
+
+    assert len(client.calls) >= 1
+    assert client.calls[0]["partial_on_pagination"] is True, (
+        "staging service must pass partial_on_pagination=True through "
+        "RestMarketDataFeed to the exchange client"
+    )
