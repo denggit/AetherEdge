@@ -202,6 +202,20 @@ class RangeSpeedHistoryRefresher:
         backfill = self.status_store.read() or {}
         backfill_running = worker_status_is_running(backfill)
         backfill_pid = backfill.get("pid") if backfill_running else None
+        first_start = status.first_missing_bucket_start_ms
+        now = int(time.time() * 1000)
+        closed_end = status.current_closed_bucket_end_ms
+        is_current_day_gap = (
+            first_start is not None
+            and (first_start // 86_400_000) == (closed_end // 86_400_000)
+        )
+        archive_safe = backfill.get("archive_max_target_end_ms")
+        archive_ready = (
+            first_start is not None
+            and archive_safe is not None
+            and status.first_missing_bucket_end_ms is not None
+            and status.first_missing_bucket_end_ms <= int(archive_safe)
+        )
         logger.warning(
             "V10A range-speed history still insufficient; live runtime continues | "
             "symbol=%s exchange=%s range_pct=%s interval=%s complete_history=%s "
@@ -209,9 +223,11 @@ class RangeSpeedHistoryRefresher:
             "latest_complete_bucket_end_ms=%s current_closed_bucket_end_ms=%s "
             "backfill_enabled=%s backfill_process_running=%s backfill_pid=%s "
             "backfill_mode=%s backfill_direction=%s backfill_last_heartbeat_ms=%s "
-            "backfill_last_completed_bucket_end_ms=%s backfill_last_error=%s "
+            "backfill_last_completed_bucket_end_ms=%s backfill_last_repaired_bucket_end_ms=%s backfill_last_error=%s "
             "first_missing_bucket_start_ms=%s first_missing_bucket_end_ms=%s "
             "first_missing_reason=%s first_missing_coverage_status=%s "
+            "is_current_day=%s archive_ready=%s safe_archive_end_ms=%s "
+            "waiting_for_global_lock=%s "
             "next_check_seconds=%s",
             status.symbol,
             status.exchange,
@@ -231,11 +247,16 @@ class RangeSpeedHistoryRefresher:
             backfill.get("direction"),
             worker_heartbeat_ms(backfill),
             backfill.get("last_completed_bucket_end_ms"),
+            backfill.get("last_repaired_bucket_end_ms"),
             backfill.get("last_error"),
             status.first_missing_bucket_start_ms,
             status.first_missing_bucket_end_ms,
             status.first_missing_reason,
             status.first_missing_coverage_status,
+            is_current_day_gap,
+            archive_ready,
+            archive_safe,
+            backfill.get("phase") == "global_lock_not_acquired",
             int(self.refresh_seconds),
         )
 

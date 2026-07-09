@@ -573,3 +573,132 @@ def test_live_just_closed_okx_archive_404_is_archive_not_ready(
     assert summary.raw_rows == 0
     assert summary.trades_loaded == 0
     assert summary.aggregates_written == 0
+
+
+def test_service_repairs_historical_isolated_gap_when_current_day_archive_not_ready(
+    tmp_path, monkeypatch,
+) -> None:
+    """When two gaps exist — one historical with an available archive and one
+    current-day whose archive date equals the current OKX archive day — the
+    combined window fails with _live_archive_is_not_ready.  The service must
+    fall back to individual gaps and successfully repair the historical gap
+    instead of skipping all work.
+
+    This reproduces the live scenario where one isolated gap sits in the
+    rolling window and the latest-closed bucket needs an archive that has
+    not been published yet."""
+    symbol = "ETH-USDT-PERP"
+    raw = okx_raw_symbol_from_canonical(symbol)
+    raw_root = tmp_path / "raw"
+    bucket_ms = 4 * 60 * 60_000
+    now_ms = 1782950400000
+    closed_end = current_closed_bucket_end_ms(now_ms, "4h")
+    gap_historical_end = closed_end - 2 * bucket_ms
+    gap_historical_start = gap_historical_end - bucket_ms + 1
+    gap_current_end = closed_end
+
+    # Provide archive files for the historical bucket.
+    _write_zip(
+        raw_root, raw, "2026-06-29", "",
+    )
+    _write_zip(
+        raw_root, raw, "2026-06-30",
+        f"{gap_historical_start + 1},100,1,buy,a\n"
+        f"{gap_historical_start + 2},101.5,1,buy,b\n",
+    )
+
+    market_db = tmp_path / "market.sqlite3"
+    SqliteTradeStore(market_db)
+    request = RangeBackfillRequest(
+        symbol=symbol,
+        exchange="okx",
+        raw_symbol=raw,
+        range_pct="0.01",
+        required_buckets=3,
+        lookback_buckets=5,
+        max_buckets_per_cycle=3,
+        market_db_path=market_db,
+        checkpoint_db_path=tmp_path / "checkpoint.sqlite3",
+        raw_root=raw_root,
+        status_path=tmp_path / "status.json",
+        lock_path=tmp_path / "range.lock",
+        allow_download=False,
+        mode="live",
+    )
+
+    service = RangeBackfillService(request)
+
+    # Track that the individual fallback loop runs for both gaps.
+    build_calls: list[tuple] = []
+    original_build = service._run_build_window
+
+    def tracked_build(gaps, raw_symbol, started, coverage_before):
+        result = original_build(
+            gaps=gaps, raw_symbol=raw_symbol,
+            started=started, coverage_before=coverage_before,
+        )
+        build_calls.append((tuple(g.bucket_end_ms for g in gaps), result.aggregates_written))
+        return result
+
+    monkeypatch.setattr(service, "_run_build_window", tracked_build)
+
+    # Simulate the live scenario: the combined window encounters a current-day
+    # archive that is not ready, so _live_archive_is_not_ready returns True.
+    call_count = [0]
+    original_live_check = service._live_archive_is_not_ready
+
+    def staged_live_check(result):
+        call_count[0] += 1
+        # First call: combined window → pretend the current-day archive is
+        # not ready (all missing raw days are archive_not_ready days).
+        if call_count[0] == 1:
+            return True
+        # Subsequent calls: individual gaps — use real check.
+        return original_live_check(result)
+
+    monkeypatch.setattr(service, "_live_archive_is_not_ready", staged_live_check)
+
+    # Pre-populate the middle bucket as COMPLETE so only 2 gaps remain:
+    # the historical isolated gap and the current-day bucket.
+    middle_end = closed_end - bucket_ms
+    middle_start = middle_end - bucket_ms + 1
+    service.checkpoint_store.save_completed_aggregate(
+        exchange="okx",
+        aggregate=RangeBarAggregate(
+            symbol=symbol, range_pct=Decimal("0.01"),
+            bucket_start_ms=middle_start, bucket_end_ms=middle_end,
+            bar_count=10, first_open=Decimal("100"), last_close=Decimal("101"),
+            high=Decimal("101"), low=Decimal("100"),
+            buy_notional_sum=Decimal("10"), sell_notional_sum=Decimal("5"),
+            delta_notional_sum=Decimal("5"), notional_sum=Decimal("15"),
+        ),
+        coverage_status=RangeCoverageStatus.COMPLETE.value,
+        completed_at_ms=middle_end,
+    )
+
+    summary = service.run_once(now_ms_value=now_ms)
+
+    # The key assertion: the individual fallback path must have been taken.
+    # build_calls should have >= 3 entries: the combined window + at least
+    # 2 individual gap attempts.
+    assert len(build_calls) >= 3, (
+        f"Expected individual fallback; got {len(build_calls)} build calls: "
+        f"{[(ends, agg) for ends, agg in build_calls]}"
+    )
+    # The combined window was the first call (both gaps together).
+    assert len(build_calls[0][0]) == 2, (
+        "First build should combine both gaps"
+    )
+    # Subsequent calls are individual gaps (one gap per call).
+    assert all(len(ends) == 1 for ends, _agg in build_calls[1:]), (
+        f"All fallback calls should be individual gaps: {build_calls[1:]}"
+    )
+    individual_ends = [ends[0] for ends, _agg in build_calls[1:]]
+    assert gap_historical_end in individual_ends, (
+        f"Historical gap {gap_historical_end} not found in individual "
+        f"fallback calls: {individual_ends}"
+    )
+    assert gap_current_end in individual_ends, (
+        f"Current-day gap {gap_current_end} not found in individual "
+        f"fallback calls: {individual_ends}"
+    )

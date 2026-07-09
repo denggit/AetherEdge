@@ -817,8 +817,10 @@ def test_parser_sleep_seconds_default() -> None:
 
 
 def test_parser_global_lock_priority_default() -> None:
+    # Default is now BACKGROUND to avoid starving live range-speed backfill
+    # when the worker is invoked directly without an explicit priority.
     args = worker.parse_args([])
-    assert args.global_lock_priority == EXPEDITED_BACKFILL_PRIORITY
+    assert args.global_lock_priority == BACKGROUND_BACKFILL_PRIORITY
 
 
 # ---------------------------------------------------------------------------

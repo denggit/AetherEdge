@@ -112,7 +112,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--global-lock-priority",
         type=int,
-        default=EXPEDITED_BACKFILL_PRIORITY,
+        default=BACKGROUND_BACKFILL_PRIORITY,
+        help=(
+            "Priority for the shared raw-trade global lock. "
+            "Default BACKGROUND (10). Use EXPEDITED (100) only for "
+            "one-off manual prebuild runs where you are sure no "
+            "live range-speed backfill is competing for the lock."
+        ),
     )
     parser.add_argument("--save-raw-trades", action="store_true", default=False)
     parser.add_argument("--contract-value", type=str, default="0.01")

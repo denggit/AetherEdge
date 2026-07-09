@@ -106,23 +106,56 @@ class RangeRepairBootstrapService:
         if not repairable:
             if recovery.missing_gap_ms > 0:
                 bucket_start_ms = int(initial_bucket_ms or 0)
+                bucket_end_ms = bucket_start_ms + self.closed_bar_interval_ms - 1
+                # Diagnose the specific reason micro repair is not possible.
+                reasons: list[str] = []
+                if not recovery.recovered_from_checkpoint:
+                    reasons.append("no_checkpoint_recovered")
+                else:
+                    checkpoint = recovery.checkpoint
+                    if checkpoint is None:
+                        reasons.append("checkpoint_is_none")
+                    elif checkpoint.last_trade_ts_ms is None:
+                        reasons.append("checkpoint_last_trade_ts_ms_is_none")
+                if recovery.coverage_status == RangeCoverageStatus.COMPLETE.value:
+                    reasons.append("bucket_already_complete")
+                if not self.runtime_config.range_repair_journal_enabled:
+                    reasons.append("repair_journal_disabled")
+                failure_reason = (
+                    "+".join(reasons)
+                    if reasons
+                    else "missing_checkpoint_or_repair_journal_disabled"
+                )
                 logger.warning(
                     "range_micro_repair_skipped | symbol=%s "
                     "exchange=%s range_pct=%s bucket_start_ms=%s "
                     "bucket_end_ms=%s checkpoint_last_trade_ts_ms=%s "
                     "checkpoint_last_trade_id=%s missing_gap_ms=%s "
-                    "coverage_before=%s coverage_after=%s failure_reason=%s",
+                    "coverage_before=%s coverage_after=%s failure_reason=%s "
+                    "needs_archive_backfill=%s is_current_day=%s",
                     self.symbol,
                     self.exchange,
                     self.range_pct,
                     bucket_start_ms,
-                    bucket_start_ms + self.closed_bar_interval_ms - 1,
-                    None,
-                    None,
+                    bucket_end_ms,
+                    (
+                        recovery.checkpoint.last_trade_ts_ms
+                        if recovery.checkpoint is not None
+                        else None
+                    ),
+                    (
+                        recovery.checkpoint.last_trade_id
+                        if recovery.checkpoint is not None
+                        else None
+                    ),
                     recovery.missing_gap_ms,
                     recovery.coverage_status,
                     recovery.coverage_status,
-                    "missing_checkpoint_or_repair_journal_disabled",
+                    failure_reason,
+                    not recovery.recovered_from_checkpoint
+                    or recovery.checkpoint is None
+                    or recovery.checkpoint.last_trade_ts_ms is None,
+                    True,  # startup recovery always targets the current/in-progress day bucket
                 )
             return self._result()
 

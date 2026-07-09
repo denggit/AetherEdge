@@ -143,14 +143,41 @@ class RangeBackfillSupervisor:
             status_path=self.config.global_status_path,
             stale_after_seconds=self.config.heartbeat_stale_seconds,
         ):
+            coordinator = RawTradeBackfillCoordinator(
+                lock_path=self.config.global_lock_path,
+                status_path=self.config.global_status_path,
+                stale_after_seconds=self.config.heartbeat_stale_seconds,
+            )
+            owner = coordinator.current_owner() or {}
+            lock_status = coordinator.status() or {}
+            lock_heartbeat = worker_heartbeat_ms(lock_status)
+            lock_age_ms = (
+                (now_ms() - lock_heartbeat) if lock_heartbeat else None
+            )
             self.status_store.patch(
                 running=False,
                 phase="global_lock_not_acquired",
                 range_speed_available=False,
                 range_speed_reason="global_lock_not_acquired",
+                global_lock_owner=owner.get("owner"),
+                global_lock_priority=owner.get("priority"),
+                global_lock_pid=owner.get("pid"),
+                global_lock_heartbeat_ms=lock_heartbeat,
+                global_lock_age_ms=lock_age_ms,
+                global_lock_stale=(
+                    lock_age_ms is not None
+                    and lock_age_ms > self.config.heartbeat_stale_seconds * 1000
+                ),
             )
             logger.info(
-                "Range backfill skipped: global raw-trade lock held by higher-priority worker"
+                "Range backfill skipped: global raw-trade lock held by higher-priority worker | "
+                "owner=%s priority=%s pid=%s heartbeat_ms=%s age_ms=%s stale_after_ms=%s",
+                owner.get("owner"),
+                owner.get("priority"),
+                owner.get("pid"),
+                lock_heartbeat,
+                lock_age_ms,
+                self.config.heartbeat_stale_seconds * 1000,
             )
             return False
         try:

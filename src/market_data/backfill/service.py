@@ -269,7 +269,32 @@ class RangeBackfillService:
             coverage_before=coverage_before,
         )
         if self._live_archive_is_not_ready(first):
-            results.append(first)
+            if len(target_gaps) > 1:
+                # The combined window failed because a current/future archive
+                # date is not yet published, but earlier isolated gaps may
+                # still be repairable from already-available archives.
+                # Try each gap individually so historical gaps are not
+                # starved by a single not-ready archive day.
+                self._emit(
+                    "live_archive_not_ready_fallback_to_individual_gaps",
+                    total_gaps=len(target_gaps),
+                )
+                for gap in target_gaps:
+                    result = self._run_build_window(
+                        gaps=(gap,),
+                        raw_symbol=raw_symbol,
+                        started=started,
+                        coverage_before=coverage_before,
+                    )
+                    results.append(result)
+                    if result.resource_limited:
+                        break
+                    # If this individual gap also failed because its archive
+                    # is not ready, continue trying older gaps.
+                    if result.aggregates_written == 0 and result.missing_raw_days:
+                        continue
+            else:
+                results.append(first)
         elif first.missing_raw_days and len(target_gaps) > 1:
             for gap in target_gaps:
                 result = self._run_build_window(
@@ -360,6 +385,18 @@ class RangeBackfillService:
             else None
         )
         last_error = failed_downloads[-1] if failed_downloads else None
+        last_repaired_bucket_end_ms: int | None = None
+        repaired_results = [
+            result
+            for result in results
+            if result.aggregates_written > 0
+            and result.target_bucket_end_ms is not None
+        ]
+        if repaired_results:
+            last_repaired_bucket_end_ms = max(
+                result.target_bucket_end_ms
+                for result in repaired_results
+            )
         return self._finish_summary(
             started=started,
             before=coverage_before,
@@ -386,6 +423,7 @@ class RangeBackfillService:
             candidate_range_bars=candidate_range_bars,
             candidate_aggregates=candidate_aggregates,
             filtered_reason_if_zero=filtered_reason_if_zero,
+            last_repaired_bucket_end_ms=last_repaired_bucket_end_ms,
         )
 
     def _run_build_window(
@@ -896,6 +934,7 @@ class RangeBackfillService:
         candidate_range_bars: int = 0,
         candidate_aggregates: int = 0,
         filtered_reason_if_zero: str | None = None,
+        last_repaired_bucket_end_ms: int | None = None,
     ) -> RangeBackfillSummary:
         after = self.check_coverage(now_ms_value=self._now_ms_value, direction=self.request.direction)
         summary = RangeBackfillSummary(
@@ -969,6 +1008,7 @@ class RangeBackfillService:
                 range_bars_written=summary.range_bars_written,
                 aggregates_written=summary.aggregates_written,
                 last_completed_bucket_end_ms=after.latest_complete_bucket_end_ms,
+                last_repaired_bucket_end_ms=last_repaired_bucket_end_ms,
                 last_scanned_bucket_end_ms=after.current_closed_bucket_end_ms,
                 last_error=last_error,
                 missing_raw_days=list(missing_raw_days),
