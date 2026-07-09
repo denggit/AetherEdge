@@ -239,6 +239,10 @@ def main(argv: list[str] | None = None) -> int:
                 f"candidate_range_bars={summary.candidate_range_bars} "
                 f"candidate_aggregates={summary.candidate_aggregates} "
                 f"filtered_reason_if_zero={summary.filtered_reason_if_zero} "
+                f"processed_through_ms={summary.processed_through_ms} "
+                f"reached_target_start={summary.reached_target_start} "
+                f"reached_target_end={summary.reached_target_end} "
+                f"resource_limit_phase={summary.resource_limit_phase} "
                 f"last_error={summary.last_error}",
                 flush=True,
             )
@@ -380,6 +384,10 @@ def _write_process_status(
             candidate_aggregates=int(summary.candidate_aggregates),
             aggregates_written=int(summary.aggregates_written),
             filtered_reason_if_zero=summary.filtered_reason_if_zero,
+            processed_through_ms=summary.processed_through_ms,
+            reached_target_start=summary.reached_target_start,
+            reached_target_end=summary.reached_target_end,
+            resource_limit_phase=summary.resource_limit_phase,
         )
     status_store.patch(**payload)
 
@@ -409,6 +417,13 @@ def _no_progress_reason(
 
 
 def _partial_without_progress(summary) -> bool:
+    # A resource-limited cycle that stopped before reaching the target
+    # bucket is *not* an archive gap or a permanent failure — the worker
+    # should retry on its next normal sleep cadence instead of entering a
+    # long cooldown.  Once the seek-phase guard (service.py) is in place
+    # this case should be rare, but the worker must still handle it safely.
+    if summary.filtered_reason_if_zero == "resource_limit_before_target_complete":
+        return False
     return (
         summary.status == "partial"
         and int(summary.aggregates_written) == 0

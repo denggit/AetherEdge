@@ -230,6 +230,11 @@ def test_range_worker_acquires_and_releases_global_lock(
                 last_error=None,
                 missing_raw_days=(),
                 failed_downloads=(),
+                processed_through_ms=None,
+                reached_target_start=False,
+                reached_target_end=False,
+                resource_limit_phase=None,
+                range_bars_written=0,
             )
 
     monkeypatch.setattr(range_backfill_worker, "RangeBackfillService", FakeService)

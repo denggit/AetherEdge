@@ -107,3 +107,7 @@ class RangeBackfillSummary:
     candidate_range_bars: int = 0
     candidate_aggregates: int = 0
     filtered_reason_if_zero: str | None = None
+    processed_through_ms: int | None = None
+    reached_target_start: bool = False
+    reached_target_end: bool = False
+    resource_limit_phase: str | None = None

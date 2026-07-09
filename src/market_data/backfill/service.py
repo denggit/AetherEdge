@@ -58,6 +58,10 @@ class _BuildWindowResult:
     candidate_range_bars: int = 0
     candidate_aggregates: int = 0
     filtered_reason_if_zero: str | None = None
+    processed_through_ms: int | None = None
+    reached_target_start: bool = False
+    reached_target_end: bool = False
+    resource_limit_phase: str | None = None
 
 
 class RangeBackfillService:
@@ -366,6 +370,28 @@ class RangeBackfillService:
             ),
             None,
         )
+        processed_through_ms = max(
+            (
+                result.processed_through_ms
+                for result in results
+                if result.processed_through_ms is not None
+            ),
+            default=None,
+        )
+        reached_target_start = any(
+            result.reached_target_start for result in results
+        )
+        reached_target_end = any(
+            result.reached_target_end for result in results
+        )
+        resource_limit_phase = next(
+            (
+                result.resource_limit_phase
+                for result in reversed(results)
+                if result.resource_limit_phase
+            ),
+            None,
+        )
         archive_not_ready = any(
             self._live_archive_is_not_ready(result) for result in results
         )
@@ -424,6 +450,10 @@ class RangeBackfillService:
             candidate_aggregates=candidate_aggregates,
             filtered_reason_if_zero=filtered_reason_if_zero,
             last_repaired_bucket_end_ms=last_repaired_bucket_end_ms,
+            processed_through_ms=processed_through_ms,
+            reached_target_start=reached_target_start,
+            reached_target_end=reached_target_end,
+            resource_limit_phase=resource_limit_phase,
         )
 
     def _run_build_window(
@@ -497,6 +527,7 @@ class RangeBackfillService:
         trades_loaded = 0
         processed_through_ms: int | None = None
         resource_limited = False
+        resource_limit_phase: str | None = None
         chunk_index = 0
         last_progress_at = started
         per_file_min: dict[str, int | None] = {}
@@ -603,24 +634,53 @@ class RangeBackfillService:
                     )
                 if self.request.chunk_sleep_seconds > 0:
                     time.sleep(float(self.request.chunk_sleep_seconds))
-                if (
-                    self.request.max_chunks_per_cycle > 0
-                    and chunk_index >= self.request.max_chunks_per_cycle
-                ):
-                    resource_limited = True
-                    break
-                if (
-                    self.request.max_trades_per_cycle > 0
-                    and trades_loaded >= self.request.max_trades_per_cycle
-                ):
-                    resource_limited = True
-                    break
-                if (
-                    self.request.max_seconds_per_cycle > 0
-                    and time.monotonic() - started >= self.request.max_seconds_per_cycle
-                ):
-                    resource_limited = True
-                    break
+                # ── resource-limit guard ──────────────────────────────
+                # In live mode the worker must replay from anchor_start
+                # to target_bucket_end_ms before the RangeBarBuilder state
+                # is correct for the target window.  Normal per-cycle caps
+                # (max_trades / max_seconds) must not interrupt this seek
+                # phase; otherwise the worker restarts from scratch every
+                # cycle and the historical gap can never be filled.
+                reached_target_end = (
+                    processed_through_ms is not None
+                    and processed_through_ms >= latest_end
+                )
+                is_live = str(self.request.mode).strip().lower() == "live"
+                if is_live and not reached_target_end:
+                    # Seek phase — only hard safety caps apply.
+                    _HARD_SEEK_SECONDS = 1800
+                    _HARD_SEEK_TRADES = 10_000_000
+                    if time.monotonic() - started >= _HARD_SEEK_SECONDS:
+                        resource_limited = True
+                        resource_limit_phase = "seek_hard_timeout"
+                        break
+                    if trades_loaded >= _HARD_SEEK_TRADES:
+                        resource_limited = True
+                        resource_limit_phase = "seek_hard_trades"
+                        break
+                    # Normal limits skipped — continue seeking.
+                else:
+                    if (
+                        self.request.max_chunks_per_cycle > 0
+                        and chunk_index >= self.request.max_chunks_per_cycle
+                    ):
+                        resource_limited = True
+                        resource_limit_phase = "after_target"
+                        break
+                    if (
+                        self.request.max_trades_per_cycle > 0
+                        and trades_loaded >= self.request.max_trades_per_cycle
+                    ):
+                        resource_limited = True
+                        resource_limit_phase = "after_target"
+                        break
+                    if (
+                        self.request.max_seconds_per_cycle > 0
+                        and time.monotonic() - started >= self.request.max_seconds_per_cycle
+                    ):
+                        resource_limited = True
+                        resource_limit_phase = "after_target"
+                        break
                 if (
                     filtered.first_trade_time_ms is not None
                     and filtered.last_trade_time_ms is not None
@@ -716,6 +776,16 @@ class RangeBackfillService:
             candidate_range_bars=len(bars),
             candidate_aggregates=len(candidate_aggregate_rows),
             filtered_reason_if_zero=filtered_reason_if_zero,
+            processed_through_ms=processed_through_ms,
+            reached_target_start=(
+                processed_through_ms is not None
+                and processed_through_ms >= earliest_start
+            ),
+            reached_target_end=(
+                processed_through_ms is not None
+                and processed_through_ms >= latest_end
+            ),
+            resource_limit_phase=resource_limit_phase,
         )
         completed_at = now_ms()
         for aggregate in aggregates:
@@ -730,6 +800,8 @@ class RangeBackfillService:
             "aggregates_written",
             rows=len(aggregates),
             filtered_reason_if_zero=filtered_reason_if_zero,
+            processed_through_ms=processed_through_ms,
+            resource_limit_phase=resource_limit_phase,
         )
         return _BuildWindowResult(
             downloaded_files=downloaded,
@@ -749,6 +821,16 @@ class RangeBackfillService:
             candidate_range_bars=len(bars),
             candidate_aggregates=len(candidate_aggregate_rows),
             filtered_reason_if_zero=filtered_reason_if_zero,
+            processed_through_ms=processed_through_ms,
+            reached_target_start=(
+                processed_through_ms is not None
+                and processed_through_ms >= earliest_start
+            ),
+            reached_target_end=(
+                processed_through_ms is not None
+                and processed_through_ms >= latest_end
+            ),
+            resource_limit_phase=resource_limit_phase,
         )
 
     def _ensure_raw_days(
@@ -935,6 +1017,10 @@ class RangeBackfillService:
         candidate_aggregates: int = 0,
         filtered_reason_if_zero: str | None = None,
         last_repaired_bucket_end_ms: int | None = None,
+        processed_through_ms: int | None = None,
+        reached_target_start: bool = False,
+        reached_target_end: bool = False,
+        resource_limit_phase: str | None = None,
     ) -> RangeBackfillSummary:
         after = self.check_coverage(now_ms_value=self._now_ms_value, direction=self.request.direction)
         summary = RangeBackfillSummary(
@@ -970,6 +1056,10 @@ class RangeBackfillService:
             candidate_range_bars=candidate_range_bars,
             candidate_aggregates=candidate_aggregates,
             filtered_reason_if_zero=filtered_reason_if_zero,
+            processed_through_ms=processed_through_ms,
+            reached_target_start=reached_target_start,
+            reached_target_end=reached_target_end,
+            resource_limit_phase=resource_limit_phase,
         )
         if update_status:
             if status == "error":
@@ -1024,6 +1114,10 @@ class RangeBackfillService:
                 candidate_range_bars=summary.candidate_range_bars,
                 candidate_aggregates=summary.candidate_aggregates,
                 filtered_reason_if_zero=summary.filtered_reason_if_zero,
+                processed_through_ms=summary.processed_through_ms,
+                reached_target_start=summary.reached_target_start,
+                reached_target_end=summary.reached_target_end,
+                resource_limit_phase=summary.resource_limit_phase,
                 exit_code=0 if status in {"ok", "dry_run", "partial", "no_progress", "archive_not_ready"} else 1,
                 finished_at_ms=now_ms() if mark_process_finished else None,
             )
@@ -1047,6 +1141,10 @@ class RangeBackfillService:
             candidate_range_bars=summary.candidate_range_bars,
             candidate_aggregates=summary.candidate_aggregates,
             filtered_reason_if_zero=summary.filtered_reason_if_zero,
+            processed_through_ms=summary.processed_through_ms,
+            reached_target_start=summary.reached_target_start,
+            reached_target_end=summary.reached_target_end,
+            resource_limit_phase=summary.resource_limit_phase,
             elapsed_seconds=summary.elapsed_seconds,
         )
         return summary
