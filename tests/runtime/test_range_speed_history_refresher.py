@@ -142,3 +142,39 @@ async def test_refresher_detects_older_bucket_backfill_when_latest_marker_unchan
     assert second.available is True
     assert strategy.values == [10, 11, 12]
     assert strategy.calls == 2
+
+@pytest.mark.asyncio
+async def test_refresher_keeps_rolling_complete_history_when_required_window_has_gap(tmp_path) -> None:
+    store = SqliteRangeCheckpointStore(tmp_path / "checkpoint.sqlite3")
+    bucket_ms = 4 * 60 * 60_000
+    closed_end = current_closed_bucket_end_ms(int(time.time() * 1000), "4h")
+    # Required window is the latest 3 buckets.  Leave the middle one missing,
+    # but keep enough complete buckets in the rolling history for the strategy
+    # tracker to remain usable.
+    for offset, count in ((0, 13), (2, 11), (3, 10)):
+        end = closed_end - offset * bucket_ms
+        store.save_completed_aggregate(
+            exchange="okx",
+            aggregate=_aggregate(end - bucket_ms + 1, end, count),
+            coverage_status=RangeCoverageStatus.COMPLETE.value,
+            completed_at_ms=end,
+        )
+    strategy = Strategy()
+    refresher = RangeSpeedHistoryRefresher(
+        strategy=strategy,
+        store=store,
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        range_pct="0.002",
+        bucket_interval="4h",
+        status_path=str(tmp_path / "status.json"),
+    )
+
+    status = await refresher.refresh_once()
+
+    assert status.available is False
+    assert status.missing_periods == 1
+    assert status.first_missing_bucket_end_ms == closed_end - bucket_ms
+    assert strategy.values == [10, 11, 13]
+    assert status.complete_history == 3
+

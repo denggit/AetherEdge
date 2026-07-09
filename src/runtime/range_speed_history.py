@@ -13,7 +13,6 @@ from src.market_data.backfill.status_store import (
     worker_status_is_running,
 )
 from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
-from src.market_data.warmup.gap_detector import interval_to_ms
 from src.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -33,6 +32,10 @@ class RangeSpeedHistoryStatus:
     latest_complete_bucket_end_ms: int | None
     current_closed_bucket_end_ms: int
     refreshed: bool = False
+    first_missing_bucket_start_ms: int | None = None
+    first_missing_bucket_end_ms: int | None = None
+    first_missing_reason: str | None = None
+    first_missing_coverage_status: str | None = None
 
 
 class RangeSpeedHistoryRefresher:
@@ -127,9 +130,14 @@ class RangeSpeedHistoryRefresher:
             coverage.current_closed_bucket_end_ms,
             coverage.required_window_missing_count,
         )
+        first_missing = (
+            coverage.required_window_missing_buckets[0]
+            if coverage.required_window_missing_buckets
+            else None
+        )
         refreshed = False
         if marker != self._last_marker or coverage_marker != self._last_coverage_marker:
-            values = self._history_values_for_strategy(rows, coverage=coverage, min_periods=min_periods)
+            values = self._history_values_for_strategy(rows)
             replace = getattr(self.strategy, "replace_range_speed_history", None)
             if callable(replace):
                 replace(values)
@@ -152,24 +160,28 @@ class RangeSpeedHistoryRefresher:
             latest_complete_bucket_end_ms=latest_end,
             current_closed_bucket_end_ms=closed_end,
             refreshed=refreshed,
+            first_missing_bucket_start_ms=(
+                None if first_missing is None else first_missing.bucket_start_ms
+            ),
+            first_missing_bucket_end_ms=(
+                None if first_missing is None else first_missing.bucket_end_ms
+            ),
+            first_missing_reason=None if first_missing is None else first_missing.reason,
+            first_missing_coverage_status=(
+                None if first_missing is None else first_missing.coverage_status
+            ),
         )
         self.last_status = status
         self._log_status_if_needed(status)
         return status
 
-    def _history_values_for_strategy(self, rows, *, coverage, min_periods: int) -> list[int]:
-        if coverage.available:
-            return [row.rf_bar_count for row in rows]
-        bucket_ms = interval_to_ms(self.bucket_interval)
-        required_oldest_end = (
-            coverage.current_closed_bucket_end_ms
-            - (max(1, int(min_periods)) - 1) * bucket_ms
-        )
-        return [
-            row.rf_bar_count
-            for row in rows
-            if row.bucket_end_ms >= required_oldest_end
-        ]
+    def _history_values_for_strategy(self, rows) -> list[int]:
+        # Keep the strategy-side tracker filled with the complete rolling history we
+        # actually have.  Coverage.available is intentionally stricter: it means
+        # the latest required buckets are consecutive and is used to trigger
+        # backfill/diagnostics.  It must not shrink an otherwise usable 1080-bar
+        # rolling history to 99 bars just because one recent bucket is missing.
+        return [row.rf_bar_count for row in rows]
 
     def _log_status_if_needed(self, status: RangeSpeedHistoryStatus) -> None:
         if status.available:
@@ -197,7 +209,10 @@ class RangeSpeedHistoryRefresher:
             "latest_complete_bucket_end_ms=%s current_closed_bucket_end_ms=%s "
             "backfill_enabled=%s backfill_process_running=%s backfill_pid=%s "
             "backfill_mode=%s backfill_direction=%s backfill_last_heartbeat_ms=%s "
-            "backfill_last_completed_bucket_end_ms=%s backfill_last_error=%s next_check_seconds=%s",
+            "backfill_last_completed_bucket_end_ms=%s backfill_last_error=%s "
+            "first_missing_bucket_start_ms=%s first_missing_bucket_end_ms=%s "
+            "first_missing_reason=%s first_missing_coverage_status=%s "
+            "next_check_seconds=%s",
             status.symbol,
             status.exchange,
             status.range_pct,
@@ -217,6 +232,10 @@ class RangeSpeedHistoryRefresher:
             worker_heartbeat_ms(backfill),
             backfill.get("last_completed_bucket_end_ms"),
             backfill.get("last_error"),
+            status.first_missing_bucket_start_ms,
+            status.first_missing_bucket_end_ms,
+            status.first_missing_reason,
+            status.first_missing_coverage_status,
             int(self.refresh_seconds),
         )
 
