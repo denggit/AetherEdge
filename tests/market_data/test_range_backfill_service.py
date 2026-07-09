@@ -597,12 +597,25 @@ def test_service_repairs_historical_isolated_gap_when_current_day_archive_not_re
     gap_historical_start = gap_historical_end - bucket_ms + 1
     gap_current_end = closed_end
 
-    # Provide archive files for the historical bucket.
+    # Provide archive files.  Compute which OKX days are needed by
+    # looking at what _run_build_window chooses for each gap.
+    from src.market_data.backfill.coverage import previous_utc_day_start_ms
+    from src.market_data.backfill.service import _BuildWindowResult
+    from src.market_data.historical_trades.okx_archive import (
+        iter_okx_archive_dates_for_utc_range,
+    )
+    # Historical gap archive days.
+    hist_anchor = previous_utc_day_start_ms(gap_historical_start)
+    hist_okx_days = tuple(
+        iter_okx_archive_dates_for_utc_range(hist_anchor, gap_historical_end)
+    )
+    # Write trades into the earliest historical archive day so the
+    # individual fallback can find them.
     _write_zip(
-        raw_root, raw, "2026-06-29", "",
+        raw_root, raw, hist_okx_days[0].isoformat(), "",
     )
     _write_zip(
-        raw_root, raw, "2026-06-30",
+        raw_root, raw, hist_okx_days[-1].isoformat(),
         f"{gap_historical_start + 1},100,1,buy,a\n"
         f"{gap_historical_start + 2},101.5,1,buy,b\n",
     )
@@ -628,35 +641,47 @@ def test_service_repairs_historical_isolated_gap_when_current_day_archive_not_re
 
     service = RangeBackfillService(request)
 
-    # Track that the individual fallback loop runs for both gaps.
-    build_calls: list[tuple] = []
-    original_build = service._run_build_window
+    # ------------------------------------------------------------------
+    # Stub _ensure_raw_days so the combined window fails with a
+    # live-archive-not-ready error, but individual historical gaps
+    # succeed.
+    # ------------------------------------------------------------------
+    original_ensure = service._ensure_raw_days
+    ensure_call_gaps: list[tuple[int, int]] = []  # (earliest_start, latest_end)
 
-    def tracked_build(gaps, raw_symbol, started, coverage_before):
-        result = original_build(
-            gaps=gaps, raw_symbol=raw_symbol,
-            started=started, coverage_before=coverage_before,
+    def staged_ensure(*, raw_symbol, days, skipped_buckets):
+        if days:
+            latest_day = days[-1]
+        else:
+            latest_day = None
+        gap_end = None
+        # Capture the window for assertions.
+        # The combined window spans both gaps, individual windows span one.
+        ensure_call_gaps.append(
+            (days[0].toordinal() if days else 0,
+             days[-1].toordinal() if days else 0)
         )
-        build_calls.append((tuple(g.bucket_end_ms for g in gaps), result.aggregates_written))
+        result = original_ensure(
+            raw_symbol=raw_symbol, days=days,
+            skipped_buckets=skipped_buckets,
+        )
+        # If the window includes the current-day archive date
+        # (the last day in the range), inject a live-archive-not-ready
+        # failure.  This simulates the combined window failing because
+        # the current-day archive is not published.
+        if latest_day is not None:
+            current_archive_day = service._current_archive_date()
+            if latest_day >= current_archive_day:
+                day_iso = latest_day.isoformat()
+                service._archive_not_ready_days.add(day_iso)
+                return _BuildWindowResult(
+                    missing_raw_days=(day_iso,),
+                    failed_downloads=(f"https://example.test/{day_iso}.zip",),
+                    skipped_buckets_due_missing_raw=skipped_buckets,
+                )
         return result
 
-    monkeypatch.setattr(service, "_run_build_window", tracked_build)
-
-    # Simulate the live scenario: the combined window encounters a current-day
-    # archive that is not ready, so _live_archive_is_not_ready returns True.
-    call_count = [0]
-    original_live_check = service._live_archive_is_not_ready
-
-    def staged_live_check(result):
-        call_count[0] += 1
-        # First call: combined window → pretend the current-day archive is
-        # not ready (all missing raw days are archive_not_ready days).
-        if call_count[0] == 1:
-            return True
-        # Subsequent calls: individual gaps — use real check.
-        return original_live_check(result)
-
-    monkeypatch.setattr(service, "_live_archive_is_not_ready", staged_live_check)
+    monkeypatch.setattr(service, "_ensure_raw_days", staged_ensure)
 
     # Pre-populate the middle bucket as COMPLETE so only 2 gaps remain:
     # the historical isolated gap and the current-day bucket.
@@ -678,27 +703,136 @@ def test_service_repairs_historical_isolated_gap_when_current_day_archive_not_re
 
     summary = service.run_once(now_ms_value=now_ms)
 
-    # The key assertion: the individual fallback path must have been taken.
-    # build_calls should have >= 3 entries: the combined window + at least
-    # 2 individual gap attempts.
-    assert len(build_calls) >= 3, (
-        f"Expected individual fallback; got {len(build_calls)} build calls: "
-        f"{[(ends, agg) for ends, agg in build_calls]}"
+    # ------------------------------------------------------------------
+    # Assertion 2: summary reports the historical gap was written.
+    # ------------------------------------------------------------------
+    assert summary.aggregates_written > 0, (
+        f"Expected >0 aggregates; got aggregates_written={summary.aggregates_written} "
+        f"status={summary.status}"
     )
-    # The combined window was the first call (both gaps together).
-    assert len(build_calls[0][0]) == 2, (
-        "First build should combine both gaps"
+
+    # ------------------------------------------------------------------
+    # Assertion 3: only the current-day archive-not-ready bucket remains.
+    # ------------------------------------------------------------------
+    assert summary.missing_after == 1, (
+        f"Expected missing_after=1 (current-day gap only); "
+        f"got missing_after={summary.missing_after} "
+        f"complete_after={summary.complete_after}"
     )
-    # Subsequent calls are individual gaps (one gap per call).
-    assert all(len(ends) == 1 for ends, _agg in build_calls[1:]), (
-        f"All fallback calls should be individual gaps: {build_calls[1:]}"
+
+    # ------------------------------------------------------------------
+    # Assertion 4: historical gap is no longer in the required-window
+    #              missing list after the repair.
+    # ------------------------------------------------------------------
+    after_coverage = service.check_coverage(now_ms_value=now_ms)
+    after_missing_ends = {
+        gap.bucket_end_ms
+        for gap in after_coverage.required_window_missing_buckets
+    }
+    assert gap_historical_end not in after_missing_ends, (
+        f"Historical gap {gap_historical_end} should NOT appear in "
+        f"post-repair missing buckets; found: {after_missing_ends}"
     )
-    individual_ends = [ends[0] for ends, _agg in build_calls[1:]]
-    assert gap_historical_end in individual_ends, (
-        f"Historical gap {gap_historical_end} not found in individual "
-        f"fallback calls: {individual_ends}"
+    assert gap_current_end in after_missing_ends, (
+        f"Current-day gap {gap_current_end} SHOULD still be missing; "
+        f"found: {after_missing_ends}"
     )
-    assert gap_current_end in individual_ends, (
-        f"Current-day gap {gap_current_end} not found in individual "
-        f"fallback calls: {individual_ends}"
+
+    # ------------------------------------------------------------------
+    # Assertion 5: checkpoint store has the historical bucket as COMPLETE.
+    # ------------------------------------------------------------------
+    completed = service.checkpoint_store.load_completed_aggregate(
+        exchange="okx",
+        symbol=symbol,
+        range_pct="0.01",
+        bucket_end_ms=gap_historical_end,
+    )
+    assert completed is not None, (
+        f"Historical bucket {gap_historical_end} not found in "
+        f"completed_range_aggregates after repair"
+    )
+    assert completed.coverage_status == RangeCoverageStatus.COMPLETE.value, (
+        f"Historical bucket coverage_status={completed.coverage_status}, "
+        f"expected COMPLETE"
+    )
+    assert completed.rf_bar_count > 0, (
+        f"Historical bucket rf_bar_count={completed.rf_bar_count}, expected >0"
+    )
+
+    # ------------------------------------------------------------------
+    # Assertion 6: last_repaired_bucket_end_ms reflects the historical gap.
+    # ------------------------------------------------------------------
+    status = service.status_store.read()
+    assert status is not None
+    repaired = status.get("last_repaired_bucket_end_ms")
+    assert repaired == gap_historical_end, (
+        f"last_repaired_bucket_end_ms={repaired} != historical gap "
+        f"end={gap_historical_end}"
+    )
+
+    # ------------------------------------------------------------------
+    # Assertion 2: summary reports the historical gap was written.
+    # ------------------------------------------------------------------
+    assert summary.aggregates_written > 0, (
+        f"Expected >0 aggregates; got aggregates_written={summary.aggregates_written} "
+        f"status={summary.status}"
+    )
+
+    # ------------------------------------------------------------------
+    # Assertion 3: only the current-day archive-not-ready bucket remains.
+    # ------------------------------------------------------------------
+    assert summary.missing_after == 1, (
+        f"Expected missing_after=1 (current-day gap only); "
+        f"got missing_after={summary.missing_after} "
+        f"complete_after={summary.complete_after}"
+    )
+
+    # ------------------------------------------------------------------
+    # Assertion 4: historical gap is no longer in the required-window
+    #              missing list after the repair.
+    # ------------------------------------------------------------------
+    after_coverage = service.check_coverage(now_ms_value=now_ms)
+    after_missing_ends = {
+        gap.bucket_end_ms
+        for gap in after_coverage.required_window_missing_buckets
+    }
+    assert gap_historical_end not in after_missing_ends, (
+        f"Historical gap {gap_historical_end} should NOT appear in "
+        f"post-repair missing buckets; found: {after_missing_ends}"
+    )
+    assert gap_current_end in after_missing_ends, (
+        f"Current-day gap {gap_current_end} SHOULD still be missing; "
+        f"found: {after_missing_ends}"
+    )
+
+    # ------------------------------------------------------------------
+    # Assertion 5: checkpoint store has the historical bucket as COMPLETE.
+    # ------------------------------------------------------------------
+    completed = service.checkpoint_store.load_completed_aggregate(
+        exchange="okx",
+        symbol=symbol,
+        range_pct="0.01",
+        bucket_end_ms=gap_historical_end,
+    )
+    assert completed is not None, (
+        f"Historical bucket {gap_historical_end} not found in "
+        f"completed_range_aggregates after repair"
+    )
+    assert completed.coverage_status == RangeCoverageStatus.COMPLETE.value, (
+        f"Historical bucket coverage_status={completed.coverage_status}, "
+        f"expected COMPLETE"
+    )
+    assert completed.rf_bar_count > 0, (
+        f"Historical bucket rf_bar_count={completed.rf_bar_count}, expected >0"
+    )
+
+    # ------------------------------------------------------------------
+    # Assertion 6: last_repaired_bucket_end_ms reflects the historical gap.
+    # ------------------------------------------------------------------
+    status = service.status_store.read()
+    assert status is not None
+    repaired = status.get("last_repaired_bucket_end_ms")
+    assert repaired == gap_historical_end, (
+        f"last_repaired_bucket_end_ms={repaired} != historical gap "
+        f"end={gap_historical_end}"
     )
