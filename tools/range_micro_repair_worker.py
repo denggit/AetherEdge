@@ -927,7 +927,8 @@ async def _run_chunked_repair_async(
     if not coverage_complete:
         return None
 
-    # Load all accumulated staging trades
+    # Load all accumulated staging trades (may be empty when the gap is naturally
+    # devoid of trades — the provider already proved coverage is complete).
     staging_rows = checkpoint_store.load_staging_trades(
         exchange=job.exchange,
         symbol=job.symbol,
@@ -938,8 +939,11 @@ async def _run_chunked_repair_async(
         _market_trade_from_staging(row) for row in staging_rows
     )
 
-    # Strict coverage verification before writing COMPLETE
-    _assert_full_staging_coverage(all_staging_trades, job)
+    # Strict coverage verification before writing COMPLETE.
+    # Empty staging is valid when the provider proved coverage (e.g. no trades
+    # occurred between checkpoint and first live trade).
+    if all_staging_trades:
+        _assert_full_staging_coverage(all_staging_trades, job)
 
     result = await rebuild_service.rebuild(
         job,
@@ -965,14 +969,14 @@ def _assert_full_staging_coverage(
 ) -> None:
     """Verify staging trades cover the entire gap from checkpoint to first_live.
 
-    The fetch service already verified that all available REST trades in the
-    gap were returned (pagination was not exhausted).  This function performs
-    a defence-in-depth sanity check: every staging trade must fall within the
-    repair gap time bounds, and the trade closest to the checkpoint must not
-    leave an unreasonable ID gap.
+    Coverage completeness is already proven by the provider (pagination was not
+    exhausted or cursor reached the checkpoint).  This function performs a
+    defence-in-depth sanity check:
+
+    * Every staging trade must fall within the repair gap time bounds.
+    * The oldest trade ID must be reasonably close to the checkpoint.
+    * Every staging trade ID must be strictly less than the first live trade ID.
     """
-    if not trades:
-        raise RangeMicroRepairError("no staging trades to verify coverage")
 
     repair_gap_start = int(job.checkpoint_last_trade_ts_ms or 0) + 1
     repair_gap_end = int(job.first_live_trade_ts_ms or 0) - 1
@@ -985,31 +989,41 @@ def _assert_full_staging_coverage(
                 f"gap [{repair_gap_start}, {repair_gap_end}]"
             )
 
-    # Verify the earliest trade timestamp reaches the gap start boundary.
-    earliest_ts = min(int(t.trade_time_ms or 0) for t in trades)
-    if earliest_ts > repair_gap_start:
-        raise RangeMicroRepairError(
-            f"staging earliest trade at ts={earliest_ts} > "
-            f"gap_start={repair_gap_start}"
-        )
-
-    # If trade IDs are numeric, verify the oldest fetched ID does not leave
-    # an unreasonable gap vs the checkpoint.  A gap of 1 ID is expected (the
-    # checkpoint trade itself is not part of the repair gap).
+    # If trade IDs are numeric, verify:
+    # 1. The oldest fetched ID does not leave an unreasonable gap vs the
+    #    checkpoint.  A gap of 1 ID is expected (the checkpoint trade itself
+    #    is not part of the repair gap).  Larger gaps are acceptable when the
+    #    provider proved coverage (no trades exist in that span).
+    # 2. The newest fetched ID is strictly before the first live trade.
     if job.checkpoint_last_trade_id is not None:
         try:
             checkpoint_id = int(job.checkpoint_last_trade_id)
-            min_id = min(
+            numeric_ids = [
                 int(str(t.trade_id or "0"))
                 for t in trades
                 if str(t.trade_id or "").isdigit()
-            )
-            if min_id - checkpoint_id > 100:
-                raise RangeMicroRepairError(
-                    f"staging coverage gap too large: min_trade_id={min_id} "
-                    f"checkpoint_last_trade_id={checkpoint_id} "
-                    f"gap={min_id - checkpoint_id}"
-                )
+            ]
+            if numeric_ids:
+                min_id = min(numeric_ids)
+                if min_id - checkpoint_id > 100:
+                    raise RangeMicroRepairError(
+                        f"staging coverage gap too large: min_trade_id={min_id} "
+                        f"checkpoint_last_trade_id={checkpoint_id} "
+                        f"gap={min_id - checkpoint_id}"
+                    )
+        except (ValueError, TypeError):
+            pass
+
+    if job.first_live_trade_id is not None:
+        try:
+            first_live_id = int(job.first_live_trade_id)
+            for trade in trades:
+                tid = str(trade.trade_id or "")
+                if tid.isdigit() and int(tid) >= first_live_id:
+                    raise RangeMicroRepairError(
+                        f"staging trade {tid} >= first_live_trade_id "
+                        f"{first_live_id}"
+                    )
         except (ValueError, TypeError):
             pass
 

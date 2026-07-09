@@ -915,3 +915,127 @@ def test_staging_partial_no_failure_email(tmp_path) -> None:
     assert _micro_repair_is_resumable(MICRO_REPAIR_PENDING)
     assert not _micro_repair_is_resumable(MICRO_REPAIR_SUCCESS)
     assert not _micro_repair_is_resumable("micro_repair_failed")
+
+
+@pytest.mark.asyncio
+async def test_staging_empty_gap_still_replays_complete(tmp_path) -> None:
+    """Natural empty gap (no trades between checkpoint and first live) → COMPLETE."""
+    bucket_start = 1_780_000_000_000
+    bucket_end = bucket_start + 1_999
+    checkpoint_ts = bucket_start + 100
+    first_live_ts = checkpoint_ts + 88  # 87ms gap, but no trades in it
+
+    builder = RangeBarBuilder(range_pct="0.001", contract_value="1")
+    builder.on_trade(_trade(checkpoint_ts, "4048125000"))
+    job = RangeMicroRepairJob(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=bucket_start,
+        bucket_end_ms=bucket_end,
+        checkpoint_last_trade_id="4048125000",
+        checkpoint_last_trade_ts_ms=checkpoint_ts,
+        builder_state=builder.snapshot_state(),
+        coverage_status=RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value,
+        missing_gap_ms=87,
+        first_live_trade_ts_ms=first_live_ts,
+        first_live_trade_id="4048126437",
+        repair_gap_start_ms=checkpoint_ts + 1,
+        repair_gap_end_ms=first_live_ts - 1,
+        journal_start_ms=first_live_ts,
+        journal_end_ms=bucket_end,
+        journal_status="journal_finalized",
+    )
+
+    class EmptyGapProvider:
+        def __init__(self):
+            self.last_historical_trade_pages = 1  # pagination not exhausted
+            self.anchor_call = None
+
+        async def fetch_trades_between_ids(self, **kwargs):
+            self.anchor_call = dict(kwargs)
+            # No trades exist in the gap — OKX returned empty first page
+            return []
+
+    provider = EmptyGapProvider()
+    checkpoint_store = SqliteRangeCheckpointStore(tmp_path / "checkpoint.sqlite3")
+
+    checkpoint_store.save_completed_aggregate(
+        exchange="okx",
+        aggregate=RangeBarAggregate(
+            symbol="ETH-USDT-PERP",
+            range_pct=Decimal("0.001"),
+            bucket_start_ms=bucket_start,
+            bucket_end_ms=bucket_end,
+            bar_count=1,
+            first_open=Decimal("100"),
+            last_close=Decimal("100"),
+            high=Decimal("100"),
+            low=Decimal("100"),
+            buy_notional_sum=Decimal("1"),
+            sell_notional_sum=Decimal("0"),
+            delta_notional_sum=Decimal("1"),
+            notional_sum=Decimal("1"),
+        ),
+        coverage_status=RangeCoverageStatus.RECOVERED_DEGRADED_MINOR.value,
+        missing_gap_ms=500,
+        completed_at_ms=bucket_end,
+    )
+
+    staging_service = RangeMicroRepairStagingService(
+        provider=provider,
+        checkpoint_store=checkpoint_store,
+        page_limit=100,
+        max_pages=20,
+        max_seconds=30.0,
+    )
+    rebuild_service = RangeMicroRepairRebuildService(
+        provider=provider,
+        range_bar_store=SqliteRangeBarStore(tmp_path / "market.sqlite3"),
+        checkpoint_store=checkpoint_store,
+        contract_value="1",
+        page_limit=100,
+        max_pages=20,
+        max_seconds=30.0,
+    )
+
+    # Fetch chunk → coverage complete (pagination not exhausted, even with 0 trades)
+    chunk_trades, staging, coverage_complete = await staging_service.fetch_chunk(
+        job, staging=None
+    )
+    assert coverage_complete, "empty gap with pagination not exhausted = complete"
+    assert staging is not None
+    assert staging.fetched_trade_count == 0
+
+    # Replay with empty staging trades + journal trades → must write COMPLETE
+    result = await rebuild_service.rebuild(
+        job,
+        journal_trades=[
+            _trade(
+                first_live_ts,
+                "4048126437",
+                price="100.8",
+                source=MarketDataSource.WEBSOCKET,
+            ),
+        ],
+        completed_at_ms=bucket_end + 1,
+        rest_gap_trades=(),  # empty REST gap
+    )
+
+    assert result.aggregate_written
+    checkpoint_store.clear_staging(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_start_ms=bucket_start,
+    )
+
+    repaired = checkpoint_store.load_completed_aggregate(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.001",
+        bucket_end_ms=bucket_end,
+    )
+    assert repaired is not None
+    assert repaired.coverage_status == "COMPLETE"
+    assert repaired.missing_gap_ms == 0
