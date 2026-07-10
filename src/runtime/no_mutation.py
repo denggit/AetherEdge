@@ -51,6 +51,12 @@ class NoMutationExecutionClient:
     async def fetch_open_stop_orders(self, *args: Any, **kwargs: Any):
         return await self._client.fetch_open_stop_orders(*args, **kwargs)
 
+    async def fetch_instrument_rule(self, *args: Any, **kwargs: Any):
+        fetch_rule = getattr(self._client, "fetch_instrument_rule", None)
+        if callable(fetch_rule):
+            return await fetch_rule(*args, **kwargs)
+        return None
+
     async def place_order(self, *args: Any, **kwargs: Any):
         self._block("place_order")
 

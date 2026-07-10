@@ -18,6 +18,10 @@ from src.platform.exchanges.models import (
     ExchangeName,
 )
 from src.platform.execution.factory import create_execution_client
+from src.runtime.account_config import (
+    AccountConfigEnv,
+    load_account_config_env,
+)
 from src.runtime.config import live_runtime_config_from_app
 from strategies.eth_portfolio_v1.preflight.live_gate import (
     EXIT_FAIL_API,
@@ -198,6 +202,19 @@ class PortfolioV1LiveSmokeProvider:
                 config.mf.large_share_window_days
             ),
         )
+        # Load account config env for correct margin mode in preflight snapshots.
+        account_config_env: AccountConfigEnv | None = None
+        try:
+            if not self.skip_api:
+                account_config_env = load_account_config_env(
+                    exchanges=app_config.exchanges,
+                    symbol=app_config.symbol,
+                    environ=env,
+                    require_leverage=False,
+                )
+        except Exception:
+            account_config_env = None
+
         gate = PortfolioV1LiveGate(
             app_config=app_config,
             runtime_config=runtime_config,
@@ -231,6 +248,7 @@ class PortfolioV1LiveSmokeProvider:
                     )
                 )
             ),
+            account_config_env=account_config_env,
         )
         return await gate.run()
 

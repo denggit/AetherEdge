@@ -18,6 +18,20 @@ class ReconciliationVerdict(str, Enum):
 
 
 @dataclass
+class LegacyStopAdoptionDetail:
+    """Payload for an ``adopt_legacy_stop_reference`` reconciliation action."""
+
+    position_id: str
+    exchange: str
+    stop_order_id: str
+    stop_client_order_id: str
+    effective_stop_price: str  # Decimal as string
+    canonical_theoretical_stop_price: str
+    resolution_status: str
+    adopted_at_ms: int
+
+
+@dataclass
 class ReconciliationAction:
     """A concrete action produced by reconciliation (to be applied or reported)."""
 
@@ -33,6 +47,7 @@ class ReconciliationAction:
     #   clear_all_stop_order_refs              → clears both stop order_id + stop client_order_id
     #   set_master_closed_follower_close_required
     #   block_new_entries_alert
+    #   adopt_legacy_stop_reference            → write real stop IDs + prices from legacy adoption
     #   journal_event
     target: str  # e.g. "position_plan:{position_id}" or "leg:{position_id}:{exchange}"
     detail: dict[str, Any] = field(default_factory=dict)

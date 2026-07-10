@@ -680,6 +680,119 @@ class LiveStateReconciliationService:
                         position_id,
                     )
 
+            elif action.action_type == "adopt_legacy_stop_reference":
+                # ── Legacy stop adoption: write real exchange stop IDs ──
+                #     and effective stop price back to the PositionPlan leg.
+                #     This is the ONLY place that writes corrective stop
+                #     references from legacy adoption during startup.
+                parts = action.target.split(":")
+                if len(parts) < 3:
+                    continue
+                _, position_id, exchange_str = parts
+                detail = action.detail
+                stop_order_id = str(detail.get("stop_order_id", "") or "")
+                stop_client_order_id = str(
+                    detail.get("stop_client_order_id", "") or ""
+                )
+                effective_stop_price_str = str(
+                    detail.get("effective_stop_price", "") or ""
+                )
+                canonical_theoretical = str(
+                    detail.get("canonical_theoretical_stop_price", "") or ""
+                )
+                if not stop_order_id or not effective_stop_price_str:
+                    continue
+
+                try:
+                    effective_stop_price = Decimal(effective_stop_price_str)
+                except Exception:
+                    continue
+
+                # Write stop reference via the store's direct-update path
+                # (bypasses COALESCE so NULL values are overwritten).
+                adopt_method = getattr(store, "adopt_legacy_stop_reference", None)
+                if callable(adopt_method):
+                    adopt_method(
+                        position_id=position_id,
+                        exchange=ExchangeName(exchange_str),
+                        stop_order_id=stop_order_id,
+                        stop_client_order_id=stop_client_order_id,
+                        stop_price=effective_stop_price,
+                        metadata_updates={
+                            "legacy_stop_adopted": True,
+                            "legacy_stop_adoption_source": "startup_recovery",
+                            "legacy_stop_adopted_at_ms": now_ms,
+                            "strategy_theoretical_stop_price": canonical_theoretical,
+                        },
+                    )
+                else:
+                    # Fallback: use upsert_leg (may not overwrite NULL with
+                    # COALESCE, but better than nothing for stores without
+                    # the dedicated method).
+                    leg = next(
+                        (
+                            l
+                            for l in store.get_legs(position_id)
+                            if l.exchange.value == exchange_str
+                        ),
+                        None,
+                    )
+                    if leg is not None:
+                        from dataclasses import replace as _replace
+
+                        store.upsert_leg(
+                            _replace(
+                                leg,
+                                stop_order_id=stop_order_id,
+                                stop_client_order_id=stop_client_order_id,
+                                stop_price=effective_stop_price,
+                                metadata={
+                                    **dict(leg.metadata),
+                                    "legacy_stop_adopted": True,
+                                    "legacy_stop_adoption_source": (
+                                        "startup_recovery"
+                                    ),
+                                    "legacy_stop_adopted_at_ms": now_ms,
+                                    "strategy_theoretical_stop_price": (
+                                        canonical_theoretical
+                                    ),
+                                },
+                            )
+                        )
+
+                # Update canonical stop price on the position
+                plan = store.get_position(position_id)
+                if plan is not None:
+                    store.update_stop(
+                        position_id=position_id,
+                        stop_price=effective_stop_price,
+                        exchange=ExchangeName(exchange_str),
+                        stop_order_id=stop_order_id,
+                        stop_client_order_id=stop_client_order_id,
+                    )
+
+                self._write_journal_event(
+                    position_id=position_id,
+                    status="recovered",
+                    message=(
+                        f"Legacy stop adopted during startup reconciliation: "
+                        f"exchange={exchange_str} "
+                        f"stop_order_id={stop_order_id} "
+                        f"effective_stop_price={effective_stop_price_str} "
+                        f"theoretical_stop_price={canonical_theoretical}"
+                    ),
+                )
+                logger.warning(
+                    "Startup reconciliation: legacy stop adopted | "
+                    "position_id=%s exchange=%s stop_order_id=%s "
+                    "effective_stop_price=%s theoretical=%s",
+                    position_id,
+                    exchange_str,
+                    stop_order_id,
+                    effective_stop_price_str,
+                    canonical_theoretical,
+                )
+
             elif action.action_type == "block_new_entries_alert":
                 if self._alert_sink is not None:
                     emit = getattr(self._alert_sink, "emit", None)

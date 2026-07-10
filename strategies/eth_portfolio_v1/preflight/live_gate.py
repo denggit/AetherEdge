@@ -15,11 +15,15 @@ from src.order_management.reconciliation.service import (
 )
 from src.order_management.safety import (
     RecoveryExitOrderValidator,
+    RecoveryStopScopeResolver,
+    StopScopeResolutionStatus,
     order_matches_position_scope,
 )
 from src.platform import ExchangeName, PositionMode, PositionSide
+from src.platform.exchanges.models import MarginMode
 from src.platform.markets import get_market_profile
 from src.platform.snapshot import PlatformSnapshot, fetch_platform_snapshot
+from src.runtime.account_config import AccountConfigEnv
 from src.runtime.config import LiveRuntimeConfig
 from src.runtime.no_mutation import (
     MutationAttemptError,
@@ -185,6 +189,7 @@ class PortfolioV1LiveGate:
         skip_api: bool = False,
         skip_kline: bool = False,
         sensitive_values: Sequence[str] = (),
+        account_config_env: AccountConfigEnv | None = None,
     ) -> None:
         self.app_config = app_config
         self.runtime_config = runtime_config
@@ -217,6 +222,7 @@ class PortfolioV1LiveGate:
         self.sensitive_values = tuple(
             value for value in sensitive_values if value
         )
+        self._account_config_env = account_config_env
 
     async def run(self) -> PortfolioV1LiveGateReport:
         report = PortfolioV1LiveGateReport(
@@ -714,10 +720,20 @@ class PortfolioV1LiveGate:
                     raise RuntimeError(
                         f"missing read client for {exchange.value}"
                     )
+                # Resolve margin mode from account config target, falling
+                # back to ISOLATED (the strategy default).
+                margin_mode: MarginMode = MarginMode.ISOLATED
+                if self._account_config_env is not None:
+                    target = self._account_config_env.target_for(exchange)
+                    if target is not None:
+                        margin_mode = target.margin_mode
+                    else:
+                        margin_mode = self._account_config_env.margin_mode
                 snapshots.append(
                     await fetch_platform_snapshot(
                         account=account,
                         execution=execution,
+                        leverage_margin_mode=margin_mode,
                     )
                 )
         except Exception as exc:
@@ -800,6 +816,9 @@ class PortfolioV1LiveGate:
             payloads=payloads,
         )
         issues.extend(stop_issues)
+        # Propagate legacy stop adoption warnings to the report
+        for warning in stop_audit.get("legacy_warnings", ()):
+            report.warnings.append(warning)
 
         reconciliation = LiveStateReconciliationService(
             position_plan_store=self.position_plan_store,
@@ -851,6 +870,7 @@ class PortfolioV1LiveGate:
         payloads: Sequence[Mapping[str, Any]],
     ) -> tuple[list[str], dict[str, Any]]:
         issues: list[str] = []
+        legacy_warnings: list[str] = []
         scopes: list[dict[str, Any]] = []
         market_profile = get_market_profile(self.app_config.symbol)
         converter = NativeQuantityConverter()
@@ -941,6 +961,68 @@ class PortfolioV1LiveGate:
                     leg.get("filled_qty_base")
                     or leg.get("target_qty_base")
                 )
+                # ── Legacy stop scope check ──────────────────────────
+                # When exact scoped match fails and the leg has no known
+                # stop IDs, attempt legacy adoption resolution before
+                # declaring the stop missing.
+                has_known_stop_ids = bool(
+                    leg.get("stop_order_id") or leg.get("stop_client_order_id")
+                )
+                if (
+                    not scoped_orders
+                    and not has_known_stop_ids
+                    and stop_price is not None
+                    and quantity is not None
+                    and position_side is not None
+                ):
+                    native = converter.convert_quantity(
+                        exchange=snapshot.balance.exchange,
+                        symbol=self.app_config.symbol,
+                        base_quantity=quantity,
+                        market_profile=market_profile,
+                    ).native_quantity
+                    resolver = RecoveryStopScopeResolver(
+                        validator=validator,
+                        converter=converter,
+                    )
+                    resolution = resolver.resolve(
+                        exchange=snapshot.balance.exchange,
+                        symbol=self.app_config.symbol,
+                        strategy_id="eth_portfolio_v1",
+                        position_id=position_id,
+                        position_side=position_side,
+                        position_mode=snapshot.position_mode,
+                        current_position_native_quantity=native,
+                        canonical_stop_price=stop_price,
+                        open_stop_orders=snapshot.open_stop_orders,
+                        known_stop_order_ids=(None, None),
+                        market_profile=market_profile,
+                        instrument_rule=snapshot.instrument_rule,
+                        active_plan_count_same_exchange_side=1,
+                        open_positions_on_exchange=snapshot.positions,
+                    )
+                    if resolution.status == StopScopeResolutionStatus.ADOPTABLE_LEGACY:
+                        # Legacy stop is valid and unambiguously belongs to
+                        # this position scope.  Allow preflight to pass with
+                        # a warning — do NOT mutate PositionPlan.
+                        scope["legacy_stop_scope_adoptable"] = True
+                        scope["legacy_resolution"] = resolution.audit_dict()
+                        legacy_warnings.append(
+                            "legacy_stop_scope_will_be_adopted_during_runtime_recovery:"
+                            f"{exchange}:{position_id}:"
+                            f"order_id={resolution.order_id}:"
+                            f"effective_stop_price={_decimal_text(resolution.effective_stop_price) if resolution.effective_stop_price else 'none'}"
+                        )
+                        continue
+                    if resolution.is_blocking:
+                        issues.append(
+                            f"legacy_stop_scope_{resolution.status.value}:"
+                            f"{exchange}:{position_id}:"
+                            f"{resolution.detail.get('reason', 'unknown')}"
+                        )
+                        continue
+                    # MISSING: fall through to normal missing handling
+
                 if (
                     not scoped_orders
                     or stop_price is None
@@ -984,10 +1066,21 @@ class PortfolioV1LiveGate:
             for order in snapshot.open_stop_orders:
                 assigned = any(
                     scope["exchange"] == exchange
-                    and order_matches_position_scope(
-                        order,
-                        position_id=scope["position_id"],
-                        known_order_ids=scope["known_ids"],
+                    and (
+                        order_matches_position_scope(
+                            order,
+                            position_id=scope["position_id"],
+                            known_order_ids=scope["known_ids"],
+                        )
+                        # Legacy-adoptable scopes: the stop is assigned
+                        # even without exact local ID match.
+                        or (
+                            scope.get("legacy_stop_scope_adoptable")
+                            and scope.get("legacy_resolution", {}).get(
+                                "order_id"
+                            )
+                            == order.order_id
+                        )
                     )
                     for scope in scopes
                 )
@@ -1002,6 +1095,7 @@ class PortfolioV1LiveGate:
             "scope_count": len(scopes),
             "issues": list(dict.fromkeys(issues)),
             "mf_protective_stop_required": False,
+            "legacy_warnings": legacy_warnings,
         }
 
     async def _call_on_start_read_only(
@@ -1225,6 +1319,12 @@ def _positive_decimal(value: object) -> Decimal | None:
     except Exception:
         return None
     return parsed if parsed.is_finite() and parsed > 0 else None
+
+
+def _decimal_text(value: Decimal | None) -> str | None:
+    if value is None:
+        return None
+    return format(value.normalize(), "f")
 
 
 __all__ = [

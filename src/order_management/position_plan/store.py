@@ -260,6 +260,71 @@ class SqlitePositionPlanStore:
                 params,
             )
 
+    def adopt_legacy_stop_reference(
+        self,
+        *,
+        position_id: str,
+        exchange: ExchangeName | str,
+        stop_order_id: str,
+        stop_client_order_id: str,
+        stop_price: Decimal,
+        metadata_updates: dict[str, Any] | None = None,
+    ) -> None:
+        """Write real exchange stop IDs and price back to a leg.
+
+        Unlike ``upsert_leg``, this bypasses the COALESCE guard so that
+        previously-NULL stop fields are overwritten.  Used exclusively
+        for legacy stop adoption during startup reconciliation.
+        """
+        exchange_name = (
+            exchange
+            if isinstance(exchange, ExchangeName)
+            else ExchangeName(str(exchange).strip().lower())
+        )
+        now_ms = int(time.time() * 1000)
+        existing = self.get_legs(position_id)
+        leg = next(
+            (l for l in existing if l.exchange == exchange_name), None
+        )
+        merged_metadata = dict(
+            (leg.metadata if leg is not None else {}) if leg is not None else {}
+        )
+        if metadata_updates:
+            merged_metadata.update(metadata_updates)
+
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE leg_plans
+                   SET stop_order_id = ?,
+                       stop_client_order_id = ?,
+                       stop_price = ?,
+                       metadata_json = ?,
+                       updated_time_ms = ?
+                   WHERE position_id = ? AND exchange = ?""",
+                (
+                    stop_order_id,
+                    stop_client_order_id,
+                    _dec(stop_price),
+                    _json(merged_metadata),
+                    now_ms,
+                    position_id,
+                    exchange_name.value,
+                ),
+            )
+        logger = __import__("src.utils.log", fromlist=["get_logger"]).get_logger(
+            __name__
+        )
+        logger.warning(
+            "Legacy stop reference written to PositionPlan | "
+            "position_id=%s exchange=%s stop_order_id=%s "
+            "stop_client_order_id=%s stop_price=%s",
+            position_id,
+            exchange_name.value,
+            stop_order_id,
+            stop_client_order_id,
+            _dec(stop_price),
+        )
+
     def serialize_active_positions(self) -> list[dict[str, Any]]:
         payload: list[dict[str, Any]] = []
         for plan in self.list_active_positions():

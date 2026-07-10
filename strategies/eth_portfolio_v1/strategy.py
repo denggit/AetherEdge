@@ -13,6 +13,8 @@ from src.order_management.quantity import NativeQuantityConverter
 from src.order_management.safety import (
     RecoveryExitOrderValidator,
     RecoveryExitValidationResult,
+    RecoveryStopScopeResolver,
+    StopScopeResolutionStatus,
     filter_orders_for_position_scope,
     is_bot_owned_order,
     order_matches_position_scope,
@@ -3221,6 +3223,87 @@ class Strategy:
                     leg.get("stop_client_order_id"),
                 ),
             )
+            # ── Legacy stop adoption ──────────────────────────────────
+            # When the local PositionPlan has no stop IDs but a valid
+            # bot-owned stop exists on the exchange, attempt unambiguous
+            # legacy adoption before falling through to normal recovery.
+            has_known_stop_ids = bool(
+                leg.get("stop_order_id") or leg.get("stop_client_order_id")
+            )
+            legacy_adopted = False
+            if (
+                not scoped_stops
+                and not has_known_stop_ids
+                and stop_price is not None
+            ):
+                resolver = RecoveryStopScopeResolver(
+                    validator=validator,
+                    converter=converter,
+                )
+                resolution = resolver.resolve(
+                    exchange=snapshot.balance.exchange,
+                    symbol=self.config.symbol,
+                    strategy_id=self.config.strategy_id,
+                    position_id=self.position.position_id,
+                    position_side=_position_side_for_strategy_side(side),
+                    position_mode=snapshot.position_mode,
+                    current_position_native_quantity=native_qty,
+                    canonical_stop_price=stop_price,
+                    open_stop_orders=snapshot.open_stop_orders,
+                    known_stop_order_ids=(None, None),
+                    market_profile=market_profile,
+                    instrument_rule=snapshot.instrument_rule,
+                    active_plan_count_same_exchange_side=1,
+                    open_positions_on_exchange=snapshot.positions,
+                )
+                if resolution.status == StopScopeResolutionStatus.ADOPTABLE_LEGACY:
+                    # Adopt the legacy stop: write real exchange IDs and
+                    # effective stop price into in-memory state.  Do NOT
+                    # generate any PLACE / CANCEL signals.
+                    leg_state.stop_order_id = resolution.order_id
+                    leg_state.stop_client_order_id = resolution.client_order_id
+                    leg_state.stop_price = (
+                        resolution.effective_stop_price or stop_price
+                    )
+                    if exchange == self.config.data_exchange:
+                        self.position.update_stop(
+                            resolution.effective_stop_price or stop_price
+                        )
+                    all_stops_valid = all_stops_valid and True
+                    legacy_adopted = True
+                    # Store resolution for later write-back via
+                    # reconciliation service.
+                    if not hasattr(self, "_legacy_adoptions"):
+                        self._legacy_adoptions: list[dict[str, Any]] = []
+                    self._legacy_adoptions.append({
+                        "position_id": self.position.position_id,
+                        "exchange": exchange,
+                        "stop_order_id": resolution.order_id,
+                        "stop_client_order_id": resolution.client_order_id,
+                        "effective_stop_price": (
+                            str(resolution.effective_stop_price)
+                            if resolution.effective_stop_price is not None
+                            else str(stop_price)
+                        ),
+                        "canonical_theoretical_stop_price": str(stop_price),
+                        "resolution_status": resolution.status.value,
+                    })
+                elif resolution.is_blocking:
+                    self._block_portfolio_recovery(
+                        audit=audit,
+                        issues=(
+                            f"legacy_stop_scope_{resolution.status.value}:"
+                            f"{exchange}:"
+                            f"{resolution.detail.get('reason', 'unknown')}",
+                        ),
+                    )
+                    return signals
+
+            if legacy_adopted:
+                # Skip normal validation and signal generation for this
+                # leg — the legacy stop is already confirmed valid.
+                continue
+
             validation = validator.validate_stop_orders(
                 exchange=snapshot.balance.exchange,
                 symbol=self.config.symbol,

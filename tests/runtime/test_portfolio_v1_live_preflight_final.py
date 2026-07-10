@@ -102,6 +102,23 @@ class _Execution:
     async def fetch_open_stop_orders(self):
         return list(self.stops)
 
+    async def fetch_instrument_rule(self):
+        from src.platform.exchanges.models import InstrumentRule
+
+        return InstrumentRule(
+            exchange=self.exchange,
+            symbol=SYMBOL,
+            raw_symbol=(
+                "ETH-USDT-SWAP"
+                if self.exchange == ExchangeName.OKX
+                else "ETHUSDT"
+            ),
+            price_tick=Decimal("0.05"),
+            quantity_step=Decimal("0.01"),
+            min_quantity=Decimal("0.01"),
+            contract_value=Decimal("1"),
+        )
+
 
 class _Inspector:
     def __init__(
@@ -298,6 +315,7 @@ def _gate(
     okx_positions=(),
     binance_positions=(),
     okx_stops=(),
+    binance_stops=(),
     inspector=None,
     startup_feature_backfill_enabled=True,
     call_strategy_on_start=False,
@@ -343,10 +361,14 @@ def _gate(
                     positions=tuple(binance_positions),
                 )
             )
+        if exchange is ExchangeName.OKX:
+            stops_for_exchange = okx_stops
+        else:
+            stops_for_exchange = binance_stops
         executions.append(
             _Execution(
                 exchange,
-                stops=okx_stops if exchange is ExchangeName.OKX else (),
+                stops=tuple(stops_for_exchange),
             )
         )
     gate = PortfolioV1LiveGate(
@@ -823,3 +845,480 @@ async def test_report_has_required_sections_and_no_secrets(tmp_path) -> None:
         "EMAIL_PASSWORD",
     ):
         assert sensitive_name not in text
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Legacy Stop Scope Preflight Tests
+# ═══════════════════════════════════════════════════════════════════════
+
+
+LEGACY_LF_POSITION_ID = "legacy-lf-preflight-001"
+LEGACY_THEORETICAL_STOP = Decimal("1738.2542231936259150")
+LEGACY_EXCHANGE_STOP = Decimal("1738.25")
+
+
+def _legacy_lf_plan(store: SqlitePositionPlanStore) -> None:
+    """Create an LF PositionPlan with empty stop IDs — the legacy state."""
+    store.upsert_position(
+        PositionPlan(
+            position_id=LEGACY_LF_POSITION_ID,
+            strategy_id="eth_portfolio_v1",
+            entry_engine="BULL_RECLAIM_V2",
+            side="long",
+            status=PositionPlanStatus.ACTIVE,
+            canonical_stop_price=LEGACY_THEORETICAL_STOP,
+            master_exchange=ExchangeName.OKX,
+            master_target_qty_base=Decimal("0.6"),
+            master_filled_qty_base=Decimal("0.6"),
+            metadata={"sleeve_id": "lf"},
+        )
+    )
+    for exchange, role in (
+        (ExchangeName.OKX, LegRole.MASTER),
+        (ExchangeName.BINANCE, LegRole.FOLLOWER),
+    ):
+        store.upsert_leg(
+            LegPlan(
+                position_id=LEGACY_LF_POSITION_ID,
+                exchange=exchange,
+                role=role,
+                target_qty_base=Decimal("0.6"),
+                filled_qty_base=Decimal("0.6"),
+                sync_status=LegSyncStatus.OPEN,
+            )
+        )
+
+
+def _legacy_okx_preflight_stop(
+    *,
+    order_id: str = "1111222233334444",
+    client_order_id: str = "AEOKSL0123456789ABCDEF",
+    price: Decimal = LEGACY_EXCHANGE_STOP,
+) -> Order:
+    """Realistic OKX stop with no position_id in raw."""
+    return Order(
+        exchange=ExchangeName.OKX,
+        symbol=SYMBOL,
+        raw_symbol="ETH-USDT-SWAP",
+        order_id=order_id,
+        client_order_id=client_order_id,
+        price=price,
+        quantity=Decimal("6"),
+        side=OrderSide.SELL,
+        status=OrderStatus.NEW,
+        raw={
+            "algoId": order_id,
+            "algoClOrdId": client_order_id,
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "long",
+            "side": "sell",
+            "sz": "6",
+            "slTriggerPx": str(price),
+            "reduceOnly": "true",
+            "state": "live",
+        },
+    )
+
+
+def _legacy_binance_preflight_stop(
+    *,
+    order_id: str = "5555666677778888",
+    client_order_id: str = "AEBISL0123456789ABCDEF",
+    price: Decimal = LEGACY_EXCHANGE_STOP,
+) -> Order:
+    """Realistic Binance stop with no position_id in raw."""
+    return Order(
+        exchange=ExchangeName.BINANCE,
+        symbol=SYMBOL,
+        raw_symbol="ETHUSDT",
+        order_id=order_id,
+        client_order_id=client_order_id,
+        price=price,
+        quantity=None,
+        side=OrderSide.SELL,
+        status=OrderStatus.NEW,
+        raw={
+            "algoId": order_id,
+            "clientAlgoId": client_order_id,
+            "symbol": "ETHUSDT",
+            "positionSide": "LONG",
+            "side": "SELL",
+            "triggerPrice": str(price),
+            "closePosition": "true",
+            "algoStatus": "NEW",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_stop_adoptable_passes_preflight_with_warning(
+    tmp_path,
+) -> None:
+    """Preflight passes when legacy stop is adoptable, with warning."""
+    plan_store = SqlitePositionPlanStore(
+        tmp_path / "plan.sqlite3"
+    )
+    _legacy_lf_plan(plan_store)
+
+    okx_stop = _legacy_okx_preflight_stop()
+    binance_stop = _legacy_binance_preflight_stop()
+
+    okx_pos = _position(ExchangeName.OKX, "6")
+    binance_pos = _position(ExchangeName.BINANCE, "6")
+
+    gate, _ = _gate(
+        tmp_path,
+        strategy=_strategy(),
+        okx_positions=(okx_pos,),
+        binance_positions=(binance_pos,),
+        okx_stops=(okx_stop,),
+        binance_stops=(binance_stop,),
+        call_strategy_on_start=False,
+        startup_feature_backfill_enabled=False,
+    )
+    gate.position_plan_store = plan_store
+
+    report = await gate.run()
+
+    assert report.ok is True
+    assert report.verdict == "pass"
+
+    # Check the recovery audit for legacy adoption info
+    recovery_audit = report.recovery_audit_summary
+    stop_scope = recovery_audit.get("stop_scope_audit", {})
+    assert stop_scope.get("ok") is True
+
+    has_legacy_warning = any(
+        "legacy_stop_scope_will_be_adopted_during_runtime_recovery"
+        in w
+        for w in report.warnings
+    )
+    assert has_legacy_warning, (
+        f"Expected legacy adoption warning, got warnings={report.warnings}"
+    )
+
+    # No mutations during preflight
+    assert not report.mutation_attempted
+    assert not report.mutation_attempts
+
+
+@pytest.mark.asyncio
+async def test_legacy_stop_ambiguous_blocks_preflight(tmp_path) -> None:
+    """Multiple valid bot stops → ambiguous → preflight blocked."""
+    plan_store = SqlitePositionPlanStore(
+        tmp_path / "plan.sqlite3"
+    )
+    _legacy_lf_plan(plan_store)
+
+    stop1 = _legacy_okx_preflight_stop(
+        order_id="111", client_order_id="AEOKSL00000000000000A1"
+    )
+    stop2 = _legacy_okx_preflight_stop(
+        order_id="222", client_order_id="AEOKSL00000000000000A2"
+    )
+
+    okx_pos = _position(ExchangeName.OKX, "6")
+    binance_pos = _position(ExchangeName.BINANCE, "6")
+
+    gate, _ = _gate(
+        tmp_path,
+        strategy=_strategy(),
+        okx_positions=(okx_pos,),
+        binance_positions=(binance_pos,),
+        okx_stops=(stop1, stop2),
+        call_strategy_on_start=False,
+        startup_feature_backfill_enabled=False,
+    )
+    gate.position_plan_store = plan_store
+
+    report = await gate.run()
+
+    # Should fail because ambiguous stop scope
+    assert report.ok is False
+    assert report.verdict == "fail_recovery"
+    assert any(
+        "legacy_stop_scope_ambiguous" in issue
+        or "unknown_stop_scope" in issue
+        for issue in report.issues
+    ), f"Expected ambiguous/unknown in issues: {report.issues}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Preflight Margin Mode Tests
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class _MarginTrackingAccount:
+    """Fake account that tracks which margin_mode was used in fetch_leverage."""
+
+    def __init__(
+        self,
+        exchange: ExchangeName,
+        *,
+        isolated_leverage: int = 15,
+        cross_leverage: int = 20,
+        mode: PositionMode = PositionMode.HEDGE,
+        positions: tuple[Position, ...] = (),
+    ) -> None:
+        self.exchange = exchange
+        self.symbol = SYMBOL
+        self.isolated_leverage = isolated_leverage
+        self.cross_leverage = cross_leverage
+        self.mode = mode
+        self.positions = positions
+        self.fetch_leverage_calls: list[MarginMode | None] = []
+
+    async def fetch_balance(self, asset="USDT"):
+        return Balance(
+            exchange=self.exchange,
+            asset=asset,
+            total=Decimal("10000"),
+            available=Decimal("9000"),
+        )
+
+    async def fetch_positions(self, *args, **kwargs):
+        return list(self.positions)
+
+    async def fetch_leverage(self, margin_mode=MarginMode.CROSS):
+        self.fetch_leverage_calls.append(margin_mode)
+        leverage = (
+            self.isolated_leverage
+            if margin_mode is MarginMode.ISOLATED
+            else self.cross_leverage
+        )
+        return LeverageInfo(
+            exchange=self.exchange,
+            symbol=SYMBOL,
+            raw_symbol=SYMBOL,
+            leverage=Decimal(str(leverage)),
+            margin_mode=margin_mode,
+        )
+
+    async def fetch_position_mode(self):
+        return self.mode
+
+
+class _MarginTrackingExecution:
+    def __init__(self, exchange: ExchangeName, *, stops=()) -> None:
+        self.exchange = exchange
+        self.symbol = SYMBOL
+        self._sandbox = False
+        self._live_trading_enabled = True
+        self.stops = tuple(stops)
+
+    async def fetch_open_orders(self):
+        return []
+
+    async def fetch_open_stop_orders(self):
+        return list(self.stops)
+
+    async def fetch_instrument_rule(self):
+        from src.platform.exchanges.models import InstrumentRule
+
+        return InstrumentRule(
+            exchange=self.exchange,
+            symbol=SYMBOL,
+            raw_symbol=(
+                "ETH-USDT-SWAP"
+                if self.exchange == ExchangeName.OKX
+                else "ETHUSDT"
+            ),
+            price_tick=Decimal("0.05"),
+            quantity_step=Decimal("0.01"),
+            min_quantity=Decimal("0.01"),
+            contract_value=Decimal("1"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_preflight_uses_isolated_leverage_from_config(
+    tmp_path,
+) -> None:
+    """Preflight fetches leverage with ISOLATED when MARGIN_MODE=isolated."""
+    from src.runtime.account_config import (
+        AccountConfigEnv,
+        AccountConfigTarget,
+    )
+
+    okx_account = _MarginTrackingAccount(ExchangeName.OKX)
+    binance_account = _MarginTrackingAccount(ExchangeName.BINANCE)
+
+    okx_exec = _MarginTrackingExecution(ExchangeName.OKX)
+    binance_exec = _MarginTrackingExecution(ExchangeName.BINANCE)
+
+    app = _app()
+    policy = MasterFollowerPolicyConfig(
+        master_exchange=ExchangeName.OKX,
+        follower_exchanges=(ExchangeName.BINANCE,),
+    )
+    runtime_config = LiveRuntimeConfig(
+        app=app,
+        mode=RuntimeMode.LIVE_RUNTIME,
+        master_follower_policy=policy,
+    )
+
+    plan_store = SqlitePositionPlanStore(
+        tmp_path / "plan.sqlite3"
+    )
+    journal = SqliteOrderJournalStore(
+        tmp_path / "journal.sqlite3"
+    )
+
+    # Ensure DB files exist (required by _probe_databases)
+    db_paths = {
+        "state": tmp_path / "state.sqlite3",
+        "position_plan": tmp_path / "plan.sqlite3",
+        "order_journal": tmp_path / "journal.sqlite3",
+        "range_checkpoint": tmp_path / "range_checkpoint.sqlite3",
+        "mf_feature": tmp_path / "features.sqlite3",
+    }
+    for name in ("state", "range_checkpoint", "mf_feature"):
+        sqlite3.connect(db_paths[name]).close()
+
+    # Build an AccountConfigEnv with ISOLATED + 15x leverage
+    account_config_env = AccountConfigEnv(
+        margin_mode=MarginMode.ISOLATED,
+        targets=(
+            AccountConfigTarget(
+                exchange=ExchangeName.OKX,
+                symbol=SYMBOL,
+                margin_mode=MarginMode.ISOLATED,
+                leverage=Decimal("15"),
+            ),
+            AccountConfigTarget(
+                exchange=ExchangeName.BINANCE,
+                symbol=SYMBOL,
+                margin_mode=MarginMode.ISOLATED,
+                leverage=Decimal("15"),
+            ),
+        ),
+    )
+
+    gate = PortfolioV1LiveGate(
+        app_config=app,
+        runtime_config=runtime_config,
+        strategy=_strategy(),
+        account_clients=(okx_account, binance_account),
+        execution_clients=(okx_exec, binance_exec),
+        position_plan_store=plan_store,
+        order_journal=journal,
+        readiness_inspector=_Inspector(),
+        database_paths=db_paths,
+        repo_root=tmp_path,
+        required_master_exchange=ExchangeName.OKX,
+        required_follower_exchange=ExchangeName.BINANCE,
+        call_strategy_on_start=False,
+        startup_feature_backfill_enabled=False,
+        account_config_env=account_config_env,
+    )
+
+    report = await gate.run()
+    assert report.ok is True
+
+    # Verify fetch_leverage was called with ISOLATED, never CROSS
+    for account in (okx_account, binance_account):
+        assert len(account.fetch_leverage_calls) >= 1
+        for call in account.fetch_leverage_calls:
+            assert call is MarginMode.ISOLATED, (
+                f"{account.exchange.value}: expected ISOLATED, got {call}"
+            )
+
+    # Verify leverage in snapshots
+    summary = report.account_snapshot_summary
+    for exchange_val in ("okx", "binance"):
+        assert summary[exchange_val]["leverage_read"] is True
+
+
+@pytest.mark.asyncio
+async def test_preflight_leverage_matches_account_config_target(
+    tmp_path,
+) -> None:
+    """MARGIN_MODE=isolated, OKX_LEVERAGE=15 → snapshot shows 15."""
+    from src.runtime.account_config import (
+        AccountConfigEnv,
+        AccountConfigTarget,
+    )
+
+    okx_account = _MarginTrackingAccount(
+        ExchangeName.OKX, isolated_leverage=15, cross_leverage=20
+    )
+    binance_account = _MarginTrackingAccount(
+        ExchangeName.BINANCE, isolated_leverage=15, cross_leverage=20
+    )
+
+    okx_exec = _MarginTrackingExecution(ExchangeName.OKX)
+    binance_exec = _MarginTrackingExecution(ExchangeName.BINANCE)
+
+    app = _app()
+    policy = MasterFollowerPolicyConfig(
+        master_exchange=ExchangeName.OKX,
+        follower_exchanges=(ExchangeName.BINANCE,),
+    )
+    runtime_config = LiveRuntimeConfig(
+        app=app,
+        mode=RuntimeMode.LIVE_RUNTIME,
+        master_follower_policy=policy,
+    )
+
+    plan_store = SqlitePositionPlanStore(
+        tmp_path / "plan.sqlite3"
+    )
+    journal = SqliteOrderJournalStore(
+        tmp_path / "journal.sqlite3"
+    )
+
+    # Ensure DB files exist
+    db_paths = {
+        "state": tmp_path / "state.sqlite3",
+        "position_plan": tmp_path / "plan.sqlite3",
+        "order_journal": tmp_path / "journal.sqlite3",
+        "range_checkpoint": tmp_path / "range_checkpoint.sqlite3",
+        "mf_feature": tmp_path / "features.sqlite3",
+    }
+    for name in ("state", "range_checkpoint", "mf_feature"):
+        sqlite3.connect(db_paths[name]).close()
+
+    account_config_env = AccountConfigEnv(
+        margin_mode=MarginMode.ISOLATED,
+        targets=(
+            AccountConfigTarget(
+                exchange=ExchangeName.OKX,
+                symbol=SYMBOL,
+                margin_mode=MarginMode.ISOLATED,
+                leverage=Decimal("15"),
+            ),
+            AccountConfigTarget(
+                exchange=ExchangeName.BINANCE,
+                symbol=SYMBOL,
+                margin_mode=MarginMode.ISOLATED,
+                leverage=Decimal("15"),
+            ),
+        ),
+    )
+
+    gate = PortfolioV1LiveGate(
+        app_config=app,
+        runtime_config=runtime_config,
+        strategy=_strategy(),
+        account_clients=(okx_account, binance_account),
+        execution_clients=(okx_exec, binance_exec),
+        position_plan_store=plan_store,
+        order_journal=journal,
+        readiness_inspector=_Inspector(),
+        database_paths=db_paths,
+        repo_root=tmp_path,
+        required_master_exchange=ExchangeName.OKX,
+        required_follower_exchange=ExchangeName.BINANCE,
+        call_strategy_on_start=False,
+        startup_feature_backfill_enabled=False,
+        account_config_env=account_config_env,
+    )
+
+    report = await gate.run()
+    assert report.ok is True
+
+    # ISOLATED leverage should be 15, not CROSS leverage of 20
+    for account in (okx_account, binance_account):
+        for call in account.fetch_leverage_calls:
+            assert call is MarginMode.ISOLATED
+            assert call is not MarginMode.CROSS

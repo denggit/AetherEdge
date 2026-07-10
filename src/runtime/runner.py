@@ -4223,6 +4223,59 @@ class LiveRuntimeRunner:
             for s in snapshots
         )
         logger.info("Startup reconciliation starting | exchanges=%s count=%s", exchange_names, len(snapshots))
+
+        # ── Inject legacy stop adoptions from strategy recovery ───────
+        legacy_adoptions: list[dict[str, Any]] = getattr(
+            self.context.strategy, "_legacy_adoptions", []
+        ) or []
+        if legacy_adoptions:
+            from src.order_management.reconciliation.models import (
+                ReconciliationAction,
+            )
+
+            now_ms = int(time.time() * 1000)
+            for adoption in legacy_adoptions:
+                action = ReconciliationAction(
+                    action_type="adopt_legacy_stop_reference",
+                    target=(
+                        f"leg:{adoption['position_id']}:"
+                        f"{adoption['exchange']}"
+                    ),
+                    detail={
+                        "position_id": adoption["position_id"],
+                        "exchange": adoption["exchange"],
+                        "stop_order_id": adoption["stop_order_id"],
+                        "stop_client_order_id": adoption[
+                            "stop_client_order_id"
+                        ],
+                        "effective_stop_price": adoption[
+                            "effective_stop_price"
+                        ],
+                        "canonical_theoretical_stop_price": adoption[
+                            "canonical_theoretical_stop_price"
+                        ],
+                        "resolution_status": adoption[
+                            "resolution_status"
+                        ],
+                        "adopted_at_ms": now_ms,
+                    },
+                )
+                # Apply legacy adoption directly to the store before
+                # reconciliation runs (so reconciliation sees the
+                # corrected state).
+                service._apply_actions([action], self.app_config.symbol)
+                logger.warning(
+                    "Startup recovery: legacy stop adopted | "
+                    "position_id=%s exchange=%s stop_order_id=%s "
+                    "effective_stop_price=%s",
+                    adoption["position_id"],
+                    adoption["exchange"],
+                    adoption["stop_order_id"],
+                    adoption["effective_stop_price"],
+                )
+            # Clear the list so it is not re-applied on subsequent calls.
+            self.context.strategy._legacy_adoptions = []
+
         report = await service.reconcile_and_apply(snapshots)
         if report.stale_plans_closed > 0:
             logger.warning(
