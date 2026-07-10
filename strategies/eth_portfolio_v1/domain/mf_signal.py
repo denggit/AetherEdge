@@ -109,12 +109,19 @@ class MfLowSweepConfig:
     range_pct: Decimal = Decimal("0.002")
     range_price_step: Decimal = Decimal("1")
     exit_variant: str = MF_LIVE_EXIT_VARIANT
+    hard_stop_enabled: bool = True
+    hard_stop_pct: Decimal = Decimal("0.0500")
+    hard_stop_cooldown_hours: int = 12
 
     def __post_init__(self) -> None:
         validate_mf_exit_variant(self.exit_variant)
         if self.position_fraction is not None:
             legacy_fraction = Decimal(str(self.position_fraction))
-            if legacy_fraction != self.margin_fraction and self.margin_fraction != Decimal("0.10"):
+            if (
+                legacy_fraction != self.margin_fraction
+                and self.margin_fraction != Decimal("0.10")
+                and legacy_fraction != Decimal("0.10")
+            ):
                 raise ValueError(
                     "mf.position_fraction and mf.margin_fraction are ambiguous"
                 )
@@ -198,6 +205,14 @@ class MfLowSweepConfig:
                 "mf.decision_buffer_minutes must not exceed "
                 "decision_buffer_max_minutes"
             )
+        if not Decimal("0") < self.hard_stop_pct <= Decimal("0.20"):
+            raise ValueError(
+                "mf.hard_stop_pct must be within (0, 0.20]"
+            )
+        if self.hard_stop_cooldown_hours < 0:
+            raise ValueError(
+                "mf.hard_stop_cooldown_hours must be >= 0"
+            )
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any] | None) -> "MfLowSweepConfig":
@@ -252,6 +267,15 @@ class MfLowSweepConfig:
                 str(raw.get("range_price_step", "1"))
             ),
             exit_variant=str(raw.get("exit_variant", MF_LIVE_EXIT_VARIANT)),
+            hard_stop_enabled=_config_bool(
+                raw.get("hard_stop_enabled"), default=True
+            ),
+            hard_stop_pct=Decimal(
+                str(raw.get("hard_stop_pct", "0.0500"))
+            ),
+            hard_stop_cooldown_hours=int(
+                raw.get("hard_stop_cooldown_hours", 12)
+            ),
         )
 
 

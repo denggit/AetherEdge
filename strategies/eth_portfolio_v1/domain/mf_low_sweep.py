@@ -142,6 +142,12 @@ def evaluate_mf_low_sweep(
         _set_reason(audit, sleeve.state_label)
         return None, audit
 
+    # ── Hard stop cooldown: block new entries only, exits still fire ──
+    if not sleeve.active and sleeve.cooldown_active(decision_time_ms):
+        _set_reason(audit, "mf_hard_stop_cooldown")
+        audit["cooldown_until_ms"] = sleeve.hard_stop_cooldown_until_ms
+        return None, audit
+
     holding_minutes, holding_bars = _holding_age(
         sleeve=sleeve,
         latest=latest,

@@ -128,6 +128,95 @@ def test_mf_config_rejects_invalid_margin_fraction() -> None:
         MfLowSweepConfig.from_mapping({"margin_fraction": "1.5"})
 
 
+def test_margin_fraction_1x_sizing() -> None:
+    """Live sizing: margin_fraction=0.0666666667 → 1.0× equity notional at 15×."""
+    equity = Decimal("10000")
+    leverage = Decimal("15")
+    margin_fraction = Decimal("0.0666666667")
+    reference_price = Decimal("2500")
+
+    target_notional = equity * margin_fraction * leverage
+    # Should be approximately 10000 (1× equity), not 15000 (1.5× equity)
+    expected = Decimal("10000")
+    assert abs(target_notional - expected) / expected < Decimal(
+        "0.001"
+    ), (
+        f"target_notional={target_notional} should be ≈{expected} "
+        f"(1× equity), not 1.5×"
+    )
+
+    quantity = target_notional / reference_price
+    expected_qty = Decimal("4.0")
+    assert abs(quantity - expected_qty) / expected_qty < Decimal(
+        "0.001"
+    )
+
+    # Verify it's NOT 1.5× (which would be 15000 notional, 6.0 qty)
+    old_notional = equity * Decimal("0.10") * leverage
+    assert old_notional == Decimal("15000"), (
+        "old margin_fraction=0.10 gives 1.5×"
+    )
+
+
+def test_hard_stop_config_defaults() -> None:
+    """Hard stop config fields parse with correct defaults."""
+    from strategies.eth_portfolio_v1.domain.mf_signal import (
+        MfLowSweepConfig,
+    )
+
+    cfg = MfLowSweepConfig.from_mapping(
+        {
+            "margin_fraction": "0.0666666667",
+            "hard_stop_enabled": True,
+            "hard_stop_pct": "0.0500",
+            "hard_stop_cooldown_hours": 12,
+        }
+    )
+    assert cfg.hard_stop_enabled is True
+    assert cfg.hard_stop_pct == Decimal("0.0500")
+    assert cfg.hard_stop_cooldown_hours == 12
+
+    # Defaults
+    cfg2 = MfLowSweepConfig.from_mapping(
+        {"margin_fraction": "0.0666666667"}
+    )
+    assert cfg2.hard_stop_enabled is True
+    assert cfg2.hard_stop_pct == Decimal("0.0500")
+    assert cfg2.hard_stop_cooldown_hours == 12
+
+
+def test_hard_stop_config_rejects_invalid() -> None:
+    """Hard stop pct must be in (0, 0.20]. Cooldown must be >= 0."""
+    import pytest
+    from strategies.eth_portfolio_v1.domain.mf_signal import (
+        MfLowSweepConfig,
+    )
+
+    with pytest.raises(ValueError, match="hard_stop_pct"):
+        MfLowSweepConfig.from_mapping(
+            {
+                "margin_fraction": "0.0666666667",
+                "hard_stop_pct": "0.25",
+            }
+        )
+
+    with pytest.raises(ValueError, match="hard_stop_pct"):
+        MfLowSweepConfig.from_mapping(
+            {
+                "margin_fraction": "0.0666666667",
+                "hard_stop_pct": "0",
+            }
+        )
+
+    with pytest.raises(ValueError, match="hard_stop_cooldown_hours"):
+        MfLowSweepConfig.from_mapping(
+            {
+                "margin_fraction": "0.0666666667",
+                "hard_stop_cooldown_hours": -1,
+            }
+        )
+
+
 def test_cb_exposure_to_ae_margin_formula() -> None:
     """Conversion formula: margin_fraction = mf_exposure / leverage."""
     for exposure, leverage, expected_margin in [

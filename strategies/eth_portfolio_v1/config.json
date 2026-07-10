@@ -97,7 +97,7 @@
   },
   "mf": {
     "enabled": true,
-    "margin_fraction": "0.10",
+    "margin_fraction": "0.0666666667",
     "available_margin_buffer": "0.95",
     "exit_variant": "time48",
     "holding_minutes": 48,
@@ -115,6 +115,9 @@
     "decision_buffer_minutes": 4320,
     "decision_buffer_max_minutes": 10080,
     "range_pct": "0.002",
-    "range_price_step": "1"
+    "range_price_step": "1",
+    "hard_stop_enabled": true,
+    "hard_stop_pct": "0.0500",
+    "hard_stop_cooldown_hours": 12
   }
 }

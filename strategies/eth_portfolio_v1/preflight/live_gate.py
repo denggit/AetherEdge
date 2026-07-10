@@ -904,10 +904,36 @@ class PortfolioV1LiveGate:
                     )
                 )
                 if sleeve_id == MF_RESERVED_SLEEVE_ID:
-                    if scoped_orders:
-                        issues.append(
-                            f"unexpected_mf_stop:{exchange}:{position_id}"
-                        )
+                    # MF scoped hard stop is expected when hard_stop is
+                    # enabled and the stop belongs to an active MF position.
+                    mf_config = getattr(
+                        getattr(self.strategy, "config", None),
+                        "mf",
+                        None,
+                    )
+                    mf_hard_stop_enabled = bool(
+                        getattr(mf_config, "hard_stop_enabled", False)
+                        if mf_config is not None
+                        else False
+                    )
+                    mf_sleeve = getattr(
+                        self.strategy, "mf_sleeve", None
+                    )
+                    mf_active = (
+                        mf_sleeve is not None
+                        and mf_sleeve.active
+                        and mf_sleeve.position_id == position_id
+                    )
+                    if not (
+                        mf_hard_stop_enabled
+                        and mf_active
+                        and scoped_orders
+                    ):
+                        if scoped_orders:
+                            issues.append(
+                                "unexpected_mf_stop:"
+                                f"{exchange}:{position_id}"
+                            )
                     continue
                 if sleeve_id != LF_SLEEVE_ID:
                     continue

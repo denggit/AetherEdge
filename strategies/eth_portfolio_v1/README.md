@@ -26,6 +26,20 @@ strategy_version: V1
   (`OKX_LEVERAGE`, `BINANCE_LEVERAGE`, `MARGIN_MODE`). Each exchange sizes from
   its own account equity and available balance, with `available_margin_buffer`
   applied to the available-margin cap.
+- **Live sizing (1× equity):** `margin_fraction=0.0666666667` at 15× leverage
+  → target notional ≈ 1.0× equity. This is a conservative reduction from the
+  CoinBacktest 1.5× exposure, to improve survivability during deep MAE paths
+  (e.g. 2025-02-03 style extreme moves) under isolated-margin execution.
+- **MF hard stop:** after a successful MF open, a 5.0% hard stop loss is
+  placed as an exchange stop market order on each filled exchange, calculated
+  from the master average fill price. The stop is reduce-only and scoped to
+  the MF sleeve only.
+- **Hard stop cooldown:** when the MF hard stop is filled, the MF sleeve is
+  cleared and a 12-hour cooldown is activated. During cooldown, new MF entries
+  are blocked but LF signals and time48 exits on an active sleeve are not
+  affected.
+- **Time48 exit cancels stop:** a normal time48 close automatically cancels
+  the associated MF hard stop orders (scoped cancel, not global).
 - The plugin owns its copied domain, engine, execution, feature, and
   persistence modules and does not import another concrete strategy plugin.
 - V1 regular stop replacement never uses global `cancel_all_stop_orders`.

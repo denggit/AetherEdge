@@ -29,6 +29,13 @@ class MfSleeveState:
     entry_tradebar_open_time_ms: int | None = None
     pending_open: bool = False
     pending_close: bool = False
+    hard_stop_price: Decimal | None = None
+    stop_order_ids_by_exchange: dict[str, str] = field(default_factory=dict)
+    stop_client_order_ids_by_exchange: dict[str, str] = field(
+        default_factory=dict
+    )
+    hard_stop_cooldown_until_ms: int | None = None
+    last_hard_stop_time_ms: int | None = None
 
     @property
     def active(self) -> bool:
@@ -193,6 +200,46 @@ class MfSleeveState:
         self.entry_tradebar_open_time_ms = None
         self.pending_open = False
         self.pending_close = False
+        self.clear_hard_stop()
+
+    def record_hard_stop(
+        self,
+        *,
+        stop_price: Decimal,
+        stop_order_id: str | None = None,
+        stop_client_order_id: str | None = None,
+        exchange: str,
+    ) -> None:
+        self.hard_stop_price = Decimal(stop_price)
+        norm_exchange = str(exchange).strip().lower()
+        if stop_order_id:
+            self.stop_order_ids_by_exchange[norm_exchange] = str(
+                stop_order_id
+            )
+        if stop_client_order_id:
+            self.stop_client_order_ids_by_exchange[norm_exchange] = str(
+                stop_client_order_id
+            )
+
+    def clear_hard_stop(self) -> None:
+        self.hard_stop_price = None
+        self.stop_order_ids_by_exchange = {}
+        self.stop_client_order_ids_by_exchange = {}
+
+    def set_hard_stop_cooldown(
+        self,
+        event_time_ms: int,
+        cooldown_hours: int,
+    ) -> None:
+        self.hard_stop_cooldown_until_ms = (
+            int(event_time_ms) + int(cooldown_hours) * 3_600_000
+        )
+        self.last_hard_stop_time_ms = int(event_time_ms)
+
+    def cooldown_active(self, current_time_ms: int) -> bool:
+        if self.hard_stop_cooldown_until_ms is None:
+            return False
+        return int(current_time_ms) < self.hard_stop_cooldown_until_ms
 
     def position_snapshots(self) -> tuple[StrategyPositionSnapshot, ...]:
         if not self.active or self.position_id is None:
@@ -202,6 +249,33 @@ class MfSleeveState:
             if self.pending_close
             else StrategyPositionStatus.ACTIVE
         )
+        metadata: dict[str, Any] = {
+            "active_exchanges": sorted(self.exchange_quantities),
+            "exchange_quantities_base": _string_decimal_mapping(
+                self.exchange_quantities
+            ),
+            "exit_variant": "time48",
+            "stop_scope": self.position_id,
+            "protective_stop_required": self.hard_stop_price is not None,
+            "entry_execution_time_ms": self.entry_execution_time_ms,
+            "entry_tradebar_open_time_ms": (
+                self.entry_tradebar_open_time_ms
+            ),
+        }
+        if self.hard_stop_price is not None:
+            metadata["stop_price"] = str(self.hard_stop_price)
+            if self.stop_order_ids_by_exchange:
+                metadata["stop_order_ids_by_exchange"] = dict(
+                    self.stop_order_ids_by_exchange
+                )
+            if self.stop_client_order_ids_by_exchange:
+                metadata[
+                    "stop_client_order_ids_by_exchange"
+                ] = dict(self.stop_client_order_ids_by_exchange)
+        if self.hard_stop_cooldown_until_ms is not None:
+            metadata["hard_stop_cooldown_until_ms"] = (
+                self.hard_stop_cooldown_until_ms
+            )
         return (
             StrategyPositionSnapshot(
                 strategy_id=self.strategy_id,
@@ -211,23 +285,11 @@ class MfSleeveState:
                 status=status,
                 base_quantity=self.quantity,
                 average_entry_price=self.average_entry_price,
-                stop_price=None,
+                stop_price=self.hard_stop_price,
                 sleeve_id=self.sleeve_id,
                 engine=MF_ENGINE_NAME,
                 entry_time_ms=self.entry_execution_time_ms,
-                metadata={
-                    "active_exchanges": sorted(self.exchange_quantities),
-                    "exchange_quantities_base": _string_decimal_mapping(
-                        self.exchange_quantities
-                    ),
-                    "exit_variant": "time48",
-                    "stop_scope": self.position_id,
-                    "protective_stop_required": False,
-                    "entry_execution_time_ms": self.entry_execution_time_ms,
-                    "entry_tradebar_open_time_ms": (
-                        self.entry_tradebar_open_time_ms
-                    ),
-                },
+                metadata=metadata,
             ),
         )
 
