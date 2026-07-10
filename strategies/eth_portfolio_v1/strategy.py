@@ -9,7 +9,10 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from src.market_data.events import MarketFeatureEvent, MarketFeatureEventType
-from src.order_management.quantity import NativeQuantityConverter
+from src.order_management.quantity import (
+    NativeQuantityConverter,
+    resolve_executable_base_quantity,
+)
 from src.order_management.safety import (
     RecoveryExitOrderValidator,
     RecoveryExitValidationResult,
@@ -294,6 +297,7 @@ class Strategy:
         self.bar_ready_events: list[BarReadyContext] = []
         self.last_decision_audit: dict[str, Any] | None = None
         self.recovery_alerts: list[str] = []
+        self._position_plan_recovery_updates: list[dict[str, Any]] = []
         self.last_recovery_audit: dict[str, Any] | None = None
         self.stop_safety_alerts: list[str] = []
         self.mf_execution_alerts: list[str] = []
@@ -509,6 +513,7 @@ class Strategy:
         self.recovery_manual_required = False
         self.recovery_blocking_manual_required = False
         self.recovery_alerts.clear()
+        self._position_plan_recovery_updates.clear()
         for snapshot in context.snapshots:
             self._refresh_account_equity(snapshot)
         plans = tuple(context.metadata.get("active_position_plans", ()) if context.metadata else ())
@@ -522,6 +527,11 @@ class Strategy:
             plans=plans,
             prior_strategy_positions=prior_strategy_positions,
         )
+
+    def position_plan_recovery_updates(self) -> tuple[dict[str, Any], ...]:
+        """Return durable leg resolutions decided during the latest recovery."""
+
+        return tuple(dict(item) for item in self._position_plan_recovery_updates)
 
     async def on_account_snapshot(self, snapshot: PlatformSnapshot) -> None:
         self._refresh_account_equity(snapshot)
@@ -591,6 +601,26 @@ class Strategy:
         source: str,
         event_time_ms: int | None,
     ) -> Sequence[TradeSignal]:
+        if (
+            signal.metadata
+            and signal.metadata.get("execution_purpose")
+            == "follower_recovery_topup"
+            and results
+            and all(
+                result.raw.get("execution_outcome")
+                == "skipped_non_executable_quantity"
+                for result in results
+            )
+        ):
+            for result in results:
+                leg = self.position.legs.get(result.exchange.value)
+                if leg is not None:
+                    leg.sync_status = "synced"
+                    leg.metadata = {
+                        **dict(leg.metadata),
+                        "execution_outcome": "skipped_non_executable_quantity",
+                    }
+            return []
         if (
             signal.metadata
             and signal.metadata.get("sleeve_id") == MF_RESERVED_SLEEVE_ID
@@ -3492,12 +3522,30 @@ class Strategy:
             exchange = str(leg.get("exchange") or "").lower()
             if not exchange or exchange == self.config.data_exchange:
                 continue
-            target_qty = _dec_or_zero(leg.get("target_qty_base"))
+            raw_target_qty = _dec_or_zero(leg.get("target_qty_base"))
+            confirmed_filled_qty = _dec_or_zero(leg.get("filled_qty_base"))
             follower_snapshot = snapshots.get(exchange)
             same_qty, same_native_qty, reverse_qty, _reverse_native_qty = _side_quantities_with_native(
                 follower_snapshot.positions if follower_snapshot else [],
                 side,
                 market_profile=market_profile,
+            )
+            instrument_rule = (
+                None if follower_snapshot is None else follower_snapshot.instrument_rule
+            )
+            target_resolution = resolve_executable_base_quantity(
+                exchange=exchange,
+                symbol=self.config.symbol,
+                raw_base_quantity=raw_target_qty,
+                market_profile=market_profile,
+                instrument_rule=instrument_rule,
+                reference_price=entry_price,
+                quantity_converter=converter,
+            )
+            expected_existing_qty = (
+                confirmed_filled_qty
+                if confirmed_filled_qty > 0
+                else target_resolution.normalized_base_quantity
             )
             if reverse_qty > 0:
                 self.position.legs[exchange] = self.position.legs.get(exchange) or self.position.mark_leg_closed(exchange=exchange, sync_status="reverse_position_manual_required")
@@ -3515,7 +3563,114 @@ class Strategy:
                     self.position.position_id,
                 )
                 continue
-            if same_qty <= 0 and target_qty > 0:
+
+            # A confirmed fill is the recovery contract for an established
+            # leg.  The theoretical sizing target may contain a non-executable
+            # decimal tail and must never cause a second entry by itself.
+            if confirmed_filled_qty > 0 and same_qty == confirmed_filled_qty:
+                raw_delta = max(Decimal("0"), raw_target_qty - same_qty)
+                delta_resolution = resolve_executable_base_quantity(
+                    exchange=exchange,
+                    symbol=self.config.symbol,
+                    raw_base_quantity=raw_delta,
+                    market_profile=market_profile,
+                    instrument_rule=instrument_rule,
+                    reference_price=entry_price,
+                    quantity_converter=converter,
+                )
+                reason = (
+                    "non_executable_rounding_dust"
+                    if raw_delta > 0 and not delta_resolution.executable
+                    else "actual_matches_confirmed_fill"
+                )
+                resolution_metadata = self._follower_quantity_resolution_metadata(
+                    resolution="confirmed_fill",
+                    raw_target_qty=raw_target_qty,
+                    confirmed_filled_qty=confirmed_filled_qty,
+                    actual_exchange_qty=same_qty,
+                    raw_delta=raw_delta,
+                    delta_resolution=delta_resolution,
+                    reason=reason,
+                )
+                leg_state = self.position.mark_leg_open(
+                    exchange=exchange,
+                    avg_fill_price=entry_price,
+                    base_qty=same_qty,
+                    native_qty=same_native_qty,
+                    sync_status="synced",
+                )
+                leg_state.metadata = resolution_metadata
+                self._record_position_plan_recovery_update(
+                    position_id=str(plan.get("position_id") or ""),
+                    exchange=exchange,
+                    sync_status="synced",
+                    metadata=resolution_metadata,
+                )
+                signals.extend(
+                    self._validate_existing_follower_stop(
+                        validator=validator,
+                        snapshot=follower_snapshot,
+                        exchange=exchange,
+                        side=side,
+                        base_quantity=same_qty,
+                        native_quantity=same_native_qty,
+                        stop_price=stop_price,
+                        market_profile=market_profile,
+                    )
+                )
+                continue
+
+            # Without a confirmed fill, an already-present exchange position
+            # is evidence that must not be enlarged from a theoretical target.
+            if confirmed_filled_qty <= 0 and same_qty > 0:
+                raw_delta = max(Decimal("0"), raw_target_qty - same_qty)
+                delta_resolution = resolve_executable_base_quantity(
+                    exchange=exchange,
+                    symbol=self.config.symbol,
+                    raw_base_quantity=raw_delta,
+                    market_profile=market_profile,
+                    instrument_rule=instrument_rule,
+                    reference_price=entry_price,
+                    quantity_converter=converter,
+                )
+                resolution_metadata = self._follower_quantity_resolution_metadata(
+                    resolution="exchange_position",
+                    raw_target_qty=raw_target_qty,
+                    confirmed_filled_qty=confirmed_filled_qty,
+                    actual_exchange_qty=same_qty,
+                    raw_delta=raw_delta,
+                    delta_resolution=delta_resolution,
+                    reason="existing_position_without_confirmed_fill",
+                )
+                leg_state = self.position.mark_leg_open(
+                    exchange=exchange,
+                    avg_fill_price=entry_price,
+                    base_qty=same_qty,
+                    native_qty=same_native_qty,
+                    sync_status="synced",
+                )
+                leg_state.metadata = resolution_metadata
+                self._record_position_plan_recovery_update(
+                    position_id=str(plan.get("position_id") or ""),
+                    exchange=exchange,
+                    sync_status="synced",
+                    metadata=resolution_metadata,
+                )
+                signals.extend(
+                    self._validate_existing_follower_stop(
+                        validator=validator,
+                        snapshot=follower_snapshot,
+                        exchange=exchange,
+                        side=side,
+                        base_quantity=same_qty,
+                        native_quantity=same_native_qty,
+                        stop_price=stop_price,
+                        market_profile=market_profile,
+                    )
+                )
+                continue
+
+            if same_qty <= 0 and expected_existing_qty > 0:
                 self.position.mark_leg_closed(exchange=exchange, sync_status="missing")
                 signals.extend(
                     self._cleanup_missing_follower_stops(
@@ -3525,89 +3680,243 @@ class Strategy:
                     )
                 )
                 self.recovery_alerts.append(f"follower_missing_manual_required:{exchange}")
-                if not self.recovery_manual_required:
-                    signals.append(self._follower_topup_signal(exchange=exchange, side=side, quantity=target_qty, plan=plan))
-            elif same_qty < target_qty:
-                self.position.mark_leg_open(exchange=exchange, avg_fill_price=entry_price, base_qty=same_qty, native_qty=same_native_qty, sync_status="underfilled")
-                if follower_snapshot is not None:
-                    follower_validation = validator.validate_stop_orders(
-                        exchange=follower_snapshot.balance.exchange,
-                        symbol=self.config.symbol,
-                        strategy_id=self.config.strategy_id,
-                        position_id=self.position.position_id,
-                        position_side=_position_side_for_strategy_side(side),
-                        position_mode=follower_snapshot.position_mode,
-                        current_position_native_quantity=same_native_qty,
-                        canonical_stop_price=stop_price,
-                        open_stop_orders=follower_snapshot.open_stop_orders,
-                        open_orders=follower_snapshot.open_orders,
-                        market_profile=market_profile,
-                        instrument_rule=follower_snapshot.instrument_rule,
-                    )
-                    signals.extend(
-                        self._signals_from_recovery_exit_validation(
-                            validation=follower_validation,
+                missing_resolution = resolve_executable_base_quantity(
+                    exchange=exchange,
+                    symbol=self.config.symbol,
+                    raw_base_quantity=expected_existing_qty,
+                    market_profile=market_profile,
+                    instrument_rule=instrument_rule,
+                    reference_price=entry_price,
+                    quantity_converter=converter,
+                )
+                if not self.recovery_manual_required and missing_resolution.executable:
+                    signals.append(
+                        self._follower_topup_signal(
                             exchange=exchange,
-                            quantity=same_qty,
-                            stop_price=stop_price,
-                            reason="RECOVERY_FOLLOWER_STOP_SYNC",
+                            side=side,
+                            quantity=missing_resolution.normalized_base_quantity,
+                            plan=plan,
+                            quantity_metadata=self._follower_quantity_resolution_metadata(
+                                resolution=(
+                                    "confirmed_fill"
+                                    if confirmed_filled_qty > 0
+                                    else "normalized_planned_target"
+                                ),
+                                raw_target_qty=raw_target_qty,
+                                confirmed_filled_qty=confirmed_filled_qty,
+                                actual_exchange_qty=same_qty,
+                                raw_delta=expected_existing_qty,
+                                delta_resolution=missing_resolution,
+                                reason="executable_missing_quantity",
+                            ),
                         )
                     )
-                signals.append(self._follower_topup_signal(exchange=exchange, side=side, quantity=target_qty - same_qty, plan=plan))
-            elif same_qty > target_qty and target_qty > 0:
+            elif same_qty < expected_existing_qty:
+                raw_delta = expected_existing_qty - same_qty
+                delta_resolution = resolve_executable_base_quantity(
+                    exchange=exchange,
+                    symbol=self.config.symbol,
+                    raw_base_quantity=raw_delta,
+                    market_profile=market_profile,
+                    instrument_rule=instrument_rule,
+                    reference_price=entry_price,
+                    quantity_converter=converter,
+                )
+                resolution_metadata = self._follower_quantity_resolution_metadata(
+                    resolution=(
+                        "confirmed_fill"
+                        if confirmed_filled_qty > 0
+                        else "normalized_planned_target"
+                    ),
+                    raw_target_qty=raw_target_qty,
+                    confirmed_filled_qty=confirmed_filled_qty,
+                    actual_exchange_qty=same_qty,
+                    raw_delta=raw_delta,
+                    delta_resolution=delta_resolution,
+                    reason=(
+                        "executable_underfill"
+                        if delta_resolution.executable
+                        else "non_executable_rounding_dust"
+                    ),
+                )
+                sync_status = "underfilled" if delta_resolution.executable else "synced"
+                leg_state = self.position.mark_leg_open(
+                    exchange=exchange,
+                    avg_fill_price=entry_price,
+                    base_qty=same_qty,
+                    native_qty=same_native_qty,
+                    sync_status=sync_status,
+                )
+                leg_state.metadata = resolution_metadata
+                signals.extend(
+                    self._validate_existing_follower_stop(
+                        validator=validator,
+                        snapshot=follower_snapshot,
+                        exchange=exchange,
+                        side=side,
+                        base_quantity=same_qty,
+                        native_quantity=same_native_qty,
+                        stop_price=stop_price,
+                        market_profile=market_profile,
+                    )
+                )
+                if delta_resolution.executable:
+                    signals.append(
+                        self._follower_topup_signal(
+                            exchange=exchange,
+                            side=side,
+                            quantity=delta_resolution.normalized_base_quantity,
+                            plan=plan,
+                            quantity_metadata=resolution_metadata,
+                        )
+                    )
+                else:
+                    self._record_position_plan_recovery_update(
+                        position_id=str(plan.get("position_id") or ""),
+                        exchange=exchange,
+                        sync_status="synced",
+                        metadata=resolution_metadata,
+                    )
+            elif same_qty > expected_existing_qty and expected_existing_qty > 0:
                 self.position.mark_leg_open(exchange=exchange, avg_fill_price=entry_price, base_qty=same_qty, native_qty=same_native_qty, sync_status="overfilled")
                 self.recovery_alerts.append(f"follower_overfilled:{exchange}")
-                if follower_snapshot is not None:
-                    follower_validation = validator.validate_stop_orders(
-                        exchange=follower_snapshot.balance.exchange,
-                        symbol=self.config.symbol,
-                        strategy_id=self.config.strategy_id,
-                        position_id=self.position.position_id,
-                        position_side=_position_side_for_strategy_side(side),
-                        position_mode=follower_snapshot.position_mode,
-                        current_position_native_quantity=same_native_qty,
-                        canonical_stop_price=stop_price,
-                        open_stop_orders=follower_snapshot.open_stop_orders,
-                        open_orders=follower_snapshot.open_orders,
+                signals.extend(
+                    self._validate_existing_follower_stop(
+                        validator=validator,
+                        snapshot=follower_snapshot,
+                        exchange=exchange,
+                        side=side,
+                        base_quantity=same_qty,
+                        native_quantity=same_native_qty,
+                        stop_price=stop_price,
                         market_profile=market_profile,
-                        instrument_rule=follower_snapshot.instrument_rule,
                     )
-                    signals.extend(
-                        self._signals_from_recovery_exit_validation(
-                            validation=follower_validation,
-                            exchange=exchange,
-                            quantity=same_qty,
-                            stop_price=stop_price,
-                            reason="RECOVERY_FOLLOWER_STOP_SYNC",
-                        )
-                    )
+                )
             elif same_qty > 0:
                 self.position.mark_leg_open(exchange=exchange, avg_fill_price=entry_price, base_qty=same_qty, native_qty=same_native_qty, sync_status="synced")
-                if follower_snapshot is not None:
-                    follower_validation = validator.validate_stop_orders(
-                        exchange=follower_snapshot.balance.exchange,
-                        symbol=self.config.symbol,
-                        strategy_id=self.config.strategy_id,
-                        position_id=self.position.position_id,
-                        position_side=_position_side_for_strategy_side(side),
-                        position_mode=follower_snapshot.position_mode,
-                        current_position_native_quantity=same_native_qty,
-                        canonical_stop_price=stop_price,
-                        open_stop_orders=follower_snapshot.open_stop_orders,
-                        open_orders=follower_snapshot.open_orders,
+                signals.extend(
+                    self._validate_existing_follower_stop(
+                        validator=validator,
+                        snapshot=follower_snapshot,
+                        exchange=exchange,
+                        side=side,
+                        base_quantity=same_qty,
+                        native_quantity=same_native_qty,
+                        stop_price=stop_price,
                         market_profile=market_profile,
-                        instrument_rule=follower_snapshot.instrument_rule,
                     )
-                    signals.extend(
-                        self._signals_from_recovery_exit_validation(
-                            validation=follower_validation,
-                            exchange=exchange,
-                            quantity=same_qty,
-                            stop_price=stop_price,
-                            reason="RECOVERY_FOLLOWER_STOP_SYNC",
-                        )
-                    )
+                )
         return signals
+
+    def _validate_existing_follower_stop(
+        self,
+        *,
+        validator: RecoveryExitOrderValidator,
+        snapshot: PlatformSnapshot | None,
+        exchange: str,
+        side: Side,
+        base_quantity: Decimal,
+        native_quantity: Decimal,
+        stop_price: Decimal,
+        market_profile,
+    ) -> list[TradeSignal]:
+        if snapshot is None or base_quantity <= 0:
+            return []
+        validation = validator.validate_stop_orders(
+            exchange=snapshot.balance.exchange,
+            symbol=self.config.symbol,
+            strategy_id=self.config.strategy_id,
+            position_id=self.position.position_id,
+            position_side=_position_side_for_strategy_side(side),
+            position_mode=snapshot.position_mode,
+            current_position_native_quantity=native_quantity,
+            canonical_stop_price=stop_price,
+            open_stop_orders=snapshot.open_stop_orders,
+            open_orders=snapshot.open_orders,
+            market_profile=market_profile,
+            instrument_rule=snapshot.instrument_rule,
+        )
+        return self._signals_from_recovery_exit_validation(
+            validation=validation,
+            exchange=exchange,
+            quantity=base_quantity,
+            stop_price=stop_price,
+            reason="RECOVERY_FOLLOWER_STOP_SYNC",
+        )
+
+    def _follower_quantity_resolution_metadata(
+        self,
+        *,
+        resolution: str,
+        raw_target_qty: Decimal,
+        confirmed_filled_qty: Decimal,
+        actual_exchange_qty: Decimal,
+        raw_delta: Decimal,
+        delta_resolution,
+        reason: str,
+    ) -> dict[str, Any]:
+        return {
+            "recovery_quantity_resolution": resolution,
+            "raw_target_qty": str(raw_target_qty),
+            "confirmed_filled_qty": str(confirmed_filled_qty),
+            "actual_exchange_qty": str(actual_exchange_qty),
+            "raw_delta": str(raw_delta),
+            "normalized_delta": str(
+                delta_resolution.normalized_base_quantity
+            ),
+            "normalized_native_delta": str(
+                delta_resolution.normalized_native_quantity
+            ),
+            "quantity_step": (
+                None
+                if delta_resolution.quantity_step is None
+                else str(delta_resolution.quantity_step)
+            ),
+            "min_quantity": (
+                None
+                if delta_resolution.min_quantity is None
+                else str(delta_resolution.min_quantity)
+            ),
+            "min_notional": (
+                None
+                if delta_resolution.min_notional is None
+                else str(delta_resolution.min_notional)
+            ),
+            "normalized_notional": (
+                None
+                if delta_resolution.normalized_notional is None
+                else str(delta_resolution.normalized_notional)
+            ),
+            "reference_price": (
+                None
+                if delta_resolution.normalized_notional is None
+                or delta_resolution.normalized_base_quantity <= 0
+                else str(
+                    delta_resolution.normalized_notional
+                    / delta_resolution.normalized_base_quantity
+                )
+            ),
+            "reason": reason,
+        }
+
+    def _record_position_plan_recovery_update(
+        self,
+        *,
+        position_id: str,
+        exchange: str,
+        sync_status: str,
+        metadata: Mapping[str, Any],
+    ) -> None:
+        if not position_id:
+            return
+        self._position_plan_recovery_updates.append(
+            {
+                "position_id": position_id,
+                "exchange": exchange,
+                "sync_status": sync_status,
+                "metadata": dict(metadata),
+            }
+        )
 
     def _recover_active_master_without_plan(self, master: Position) -> None:
         side = _side_from_position(master)
@@ -3877,7 +4186,15 @@ class Strategy:
         )
         return cancel_signals
 
-    def _follower_topup_signal(self, *, exchange: str, side: Side, quantity: Decimal, plan: Mapping[str, Any]) -> TradeSignal:
+    def _follower_topup_signal(
+        self,
+        *,
+        exchange: str,
+        side: Side,
+        quantity: Decimal,
+        plan: Mapping[str, Any],
+        quantity_metadata: Mapping[str, Any] | None = None,
+    ) -> TradeSignal:
         return TradeSignal(
             symbol=self.config.symbol,
             action=SignalAction.OPEN_LONG if side is Side.LONG else SignalAction.OPEN_SHORT,
@@ -3890,6 +4207,7 @@ class Strategy:
                 "execution_purpose": "follower_recovery_topup",
                 "position_id": plan.get("position_id"),
                 "engine": plan.get("entry_engine"),
+                **dict(quantity_metadata or {}),
             },
         )
 

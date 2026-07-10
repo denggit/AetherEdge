@@ -130,6 +130,34 @@ class SqlitePositionPlanStore:
                 (_enum_value(sync_status), int(time.time() * 1000), position_id, exchange_name.value),
             )
 
+    def apply_recovery_leg_resolution(
+        self,
+        *,
+        position_id: str,
+        exchange: ExchangeName | str,
+        sync_status: LegSyncStatus | str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist a strategy-decided recovery status with auditable metadata."""
+
+        exchange_name = (
+            exchange
+            if isinstance(exchange, ExchangeName)
+            else ExchangeName(str(exchange).strip().lower())
+        )
+        leg = {item.exchange: item for item in self.get_legs(position_id)}.get(
+            exchange_name
+        )
+        if leg is None:
+            return
+        self.upsert_leg(
+            replace(
+                leg,
+                sync_status=sync_status,
+                metadata={**dict(leg.metadata), **dict(metadata or {})},
+            )
+        )
+
     def add_to_leg_target(self, *, position_id: str, exchange: ExchangeName, delta_target_qty_base: Decimal, delta_filled_qty_base: Decimal = Decimal("0")) -> None:
         legs = {leg.exchange: leg for leg in self.get_legs(position_id)}
         leg = legs.get(exchange)

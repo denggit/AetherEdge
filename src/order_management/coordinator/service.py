@@ -10,7 +10,10 @@ from src.order_management.idempotency.client_order_id import DeterministicClient
 from src.order_management.models import ExchangeOrderResult, OrderIntent, OrderIntentStatus, OrderJournalEvent
 from src.order_management.position_plan import LegPlan, LegRole, LegSyncStatus, PositionPlan, PositionPlanStatus
 from src.order_management.ports import ClientOrderIdFactory, DuplicateOrderGuard, OrderIntentRepository
-from src.order_management.quantity import NativeQuantityConverter
+from src.order_management.quantity import (
+    NativeQuantityConverter,
+    resolve_executable_base_quantity,
+)
 from src.order_management.master_follower import MasterFollowerExecutionPolicy, MasterFollowerPolicyEvaluator
 from src.order_management.safety import ExitSafetyError, ExitSafetyGuard, is_exit_action, normalize_exit_request_for_exchange, target_position_side_for_action
 from src.order_management.sync import OrderStatusSynchronizer, extract_avg_fill_price, extract_fee
@@ -66,6 +69,9 @@ class MultiExchangeOrderCoordinator:
         self._position_mode_cache: dict[ExchangeName, PositionMode] = {}
 
     async def execute(self, intent: OrderIntent) -> list[ExchangeOrderResult]:
+        intent, skipped = await self._normalize_recovery_topup_intent(intent)
+        if skipped is not None:
+            return skipped
         if self.duplicate_guard is not None:
             self.duplicate_guard.assert_not_duplicate(intent)
         plan = self.planner.plan(intent.signal)
@@ -134,6 +140,159 @@ class MultiExchangeOrderCoordinator:
                         },
                     )
                 )
+        return results
+
+    async def _normalize_recovery_topup_intent(
+        self, intent: OrderIntent
+    ) -> tuple[OrderIntent, list[ExchangeOrderResult] | None]:
+        """Normalize follower top-ups before planning and turn dust into a no-op."""
+
+        signal = intent.signal
+        purpose = str(
+            signal.metadata.get("execution_purpose", "")
+            if signal.metadata
+            else ""
+        ).strip().lower()
+        if purpose != "follower_recovery_topup" or signal.action not in {
+            SignalAction.OPEN_LONG,
+            SignalAction.OPEN_SHORT,
+        }:
+            return intent, None
+
+        client_by_exchange = {client.exchange: client for client in self.clients}
+        reference_price = _optional_decimal(
+            signal.metadata.get("reference_price") if signal.metadata else None
+        )
+        resolutions = {}
+        for exchange in intent.target_exchanges:
+            client = client_by_exchange.get(exchange)
+            profile = _client_market_profile(client) if client is not None else None
+            if client is None or profile is None:
+                return intent, None
+            fetch_rule = getattr(client, "fetch_instrument_rule", None)
+            rule = await fetch_rule() if callable(fetch_rule) else None
+            raw_quantity = _signal_exchange_quantity(
+                signal, exchange, fallback=signal.quantity
+            )
+            resolutions[exchange] = resolve_executable_base_quantity(
+                exchange=exchange,
+                symbol=signal.symbol,
+                raw_base_quantity=raw_quantity,
+                market_profile=profile,
+                instrument_rule=rule,
+                reference_price=reference_price,
+                quantity_converter=self.quantity_converter,
+            )
+
+        executable = {
+            exchange: resolution
+            for exchange, resolution in resolutions.items()
+            if resolution.executable
+        }
+        if not executable:
+            return intent, self._record_skipped_recovery_topup(
+                intent=intent,
+                resolutions=resolutions,
+            )
+
+        # Recovery top-ups are normally single-venue.  Still preserve exact
+        # per-exchange quantities if a caller supplies more than one target.
+        normalized_quantities = {
+            exchange.value: str(resolution.normalized_base_quantity)
+            for exchange, resolution in executable.items()
+        }
+        metadata = {
+            **dict(signal.metadata or {}),
+            "exchange_quantities_base": normalized_quantities,
+            "target_exchanges": [exchange.value for exchange in executable],
+            "coordinator_quantity_normalized": True,
+        }
+        normalized_signal = replace(
+            signal,
+            quantity=(
+                next(iter(executable.values())).normalized_base_quantity
+                if len(executable) == 1
+                else signal.quantity
+            ),
+            metadata=metadata,
+        )
+        return replace(
+            intent,
+            signal=normalized_signal,
+            target_exchanges=tuple(executable),
+        ), None
+
+    def _record_skipped_recovery_topup(
+        self,
+        *,
+        intent: OrderIntent,
+        resolutions: Mapping[ExchangeName, Any],
+    ) -> list[ExchangeOrderResult]:
+        outcome = "skipped_non_executable_quantity"
+        resolution_metadata = {
+            exchange.value: resolution.metadata()
+            for exchange, resolution in resolutions.items()
+        }
+        recovered_intent = replace(
+            intent,
+            status=OrderIntentStatus.RECOVERED,
+            metadata={
+                **dict(intent.metadata),
+                "execution_outcome": outcome,
+                "quantity_resolutions": resolution_metadata,
+            },
+        )
+        self.repository.save_intent(recovered_intent)
+        self.repository.update_status(
+            intent_id=intent.intent_id, status=OrderIntentStatus.RECOVERED
+        )
+        results = [
+            ExchangeOrderResult(
+                exchange=exchange,
+                ok=True,
+                status=OrderStatus.CANCELED,
+                quantity=Decimal("0"),
+                filled_quantity=Decimal("0"),
+                raw={
+                    "execution_outcome": outcome,
+                    **resolution.metadata(),
+                },
+            )
+            for exchange, resolution in resolutions.items()
+        ]
+        save_result = getattr(self.repository, "save_result", None)
+        if callable(save_result):
+            for result in results:
+                save_result(intent_id=intent.intent_id, result=result)
+
+        if self.position_plan_store is not None and intent.signal.metadata:
+            position_id = str(intent.signal.metadata.get("position_id") or "")
+            apply_resolution = getattr(
+                self.position_plan_store, "apply_recovery_leg_resolution", None
+            )
+            if position_id and callable(apply_resolution):
+                for exchange, resolution in resolutions.items():
+                    apply_resolution(
+                        position_id=position_id,
+                        exchange=exchange,
+                        sync_status=LegSyncStatus.SYNCED,
+                        metadata={
+                            **dict(intent.signal.metadata),
+                            "normalized_delta": str(
+                                resolution.normalized_base_quantity
+                            ),
+                            "reason": "non_executable_rounding_dust",
+                            "execution_outcome": outcome,
+                        },
+                    )
+        logger.info(
+            "Follower recovery top-up skipped before planning | "
+            "intent_id=%s targets=%s outcome=%s resolutions=%s",
+            intent.intent_id,
+            [exchange.value for exchange in intent.target_exchanges],
+            outcome,
+            resolution_metadata,
+        )
         return results
 
     def _record_position_plan(self, intent: OrderIntent, results: Sequence[ExchangeOrderResult]) -> None:

@@ -4182,6 +4182,8 @@ class LiveRuntimeRunner:
         for result in results:
             if not result.ok:
                 continue
+            if result.raw.get("execution_outcome") == "skipped_non_executable_quantity":
+                continue
             save_order(
                 Order(
                     exchange=result.exchange,

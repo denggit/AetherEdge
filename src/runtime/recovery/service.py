@@ -93,6 +93,7 @@ class RuntimeRecoveryService:
             strategy_positions=strategy_position_index.snapshots,
             active_strategy_positions=strategy_position_index.active,
         )
+        self._apply_strategy_position_plan_updates(strategy)
         recovered_strategy_position_index = resolve_strategy_position_snapshot_index(strategy)
         ok = not issues
         return RecoveryReport(
@@ -173,6 +174,41 @@ class RuntimeRecoveryService:
         if not callable(serializer):
             return ()
         return tuple(serializer())
+
+    def _apply_strategy_position_plan_updates(self, strategy: object | None) -> None:
+        """Apply explicit recovery decisions without duplicating strategy logic."""
+
+        if self.position_plan_store is None or strategy is None:
+            return
+        updates = getattr(strategy, "position_plan_recovery_updates", None)
+        apply_resolution = getattr(
+            self.position_plan_store, "apply_recovery_leg_resolution", None
+        )
+        if not callable(updates) or not callable(apply_resolution):
+            return
+        for raw in updates() or ():
+            if not isinstance(raw, dict):
+                continue
+            position_id = str(raw.get("position_id") or "").strip()
+            exchange = str(raw.get("exchange") or "").strip().lower()
+            sync_status = str(raw.get("sync_status") or "").strip().lower()
+            if not position_id or not exchange or not sync_status:
+                continue
+            metadata = raw.get("metadata")
+            apply_resolution(
+                position_id=position_id,
+                exchange=exchange,
+                sync_status=sync_status,
+                metadata=dict(metadata) if isinstance(metadata, dict) else {},
+            )
+            logger.info(
+                "Strategy recovery position-plan resolution applied | "
+                "position_id=%s exchange=%s sync_status=%s reason=%s",
+                position_id,
+                exchange,
+                sync_status,
+                metadata.get("reason") if isinstance(metadata, dict) else None,
+            )
 
     async def _call_strategy_recover(
         self,
