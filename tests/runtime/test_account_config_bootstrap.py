@@ -202,6 +202,38 @@ async def test_already_matching_with_position_is_verified_without_set() -> None:
 
 
 @pytest.mark.asyncio
+async def test_already_matching_with_position_and_orders_allows_restart() -> None:
+    account = FakeAccount(
+        ExchangeName.OKX,
+        leverage=Decimal("15"),
+        margin_mode=MarginMode.ISOLATED,
+        positions=[_position(ExchangeName.OKX)],
+    )
+    execution = FakeExecution(
+        ExchangeName.OKX,
+        open_orders=[_order(ExchangeName.OKX, "regular")],
+        open_stop_orders=[_order(ExchangeName.OKX, "stop")],
+    )
+
+    result = (
+        await bootstrap_account_config(
+            targets=[_target(ExchangeName.OKX)],
+            account_clients=[account],
+            execution_clients=[execution],
+            apply=True,
+            dry_run=False,
+        )
+    )[0]
+
+    assert result.verified is True
+    assert result.reason == "already_configured"
+    assert result.has_blockers is True
+    assert account.set_margin_mode_calls == []
+    assert account.set_leverage_calls == []
+    raise_on_failed_account_config([result])
+
+
+@pytest.mark.asyncio
 async def test_set_then_fetch_mismatch_fails() -> None:
     account = FakeAccount(ExchangeName.OKX, leverage=Decimal("3"), margin_mode=MarginMode.CROSS, mismatch_after_set=True)
     execution = FakeExecution(ExchangeName.OKX)
@@ -385,6 +417,10 @@ async def test_live_runtime_startup_hook_applies_account_config_from_project_env
 
     assert account.set_margin_mode_calls == [MarginMode.ISOLATED]
     assert account.set_leverage_calls == [(Decimal("15"), MarginMode.ISOLATED)]
+
+    sync_context = runner._get_sync_contexts()[0]
+    assert sync_context.leverage_margin_mode is MarginMode.ISOLATED
+    assert sync_context.expected_leverage == Decimal("15")
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ from decimal import Decimal
 from src.platform import (
     Balance,
     ExchangeName,
+    InstrumentRule,
     LeverageInfo,
     MarginMode,
     Order,
@@ -42,6 +43,14 @@ class FakeExecution:
     async def fetch_open_stop_orders(self):
         return []
 
+    async def fetch_instrument_rule(self):
+        return InstrumentRule(
+            exchange=self.exchange,
+            symbol=self.symbol,
+            raw_symbol="ETH-USDT-SWAP",
+            price_tick=Decimal("0.01"),
+        )
+
 
 def test_fetch_platform_snapshot_collects_read_only_state():
     snapshot = asyncio.run(fetch_platform_snapshot(account=FakeAccount(), execution=FakeExecution()))
@@ -53,3 +62,5 @@ def test_fetch_platform_snapshot_collects_read_only_state():
     assert snapshot.open_stop_orders == []
     assert snapshot.leverage.leverage == Decimal("3")
     assert snapshot.position_mode is PositionMode.ONE_WAY
+    assert snapshot.instrument_rule is not None
+    assert snapshot.instrument_rule.price_tick == Decimal("0.01")

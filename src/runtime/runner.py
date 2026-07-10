@@ -54,11 +54,12 @@ from src.platform.account.events import AccountEvent
 from src.platform.account.ports import AccountClient
 from src.platform.config import ProjectEnvConfig, get_project_env_config
 from src.platform.data.models import MarketEvent, MarketEventType, MarketKline, MarketOrderBook, MarketTicker, MarketTrade
-from src.platform.exchanges.models import ExchangeConfig, ExchangeName, Order, OrderStatus, Position, PositionMode, PositionSide
+from src.platform.exchanges.models import ExchangeConfig, ExchangeName, InstrumentRule, Order, OrderStatus, Position, PositionMode, PositionSide
 from src.platform.execution.ports import ExecutionClient
 from src.platform.markets import get_market_profile
 from src.platform.snapshot import PlatformSnapshot
 from src.runtime.account_config import (
+    AccountConfigEnv,
     bootstrap_account_config,
     load_account_config_env,
     raise_on_failed_account_config,
@@ -352,6 +353,7 @@ class LiveRuntimeRunner:
         self.context = app_context
         self.services = dict(services or {})
         self._project_env: ProjectEnvConfig = self.services.get("project_env_config") or get_project_env_config()
+        self._account_config_env: AccountConfigEnv | None = None
         self.requirements: StrategyRuntimeRequirements = self.services.get("runtime_requirements") or resolve_strategy_runtime_requirements(app_context.strategy, fallback_data_streams=app_config.data_streams)
         self.stats = LiveRuntimeStats()
         self._market_queue: asyncio.Queue[MarketEvent] = asyncio.Queue(maxsize=app_config.market_queue_maxsize)
@@ -1371,6 +1373,7 @@ class LiveRuntimeRunner:
             environ=project_env.values,
             require_leverage=require_leverage,
         )
+        self._account_config_env = env
         if env.missing_leverage:
             logger.warning(
                 "Account config leverage env missing; skipping exchanges | exchanges=%s dry_run=%s live_trading=%s",
@@ -2004,6 +2007,7 @@ class LiveRuntimeRunner:
                             open_stop_orders=open_stop_orders,
                             open_orders=getattr(snapshot, "open_orders", ()) or (),
                             market_profile=market_profile,
+                            instrument_rule=snapshot.instrument_rule,
                         )
                         if validation.should_keep_existing_stop:
                             continue
@@ -2058,7 +2062,12 @@ class LiveRuntimeRunner:
         master_exchange_str = self.app_config.data_exchange.value
         exchange_state: dict[
             ExchangeName,
-            tuple[Sequence[Position], Sequence[Order], PositionMode],
+            tuple[
+                Sequence[Position],
+                Sequence[Order],
+                PositionMode,
+                InstrumentRule | None,
+            ],
         ] = {}
 
         for strategy_position in active_strategy_positions:
@@ -2094,6 +2103,9 @@ class LiveRuntimeRunner:
                         open_stop_orders = tuple(
                             await exec_client.fetch_open_stop_orders() or ()
                         )
+                        instrument_rule = (
+                            await _fetch_execution_instrument_rule(exec_client)
+                        )
                     except Exception as exc:
                         raise LiveRuntimeError(
                             "post-execution stop validation failed: cannot fetch exchange state | "
@@ -2103,9 +2115,19 @@ class LiveRuntimeRunner:
                         mode = await acct_client.fetch_position_mode()
                     except Exception:
                         mode = PositionMode.ONE_WAY
-                    exchange_state[exchange] = (positions, open_stop_orders, mode)
+                    exchange_state[exchange] = (
+                        positions,
+                        open_stop_orders,
+                        mode,
+                        instrument_rule,
+                    )
 
-                positions, open_stop_orders, mode = exchange_state[exchange]
+                (
+                    positions,
+                    open_stop_orders,
+                    mode,
+                    instrument_rule,
+                ) = exchange_state[exchange]
                 matching_positions = _exchange_positions_matching_strategy_position(
                     positions,
                     strategy_position,
@@ -2162,6 +2184,7 @@ class LiveRuntimeRunner:
                     ),
                     open_orders=(),
                     market_profile=market_profile,
+                    instrument_rule=instrument_rule,
                 )
 
                 if not validation.should_keep_existing_stop:
@@ -2178,7 +2201,10 @@ class LiveRuntimeRunner:
                         f"valid_bot_stops={len(validation.valid_bot_owned_orders)} "
                         f"invalid_bot_stops={len(validation.invalid_bot_owned_orders)} "
                         f"unknown_stops={len(validation.unknown_exit_orders)} "
-                        f"primary_reason={validation.primary_invalid_reason}"
+                        f"primary_reason={validation.primary_invalid_reason} "
+                        f"detail_reason={validation.primary_invalid_detail_reason} "
+                        f"effective_expected_stop_price={validation.effective_expected_stop_price} "
+                        f"price_tick={validation.price_tick}"
                     )
 
                 logger.info(
@@ -3718,6 +3744,24 @@ class LiveRuntimeRunner:
                 )
                 continue
 
+            try:
+                instrument_rule = await _fetch_execution_instrument_rule(
+                    exec_client
+                )
+            except Exception as exc:
+                verified.append(
+                    self._stop_post_check_failed_result(
+                        result,
+                        reason="stop_post_check_instrument_rule_fetch_failed",
+                        metadata={
+                            "post_check": "stop_order_exchange_verification",
+                            "exchange": exchange.value,
+                            "fetch_error": str(exc),
+                        },
+                    )
+                )
+                continue
+
             # ── Retry loop: exchange state may be briefly stale ──
             attempts = _stop_post_check_attempts_from_env(self._project_env)
             delay = _stop_post_check_delay_from_env(self._project_env)
@@ -3830,8 +3874,13 @@ class LiveRuntimeRunner:
                     open_stop_orders=open_stop_orders or (),
                     open_orders=(),
                     market_profile=market_profile,
+                    instrument_rule=instrument_rule,
                 )
                 if validation.should_keep_existing_stop:
+                    validation_fields = validation.diagnostic_fields(
+                        action="keep_existing_stop"
+                    )
+                    confirmed_stop_price = validation.confirmed_stop_price
                     exchange_position_metadata = _exchange_position_metadata(
                         active_pos=active_pos,
                         exchange=exchange,
@@ -3855,15 +3904,24 @@ class LiveRuntimeRunner:
                             raw={
                                 **dict(result.raw),
                                 "stop_post_check_attempts": attempt,
+                                **validation_fields,
+                                "confirmed_stop_price": (
+                                    None
+                                    if confirmed_stop_price is None
+                                    else str(confirmed_stop_price)
+                                ),
                                 **exchange_position_metadata,
                             },
                         )
                     )
                     logger.info(
-                        "Stop order post-check verified | exchange=%s position_qty=%s desired_stop=%s open_stop_orders=%s attempts=%s",
+                        "Stop order post-check verified | exchange=%s position_qty=%s canonical_stop_price=%s effective_expected_stop_price=%s actual_exchange_stop_price=%s price_tick=%s open_stop_orders=%s attempts=%s",
                         exchange.value,
                         native_qty,
                         canonical_stop_price,
+                        validation.effective_expected_stop_price,
+                        confirmed_stop_price,
+                        validation.price_tick,
                         len(open_stop_orders or ()),
                         attempt,
                     )
@@ -3872,25 +3930,37 @@ class LiveRuntimeRunner:
                 if attempt < attempts:
                     reason_hint = validation.primary_invalid_reason or "missing_bot_owned_stop"
                     logger.warning(
-                        "Stop post-check not verified yet; retrying | exchange=%s attempt=%s attempts=%s reason=%s",
+                        "Stop post-check not verified yet; retrying | exchange=%s attempt=%s attempts=%s invalid_category=%s invalid_detail_reason=%s",
                         exchange.value,
                         attempt,
                         attempts,
                         reason_hint,
+                        validation.primary_invalid_detail_reason,
                     )
                     await asyncio.sleep(delay)
                     continue
 
                 # ── All retry attempts exhausted → fail ──────────────────
                 reason = validation.primary_invalid_reason or "missing_bot_owned_stop"
+                detail_reason = (
+                    validation.primary_invalid_detail_reason or reason
+                )
+                validation_fields = validation.diagnostic_fields(
+                    action="fail_post_check"
+                )
                 logger.critical(
-                    "Stop order post-check failed after %s attempts | exchange=%s position_qty=%s desired_stop=%s open_stop_orders=%s invalid_reason=%s",
+                    "Stop order post-check failed after %s attempts | exchange=%s position_qty=%s canonical_stop_price=%s effective_expected_stop_price=%s actual_exchange_stop_price=%s price_tick=%s price_difference=%s open_stop_orders=%s invalid_category=%s invalid_detail_reason=%s",
                     attempt,
                     exchange.value,
                     native_qty,
                     canonical_stop_price,
+                    validation.effective_expected_stop_price,
+                    validation_fields.get("actual_exchange_stop_price"),
+                    validation.price_tick,
+                    validation_fields.get("price_difference"),
                     len(open_stop_orders or ()),
                     reason,
+                    detail_reason,
                 )
                 self.context.alerts.emit(
                     AppAlert(
@@ -3900,9 +3970,16 @@ class LiveRuntimeRunner:
                             f"exchange={exchange.value}\n"
                             f"symbol={self.app_config.symbol}\n"
                             f"position_qty={native_qty}\n"
-                            f"desired_stop={canonical_stop_price}\n"
+                            f"canonical_stop_price={canonical_stop_price}\n"
+                            f"effective_expected_stop_price={validation.effective_expected_stop_price}\n"
+                            f"actual_exchange_stop_price={validation_fields.get('actual_exchange_stop_price')}\n"
+                            f"price_tick={validation.price_tick}\n"
+                            f"price_difference={validation_fields.get('price_difference')}\n"
                             f"open_stop_orders={len(open_stop_orders or ())}\n"
-                            f"invalid_reason={reason}\n"
+                            f"invalid_category={reason}\n"
+                            f"invalid_detail_reason={detail_reason}\n"
+                            f"order_id={validation_fields.get('existing_order_id')}\n"
+                            f"client_order_id={validation_fields.get('existing_client_order_id')}\n"
                             f"stop_post_check_attempts={attempt}\n"
                         ),
                     )
@@ -3918,6 +3995,7 @@ class LiveRuntimeRunner:
                             "desired_stop": str(canonical_stop_price),
                             "open_stop_orders": len(open_stop_orders or ()),
                             "invalid_reason": reason,
+                            **validation_fields,
                         },
                     )
                 )
@@ -4084,10 +4162,22 @@ class LiveRuntimeRunner:
         if self._recovery_service == "__default__":
             clients = self._get_execution_clients()
             accounts = self._get_account_clients()
-            contexts = [
-                RecoveryExchangeContext(account=account, execution=execution, state_store=self.context.state_store)
-                for account, execution in zip(accounts, clients, strict=False)
-            ]
+            config_env = self._resolved_account_config_env()
+            contexts = []
+            for account, execution in zip(accounts, clients, strict=False):
+                target = config_env.target_for(account.exchange)
+                contexts.append(
+                    RecoveryExchangeContext(
+                        account=account,
+                        execution=execution,
+                        state_store=self.context.state_store,
+                        leverage_margin_mode=(
+                            config_env.margin_mode
+                            if target is None
+                            else target.margin_mode
+                        ),
+                    )
+                )
             self._recovery_service = RuntimeRecoveryService(exchange_contexts=contexts, order_journal=self._get_order_journal(), position_plan_store=self._get_position_plan_store())
         return self._recovery_service
 
@@ -4224,10 +4314,36 @@ class LiveRuntimeRunner:
                 f"expected={sorted(exchange.value for exchange in expected)} "
                 f"actual={sorted(exchange.value for exchange in execution_by_exchange)}"
             )
-        return tuple(
-            SyncExchangeContext(account=account_by_exchange[exchange], execution=execution_by_exchange[exchange], state_store=self.context.state_store)
-            for exchange in self.app_config.exchanges
-        )
+        config_env = self._resolved_account_config_env()
+        contexts: list[SyncExchangeContext] = []
+        for exchange in self.app_config.exchanges:
+            target = config_env.target_for(exchange)
+            contexts.append(
+                SyncExchangeContext(
+                    account=account_by_exchange[exchange],
+                    execution=execution_by_exchange[exchange],
+                    state_store=self.context.state_store,
+                    leverage_margin_mode=(
+                        config_env.margin_mode
+                        if target is None
+                        else target.margin_mode
+                    ),
+                    expected_leverage=(
+                        None if target is None else target.leverage
+                    ),
+                )
+            )
+        return tuple(contexts)
+
+    def _resolved_account_config_env(self) -> AccountConfigEnv:
+        if self._account_config_env is None:
+            self._account_config_env = load_account_config_env(
+                exchanges=self.app_config.exchanges,
+                symbol=self.app_config.symbol,
+                environ=self._project_env.values,
+                require_leverage=False,
+            )
+        return self._account_config_env
 
     def _get_account_sync_service(self):
         if self._account_sync_service is None:
@@ -4893,6 +5009,20 @@ class LiveRuntimeRunner:
             error=error if error is not None else self._health.error,
             metadata=dict(self._health.metadata if metadata is None else metadata),
         )
+
+
+async def _fetch_execution_instrument_rule(
+    execution: ExecutionClient,
+) -> InstrumentRule | None:
+    """Read the bound rule through the public execution facade when exposed."""
+
+    fetch_rule = getattr(execution, "fetch_instrument_rule", None)
+    if not callable(fetch_rule):
+        return None
+    value = fetch_rule()
+    if inspect.isawaitable(value):
+        value = await value
+    return value if isinstance(value, InstrumentRule) else None
 
 
 def _event_time_ms(event: MarketEvent) -> int | None:

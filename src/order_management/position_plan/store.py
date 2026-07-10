@@ -143,9 +143,18 @@ class SqlitePositionPlanStore:
             )
         )
 
-    def update_stop(self, *, position_id: str, stop_price: Decimal, exchange: ExchangeName | None = None, stop_order_id: str | None = None, stop_client_order_id: str | None = None) -> None:
+    def update_stop(
+        self,
+        *,
+        position_id: str,
+        stop_price: Decimal,
+        exchange: ExchangeName | None = None,
+        stop_order_id: str | None = None,
+        stop_client_order_id: str | None = None,
+        update_canonical: bool = True,
+    ) -> None:
         plan = self.get_position(position_id)
-        if plan is not None:
+        if plan is not None and update_canonical:
             self.upsert_position(replace(plan, canonical_stop_price=stop_price))
         legs = self.get_legs(position_id)
         for leg in legs:

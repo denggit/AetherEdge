@@ -6,7 +6,16 @@ from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
 from src.order_management.quantity import NativeQuantityConverter
-from src.platform.exchanges.models import ExchangeName, Order, OrderSide, OrderStatus, PositionMode, PositionSide
+from src.platform.execution.rules import normalize_stop_trigger_price
+from src.platform.exchanges.models import (
+    ExchangeName,
+    InstrumentRule,
+    Order,
+    OrderSide,
+    OrderStatus,
+    PositionMode,
+    PositionSide,
+)
 from src.platform.markets import MarketProfile
 
 
@@ -26,7 +35,9 @@ class RecoveryExitOrderCheck:
     expected_position_side: PositionSide | None
     expected_base_quantity: Decimal
     expected_native_quantity: Decimal
+    canonical_stop_price: Decimal
     expected_trigger_price: Decimal
+    price_tick: Decimal | None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def log_fields(self, *, action: str) -> dict[str, Any]:
@@ -37,7 +48,33 @@ class RecoveryExitOrderCheck:
             "position_mode": self.metadata.get("position_mode"),
             "current_position_base_quantity": _decimal_text(self.expected_base_quantity),
             "current_position_native_quantity": _decimal_text(self.expected_native_quantity),
-            "canonical_stop_price": _decimal_text(self.expected_trigger_price),
+            "invalid_category": (
+                "invalid_bot_owned_stop_present"
+                if self.bot_owned and not self.valid
+                else self.invalid_reason
+            ),
+            "invalid_detail_reason": self.invalid_reason,
+            "canonical_stop_price": _decimal_text(self.canonical_stop_price),
+            "effective_expected_stop_price": _decimal_text(
+                self.expected_trigger_price
+            ),
+            "actual_exchange_stop_price": (
+                None
+                if self.order is None or self.order.price is None
+                else _decimal_text(self.order.price)
+            ),
+            "price_tick": (
+                None
+                if self.price_tick is None
+                else _decimal_text(self.price_tick)
+            ),
+            "price_difference": (
+                None
+                if self.order is None or self.order.price is None
+                else _decimal_text(
+                    abs(self.order.price - self.expected_trigger_price)
+                )
+            ),
             "existing_order_id": None if self.order is None else self.order.order_id,
             "existing_client_order_id": None if self.order is None else self.order.client_order_id,
             "existing_side": None if self.order is None or self.order.side is None else self.order.side.value,
@@ -61,6 +98,8 @@ class RecoveryExitValidationResult:
     current_position_base_quantity: Decimal
     current_position_native_quantity: Decimal
     canonical_stop_price: Decimal
+    effective_expected_stop_price: Decimal
+    price_tick: Decimal | None
     expected_side: OrderSide
     expected_position_side: PositionSide | None
     expected_native_quantity: Decimal
@@ -133,6 +172,57 @@ class RecoveryExitValidationResult:
                 return check.invalid_reason
         return "missing_bot_owned_stop"
 
+    @property
+    def primary_invalid_detail_reason(self) -> str | None:
+        if self.has_invalid_bot_owned_stop:
+            for check in self.checks:
+                if check.bot_owned and not check.valid:
+                    return check.invalid_reason
+        if len(self.valid_bot_owned_orders) > 1:
+            return "duplicate_valid_bot_owned_stop"
+        if self.should_keep_existing_stop:
+            return None
+        for check in self.checks:
+            if check.invalid_reason:
+                return check.invalid_reason
+        return "missing_bot_owned_stop"
+
+    @property
+    def confirmed_stop_price(self) -> Decimal | None:
+        if not self.should_keep_existing_stop:
+            return None
+        order = self.valid_bot_owned_orders[0]
+        return order.price
+
+    def diagnostic_fields(self, *, action: str) -> dict[str, Any]:
+        check = next(
+            (
+                item
+                for item in self.checks
+                if item.bot_owned and not item.valid
+            ),
+            self.checks[0] if self.checks else None,
+        )
+        fields = {} if check is None else check.log_fields(action=action)
+        fields.update(
+            {
+                "invalid_category": self.primary_invalid_reason,
+                "invalid_detail_reason": self.primary_invalid_detail_reason,
+                "canonical_stop_price": _decimal_text(
+                    self.canonical_stop_price
+                ),
+                "effective_expected_stop_price": _decimal_text(
+                    self.effective_expected_stop_price
+                ),
+                "price_tick": (
+                    None
+                    if self.price_tick is None
+                    else _decimal_text(self.price_tick)
+                ),
+            }
+        )
+        return fields
+
 
 class RecoveryExitOrderValidator:
     """Validate open recovery exit orders against the active exchange position.
@@ -167,6 +257,7 @@ class RecoveryExitOrderValidator:
         open_stop_orders: Sequence[Order],
         market_profile: MarketProfile,
         open_orders: Sequence[Order] = (),
+        instrument_rule: InstrumentRule | None = None,
     ) -> RecoveryExitValidationResult:
         exchange_name = exchange if isinstance(exchange, ExchangeName) else ExchangeName(str(exchange).strip().lower())
         current_position_native_quantity = abs(current_position_native_quantity)
@@ -178,6 +269,13 @@ class RecoveryExitOrderValidator:
         )
         expected_side = _expected_close_side(position_side)
         expected_position_side = position_side if position_mode is PositionMode.HEDGE else None
+        effective_expected_stop_price = normalize_stop_trigger_price(
+            canonical_stop_price,
+            instrument_rule,
+        )
+        price_tick = (
+            None if instrument_rule is None else instrument_rule.price_tick
+        )
         checks: list[RecoveryExitOrderCheck] = []
         for order in open_stop_orders:
             if order.exchange != exchange_name or order.symbol != symbol:
@@ -196,7 +294,9 @@ class RecoveryExitOrderValidator:
                         expected_position_side=expected_position_side,
                         expected_base_quantity=current_position_base_quantity,
                         expected_native_quantity=current_position_native_quantity,
-                        expected_trigger_price=canonical_stop_price,
+                        canonical_stop_price=canonical_stop_price,
+                        expected_trigger_price=effective_expected_stop_price,
+                        price_tick=price_tick,
                     )
                 )
                 continue
@@ -209,7 +309,7 @@ class RecoveryExitOrderValidator:
                 expected_side=expected_side,
                 expected_position_side=expected_position_side,
                 expected_native_quantity=current_position_native_quantity,
-                canonical_stop_price=canonical_stop_price,
+                effective_expected_stop_price=effective_expected_stop_price,
                 bot_owned=bot_owned,
             )
             checks.append(
@@ -227,7 +327,9 @@ class RecoveryExitOrderValidator:
                     expected_position_side=expected_position_side,
                     expected_base_quantity=current_position_base_quantity,
                     expected_native_quantity=current_position_native_quantity,
-                    expected_trigger_price=canonical_stop_price,
+                    canonical_stop_price=canonical_stop_price,
+                    expected_trigger_price=effective_expected_stop_price,
+                    price_tick=price_tick,
                 )
             )
         if not checks:
@@ -246,7 +348,9 @@ class RecoveryExitOrderValidator:
                     expected_position_side=expected_position_side,
                     expected_base_quantity=current_position_base_quantity,
                     expected_native_quantity=current_position_native_quantity,
-                    expected_trigger_price=canonical_stop_price,
+                    canonical_stop_price=canonical_stop_price,
+                    expected_trigger_price=effective_expected_stop_price,
+                    price_tick=price_tick,
                 )
             )
         unknown_exit_orders = tuple(
@@ -272,6 +376,8 @@ class RecoveryExitOrderValidator:
             current_position_base_quantity=current_position_base_quantity,
             current_position_native_quantity=current_position_native_quantity,
             canonical_stop_price=canonical_stop_price,
+            effective_expected_stop_price=effective_expected_stop_price,
+            price_tick=price_tick,
             expected_side=expected_side,
             expected_position_side=expected_position_side,
             expected_native_quantity=current_position_native_quantity,
@@ -290,7 +396,7 @@ class RecoveryExitOrderValidator:
         expected_side: OrderSide,
         expected_position_side: PositionSide | None,
         expected_native_quantity: Decimal,
-        canonical_stop_price: Decimal,
+        effective_expected_stop_price: Decimal,
         bot_owned: bool,
     ) -> str | None:
         if not bot_owned:
@@ -299,7 +405,11 @@ class RecoveryExitOrderValidator:
             return "order_not_active"
         if order.exchange != exchange or order.symbol != symbol:
             return "exchange_or_symbol_mismatch"
-        if order.price is None or abs(order.price - canonical_stop_price) > self.price_tolerance:
+        if (
+            order.price is None
+            or abs(order.price - effective_expected_stop_price)
+            > self.price_tolerance
+        ):
             return "trigger_price_mismatch"
         if order.side is not expected_side:
             return "wrong_side"
@@ -345,7 +455,9 @@ class RecoveryExitOrderValidator:
         expected_position_side: PositionSide | None,
         expected_base_quantity: Decimal,
         expected_native_quantity: Decimal,
+        canonical_stop_price: Decimal,
         expected_trigger_price: Decimal,
+        price_tick: Decimal | None,
     ) -> RecoveryExitOrderCheck:
         return RecoveryExitOrderCheck(
             order=order,
@@ -358,7 +470,9 @@ class RecoveryExitOrderValidator:
             expected_position_side=expected_position_side,
             expected_base_quantity=expected_base_quantity,
             expected_native_quantity=expected_native_quantity,
+            canonical_stop_price=canonical_stop_price,
             expected_trigger_price=expected_trigger_price,
+            price_tick=price_tick,
             metadata={"exchange": exchange.value, "symbol": symbol, "position_mode": position_mode.value},
         )
 

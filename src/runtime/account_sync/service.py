@@ -12,7 +12,7 @@ from src.order_management.reconciliation.validation import (
     is_valid_client_order_id,
     resolve_query_params,
 )
-from src.platform.exchanges.models import Balance, ExchangeName, MarginMode, Order, OrderQuery, OrderStatus, StopOrderQuery
+from src.platform.exchanges.models import Balance, ExchangeName, Order, OrderQuery, OrderStatus, StopOrderQuery
 from src.platform.snapshot import PlatformSnapshot
 from src.runtime.account_sync.models import KnownOrderRef, KnownOrderRefStatus, SyncExchangeContext, SyncResult
 from src.runtime.requirements import AccountStateRequirement, OrderStateRequirement
@@ -108,7 +108,9 @@ class AccountStateSyncService:
             request_count += 1
             positions = await context.account.fetch_positions()
             request_count += 1
-            leverage = await context.account.fetch_leverage(margin_mode=MarginMode.CROSS)
+            leverage = await context.account.fetch_leverage(
+                margin_mode=context.leverage_margin_mode
+            )
             request_count += 1
             position_mode = await context.account.fetch_position_mode()
             request_count += 1
@@ -133,7 +135,21 @@ class AccountStateSyncService:
                 if inspect.isawaitable(maybe_awaitable):
                     await maybe_awaitable
             self._failures[exchange] = 0
-            result = _result(exchange, sync_type, request_count, start, True)
+            result = _result(
+                exchange,
+                sync_type,
+                request_count,
+                start,
+                True,
+                metadata={
+                    "leverage_margin_mode": context.leverage_margin_mode.value,
+                    "expected_leverage": (
+                        None
+                        if context.expected_leverage is None
+                        else str(context.expected_leverage)
+                    ),
+                },
+            )
 
             # ── Fingerprint-based change detection ──
             if isinstance(positions, list):
@@ -158,7 +174,7 @@ class AccountStateSyncService:
             if prev_fp is None or prev_fp != new_fp:
                 logger.info(
                     "Account state changed | exchange=%s sync_type=%s request_count=%s duration_ms=%s "
-                    "available=%s total=%s positions=%s leverage=%s mode=%s",
+                    "available=%s total=%s positions=%s leverage=%s leverage_margin_mode=%s expected_leverage=%s mode=%s",
                     result.exchange,
                     result.sync_type,
                     result.request_count,
@@ -167,6 +183,8 @@ class AccountStateSyncService:
                     str(balance.total) if balance else "?",
                     len(nonzero_positions),
                     str(leverage.leverage) if leverage and hasattr(leverage, "leverage") else "?",
+                    context.leverage_margin_mode.value,
+                    context.expected_leverage,
                     position_mode.value if hasattr(position_mode, "value") else str(position_mode),
                 )
             else:

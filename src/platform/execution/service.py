@@ -187,6 +187,11 @@ class ExchangeExecutionService:
             return PositionMode.ONE_WAY
         return await fetch_position_mode()
 
+    async def fetch_instrument_rule(self) -> InstrumentRule | None:
+        """Expose the bound instrument rule through the execution facade."""
+
+        return await self._fetch_rule_if_available(self._symbol)
+
     async def replace_order(self, cancel_request: CancelOrderRequest, new_order: OrderRequest) -> Order:
         self._ensure_live_write_allowed("replace_order")
         await self.cancel_order(cancel_request)

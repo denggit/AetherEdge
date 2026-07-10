@@ -7,6 +7,7 @@ from typing import Any
 
 from src.order_management.models import OrderIntent
 from src.platform.exchanges.models import ExchangeName, Order, OrderStatus
+from src.platform.exchanges.models import MarginMode
 from src.platform.account.ports import AccountClient
 from src.platform.execution.ports import ExecutionClient
 from src.platform.snapshot import PlatformSnapshot, fetch_platform_snapshot
@@ -33,6 +34,7 @@ class RecoveryExchangeContext:
     execution: ExecutionClient
     state_store: StateStore
     reconciler: Reconciler | None = None
+    leverage_margin_mode: MarginMode = MarginMode.CROSS
 
 
 class RuntimeRecoveryService:
@@ -63,7 +65,11 @@ class RuntimeRecoveryService:
         issues: list[str] = []
 
         for context in self.exchange_contexts:
-            snapshot = await fetch_platform_snapshot(account=context.account, execution=context.execution)
+            snapshot = await fetch_platform_snapshot(
+                account=context.account,
+                execution=context.execution,
+                leverage_margin_mode=context.leverage_margin_mode,
+            )
             snapshots.append(snapshot)
             context.state_store.save_snapshot(snapshot)
             self._auto_close_stale_local_orders_from_snapshot(context.state_store, snapshot)

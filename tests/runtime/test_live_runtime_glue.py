@@ -20,7 +20,7 @@ from src.market_data.models import MarketDataSet, RangeBar, RangeBarAggregate, T
 from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
 from src.market_data.storage import SqliteTradeStore
 from src.market_data.warmup.current_rangebar import CurrentRangeBarWarmupResult
-from src.platform import Balance, ExchangeName, LeverageInfo, Order, OrderSide, OrderStatus, Position, PositionMode, PositionSide
+from src.platform import Balance, ExchangeName, InstrumentRule, LeverageInfo, MarginMode, Order, OrderSide, OrderStatus, Position, PositionMode, PositionSide
 from src.platform.config import ProjectEnvConfig
 from src.platform.data.models import MarketKline, MarketTicker, MarketTrade, TradeSide
 from src.platform.markets import get_market_profile
@@ -31,12 +31,18 @@ from src.planner import ExecutionPlanner
 from src.runtime import LiveRuntimeConfig, LiveRuntimeRunner, RuntimeMode, RuntimePhase, StrategyRuntimeRequirements
 from src.runtime.account_sync import RequestThrottle
 from src.runtime.recovery.models import RecoveryReport
+from src.runtime.recovery.service import (
+    RecoveryExchangeContext,
+    RuntimeRecoveryService,
+)
 from src.runtime.requirements import ClosedKlineRequirement
 from src.runtime.runner import LiveRuntimeError
+from src.reconcile.models import ReconcileReport
 from src.runtime.tasks import ClosedBarScheduler
 from src.signals import SignalAction, TradeSignal
 from strategies.eth_lf_portfolio_v8.domain.models import Side
 from strategies.eth_lf_portfolio_v8.strategy import Strategy as V8Strategy
+from strategies.eth_portfolio_v1.strategy import Strategy as PortfolioV1Strategy
 
 H4 = 4 * 60 * 60_000
 
@@ -3596,6 +3602,304 @@ async def test_execute_stop_signal_post_check_success_confirms_stop():
     assert runner.stats.failed_intents == 0
 
 
+@pytest.mark.asyncio
+async def test_portfolio_v1_startup_recovers_existing_positions_and_stops(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    canonical = Decimal("1738.2542231936259150")
+    effective = Decimal("1738.25")
+    now_minute = (int(time.time() * 1000) // 60_000) * 60_000
+    plan_store = SqlitePositionPlanStore(tmp_path / "restart-plans.sqlite3")
+    lf_position_id = "portfolio-v1-restart-lf"
+    mf_position_id = f"mf-low-sweep-time48-{now_minute}"
+    plan_store.upsert_position(
+        PositionPlan(
+            position_id=lf_position_id,
+            strategy_id="eth_portfolio_v1",
+            entry_engine="BULL_RECLAIM_V2",
+            side="long",
+            status=PositionPlanStatus.ACTIVE,
+            canonical_stop_price=canonical,
+            master_exchange=ExchangeName.OKX,
+            master_target_qty_base=Decimal("0.6"),
+            master_filled_qty_base=Decimal("0.6"),
+            metadata={
+                "sleeve_id": "lf",
+                "average_entry_price": "2000",
+            },
+        )
+    )
+    plan_store.upsert_position(
+        PositionPlan(
+            position_id=mf_position_id,
+            strategy_id="eth_portfolio_v1",
+            entry_engine="MF_LOW_SWEEP_TIME48",
+            side="long",
+            status=PositionPlanStatus.ACTIVE,
+            canonical_stop_price=None,
+            master_exchange=ExchangeName.OKX,
+            master_target_qty_base=Decimal("0.4"),
+            master_filled_qty_base=Decimal("0.4"),
+            metadata={
+                "sleeve_id": "mf",
+                "position_id": mf_position_id,
+                "engine": "MF_LOW_SWEEP_TIME48",
+                "signal_time_ms": now_minute - 49 * 60_000,
+                "entry_tradebar_open_time_ms": now_minute - 48 * 60_000,
+                "entry_execution_time_ms": now_minute - 48 * 60_000,
+                "time48_holding_minutes": 48,
+                "fixed_time_exit_holding_minutes": 48,
+                "exit_variant": "time48",
+                "quantity_scope": "mf_sleeve_quantity",
+                "protective_stop_required": False,
+                "average_entry_price": "2000",
+                "target_exchanges": ["okx", "binance"],
+                "exchange_quantities_base": {
+                    "okx": "0.4",
+                    "binance": "0.4",
+                },
+            },
+        )
+    )
+    for position_id, quantity, sleeve, stop_required in (
+        (lf_position_id, Decimal("0.6"), "lf", True),
+        (mf_position_id, Decimal("0.4"), "mf", False),
+    ):
+        for exchange, role in (
+            (ExchangeName.OKX, LegRole.MASTER),
+            (ExchangeName.BINANCE, LegRole.FOLLOWER),
+        ):
+            plan_store.upsert_leg(
+                LegPlan(
+                    position_id=position_id,
+                    exchange=exchange,
+                    role=role,
+                    target_qty_base=quantity,
+                    filled_qty_base=quantity,
+                    stop_price=effective if stop_required else None,
+                    stop_order_id=(
+                        f"{position_id}-{exchange.value}-stop"
+                        if stop_required
+                        else None
+                    ),
+                    sync_status=LegSyncStatus.OPEN,
+                )
+            )
+
+    class RestartAccount(FakeAccountClient):
+        def __init__(self, exchange, position):
+            super().__init__(exchange, positions=[position])
+            self.set_calls = []
+
+        async def fetch_leverage(self, *, margin_mode=None):
+            return LeverageInfo(
+                exchange=self.exchange,
+                symbol=self.symbol,
+                raw_symbol=(
+                    "ETH-USDT-SWAP"
+                    if self.exchange is ExchangeName.OKX
+                    else "ETHUSDT"
+                ),
+                leverage=Decimal("15"),
+                margin_mode=MarginMode.ISOLATED,
+            )
+
+        async def fetch_position_mode(self):
+            return PositionMode.HEDGE
+
+        async def set_margin_mode(self, margin_mode):
+            self.set_calls.append(("set_margin_mode", margin_mode))
+            raise AssertionError("matching restart must not change margin mode")
+
+        async def set_leverage(self, leverage, *, margin_mode=None):
+            self.set_calls.append(("set_leverage", leverage))
+            raise AssertionError("matching restart must not change leverage")
+
+    class RestartExecution(FakeExecutionClient):
+        def __init__(self, exchange, stop):
+            super().__init__(exchange, open_stop_orders=[stop])
+            self.write_calls = []
+
+        async def fetch_instrument_rule(self):
+            return InstrumentRule(
+                exchange=self.exchange,
+                symbol=self.symbol,
+                raw_symbol=(
+                    "ETH-USDT-SWAP"
+                    if self.exchange is ExchangeName.OKX
+                    else "ETHUSDT"
+                ),
+                price_tick=Decimal("0.01"),
+            )
+
+        async def place_order(self, request):
+            self.write_calls.append(("place_order", request))
+            raise AssertionError("restart must not open a duplicate position")
+
+        async def place_stop_market_order(self, request):
+            self.write_calls.append(("place_stop_market_order", request))
+            raise AssertionError("restart must not place a duplicate stop")
+
+        async def cancel_stop_order(self, request):
+            self.write_calls.append(("cancel_stop_order", request))
+            raise AssertionError("restart must not cancel a valid stop")
+
+        async def cancel_all_stop_orders(self):
+            self.write_calls.append(("cancel_all_stop_orders", None))
+            raise AssertionError("restart must not cancel valid stops")
+
+    def position(exchange):
+        return Position(
+            exchange=exchange,
+            symbol="ETH-USDT-PERP",
+            raw_symbol=(
+                "ETH-USDT-SWAP"
+                if exchange is ExchangeName.OKX
+                else "ETHUSDT"
+            ),
+            side=PositionSide.LONG,
+            quantity=(
+                Decimal("10")
+                if exchange is ExchangeName.OKX
+                else Decimal("1")
+            ),
+            entry_price=Decimal("2000"),
+        )
+
+    def stop(exchange):
+        return Order(
+            exchange=exchange,
+            symbol="ETH-USDT-PERP",
+            raw_symbol=(
+                "ETH-USDT-SWAP"
+                if exchange is ExchangeName.OKX
+                else "ETHUSDT"
+            ),
+            order_id=f"{lf_position_id}-{exchange.value}-stop",
+            client_order_id=None,
+            status=OrderStatus.NEW,
+            side=OrderSide.SELL,
+            price=effective,
+            quantity=(
+                Decimal("6")
+                if exchange is ExchangeName.OKX
+                else None
+            ),
+            raw={
+                "position_id": lf_position_id,
+                (
+                    "posSide"
+                    if exchange is ExchangeName.OKX
+                    else "positionSide"
+                ): "long",
+                "reduceOnly": "true",
+                **(
+                    {"closePosition": "true"}
+                    if exchange is ExchangeName.BINANCE
+                    else {}
+                ),
+            },
+        )
+
+    accounts = tuple(
+        RestartAccount(exchange, position(exchange))
+        for exchange in (ExchangeName.OKX, ExchangeName.BINANCE)
+    )
+    executions = tuple(
+        RestartExecution(exchange, stop(exchange))
+        for exchange in (ExchangeName.OKX, ExchangeName.BINANCE)
+    )
+    strategy = PortfolioV1Strategy()
+    runner = _runner(
+        strategy,
+        services={
+            "account_clients": accounts,
+            "execution_clients": executions,
+            "position_plan_store": plan_store,
+            "project_env_config": ProjectEnvConfig(
+                values={
+                    "AETHER_LIVE_TRADING": "true",
+                    "AETHER_DRY_RUN": "false",
+                    "MARGIN_MODE": "isolated",
+                    "OKX_LEVERAGE": "15",
+                    "BINANCE_LEVERAGE": "15",
+                },
+                source_files=(),
+                env_file=Path(".env"),
+                example_file=None,
+            ),
+        },
+    )
+
+    class CleanReconciler:
+        def __init__(self, exchange):
+            self.exchange = exchange
+
+        async def check(self):
+            return ReconcileReport(
+                exchange=self.exchange,
+                symbol="ETH-USDT-PERP",
+                checked_at_ms=now_minute,
+            )
+
+    runner._recovery_service = RuntimeRecoveryService(
+        exchange_contexts=tuple(
+            RecoveryExchangeContext(
+                account=account,
+                execution=execution,
+                state_store=runner.context.state_store,
+                reconciler=CleanReconciler(account.exchange),
+                leverage_margin_mode=MarginMode.ISOLATED,
+            )
+            for account, execution in zip(accounts, executions, strict=True)
+        ),
+        position_plan_store=plan_store,
+    )
+
+    monkeypatch.setattr(runner, "_initialize_rangebar_trust_window", lambda: None)
+    monkeypatch.setattr(runner, "_run_warmup", AsyncMock())
+    monkeypatch.setattr(
+        runner,
+        "_warmup_range_speed_history",
+        AsyncMock(return_value=0),
+    )
+    monkeypatch.setattr(runner, "_check_startup_feature_backfills", AsyncMock())
+    monkeypatch.setattr(runner, "_run_reconciliation", AsyncMock())
+    monkeypatch.setattr(runner, "_evaluate_startup_catchup_once", AsyncMock())
+    monkeypatch.setattr(
+        runner,
+        "_finish_range_speed_warmup_after_catchup",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_start_range_speed_background_services",
+        lambda: None,
+    )
+    monkeypatch.setattr(runner._heartbeat_service, "start", lambda **kwargs: None)
+
+    await runner._startup()
+
+    assert runner._health.phase is RuntimePhase.RUNNING
+    assert strategy.recovery_blocking_manual_required is False
+    assert strategy.position.in_pos is True
+    assert strategy.position.position_id == lf_position_id
+    assert strategy.position.confirmed_stop_price == effective
+    assert strategy.mf_sleeve.active is True
+    assert strategy.mf_sleeve.position_id == mf_position_id
+    assert strategy.position.legs["okx"].stop_order_id == (
+        f"{lf_position_id}-okx-stop"
+    )
+    assert strategy.position.legs["binance"].stop_order_id == (
+        f"{lf_position_id}-binance-stop"
+    )
+    assert runner.stats.order_intents_created == 0
+    assert runner.stats.signals_seen == 0
+    assert all(account.set_calls == [] for account in accounts)
+    assert all(execution.write_calls == [] for execution in executions)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Test 3: OPEN signal NOT affected by stop post-check
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3710,6 +4014,98 @@ async def test_stop_post_check_retries_until_open_stop_order_visible(monkeypatch
     )
     assert strategy.position.confirmed_stop_price == Decimal("1686.42")
     assert strategy.position.pending_stop_replace is False
+
+
+@pytest.mark.asyncio
+async def test_stop_post_check_accepts_exchange_tick_normalized_price(
+    monkeypatch,
+):
+    monkeypatch.setenv("AETHER_STOP_POST_CHECK_ATTEMPTS", "1")
+    canonical = Decimal("1738.2542231936259150")
+    strategy = V8Strategy()
+    strategy.position.open_master(
+        side=Side.SHORT,
+        entry_time_ms=5,
+        avg_entry=Decimal("1800"),
+        qty=Decimal("2.55"),
+        stop_price=canonical,
+        entry_engine="MOMENTUM_V3",
+        position_id="tick-normalized-post-check",
+        stop_confirmed=False,
+    )
+    stop = Order(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP",
+        order_id="okx-normalized-stop",
+        client_order_id="AEOKSS0123456789ABCDEF",
+        status=OrderStatus.NEW,
+        side=OrderSide.BUY,
+        price=Decimal("1738.25"),
+        quantity=Decimal("25.5"),
+        raw={"reduceOnly": "true", "source": "aetheredge"},
+    )
+
+    class RuleAwareExecution(CountingFakeExecutionClient):
+        async def fetch_instrument_rule(self):
+            return InstrumentRule(
+                exchange=ExchangeName.OKX,
+                symbol="ETH-USDT-PERP",
+                raw_symbol="ETH-USDT-SWAP",
+                price_tick=Decimal("0.01"),
+            )
+
+    runner = _runner(
+        strategy,
+        services={
+            "execution_clients": (
+                RuleAwareExecution(
+                    ExchangeName.OKX,
+                    open_stop_orders_sequence=[[stop]],
+                ),
+            ),
+            "account_clients": (
+                FakeAccountClient(
+                    ExchangeName.OKX,
+                    positions=[_short_position()],
+                ),
+            ),
+        },
+    )
+    signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.PLACE_STOP_LOSS_SHORT,
+        quantity=Decimal("2.55"),
+        trigger_price=canonical,
+        metadata={
+            "target_exchanges": ["okx"],
+            "position_id": "tick-normalized-post-check",
+        },
+    )
+
+    verified = await runner._verify_stop_order_results(
+        signal=signal,
+        results=(
+            ExchangeOrderResult(
+                exchange=ExchangeName.OKX,
+                ok=True,
+                order_id=stop.order_id,
+                client_order_id=stop.client_order_id,
+                status=OrderStatus.NEW,
+            ),
+        ),
+    )
+
+    assert verified[0].ok is True
+    assert verified[0].raw["canonical_stop_price"] == (
+        "1738.254223193625915"
+    )
+    assert verified[0].raw["effective_expected_stop_price"] == "1738.25"
+    assert verified[0].raw["actual_exchange_stop_price"] == "1738.25"
+    assert verified[0].raw["price_tick"] == "0.01"
+    assert verified[0].raw["price_difference"] == "0"
+    assert verified[0].raw["confirmed_stop_price"] == "1738.25"
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

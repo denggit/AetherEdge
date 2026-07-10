@@ -969,12 +969,14 @@ class PortfolioV1LiveGate:
                     open_stop_orders=scoped_orders,
                     open_orders=snapshot.open_orders,
                     market_profile=market_profile,
+                    instrument_rule=snapshot.instrument_rule,
                 )
                 if not validation.should_keep_existing_stop:
                     issues.append(
                         "lf_required_stop_invalid:"
                         f"{exchange}:{position_id}:"
-                        f"{validation.primary_invalid_reason}"
+                        f"{validation.primary_invalid_reason}:"
+                        f"{validation.primary_invalid_detail_reason}"
                     )
 
         for snapshot in snapshots:

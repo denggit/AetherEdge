@@ -1476,7 +1476,21 @@ class Strategy:
                 for exchange in target_exchanges
                 if exchange in successful_by_exchange
             ]
-            stop_price = self.position.desired_stop_price or signal.trigger_price
+            theoretical_stop_price = (
+                self.position.desired_stop_price or signal.trigger_price
+            )
+            master_result = next(
+                (
+                    result
+                    for result in successful
+                    if result.exchange.value == self.config.data_exchange
+                ),
+                successful[0] if successful else None,
+            )
+            stop_price = _confirmed_stop_price_from_result(
+                master_result,
+                fallback=theoretical_stop_price,
+            )
             initial_stop_pending = self.position.confirmed_stop_price is None
             master_metadata_ok = True
             for result in successful:
@@ -1494,11 +1508,15 @@ class Strategy:
             if stop_price is not None:
                 self.position.confirm_pending_stop_replace(stop_price=stop_price)
             for result in successful:
+                leg_stop_price = _confirmed_stop_price_from_result(
+                    result,
+                    fallback=stop_price,
+                )
                 self.position.record_stop_order(
                     exchange=result.exchange.value,
                     stop_order_id=result.order_id,
                     stop_client_order_id=result.client_order_id,
-                    stop_price=stop_price,
+                    stop_price=leg_stop_price,
                 )
                 self._reconcile_master_position_from_exchange_result(
                     result=result,
@@ -3215,7 +3233,17 @@ class Strategy:
                 open_stop_orders=scoped_stops,
                 open_orders=(),
                 market_profile=market_profile,
+                instrument_rule=snapshot.instrument_rule,
             )
+            if (
+                validation.should_keep_existing_stop
+                and validation.confirmed_stop_price is not None
+            ):
+                leg_state.stop_price = validation.confirmed_stop_price
+                if exchange == self.config.data_exchange:
+                    self.position.update_stop(
+                        validation.confirmed_stop_price
+                    )
             all_stops_valid = (
                 all_stops_valid and validation.should_keep_existing_stop
             )
@@ -3359,7 +3387,15 @@ class Strategy:
             open_stop_orders=master_snapshot.open_stop_orders,
             open_orders=master_snapshot.open_orders,
             market_profile=market_profile,
+            instrument_rule=master_snapshot.instrument_rule,
         )
+        if (
+            master_validation.should_keep_existing_stop
+            and master_validation.confirmed_stop_price is not None
+        ):
+            self.position.update_stop(
+                master_validation.confirmed_stop_price
+            )
         signals.extend(
             self._signals_from_recovery_exit_validation(
                 validation=master_validation,
@@ -3423,6 +3459,7 @@ class Strategy:
                         open_stop_orders=follower_snapshot.open_stop_orders,
                         open_orders=follower_snapshot.open_orders,
                         market_profile=market_profile,
+                        instrument_rule=follower_snapshot.instrument_rule,
                     )
                     signals.extend(
                         self._signals_from_recovery_exit_validation(
@@ -3450,6 +3487,7 @@ class Strategy:
                         open_stop_orders=follower_snapshot.open_stop_orders,
                         open_orders=follower_snapshot.open_orders,
                         market_profile=market_profile,
+                        instrument_rule=follower_snapshot.instrument_rule,
                     )
                     signals.extend(
                         self._signals_from_recovery_exit_validation(
@@ -3475,6 +3513,7 @@ class Strategy:
                         open_stop_orders=follower_snapshot.open_stop_orders,
                         open_orders=follower_snapshot.open_orders,
                         market_profile=market_profile,
+                        instrument_rule=follower_snapshot.instrument_rule,
                     )
                     signals.extend(
                         self._signals_from_recovery_exit_validation(
@@ -4453,6 +4492,21 @@ def _has_stop_at_price(orders, stop_price: Decimal) -> bool:
         if order.price is not None and order.price == stop_price:
             return True
     return False
+
+
+def _confirmed_stop_price_from_result(
+    result: ExchangeOrderResult | None,
+    *,
+    fallback: Decimal | None,
+) -> Decimal | None:
+    if result is None:
+        return fallback
+    raw = dict(result.raw)
+    return (
+        _dec_or_none(raw.get("confirmed_stop_price"))
+        or _dec_or_none(raw.get("actual_exchange_stop_price"))
+        or fallback
+    )
 
 
 def _dec_or_none(value: Any) -> Decimal | None:

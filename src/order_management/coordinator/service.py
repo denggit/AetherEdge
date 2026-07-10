@@ -271,14 +271,43 @@ class MultiExchangeOrderCoordinator:
         if not signal.metadata or not signal.metadata.get("position_id"):
             return
         position_id = str(signal.metadata["position_id"])
+        plan = self.position_plan_store.get_position(position_id)
+        if plan is not None:
+            self.position_plan_store.upsert_position(
+                replace(
+                    plan,
+                    metadata={
+                        **dict(plan.metadata),
+                        "strategy_theoretical_stop_price": str(
+                            signal.trigger_price
+                        ),
+                    },
+                )
+            )
+        master_exchange = (
+            None if plan is None else plan.master_exchange
+        )
         for result in results:
             if result.ok:
+                effective_stop_price = (
+                    _optional_decimal(
+                        result.raw.get("confirmed_stop_price")
+                    )
+                    or _optional_decimal(
+                        result.raw.get("actual_exchange_stop_price")
+                    )
+                    or signal.trigger_price
+                )
                 self.position_plan_store.update_stop(
                     position_id=position_id,
                     exchange=result.exchange,
-                    stop_price=signal.trigger_price,
+                    stop_price=effective_stop_price,
                     stop_order_id=result.order_id,
                     stop_client_order_id=result.client_order_id,
+                    update_canonical=(
+                        master_exchange is None
+                        or result.exchange is master_exchange
+                    ),
                 )
 
     def _record_close_plan(self, intent: OrderIntent, results: Sequence[ExchangeOrderResult], *, purpose: str) -> None:

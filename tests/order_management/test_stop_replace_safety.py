@@ -2,11 +2,20 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from src.order_management.quantity import NativeQuantityConverter
 from src.order_management.safety import RecoveryExitOrderValidator
 from src.order_management.stops import ScopedStopReplaceService, StopScope
 from src.platform import ExchangeName
-from src.platform.exchanges.models import PositionMode, PositionSide
+from src.platform.exchanges.models import (
+    InstrumentRule,
+    Order,
+    OrderSide,
+    OrderStatus,
+    PositionMode,
+    PositionSide,
+)
 from src.platform.markets import get_market_profile
 from src.signals import SignalAction, TradeSignal
 from strategies.eth_lf_portfolio_v8.domain.models import Side
@@ -99,6 +108,121 @@ def test_stop_replace_never_places_new_then_cancel_all_without_targeted_cancel()
             assert signal.metadata.get("stop_replace_mode") != "place_new_then_cancel_all"
         if seen_place:
             assert signal.action is not SignalAction.CANCEL_ALL_STOP_ORDERS
+
+
+@pytest.mark.parametrize(
+    ("exchange", "position_mode", "quantity", "raw"),
+    [
+        (
+            ExchangeName.OKX,
+            PositionMode.ONE_WAY,
+            Decimal("10"),
+            {"reduceOnly": "true", "source": "aetheredge"},
+        ),
+        (
+            ExchangeName.BINANCE,
+            PositionMode.HEDGE,
+            None,
+            {
+                "closePosition": "true",
+                "positionSide": "LONG",
+                "source": "aetheredge",
+            },
+        ),
+    ],
+)
+def test_tick_normalized_stop_price_is_valid_for_okx_and_binance(
+    exchange,
+    position_mode,
+    quantity,
+    raw,
+) -> None:
+    canonical = Decimal("1738.2542231936259150")
+    order = Order(
+        exchange=exchange,
+        symbol="ETH-USDT-PERP",
+        raw_symbol=(
+            "ETH-USDT-SWAP"
+            if exchange is ExchangeName.OKX
+            else "ETHUSDT"
+        ),
+        order_id=f"{exchange.value}-stop",
+        client_order_id=None,
+        status=OrderStatus.NEW,
+        side=OrderSide.SELL,
+        price=Decimal("1738.25"),
+        quantity=quantity,
+        raw=raw,
+    )
+    result = RecoveryExitOrderValidator().validate_stop_orders(
+        exchange=exchange,
+        symbol="ETH-USDT-PERP",
+        strategy_id="eth_portfolio_v1",
+        position_id="position-tick-normalized",
+        position_side=PositionSide.LONG,
+        position_mode=position_mode,
+        current_position_native_quantity=Decimal("10"),
+        canonical_stop_price=canonical,
+        open_stop_orders=(order,),
+        market_profile=get_market_profile("ETH-USDT-PERP"),
+        instrument_rule=InstrumentRule(
+            exchange=exchange,
+            symbol="ETH-USDT-PERP",
+            raw_symbol=order.raw_symbol,
+            price_tick=Decimal("0.01"),
+        ),
+    )
+
+    assert result.valid is True
+    assert result.should_keep_existing_stop is True
+    assert result.effective_expected_stop_price == Decimal("1738.25")
+    assert result.confirmed_stop_price == Decimal("1738.25")
+    assert result.primary_invalid_reason is None
+
+
+def test_tick_normalization_does_not_accept_a_genuinely_wrong_stop_price() -> None:
+    order = Order(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP",
+        order_id="wrong-price-stop",
+        client_order_id=None,
+        status=OrderStatus.NEW,
+        side=OrderSide.SELL,
+        price=Decimal("1738.20"),
+        quantity=Decimal("10"),
+        raw={"reduceOnly": "true", "source": "aetheredge"},
+    )
+    result = RecoveryExitOrderValidator().validate_stop_orders(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        strategy_id="eth_portfolio_v1",
+        position_id="position-wrong-price",
+        position_side=PositionSide.LONG,
+        position_mode=PositionMode.ONE_WAY,
+        current_position_native_quantity=Decimal("10"),
+        canonical_stop_price=Decimal("1738.2542231936259150"),
+        open_stop_orders=(order,),
+        market_profile=get_market_profile("ETH-USDT-PERP"),
+        instrument_rule=InstrumentRule(
+            exchange=ExchangeName.OKX,
+            symbol="ETH-USDT-PERP",
+            raw_symbol="ETH-USDT-SWAP",
+            price_tick=Decimal("0.01"),
+        ),
+    )
+
+    assert result.valid is False
+    assert result.primary_invalid_reason == "invalid_bot_owned_stop_present"
+    assert result.primary_invalid_detail_reason == "trigger_price_mismatch"
+    fields = result.diagnostic_fields(action="reject")
+    assert fields["invalid_category"] == "invalid_bot_owned_stop_present"
+    assert fields["invalid_detail_reason"] == "trigger_price_mismatch"
+    assert fields["canonical_stop_price"] == "1738.254223193625915"
+    assert fields["effective_expected_stop_price"] == "1738.25"
+    assert fields["actual_exchange_stop_price"] == "1738.2"
+    assert fields["price_tick"] == "0.01"
+    assert fields["price_difference"] == "0.05"
 
 
 def test_scoped_stop_replace_builds_cancel_for_exact_scope() -> None:

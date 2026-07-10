@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal
 from enum import Enum
 from typing import Any, Mapping
 
 from src.platform.account.ports import AccountClient
+from src.platform.exchanges.models import MarginMode
 from src.platform.execution.ports import ExecutionClient
 from src.platform.state.ports import StateStore
 
@@ -29,6 +31,8 @@ class SyncExchangeContext:
     account: AccountClient
     execution: ExecutionClient
     state_store: StateStore
+    leverage_margin_mode: MarginMode = MarginMode.CROSS
+    expected_leverage: Decimal | None = None
 
 
 @dataclass(frozen=True)

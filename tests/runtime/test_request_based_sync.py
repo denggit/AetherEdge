@@ -10,7 +10,7 @@ import pytest
 
 import src.runtime.account_sync.service as sync_service
 from src.app.alerts import AppAlert
-from src.platform import Balance, ExchangeName, LeverageInfo, Order, OrderQuery, OrderSide, OrderStatus, Position, PositionMode, PositionSide, StopOrderQuery
+from src.platform import Balance, ExchangeName, LeverageInfo, MarginMode, Order, OrderQuery, OrderSide, OrderStatus, Position, PositionMode, PositionSide, StopOrderQuery
 from src.runtime.account_sync import AccountStateSyncService, KnownOrderRef, OrderStateSyncService, SyncExchangeContext
 from src.runtime.requirements import AccountStateRequirement, OrderStateRequirement
 
@@ -113,6 +113,105 @@ async def test_account_sync_fetches_snapshot_and_persists_state():
     assert account.calls == ["fetch_balance", "fetch_positions", "fetch_leverage", "fetch_position_mode"]
     assert len(state.snapshots) == 1
     assert state.snapshots[0].balance.available == Decimal("90")
+
+
+@pytest.mark.asyncio
+async def test_account_sync_uses_configured_isolated_leverage_dimension(
+    caplog,
+):
+    class TrackingAccount(FakeAccount):
+        def __init__(self) -> None:
+            super().__init__()
+            self.margin_modes: list[MarginMode] = []
+            self.set_calls: list[tuple[str, object]] = []
+
+        async def fetch_leverage(self, *, margin_mode=None):
+            self.calls.append("fetch_leverage")
+            self.margin_modes.append(margin_mode)
+            leverage = (
+                Decimal("15")
+                if margin_mode is MarginMode.ISOLATED
+                else Decimal("20")
+            )
+            return LeverageInfo(
+                exchange=self.exchange,
+                symbol=self.symbol,
+                raw_symbol=self.symbol,
+                leverage=leverage,
+                margin_mode=margin_mode,
+            )
+
+        async def set_margin_mode(self, margin_mode):
+            self.set_calls.append(("set_margin_mode", margin_mode))
+
+        async def set_leverage(self, leverage, *, margin_mode=None):
+            self.set_calls.append(("set_leverage", leverage))
+
+    state = MemoryState()
+    account = TrackingAccount()
+    service = AccountStateSyncService(
+        contexts=(
+            SyncExchangeContext(
+                account=account,
+                execution=FakeExecution(),
+                state_store=state,
+                leverage_margin_mode=MarginMode.ISOLATED,
+                expected_leverage=Decimal("15"),
+            ),
+        ),
+    )
+
+    with caplog.at_level(logging.INFO):
+        results = await service.sync_once()
+
+    assert results[0].success is True
+    assert results[0].metadata == {
+        "leverage_margin_mode": "isolated",
+        "expected_leverage": "15",
+    }
+    assert account.margin_modes == [MarginMode.ISOLATED]
+    assert MarginMode.CROSS not in account.margin_modes
+    assert account.set_calls == []
+    assert state.snapshots[0].leverage.leverage == Decimal("15")
+    assert state.snapshots[0].leverage.margin_mode is MarginMode.ISOLATED
+    assert "leverage=15" in caplog.text
+    assert "leverage_margin_mode=isolated" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_account_sync_cross_dimension_and_unavailable_leverage_are_safe():
+    class CrossAccount(FakeAccount):
+        def __init__(self) -> None:
+            super().__init__()
+            self.margin_modes = []
+
+        async def fetch_leverage(self, *, margin_mode=None):
+            self.calls.append("fetch_leverage")
+            self.margin_modes.append(margin_mode)
+            return LeverageInfo(
+                exchange=self.exchange,
+                symbol=self.symbol,
+                raw_symbol=self.symbol,
+                leverage=None,
+                margin_mode=margin_mode,
+            )
+
+    state = MemoryState()
+    account = CrossAccount()
+    result = await AccountStateSyncService(
+        contexts=(
+            SyncExchangeContext(
+                account=account,
+                execution=FakeExecution(),
+                state_store=state,
+                leverage_margin_mode=MarginMode.CROSS,
+            ),
+        ),
+    ).sync_once()
+
+    assert result[0].success is True
+    assert account.margin_modes == [MarginMode.CROSS]
+    assert state.snapshots[0].leverage.leverage is None
 
 
 @pytest.mark.asyncio

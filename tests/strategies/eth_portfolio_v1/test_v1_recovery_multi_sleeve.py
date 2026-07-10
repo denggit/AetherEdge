@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import replace
 from decimal import Decimal
 
 from src.platform import (
     Balance,
     ExchangeName,
+    InstrumentRule,
     LeverageInfo,
     Order,
     OrderSide,
@@ -16,6 +18,7 @@ from src.platform import (
     PositionMode,
     PositionSide,
 )
+from src.platform.execution.rules import normalize_stop_trigger_price
 from src.platform.snapshot import PlatformSnapshot
 from src.strategy import StrategyRecoveryContext
 from strategies.eth_portfolio_v1.domain.mf_signal import MF_ENGINE_NAME
@@ -33,6 +36,7 @@ def _plan(
     follower_quantity: str | None = None,
     position_id: str | None = None,
     include_mf_time: bool = True,
+    stop_price: str = "1900",
 ) -> dict:
     is_mf = sleeve == "mf"
     position_id = position_id or (
@@ -71,7 +75,7 @@ def _plan(
             "entry_engine": metadata["engine"],
             "side": "long",
             "status": "active",
-            "canonical_stop_price": None if is_mf else "1900",
+            "canonical_stop_price": None if is_mf else stop_price,
             "master_exchange": "okx",
             "master_target_qty_base": quantity,
             "master_filled_qty_base": quantity,
@@ -88,7 +92,7 @@ def _plan(
                 "sync_status": "open",
                 "stop_order_id": None if is_mf else f"{position_id}-okx-stop",
                 "stop_client_order_id": None,
-                "stop_price": None if is_mf else "1900",
+                "stop_price": None if is_mf else stop_price,
             },
             {
                 "position_id": position_id,
@@ -99,7 +103,7 @@ def _plan(
                 "sync_status": "open",
                 "stop_order_id": None if is_mf else f"{position_id}-binance-stop",
                 "stop_client_order_id": None,
-                "stop_price": None if is_mf else "1900",
+                "stop_price": None if is_mf else stop_price,
             },
         ],
     }
@@ -113,6 +117,16 @@ def _snapshot(
 ) -> PlatformSnapshot:
     base = Decimal(base_quantity)
     native = base * Decimal("10") if exchange is ExchangeName.OKX else base
+    instrument_rule = InstrumentRule(
+        exchange=exchange,
+        symbol=SYMBOL,
+        raw_symbol=(
+            "ETH-USDT-SWAP"
+            if exchange is ExchangeName.OKX
+            else "ETHUSDT"
+        ),
+        price_tick=Decimal("0.01"),
+    )
     positions = (
         ()
         if base == 0
@@ -159,7 +173,10 @@ def _snapshot(
                 status=OrderStatus.NEW,
                 side=OrderSide.SELL,
                 order_type=OrderType.MARKET,
-                price=Decimal("1900"),
+                price=normalize_stop_trigger_price(
+                    Decimal(lf_position["canonical_stop_price"]),
+                    instrument_rule,
+                ),
                 quantity=lf_native,
                 raw={
                     "reduceOnly": "true",
@@ -169,6 +186,11 @@ def _snapshot(
                         else "positionSide"
                     ): "long",
                     "position_id": lf_position["position_id"],
+                    **(
+                        {"closePosition": "true"}
+                        if exchange is ExchangeName.BINANCE
+                        else {}
+                    ),
                 },
             ),
         )
@@ -194,6 +216,7 @@ def _snapshot(
             leverage=Decimal("3"),
         ),
         position_mode=PositionMode.HEDGE,
+        instrument_rule=instrument_rule,
     )
 
 
@@ -363,6 +386,86 @@ def test_lf_and_mf_active_plans_restore_both_and_all_snapshots() -> None:
     assert Decimal(
         strategy.last_recovery_audit["exchange"]["okx"]["aggregate_qty"]
     ) == Decimal("1.0")
+
+
+def test_lf_and_mf_restart_keeps_tick_normalized_existing_stops() -> None:
+    strategy = Strategy()
+    theoretical_stop = "1738.2542231936259150"
+    lf = _plan(
+        "lf",
+        quantity="0.6",
+        stop_price=theoretical_stop,
+    )
+    mf = _plan("mf", quantity="0.4")
+
+    signals = _recover(strategy, [lf, mf], quantity="1.0")
+
+    assert signals == []
+    assert strategy.recovery_blocking_manual_required is False
+    assert strategy.position.in_pos is True
+    assert strategy.position.position_id == "v9e-lf-recovery"
+    assert strategy.position.confirmed_stop_price == Decimal("1738.25")
+    assert strategy.position.stop_price == Decimal("1738.25")
+    assert strategy.position.legs["okx"].stop_order_id == (
+        "v9e-lf-recovery-okx-stop"
+    )
+    assert strategy.position.legs["binance"].stop_order_id == (
+        "v9e-lf-recovery-binance-stop"
+    )
+    assert strategy.position.legs["okx"].stop_price == Decimal("1738.25")
+    assert strategy.position.legs["binance"].stop_price == Decimal("1738.25")
+    assert not any(
+        signal.action.value
+        in {
+            "open_long",
+            "open_short",
+            "place_stop_loss_long",
+            "place_stop_loss_short",
+            "cancel_stop_order",
+            "cancel_all_stop_orders",
+        }
+        for signal in signals
+    )
+
+
+def test_restart_without_lf_stop_is_never_silently_accepted() -> None:
+    strategy = Strategy()
+    lf = _plan("lf", quantity="0.6")
+    snapshots = tuple(
+        replace(
+            _snapshot(
+                exchange,
+                base_quantity="0.6",
+                lf_plan=lf,
+            ),
+            open_stop_orders=(),
+        )
+        for exchange in (ExchangeName.OKX, ExchangeName.BINANCE)
+    )
+
+    signals = list(
+        asyncio.run(
+            strategy.recover(
+                StrategyRecoveryContext(
+                    snapshots=snapshots,
+                    reconcile_reports=(),
+                    metadata={"active_position_plans": [lf]},
+                )
+            )
+        )
+    )
+
+    assert strategy.position.in_pos is True
+    assert strategy.recovery_blocking_manual_required is True
+    assert any(
+        signal.action.value
+        in {"place_stop_loss_long", "place_stop_loss_short"}
+        for signal in signals
+    )
+    assert not any(
+        signal.action.value in {"open_long", "open_short"}
+        for signal in signals
+    )
 
 
 def test_mf_missing_entry_execution_time_requires_manual_and_blocks() -> None:

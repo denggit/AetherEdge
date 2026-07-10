@@ -12,6 +12,23 @@ def round_to_step(value: Decimal, step: Decimal | None) -> Decimal:
     return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
 
 
+def normalize_stop_trigger_price(
+    trigger_price: Decimal,
+    rule: InstrumentRule | None,
+) -> Decimal:
+    """Return the trigger price the venue will receive for a stop order.
+
+    This is the single price-normalization primitive shared by stop order
+    submission and recovery validation.  Keeping it here prevents recovery
+    code from growing a second, subtly different tick-rounding policy.
+    """
+
+    return round_to_step(
+        trigger_price,
+        None if rule is None else rule.price_tick,
+    )
+
+
 def normalize_order_request(request: OrderRequest, rule: InstrumentRule | None) -> OrderRequest:
     if rule is None:
         return request
@@ -32,5 +49,5 @@ def normalize_stop_market_order_request(request: StopMarketOrderRequest, rule: I
     if rule is None:
         return request
     quantity = round_to_step(request.quantity, rule.quantity_step) if request.quantity is not None else None
-    trigger_price = round_to_step(request.trigger_price, rule.price_tick)
+    trigger_price = normalize_stop_trigger_price(request.trigger_price, rule)
     return replace(request, quantity=quantity, trigger_price=trigger_price)

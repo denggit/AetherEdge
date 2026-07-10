@@ -7,6 +7,7 @@ from src.platform.exchanges.models import (
     CancelOrderRequest,
     CancelStopOrderRequest,
     ExchangeName,
+    InstrumentRule,
     Order,
     OrderQuery,
     OrderRequest,
@@ -81,6 +82,9 @@ class ExecutionClient(Protocol):
         ...
 
     async def fetch_position_mode(self) -> PositionMode:
+        ...
+
+    async def fetch_instrument_rule(self) -> InstrumentRule | None:
         ...
 
     async def replace_order(self, cancel_request: CancelOrderRequest, new_order: OrderRequest) -> Order:

@@ -75,6 +75,54 @@ def test_v1_successful_new_stop_returns_exact_scoped_cancel_and_records_new_id()
     assert leg.stop_price == Decimal("2450")
 
 
+def test_v1_successful_stop_records_verified_exchange_effective_price() -> None:
+    strategy = _long_strategy()
+    canonical = Decimal("1738.2542231936259150")
+    strategy.position.mark_pending_stop_replace(
+        desired_stop_price=canonical,
+        reason="TEST_TICK_NORMALIZATION",
+        bar_close_time_ms=2,
+    )
+    signal = strategy._place_stop_signals(
+        target_exchanges=["okx"],
+        quantity=Decimal("0.40"),
+        stop_price=canonical,
+        reason="TEST_TICK_NORMALIZATION",
+        bar_close_time_ms=2,
+    )[0]
+    result = _successful_stop_result(
+        exchange=ExchangeName.OKX,
+        order_id="okx-normalized-stop",
+        client_order_id="okx-normalized-client",
+    )
+    result = ExchangeOrderResult(
+        exchange=result.exchange,
+        ok=result.ok,
+        order_id=result.order_id,
+        client_order_id=result.client_order_id,
+        status=result.status,
+        raw={
+            **dict(result.raw),
+            "canonical_stop_price": str(canonical),
+            "effective_expected_stop_price": "1738.25",
+            "actual_exchange_stop_price": "1738.25",
+            "confirmed_stop_price": "1738.25",
+            "price_tick": "0.01",
+            "price_difference": "0",
+        },
+    )
+
+    strategy._handle_stop_order_results(
+        signal=signal,
+        results=[result],
+        event_time_ms=3,
+    )
+
+    assert strategy.position.confirmed_stop_price == Decimal("1738.25")
+    assert strategy.position.stop_price == Decimal("1738.25")
+    assert strategy.position.legs["okx"].stop_price == Decimal("1738.25")
+
+
 def test_v1_failed_new_stop_never_returns_old_stop_cancel() -> None:
     strategy = _long_strategy()
     strategy.position.record_stop_order(

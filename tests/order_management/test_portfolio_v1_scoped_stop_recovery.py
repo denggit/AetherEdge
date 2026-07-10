@@ -291,3 +291,75 @@ def test_unconfirmed_mf_close_is_persisted_as_manual_required(
     assert plan is not None
     assert plan.status is PositionPlanStatus.MANUAL_REQUIRED
     assert plan.metadata["pending_close_unconfirmed"] is True
+
+
+def test_verified_exchange_stop_price_is_persisted_with_theoretical_audit(
+    tmp_path,
+) -> None:
+    store = SqlitePositionPlanStore(tmp_path / "plans.sqlite3")
+    store.upsert_position(
+        PositionPlan(
+            position_id=LF_POSITION,
+            strategy_id="eth_portfolio_v1",
+            entry_engine="BULL_RECLAIM_V2",
+            side="long",
+            status=PositionPlanStatus.ACTIVE,
+            canonical_stop_price=Decimal("1738.2542231936259150"),
+            master_exchange=ExchangeName.OKX,
+            master_target_qty_base=Decimal("0.6"),
+            master_filled_qty_base=Decimal("0.6"),
+            metadata={"sleeve_id": "lf"},
+        )
+    )
+    store.upsert_leg(
+        LegPlan(
+            position_id=LF_POSITION,
+            exchange=ExchangeName.OKX,
+            role=LegRole.MASTER,
+            target_qty_base=Decimal("0.6"),
+            filled_qty_base=Decimal("0.6"),
+            sync_status=LegSyncStatus.OPEN,
+        )
+    )
+    coordinator = MultiExchangeOrderCoordinator.__new__(
+        MultiExchangeOrderCoordinator
+    )
+    coordinator.position_plan_store = store
+    signal = TradeSignal(
+        symbol=SYMBOL,
+        action=SignalAction.PLACE_STOP_LOSS_LONG,
+        quantity=Decimal("0.6"),
+        trigger_price=Decimal("1738.2542231936259150"),
+        metadata={"position_id": LF_POSITION},
+    )
+    intent = OrderIntent(
+        intent_id="normalized-stop-plan",
+        strategy_id="eth_portfolio_v1",
+        signal=signal,
+        target_exchanges=(ExchangeName.OKX,),
+    )
+
+    coordinator._record_stop_plan(
+        intent,
+        (
+            ExchangeOrderResult(
+                exchange=ExchangeName.OKX,
+                ok=True,
+                order_id="okx-normalized-stop",
+                raw={
+                    "confirmed_stop_price": "1738.25",
+                    "actual_exchange_stop_price": "1738.25",
+                },
+            ),
+        ),
+    )
+
+    plan = store.get_position(LF_POSITION)
+    leg = store.get_legs(LF_POSITION)[0]
+    assert plan is not None
+    assert plan.canonical_stop_price == Decimal("1738.25")
+    assert plan.metadata["strategy_theoretical_stop_price"] == (
+        "1738.2542231936259150"
+    )
+    assert leg.stop_price == Decimal("1738.25")
+    assert leg.stop_order_id == "okx-normalized-stop"
