@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import time
 from decimal import Decimal
 from typing import Any, Mapping
@@ -37,6 +38,8 @@ from src.platform.exchanges.models import (
 )
 from src.platform.exchanges.ports import HttpClient
 from src.platform.exchanges.symbols import to_exchange_symbol
+
+_logger = logging.getLogger(__name__)
 
 BINANCE_PROD_REST_URL = "https://fapi.binance.com"
 BINANCE_TESTNET_REST_URL = "https://demo-fapi.binance.com"
@@ -323,14 +326,78 @@ class BinanceExchangeClient:
         raw_symbol = to_exchange_symbol(self.exchange, symbol)
         selected = next((position for position in positions if position.raw_symbol == raw_symbol), None)
         raw = selected.raw if selected is not None else {}
+
+        # --- Primary path: /fapi/v3/positionRisk ---
+        leverage = _optional_decimal(raw.get("leverage")) if raw else None
+        resolved_margin_mode = (
+            _optional_margin_mode(raw.get("marginType"))
+            or _optional_margin_mode(raw.get("margin_type"))
+            or margin_mode
+        )
+        position_side = selected.side if selected is not None else None
+
+        source = "/fapi/v3/positionRisk"
+        reason = "primary"
+        selected_row: Mapping[str, Any] | dict[str, Any] = raw
+        readback_available = leverage is not None
+
+        # --- Fallback: /fapi/v2/account when primary yields no leverage ---
+        if leverage is None or leverage <= 0:
+            try:
+                account_payload = await self._request_signed("GET", "/fapi/v2/account")
+                v2_positions = account_payload.get("positions", [])
+                matching = [row for row in v2_positions if row.get("symbol") == raw_symbol]
+
+                if matching:
+                    # Hedge mode: prefer row with non-zero positionAmt; prefer LONG if both sides non-zero
+                    non_zero = [
+                        r for r in matching
+                        if _optional_decimal(r.get("positionAmt")) not in (None, Decimal(0))
+                    ]
+                    if non_zero:
+                        long_rows = [r for r in non_zero if str(r.get("positionSide", "")).upper() == "LONG"]
+                        fallback_row = long_rows[0] if long_rows else non_zero[0]
+                    else:
+                        fallback_row = matching[0]
+
+                    fallback_leverage = _optional_decimal(fallback_row.get("leverage"))
+                    if fallback_leverage is not None:
+                        leverage = fallback_leverage
+                        fallback_margin_mode = _optional_margin_mode(fallback_row.get("marginType"))
+                        if fallback_margin_mode is not None:
+                            resolved_margin_mode = fallback_margin_mode
+                        source = "/fapi/v2/account"
+                        reason = "fallback_v2_account"
+                        selected_row = fallback_row
+                        readback_available = True
+            except Exception:
+                _logger.warning(
+                    "fetch_leverage: /fapi/v2/account fallback failed for %s",
+                    raw_symbol,
+                    exc_info=True,
+                )
+
+        if leverage is None or (leverage is not None and leverage <= 0):
+            leverage = None
+            reason = "no_leverage_data"
+            readback_available = False
+
+        enriched_raw: dict[str, Any] = {
+            **raw,
+            "source": source,
+            "selected_row": selected_row,
+            "readback_available": readback_available,
+            "reason": reason,
+        }
+
         return LeverageInfo(
             exchange=self.exchange,
             symbol=symbol,
             raw_symbol=raw_symbol,
-            leverage=_optional_decimal(raw.get("leverage")) if raw else None,
-            margin_mode=_optional_margin_mode(raw.get("marginType")) or _optional_margin_mode(raw.get("margin_type")) or margin_mode,
-            position_side=selected.side if selected is not None else None,
-            raw=raw,
+            leverage=leverage,
+            margin_mode=resolved_margin_mode,
+            position_side=position_side,
+            raw=enriched_raw,
         )
 
     async def set_leverage(self, request: LeverageRequest) -> LeverageInfo:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import os
 import queue
 from pathlib import Path
@@ -59,6 +60,7 @@ from src.platform.execution.ports import ExecutionClient
 from src.platform.markets import get_market_profile
 from src.platform.snapshot import PlatformSnapshot
 from src.runtime.account_config import (
+    AccountConfigBootstrapResult,
     AccountConfigEnv,
     bootstrap_account_config,
     load_account_config_env,
@@ -354,6 +356,9 @@ class LiveRuntimeRunner:
         self.services = dict(services or {})
         self._project_env: ProjectEnvConfig = self.services.get("project_env_config") or get_project_env_config()
         self._account_config_env: AccountConfigEnv | None = None
+        self._account_config_new_entries_blocked: bool = False
+        self._account_config_apply_writes: bool = False
+        self._account_config_results: tuple[AccountConfigBootstrapResult, ...] = ()
         self.requirements: StrategyRuntimeRequirements = self.services.get("runtime_requirements") or resolve_strategy_runtime_requirements(app_context.strategy, fallback_data_streams=app_config.data_streams)
         self.stats = LiveRuntimeStats()
         self._market_queue: asyncio.Queue[MarketEvent] = asyncio.Queue(maxsize=app_config.market_queue_maxsize)
@@ -1121,6 +1126,9 @@ class LiveRuntimeRunner:
         await self._check_startup_feature_backfills()
         self._set_health(RuntimePhase.CATCHING_UP, healthy=True, warmup_complete=True)
         snapshots = await self._run_recovery()
+        # ── Post-recovery: re-check account config if entries were blocked ──
+        if self._account_config_new_entries_blocked:
+            await self._recheck_account_config_after_recovery()
         # ── State convergence: reconcile exchange truth against local state ──
         #     CRITICAL: must reconcile ALL exchange snapshots, not just one.
         #     A single-exchange view can miss follower positions and wrongly
@@ -1387,6 +1395,7 @@ class LiveRuntimeRunner:
         apply_writes = (not self.app_config.dry_run) and (
             live_trading or _all_exchange_sandbox(self.app_config.exchanges, project_env)
         )
+        self._account_config_apply_writes = apply_writes
         results = await bootstrap_account_config(
             targets=env.targets,
             account_clients=self._get_account_clients(),
@@ -1395,6 +1404,9 @@ class LiveRuntimeRunner:
             dry_run=self.app_config.dry_run,
             fail_on_error=require_leverage,
         )
+        # Store results for downstream inspection
+        self._account_config_results = tuple(results)
+
         for result in results:
             log = logger.info if result.ok else logger.warning
             log(
@@ -1408,6 +1420,115 @@ class LiveRuntimeRunner:
             )
         if require_leverage:
             raise_on_failed_account_config(results)
+
+        # Check if any exchange has existing exposure that blocked config verification.
+        # These are non-fatal — runtime starts but new entries are blocked.
+        _EXPOSURE_BLOCKED = {"existing_exposure_config_unverified", "existing_exposure_config_mismatch"}
+        exposure_blocked = [r for r in results if r.reason in _EXPOSURE_BLOCKED]
+        if exposure_blocked:
+            self._account_config_new_entries_blocked = True
+            for blocked in exposure_blocked:
+                severity = "critical" if blocked.reason == "existing_exposure_config_mismatch" else "warning"
+                logger.log(
+                    logging.CRITICAL if severity == "critical" else logging.WARNING,
+                    "Account config: existing exposure detected — new entries blocked | "
+                    "exchange=%s symbol=%s reason=%s positions=%s orders=%s stop_orders=%s",
+                    blocked.exchange.value,
+                    blocked.symbol,
+                    blocked.reason,
+                    len(blocked.active_positions),
+                    len(blocked.open_orders),
+                    len(blocked.open_stop_orders),
+                )
+                self.context.alerts.emit(
+                    AppAlert(
+                        subject=f"AetherEdge account config: {blocked.reason}",
+                        severity=severity,
+                        content=(
+                            f"exchange={blocked.exchange.value}\n"
+                            f"symbol={blocked.symbol}\n"
+                            f"reason={blocked.reason}\n"
+                            f"positions={len(blocked.active_positions)}\n"
+                            f"open_orders={len(blocked.open_orders)}\n"
+                            f"stop_orders={len(blocked.open_stop_orders)}\n"
+                            f"new_entries_blocked=True\n"
+                        ),
+                    )
+                )
+
+    async def _recheck_account_config_after_recovery(self) -> None:
+        """After recovery, if all positions are now flat, re-run account config
+        bootstrap to try to clear the entry block."""
+        env = self._account_config_env
+        if env is None or not env.targets:
+            return
+
+        # Check if any exchange still has positions
+        account_clients = self._get_account_clients()
+        execution_clients = self._get_execution_clients()
+
+        still_has_exposure = False
+        for target in env.targets:
+            account = next((a for a in account_clients if a.exchange == target.exchange), None)
+            execution = next((e for e in execution_clients if e.exchange == target.exchange), None)
+            if account is None or execution is None:
+                continue
+            try:
+                positions = await account.fetch_positions()
+                open_orders = await execution.fetch_open_orders()
+                open_stop_orders = await execution.fetch_open_stop_orders()
+                if positions or open_orders or open_stop_orders:
+                    still_has_exposure = True
+                    break
+            except Exception:
+                still_has_exposure = True
+                break
+
+        if still_has_exposure:
+            logger.info(
+                "Post-recovery account config re-check: exposure still exists, entries remain blocked"
+            )
+            return
+
+        # All flat — re-run bootstrap
+        logger.info("Post-recovery account config re-check: all flat, re-running bootstrap")
+        try:
+            results = await bootstrap_account_config(
+                targets=env.targets,
+                account_clients=account_clients,
+                execution_clients=execution_clients,
+                apply=self._account_config_apply_writes,
+                dry_run=self.app_config.dry_run,
+                fail_on_error=False,
+            )
+            all_verified = all(r.verified for r in results)
+            if all_verified:
+                self._account_config_new_entries_blocked = False
+                logger.info("Post-recovery account config verified — new entries re-enabled")
+                self.context.alerts.emit(
+                    AppAlert(
+                        subject="AetherEdge account config verified after recovery",
+                        severity="info",
+                        content="All exchanges verified after positions closed. New entries re-enabled.",
+                    )
+                )
+            else:
+                logger.warning(
+                    "Post-recovery account config re-check: not all verified | results=%s",
+                    [r.detail() for r in results],
+                )
+        except Exception as exc:
+            logger.warning("Post-recovery account config re-check failed: %s", exc)
+            self.context.alerts.emit(
+                AppAlert(
+                    subject="AetherEdge post-recovery account config re-check failed",
+                    severity="warning",
+                    content=(
+                        f"error={exc}\n"
+                        f"new_entries_blocked=True (entries remain blocked until next restart)\n"
+                    ),
+                )
+            )
 
     def _initialize_rangebar_trust_window(self) -> None:
         if not self.requirements.range_bars.enabled or not self.requirements.trades.enabled:
@@ -2984,6 +3105,11 @@ class LiveRuntimeRunner:
                 return True
         return False
 
+    def _has_account_config_entry_block(self) -> bool:
+        """Return True when account config verification was blocked by existing
+        exposure, preventing new position entries until resolved."""
+        return self._account_config_new_entries_blocked
+
     async def _enqueue_market_event(self, event: MarketEvent) -> None:
         if self._market_queue.full():
             self.stats.market_events_dropped += 1
@@ -3512,6 +3638,30 @@ class LiveRuntimeRunner:
                     event_time_ms,
                 )
                 continue
+            # ── Entry guard: block new OPEN signals while account config
+            #     is not verified due to existing exposure. ──
+            _EXPOSURE_INCREASING_ACTIONS = {
+                SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT,
+            }
+            if signal.action in _EXPOSURE_INCREASING_ACTIONS:
+                if self._has_account_config_entry_block():
+                    logger.warning(
+                        "Blocking new entry — account config not verified due to existing exposure | action=%s source=%s",
+                        signal.action.value,
+                        source,
+                    )
+                    self.context.alerts.emit(
+                        AppAlert(
+                            subject="AetherEdge entry blocked: account config unverified",
+                            severity="warning",
+                            content=(
+                                f"action={signal.action.value}\n"
+                                f"source={source}\n"
+                                f"reason=account_config_existing_exposure\n"
+                            ),
+                        )
+                    )
+                    continue
             # ── Entry guard: block new OPEN signals while any follower close
             #     is still unresolved after master close. ──
             if signal.action in {SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT}:

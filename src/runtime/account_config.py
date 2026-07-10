@@ -24,6 +24,12 @@ class AccountConfigBootstrapError(RuntimeError):
     pass
 
 
+_EXPOSURE_BLOCKED_REASONS: frozenset[str] = frozenset({
+    "existing_exposure_config_unverified",
+    "existing_exposure_config_mismatch",
+})
+
+
 @dataclass(frozen=True)
 class AccountConfigTarget:
     exchange: ExchangeName
@@ -69,6 +75,19 @@ class AccountConfigBootstrapResult:
     @property
     def ok(self) -> bool:
         return self.verified and self.error is None
+
+    @property
+    def runtime_start_allowed(self) -> bool:
+        """Runtime may start even if config is not verified, as long as
+        the blocker is existing exposure (positions/orders)."""
+        if self.verified:
+            return True
+        return self.reason in _EXPOSURE_BLOCKED_REASONS
+
+    @property
+    def new_entries_allowed(self) -> bool:
+        """New position entries are only allowed when config is fully verified."""
+        return self.verified
 
     def detail(self) -> dict[str, Any]:
         return {
@@ -201,7 +220,41 @@ async def _bootstrap_one(
         )
 
     if positions or open_orders or open_stop_orders:
-        message = "account has active positions or open orders; refusing to change margin/leverage"
+        # Existing exposure detected — never block runtime startup.
+        # Instead, classify the config state and let the runner decide
+        # whether to allow new entries.
+        if before_leverage is None:
+            # Leverage could not be read — config is unverified but not
+            # necessarily wrong.
+            reason = "existing_exposure_config_unverified"
+            logger.warning(
+                "Account config unverified (leverage unreadable) — existing exposure "
+                "detected, writes skipped, new entries will be blocked | "
+                "exchange=%s symbol=%s positions=%s open_orders=%s stop_orders=%s",
+                target.exchange.value,
+                target.symbol,
+                len(positions),
+                len(open_orders),
+                len(open_stop_orders),
+            )
+        else:
+            # Leverage was read but does not match the target.
+            reason = "existing_exposure_config_mismatch"
+            logger.warning(
+                "Account config mismatch with existing exposure — writes skipped, "
+                "new entries will be blocked | exchange=%s symbol=%s "
+                "current_leverage=%s current_margin=%s target_leverage=%s target_margin=%s "
+                "positions=%s open_orders=%s stop_orders=%s",
+                target.exchange.value,
+                target.symbol,
+                before_leverage,
+                before_margin,
+                target.leverage,
+                target.margin_mode.value,
+                len(positions),
+                len(open_orders),
+                len(open_stop_orders),
+            )
         return AccountConfigBootstrapResult(
             exchange=target.exchange,
             symbol=target.symbol,
@@ -215,8 +268,9 @@ async def _bootstrap_one(
             open_orders=open_orders,
             open_stop_orders=open_stop_orders,
             verified=False,
-            reason="blocked_by_existing_position_or_order",
-            error=message,
+            skipped_write=True,
+            reason=reason,
+            error=None,  # CRITICAL: no error — this is a soft block, not a fatal failure
         )
 
     if dry_run or not apply:
@@ -276,8 +330,17 @@ async def _bootstrap_one(
     )
 
 
+def _is_existing_exposure_result(result: AccountConfigBootstrapResult) -> bool:
+    """Return True when the result indicates existing exposure blocked
+    config verification — these are non-fatal and must not prevent startup."""
+    return result.reason in _EXPOSURE_BLOCKED_REASONS
+
+
 def raise_on_failed_account_config(results: Sequence[AccountConfigBootstrapResult]) -> None:
-    failures = [result for result in results if not result.ok]
+    failures = [
+        result for result in results
+        if not result.ok and not _is_existing_exposure_result(result)
+    ]
     if not failures:
         return
     detail = "; ".join(

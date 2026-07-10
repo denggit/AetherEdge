@@ -147,8 +147,13 @@ async def test_active_position_mismatch_fails_without_set() -> None:
     )[0]
 
     assert result.verified is False
-    assert result.reason == "blocked_by_existing_position_or_order"
+    assert result.reason == "existing_exposure_config_mismatch"
+    assert result.error is None
+    assert result.skipped_write is True
+    assert result.runtime_start_allowed is True
+    assert result.new_entries_allowed is False
     assert account.set_leverage_calls == []
+    raise_on_failed_account_config([result])  # must not raise
 
 
 @pytest.mark.asyncio
@@ -170,9 +175,15 @@ async def test_open_regular_or_stop_orders_mismatch_fails_without_set() -> None:
         )
     )[0]
 
-    assert result.error is not None
+    assert result.verified is False
+    assert result.reason == "existing_exposure_config_mismatch"
+    assert result.error is None
+    assert result.skipped_write is True
+    assert result.runtime_start_allowed is True
+    assert result.new_entries_allowed is False
     assert account.set_margin_mode_calls == []
     assert account.set_leverage_calls == []
+    raise_on_failed_account_config([result])  # must not raise
 
 
 @pytest.mark.asyncio
@@ -361,8 +372,13 @@ async def test_position_blocks_apply_even_when_leverage_readback_unavailable() -
     )[0]
 
     assert result.verified is False
-    assert result.reason == "blocked_by_existing_position_or_order"
+    assert result.reason == "existing_exposure_config_unverified"
+    assert result.error is None
+    assert result.skipped_write is True
+    assert result.runtime_start_allowed is True
+    assert result.new_entries_allowed is False
     assert account.set_leverage_calls == []
+    raise_on_failed_account_config([result])  # must not raise
 
 
 @pytest.mark.asyncio
@@ -588,6 +604,14 @@ def _project_config(values: dict[str, str]) -> ProjectEnvConfig:
     return ProjectEnvConfig(values=values, source_files=(), env_file=Path(".env"), example_file=None)
 
 
+class _FakeAlerts:
+    def __init__(self) -> None:
+        self.emitted: list = []
+
+    def emit(self, alert) -> None:
+        self.emitted.append(alert)
+
+
 def _runner_for_account_bootstrap(
     *,
     exchange: ExchangeName,
@@ -595,6 +619,7 @@ def _runner_for_account_bootstrap(
     account: FakeAccount,
     execution: FakeExecution,
     project_env: ProjectEnvConfig,
+    alerts: _FakeAlerts | None = None,
 ) -> LiveRuntimeRunner:
     app = AppConfig(
         symbol="ETH-USDT-PERP",
@@ -611,7 +636,7 @@ def _runner_for_account_bootstrap(
     )
     return LiveRuntimeRunner(
         app_config=app,
-        app_context=AppContext(data=object(), execution=object(), state_store=object(), strategy=object(), planner=object(), alerts=object()),
+        app_context=AppContext(data=object(), execution=object(), state_store=object(), strategy=object(), planner=object(), alerts=alerts or _FakeAlerts()),
         runtime_config=LiveRuntimeConfig(app=app, mode=RuntimeMode.LIVE_RUNTIME),
         services={
             "account_clients": [account],
@@ -620,6 +645,145 @@ def _runner_for_account_bootstrap(
             "project_env_config": project_env,
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_binance_already_configured_with_position_verified() -> None:
+    """Binance: leverage=15, margin_mode=ISOLATED, position exists → fully verified."""
+    account = FakeAccount(
+        ExchangeName.BINANCE,
+        leverage=Decimal("15"),
+        margin_mode=MarginMode.ISOLATED,
+        positions=[_position(ExchangeName.BINANCE)],
+    )
+    execution = FakeExecution(ExchangeName.BINANCE)
+
+    result = (
+        await bootstrap_account_config(
+            targets=[_target(ExchangeName.BINANCE)],
+            account_clients=[account],
+            execution_clients=[execution],
+            apply=True,
+            dry_run=False,
+        )
+    )[0]
+
+    assert result.verified is True
+    assert result.reason == "already_configured"
+    assert result.new_entries_allowed is True
+    assert result.runtime_start_allowed is True
+    raise_on_failed_account_config([result])  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_no_exposure_config_unverified_fails_closed() -> None:
+    """No positions, leverage=None, apply=False → verified=False, error set, raises."""
+    account = FakeAccount(
+        ExchangeName.BINANCE,
+        leverage=Decimal("3"),
+        margin_mode=MarginMode.CROSS,
+        leverage_readback_none=True,
+    )
+    execution = FakeExecution(ExchangeName.BINANCE)
+
+    result = (
+        await bootstrap_account_config(
+            targets=[_target(ExchangeName.BINANCE)],
+            account_clients=[account],
+            execution_clients=[execution],
+            apply=False,
+            dry_run=False,
+        )
+    )[0]
+
+    assert result.verified is False
+    assert result.error is not None
+    assert result.runtime_start_allowed is False
+    with pytest.raises(AccountConfigBootstrapError):
+        raise_on_failed_account_config([result])
+
+
+@pytest.mark.asyncio
+async def test_mixed_results_exposure_blocked_does_not_raise_but_real_failure_does() -> None:
+    """Exposure-blocked result is tolerated, but a real verification failure still raises."""
+    # Exposure-blocked result (Binance, position exists, leverage=3 mismatch)
+    blocked_account = FakeAccount(
+        ExchangeName.BINANCE,
+        leverage=Decimal("3"),
+        margin_mode=MarginMode.CROSS,
+        positions=[_position(ExchangeName.BINANCE)],
+    )
+    blocked_execution = FakeExecution(ExchangeName.BINANCE)
+    blocked_result = (
+        await bootstrap_account_config(
+            targets=[_target(ExchangeName.BINANCE)],
+            account_clients=[blocked_account],
+            execution_clients=[blocked_execution],
+            apply=True,
+            dry_run=False,
+        )
+    )[0]
+
+    # Real failure (OKX, mismatch after set)
+    failed_account = FakeAccount(
+        ExchangeName.OKX,
+        leverage=Decimal("3"),
+        margin_mode=MarginMode.CROSS,
+        mismatch_after_set=True,
+    )
+    failed_execution = FakeExecution(ExchangeName.OKX)
+    failed_result = (
+        await bootstrap_account_config(
+            targets=[_target(ExchangeName.OKX)],
+            account_clients=[failed_account],
+            execution_clients=[failed_execution],
+            apply=True,
+            dry_run=False,
+        )
+    )[0]
+
+    # Should raise only for the real failure, not the exposure-blocked result
+    with pytest.raises(AccountConfigBootstrapError, match="okx"):
+        raise_on_failed_account_config([blocked_result, failed_result])
+
+
+@pytest.mark.asyncio
+async def test_live_runtime_blocked_config_allows_startup_sets_entry_block(monkeypatch) -> None:
+    """Runner: position-blocked config does not raise, sets _account_config_new_entries_blocked."""
+    monkeypatch.delenv("AETHER_LIVE_TRADING", raising=False)
+    account = FakeAccount(
+        ExchangeName.BINANCE,
+        leverage=Decimal("3"),
+        margin_mode=MarginMode.CROSS,
+        positions=[_position(ExchangeName.BINANCE)],
+    )
+    execution = FakeExecution(ExchangeName.BINANCE)
+    fake_alerts = _FakeAlerts()
+    runner = _runner_for_account_bootstrap(
+        exchange=ExchangeName.BINANCE,
+        dry_run=False,
+        account=account,
+        execution=execution,
+        project_env=_project_config(
+            {
+                "AETHER_LIVE_TRADING": "true",
+                "AETHER_DRY_RUN": "false",
+                "BINANCE_SANDBOX": "false",
+                "BINANCE_LEVERAGE": "15",
+                "MARGIN_MODE": "isolated",
+            }
+        ),
+        alerts=fake_alerts,
+    )
+
+    # Should NOT raise even though config is blocked by existing position
+    await runner._bootstrap_account_config_if_enabled()
+
+    # Entry block should be set
+    assert runner._account_config_new_entries_blocked is True
+    # Config should not have been applied
+    assert account.set_margin_mode_calls == []
+    assert account.set_leverage_calls == []
 
 
 def _position(exchange: ExchangeName) -> Position:
