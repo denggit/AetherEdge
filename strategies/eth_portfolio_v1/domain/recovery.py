@@ -349,7 +349,10 @@ def _mf_plan_issues(plan_payload: Mapping[str, Any]) -> list[str]:
         stop_ids = _extract_plan_stop_ids_by_exchange(
             plan_payload, metadata
         )
-        leg_has_any_stop = any(
+        stop_client_ids = _extract_plan_stop_client_ids_by_exchange(
+            plan_payload, metadata
+        )
+        leg_has_any_stop_ref = any(
             (
                 raw_leg.get("stop_order_id")
                 or raw_leg.get("stop_client_order_id")
@@ -357,8 +360,16 @@ def _mf_plan_issues(plan_payload: Mapping[str, Any]) -> list[str]:
             for raw_leg in plan_payload.get("legs", ())
             if isinstance(raw_leg, Mapping)
         )
-        if stop_ids is not None and not stop_ids and leg_has_any_stop:
-            # Explicitly empty when legs claim to have stops
+        has_any_stop_identifier = bool(
+            stop_ids or stop_client_ids
+        )
+        if (
+            not has_any_stop_identifier
+            and leg_has_any_stop_ref
+        ):
+            # Legs claim to have stop references but neither
+            # stop_order_id nor stop_client_order_id could be
+            # extracted → flag as empty.
             issues.append(
                 "mf_protective_stop_required_but_stop_ids_empty"
             )

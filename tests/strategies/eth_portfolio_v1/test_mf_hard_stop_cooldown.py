@@ -1541,6 +1541,113 @@ def test_recovery_no_stop_price_anywhere_is_issue() -> None:
     assert "mf_protective_stop_required_but_price_missing" in issues
 
 
+def test_recovery_client_order_id_only_not_empty() -> None:
+    """protective_stop_required=True + canonical_stop_price + legs
+    with only stop_client_order_id → no stop_ids_empty issue."""
+    from strategies.eth_portfolio_v1.domain.recovery import (
+        _mf_plan_issues,
+    )
+
+    plan = {
+        "position": {
+            "position_id": "mf-low-sweep-time48-client-only",
+            "side": "long",
+            "master_exchange": "okx",
+            "entry_engine": "MF_LOW_SWEEP_TIME48",
+            "master_filled_qty_base": "0.5",
+            "status": "active",
+            "canonical_stop_price": "2375",
+            "metadata": {
+                "average_entry_price": "2500",
+                "signal_time_ms": 1000,
+                "entry_execution_time_ms": 1001,
+                "entry_tradebar_open_time_ms": 1002,
+                "sleeve_id": "mf",
+                "engine": "MF_LOW_SWEEP_TIME48",
+                "exit_variant": "time48",
+                "quantity_scope": "mf_sleeve_quantity",
+                "time48_holding_minutes": 48,
+                "exchange_quantities_base": {"okx": "0.5"},
+                "protective_stop_required": True,
+                "mf_hard_stop_enabled": True,
+            },
+        },
+        "legs": [
+            {
+                "exchange": "okx",
+                "filled_qty_base": "0.5",
+                "sync_status": "open",
+                "stop_order_id": None,
+                "stop_client_order_id": "client-only-okx-789",
+                "stop_price": "2375",
+            },
+        ],
+    }
+    issues = _mf_plan_issues(plan)
+    assert (
+        "mf_protective_stop_required_but_stop_ids_empty"
+        not in issues
+    )
+    assert (
+        "mf_protective_stop_required_but_price_missing"
+        not in issues
+    )
+
+
+def test_recovery_in_flight_no_stop_ids_not_flagged() -> None:
+    """protective_stop_required=True + stop_price present + legs
+    have no stop_order_id or stop_client_order_id → in-flight,
+    NOT flagged as stop_ids_empty."""
+    from strategies.eth_portfolio_v1.domain.recovery import (
+        _mf_plan_issues,
+    )
+
+    plan = {
+        "position": {
+            "position_id": "mf-low-sweep-time48-inflight",
+            "side": "long",
+            "master_exchange": "okx",
+            "entry_engine": "MF_LOW_SWEEP_TIME48",
+            "master_filled_qty_base": "0.5",
+            "status": "active",
+            "canonical_stop_price": "2375",
+            "metadata": {
+                "average_entry_price": "2500",
+                "signal_time_ms": 1000,
+                "entry_execution_time_ms": 1001,
+                "entry_tradebar_open_time_ms": 1002,
+                "sleeve_id": "mf",
+                "engine": "MF_LOW_SWEEP_TIME48",
+                "exit_variant": "time48",
+                "quantity_scope": "mf_sleeve_quantity",
+                "time48_holding_minutes": 48,
+                "exchange_quantities_base": {"okx": "0.5"},
+                "protective_stop_required": True,
+                "mf_hard_stop_enabled": True,
+            },
+        },
+        "legs": [
+            {
+                "exchange": "okx",
+                "filled_qty_base": "0.5",
+                "sync_status": "open",
+                "stop_price": "2375",
+            },
+        ],
+    }
+    issues = _mf_plan_issues(plan)
+    # No stop_order_id / stop_client_order_id yet → in-flight, OK
+    assert (
+        "mf_protective_stop_required_but_stop_ids_empty"
+        not in issues
+    )
+    # stop_price present via canonical_stop_price → no price issue
+    assert (
+        "mf_protective_stop_required_but_price_missing"
+        not in issues
+    )
+
+
 # ---------------------------------------------------------------------------
 # 13. restore_from_plan from canonical_stop_price / legs
 # ---------------------------------------------------------------------------
