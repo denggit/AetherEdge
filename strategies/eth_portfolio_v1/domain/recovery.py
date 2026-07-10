@@ -143,6 +143,13 @@ def audit_portfolio_v1_plans(
     mf_metadata = (
         merged_plan_metadata(mf_payload) if mf_payload is not None else {}
     )
+    protective_stop_required = mf_metadata.get(
+        "protective_stop_required"
+    )
+    mf_stop_expected = bool(
+        mf_payload is not None
+        and protective_stop_required in (True, "true", "True", 1)
+    )
     if mf_payload is not None:
         entry_open_ms = _integer_or_none(
             mf_metadata.get("entry_tradebar_open_time_ms")
@@ -163,7 +170,7 @@ def audit_portfolio_v1_plans(
                     holding_minutes is not None
                     and holding_minutes >= MF_TIME_EXIT_BARS
                 ),
-                "stop_expected": False,
+                "stop_expected": mf_stop_expected,
                 "stop_validated": None,
             }
         )
@@ -236,8 +243,26 @@ def _mf_plan_issues(plan_payload: Mapping[str, Any]) -> list[str]:
     metadata_quantities = _positive_decimal_mapping(
         metadata.get("exchange_quantities_base")
     )
-    if metadata.get("protective_stop_required") not in (False, "false", "False", 0):
+    protective_stop_required = metadata.get("protective_stop_required")
+    if protective_stop_required not in (
+        False, "false", "False", 0,
+        True, "true", "True", 1,
+    ):
         issues.append("mf_no_stop_policy_missing")
+    elif protective_stop_required in (True, "true", "True", 1):
+        # When hard stop is enabled, protective_stop_required=True is
+        # the expected live state. Validate stop fields if they are
+        # present in the metadata (old plans without stop data are
+        # tolerated to avoid blocking legacy recovery).
+        stop_price = metadata.get("stop_price") or metadata.get(
+            "hard_stop_price"
+        )
+        stop_ids = metadata.get("stop_order_ids_by_exchange")
+        if stop_price is not None or stop_ids is not None:
+            if stop_price is None or _positive_decimal(stop_price) is None:
+                issues.append(
+                    "mf_protective_stop_required_but_price_missing"
+                )
     legs = tuple(
         dict(item)
         for item in plan_payload.get("legs", ())

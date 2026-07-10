@@ -188,6 +188,39 @@ class MfSleeveState:
         self.entry_tradebar_open_time_ms = tradebar_open_time_ms
         self.pending_open = False
         self.pending_close = False
+        # ── Restore hard stop / cooldown from plan metadata ──
+        stop_price = _positive_decimal(
+            metadata.get("stop_price")
+            or metadata.get("hard_stop_price")
+        )
+        if stop_price is not None:
+            self.hard_stop_price = stop_price
+            stop_ids = metadata.get("stop_order_ids_by_exchange")
+            if isinstance(stop_ids, Mapping):
+                for ex, oid in stop_ids.items():
+                    if str(ex).strip() and str(oid).strip():
+                        self.stop_order_ids_by_exchange[
+                            str(ex).strip().lower()
+                        ] = str(oid)
+            client_ids = metadata.get(
+                "stop_client_order_ids_by_exchange"
+            )
+            if isinstance(client_ids, Mapping):
+                for ex, cid in client_ids.items():
+                    if str(ex).strip() and str(cid).strip():
+                        self.stop_client_order_ids_by_exchange[
+                            str(ex).strip().lower()
+                        ] = str(cid)
+        cooldown_ms = _positive_int(
+            metadata.get("hard_stop_cooldown_until_ms")
+        )
+        if cooldown_ms is not None:
+            self.hard_stop_cooldown_until_ms = cooldown_ms
+        last_stop_ms = _positive_int(
+            metadata.get("last_hard_stop_time_ms")
+        )
+        if last_stop_ms is not None:
+            self.last_hard_stop_time_ms = last_stop_ms
         return True
 
     def clear(self) -> None:

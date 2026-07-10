@@ -285,6 +285,8 @@ def test_position_snapshots_include_hard_stop() -> None:
 
 
 def test_time48_exit_generates_scoped_cancel_signals() -> None:
+    """time48 close generates cancel signals but does NOT clear stop
+    ids until cancel results are confirmed."""
     strategy = Strategy()
     _activate_mf_sleeve(strategy)
 
@@ -345,9 +347,100 @@ def test_time48_exit_generates_scoped_cancel_signals() -> None:
         assert s.metadata["execution_purpose"] == (
             "mf_cancel_hard_stop_after_time_exit"
         )
-    # After cancel generation, stop state is cleared
+    # confirm_close clears the sleeve when all exchanges are closed.
+    # The cancel signals were generated using captured stop ids (passed
+    # as params), which is correct — the actual clear_hard_stop happens
+    # only after cancel results confirm success.
+    assert not strategy.mf_sleeve.active
+
+
+def test_time48_cancel_success_clears_hard_stop() -> None:
+    """All cancel results succeed → clear_hard_stop."""
+    strategy = Strategy()
+    _activate_mf_sleeve(strategy)
+    strategy.mf_sleeve.record_hard_stop(
+        stop_price=Decimal("2375"),
+        stop_order_id="okx-stop-123",
+        exchange="okx",
+    )
+    strategy.mf_sleeve.record_hard_stop(
+        stop_price=Decimal("2375"),
+        stop_order_id="binance-stop-456",
+        exchange="binance",
+    )
+
+    cancel_signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.CANCEL_STOP_ORDER,
+        metadata={
+            "strategy_id": "eth_portfolio_v1",
+            "sleeve_id": "mf",
+            "position_id": "mf-low-sweep-time48-test",
+            "execution_purpose": (
+                "mf_cancel_hard_stop_after_time_exit"
+            ),
+            "target_exchanges": ["okx"],
+            "stop_order_id": "okx-stop-123",
+        },
+    )
+    results = (
+        ExchangeOrderResult(
+            exchange=ExchangeName.OKX,
+            ok=True,
+            status=OrderStatus.FILLED,
+        ),
+    )
+    strategy._handle_mf_stop_cancel_results(
+        signal=cancel_signal, results=results, event_time_ms=5000
+    )
+    # After all cancel results succeed, stop is cleared
     assert strategy.mf_sleeve.hard_stop_price is None
     assert strategy.mf_sleeve.stop_order_ids_by_exchange == {}
+
+
+def test_time48_cancel_failure_triggers_manual_required() -> None:
+    """Cancel stop failure → manual_required, stop ids retained."""
+    strategy = Strategy()
+    _activate_mf_sleeve(strategy)
+    strategy.mf_sleeve.record_hard_stop(
+        stop_price=Decimal("2375"),
+        stop_order_id="okx-stop-123",
+        exchange="okx",
+    )
+
+    cancel_signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.CANCEL_STOP_ORDER,
+        metadata={
+            "strategy_id": "eth_portfolio_v1",
+            "sleeve_id": "mf",
+            "position_id": "mf-low-sweep-time48-test",
+            "execution_purpose": (
+                "mf_cancel_hard_stop_after_time_exit"
+            ),
+            "target_exchanges": ["okx"],
+            "stop_order_id": "okx-stop-123",
+        },
+    )
+    results = (
+        ExchangeOrderResult(
+            exchange=ExchangeName.OKX,
+            ok=False,
+            error="cancel rejected",
+        ),
+    )
+    strategy._handle_mf_stop_cancel_results(
+        signal=cancel_signal, results=results, event_time_ms=5000
+    )
+    assert strategy.recovery_manual_required is True
+    assert strategy.recovery_blocking_manual_required is True
+    assert "mf_hard_stop_cancel_failed" in strategy.mf_execution_alerts
+    # Stop ids retained
+    assert strategy.mf_sleeve.hard_stop_price == Decimal("2375")
+    assert (
+        strategy.mf_sleeve.stop_order_ids_by_exchange.get("okx")
+        == "okx-stop-123"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -573,7 +666,462 @@ def test_mf_hard_stop_does_not_pollute_lf_stop() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6. Import boundary check
+# 6. Hard stop aftermath close → cooldown
+# ---------------------------------------------------------------------------
+
+
+def test_hard_stop_aftermath_close_starts_cooldown() -> None:
+    """Follower close after master hard stop fill → cooldown started."""
+    strategy = Strategy()
+    _activate_mf_sleeve(strategy)
+
+    # Simulate: master hard stop already filled, only binance remains
+    strategy.mf_sleeve.exchange_quantities = {
+        "binance": Decimal("0.25")
+    }
+    strategy.mf_sleeve.quantity = Decimal("0.25")
+
+    close_signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.CLOSE_LONG,
+        quantity=Decimal("0.25"),
+        metadata={
+            "strategy_id": "eth_portfolio_v1",
+            "sleeve_id": "mf",
+            "position_id": "mf-low-sweep-time48-test",
+            "execution_purpose": (
+                "mf_follower_close_after_master_hard_stop"
+            ),
+            "target_exchanges": ["binance"],
+            "exchange_quantities_base": {"binance": "0.25"},
+        },
+    )
+    results = (
+        ExchangeOrderResult(
+            exchange=ExchangeName.BINANCE,
+            ok=True,
+            status=OrderStatus.FILLED,
+            filled_quantity=Decimal("0.25"),
+        ),
+    )
+    event_time_ms = 20000
+    strategy._handle_mf_order_results(
+        signal=close_signal,
+        results=results,
+        event_time_ms=event_time_ms,
+    )
+    # Sleeve is inactive (all exchanges closed)
+    assert not strategy.mf_sleeve.active
+    # Cooldown is active
+    assert strategy.mf_sleeve.cooldown_active(
+        event_time_ms + 1
+    ) is True
+    assert (
+        strategy.mf_sleeve.hard_stop_cooldown_until_ms
+        == event_time_ms + 12 * 3_600_000
+    )
+
+
+def test_normal_close_does_not_start_cooldown() -> None:
+    """Normal time48 close should NOT start cooldown (only hard stop
+    aftermath should)."""
+    strategy = Strategy()
+    _activate_mf_sleeve(strategy)
+
+    close_signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.CLOSE_LONG,
+        quantity=Decimal("0.5"),
+        metadata={
+            "strategy_id": "eth_portfolio_v1",
+            "sleeve_id": "mf",
+            "position_id": "mf-low-sweep-time48-test",
+            "execution_purpose": "normal_close",
+            "target_exchanges": ["binance", "okx"],
+            "exchange_quantities_base": {
+                "okx": "0.5",
+                "binance": "0.25",
+            },
+        },
+    )
+    results = (
+        ExchangeOrderResult(
+            exchange=ExchangeName.OKX,
+            ok=True,
+            status=OrderStatus.FILLED,
+            filled_quantity=Decimal("0.5"),
+        ),
+        ExchangeOrderResult(
+            exchange=ExchangeName.BINANCE,
+            ok=True,
+            status=OrderStatus.FILLED,
+            filled_quantity=Decimal("0.25"),
+        ),
+    )
+    strategy._handle_mf_order_results(
+        signal=close_signal, results=results, event_time_ms=5000
+    )
+    # Normal close clears sleeve but does NOT start cooldown
+    assert not strategy.mf_sleeve.active
+    assert (
+        strategy.mf_sleeve.hard_stop_cooldown_until_ms is None
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. restore_from_plan with stop/cooldown data
+# ---------------------------------------------------------------------------
+
+
+def test_restore_from_plan_with_stop_data() -> None:
+    """MfSleeveState.restore_from_plan recovers stop and cooldown."""
+    from strategies.eth_portfolio_v1.domain.mf_sleeve import (
+        MfSleeveState,
+    )
+
+    sleeve = MfSleeveState(
+        strategy_id="eth_portfolio_v1",
+        symbol="ETH-USDT-PERP",
+        enabled=True,
+    )
+    plan = {
+        "position": {
+            "position_id": "mf-low-sweep-time48-restored",
+            "side": "long",
+            "master_exchange": "okx",
+            "entry_engine": "MF_LOW_SWEEP_TIME48",
+            "master_filled_qty_base": "0.5",
+            "status": "active",
+            "metadata": {
+                "average_entry_price": "2500",
+                "signal_time_ms": 1000,
+                "entry_execution_time_ms": 1001,
+                "entry_tradebar_open_time_ms": 1002,
+                "sleeve_id": "mf",
+                "engine": "MF_LOW_SWEEP_TIME48",
+                "exit_variant": "time48",
+                "quantity_scope": "mf_sleeve_quantity",
+                "time48_holding_minutes": 48,
+                "exchange_quantities_base": {
+                    "okx": "0.5",
+                    "binance": "0.25",
+                },
+                "protective_stop_required": True,
+                "stop_price": "2375",
+                "hard_stop_price": "2375",
+                "stop_order_ids_by_exchange": {
+                    "okx": "okx-stop-restored",
+                    "binance": "binance-stop-restored",
+                },
+                "stop_client_order_ids_by_exchange": {
+                    "okx": "client-okx-restored",
+                },
+                "hard_stop_cooldown_until_ms": 50000000,
+                "last_hard_stop_time_ms": 6800000,
+            },
+        },
+        "legs": [
+            {
+                "exchange": "okx",
+                "filled_qty_base": "0.5",
+                "sync_status": "open",
+            },
+            {
+                "exchange": "binance",
+                "filled_qty_base": "0.25",
+                "sync_status": "open",
+            },
+        ],
+    }
+    assert sleeve.restore_from_plan(plan) is True
+    assert sleeve.active
+    assert sleeve.hard_stop_price == Decimal("2375")
+    assert sleeve.stop_order_ids_by_exchange == {
+        "okx": "okx-stop-restored",
+        "binance": "binance-stop-restored",
+    }
+    assert sleeve.stop_client_order_ids_by_exchange == {
+        "okx": "client-okx-restored",
+    }
+    assert sleeve.hard_stop_cooldown_until_ms == 50000000
+    assert sleeve.last_hard_stop_time_ms == 6800000
+
+
+def test_restore_from_plan_without_stop_data_still_works() -> None:
+    """Old plans without stop data should still restore successfully."""
+    from strategies.eth_portfolio_v1.domain.mf_sleeve import (
+        MfSleeveState,
+    )
+
+    sleeve = MfSleeveState(
+        strategy_id="eth_portfolio_v1",
+        symbol="ETH-USDT-PERP",
+        enabled=True,
+    )
+    plan = {
+        "position": {
+            "position_id": "mf-low-sweep-time48-legacy",
+            "side": "long",
+            "master_exchange": "okx",
+            "master_filled_qty_base": "0.5",
+            "status": "active",
+            "metadata": {
+                "average_entry_price": "2500",
+                "signal_time_ms": 1000,
+                "entry_execution_time_ms": 1001,
+                "entry_tradebar_open_time_ms": 1002,
+                "sleeve_id": "mf",
+                "engine": "MF_LOW_SWEEP_TIME48",
+                "exit_variant": "time48",
+                "quantity_scope": "mf_sleeve_quantity",
+                "time48_holding_minutes": 48,
+                "protective_stop_required": False,
+            },
+        },
+        "legs": [
+            {
+                "exchange": "okx",
+                "filled_qty_base": "0.5",
+                "sync_status": "open",
+            },
+        ],
+    }
+    assert sleeve.restore_from_plan(plan) is True
+    assert sleeve.active
+    assert sleeve.hard_stop_price is None
+    assert sleeve.stop_order_ids_by_exchange == {}
+    assert sleeve.hard_stop_cooldown_until_ms is None
+
+
+# ---------------------------------------------------------------------------
+# 8. Manual external close
+# ---------------------------------------------------------------------------
+
+
+def test_manual_close_master_generates_follower_close() -> None:
+    """Manual close of master → follower CLOSE_LONG generated, no
+    manual_required."""
+    strategy = Strategy()
+    _activate_mf_sleeve(strategy)
+
+    event_time_ms = 50000
+    event = AccountEvent(
+        exchange=ExchangeName.OKX,
+        event_type=AccountEventType.ORDER,
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-PERP",
+        event_time_ms=event_time_ms,
+        order_id="manual-order-okx",
+        client_order_id=None,
+        order_status=OrderStatus.FILLED,
+        side=OrderSide.SELL,
+        price=Decimal("2400"),
+        quantity=Decimal("0.5"),
+        filled_quantity=Decimal("0.5"),
+        raw={},
+    )
+    signals = strategy._handle_mf_manual_close(event=event)
+    assert len(signals) >= 1
+    follower_signal = signals[0]
+    assert follower_signal.action is SignalAction.CLOSE_LONG
+    assert (
+        follower_signal.metadata["execution_purpose"]
+        == "mf_follower_close_after_master_manual_close"
+    )
+    assert follower_signal.metadata["reduce_only"] is True
+    assert follower_signal.metadata["target_exchanges"] == ["binance"]
+    # Does NOT set blocking manual_required
+    assert not strategy.recovery_blocking_manual_required
+    assert "mf_manual_close_detected:okx" in (
+        strategy.mf_execution_alerts
+    )
+
+
+def test_manual_close_follower_keeps_master_active() -> None:
+    """Manual close of follower → follower removed, master remains."""
+    strategy = Strategy()
+    _activate_mf_sleeve(strategy)
+
+    event_time_ms = 50000
+    event = AccountEvent(
+        exchange=ExchangeName.BINANCE,
+        event_type=AccountEventType.ORDER,
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-PERP",
+        event_time_ms=event_time_ms,
+        order_id="manual-order-binance",
+        client_order_id=None,
+        order_status=OrderStatus.FILLED,
+        side=OrderSide.SELL,
+        price=Decimal("2400"),
+        quantity=Decimal("0.25"),
+        filled_quantity=Decimal("0.25"),
+        raw={},
+    )
+    signals = strategy._handle_mf_manual_close(event=event)
+    assert signals == []
+    # Master still active
+    assert strategy.mf_sleeve.active
+    assert "okx" in strategy.mf_sleeve.exchange_quantities
+    assert "binance" not in strategy.mf_sleeve.exchange_quantities
+    assert "mf_manual_close_detected:binance" in (
+        strategy.mf_execution_alerts
+    )
+    assert not strategy.recovery_blocking_manual_required
+
+
+def test_manual_close_all_clears_sleeve_and_cancels_stops() -> None:
+    """Manual close of only exchange → sleeve cleared, scoped cancel
+    generated, no blocking manual_required."""
+    strategy = Strategy()
+    _activate_mf_sleeve(
+        strategy, okx_qty=Decimal("0.5"), binance_qty=Decimal("0")
+    )
+    strategy.mf_sleeve.exchange_quantities = {"okx": Decimal("0.5")}
+    strategy.mf_sleeve.record_hard_stop(
+        stop_price=Decimal("2375"),
+        stop_order_id="okx-stop-manual",
+        exchange="okx",
+    )
+
+    event_time_ms = 50000
+    event = AccountEvent(
+        exchange=ExchangeName.OKX,
+        event_type=AccountEventType.ORDER,
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-PERP",
+        event_time_ms=event_time_ms,
+        order_id="manual-order-only",
+        client_order_id=None,
+        order_status=OrderStatus.FILLED,
+        side=OrderSide.SELL,
+        price=Decimal("2400"),
+        quantity=Decimal("0.5"),
+        filled_quantity=Decimal("0.5"),
+        raw={},
+    )
+    signals = strategy._handle_mf_manual_close(event=event)
+    assert not strategy.mf_sleeve.active
+    # Scoped cancel generated, not CANCEL_ALL_STOP_ORDERS
+    cancel_signals = [
+        s
+        for s in signals
+        if s.action is SignalAction.CANCEL_STOP_ORDER
+    ]
+    assert len(cancel_signals) >= 1
+    for s in cancel_signals:
+        assert (
+            s.action is not SignalAction.CANCEL_ALL_STOP_ORDERS
+        )
+        assert s.metadata["sleeve_id"] == "mf"
+    # Manual close does NOT trigger manual_required
+    assert not strategy.recovery_blocking_manual_required
+
+
+def test_manual_close_does_not_affect_lf() -> None:
+    """Manual MF close must not interfere with LF position state."""
+    strategy = Strategy()
+    from strategies.eth_portfolio_v1.domain.models import Side
+
+    strategy.position.open_master(
+        side=Side.LONG,
+        entry_time_ms=1,
+        avg_entry=Decimal("2500"),
+        qty=Decimal("0.25"),
+        stop_price=Decimal("2400"),
+        entry_engine="MOMENTUM_V3",
+        position_id="lf-position",
+    )
+    _activate_mf_sleeve(strategy)
+
+    event = AccountEvent(
+        exchange=ExchangeName.OKX,
+        event_type=AccountEventType.ORDER,
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-PERP",
+        event_time_ms=50000,
+        order_id="manual-order-okx",
+        client_order_id=None,
+        order_status=OrderStatus.FILLED,
+        side=OrderSide.SELL,
+        price=Decimal("2400"),
+        quantity=Decimal("0.5"),
+        filled_quantity=Decimal("0.5"),
+        raw={},
+    )
+    strategy._handle_mf_manual_close(event=event)
+    # LF position is untouched
+    assert strategy.position.in_pos
+    assert strategy.position.position_id == "lf-position"
+    assert strategy.position.stop_price == Decimal("2400")
+
+
+def test_manual_close_cancel_failure_is_manual_required() -> None:
+    """When the cancel-after-manual-close fails, only the cancel
+    failure triggers manual_required, not the manual close itself."""
+    strategy = Strategy()
+    _activate_mf_sleeve(
+        strategy, okx_qty=Decimal("0.5"), binance_qty=Decimal("0")
+    )
+    strategy.mf_sleeve.exchange_quantities = {"okx": Decimal("0.5")}
+    strategy.mf_sleeve.record_hard_stop(
+        stop_price=Decimal("2375"),
+        stop_order_id="okx-stop-manual",
+        exchange="okx",
+    )
+    # Manual close itself should NOT set manual_required
+    event = AccountEvent(
+        exchange=ExchangeName.OKX,
+        event_type=AccountEventType.ORDER,
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-PERP",
+        event_time_ms=50000,
+        order_id="manual-order-only",
+        client_order_id=None,
+        order_status=OrderStatus.FILLED,
+        side=OrderSide.SELL,
+        price=Decimal("2400"),
+        quantity=Decimal("0.5"),
+        filled_quantity=Decimal("0.5"),
+        raw={},
+    )
+    strategy._handle_mf_manual_close(event=event)
+    assert not strategy.recovery_blocking_manual_required
+
+    # Now simulate cancel failure
+    cancel_signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.CANCEL_STOP_ORDER,
+        metadata={
+            "strategy_id": "eth_portfolio_v1",
+            "sleeve_id": "mf",
+            "execution_purpose": (
+                "mf_cancel_hard_stop_after_manual_close"
+            ),
+            "target_exchanges": ["okx"],
+            "stop_order_id": "okx-stop-manual",
+        },
+    )
+    results = (
+        ExchangeOrderResult(
+            exchange=ExchangeName.OKX,
+            ok=False,
+            error="cancel rejected",
+        ),
+    )
+    strategy._handle_mf_stop_cancel_results(
+        signal=cancel_signal, results=results, event_time_ms=50000
+    )
+    # Cancel failure DOES set manual_required (not manual-close case)
+    # For manual-close cancels, the execution_purpose does not match
+    # "mf_cancel_hard_stop_after_time_exit", so the success path
+    # won't clear_hard_stop. But the failure path is generic — it
+    # sets manual_required for ANY cancel failure.
+    assert strategy.recovery_manual_required is True
+
+
+# ---------------------------------------------------------------------------
+# 9. Import boundary check
 # ---------------------------------------------------------------------------
 
 

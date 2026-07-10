@@ -1,46 +1,29 @@
-"""Sizing parity: CoinBacktest mf_exposure=1.5 notional ↔ AetherEdge margin_fraction=0.10.
+"""Sizing parity: CoinBacktest ↔ AetherEdge live sizing mapping.
 
-CoinBacktest Portfolio V1 sizing model
---------------------------------------
+CoinBacktest Portfolio V1 sizing model (research)
+-------------------------------------------------
 - mf_exposure is a NOTIONAL multiplier on portfolio equity.
-- primary scenario: mf_exposure=1.5 → each MF trade controls 1.5× equity notional.
-- With 15× leverage (default --leverage=15), implied margin = 1.5 / 15 = 0.10 = 10%.
-- Config comment (line 93-94): "1.5 corresponds to 10% margin with 15× leverage".
-- attach_mf_position_metrics assumes assumed_exposure=1.0 per trade;
-  the portfolio layer scales returns by mf_exposure.
-- margin_fraction_at_leverage15 = mf_exposure / 15.
+- Research primary scenario: mf_exposure=1.5 → each MF trade controls
+  1.5× equity notional.
+- With 15× leverage, implied margin = mf_exposure / 15.
+- For mf_exposure=1.5: margin = 1.5 / 15 = 0.10 (10%).
+- For mf_exposure=1.0: margin = 1.0 / 15 ≈ 0.0666666667 (6.67%).
 
-AetherEdge live sizing model
-----------------------------
-- margin_fraction = 0.10 (config.json line 100).
+AetherEdge live sizing model (current production)
+--------------------------------------------------
+- margin_fraction = 0.0666666667 (config.json).
 - Actual notional = equity * margin_fraction * leverage.
-- With 15× leverage → notional = equity * 0.10 * 15 = 1.5 × equity.
-- MfSignalMapper._exchange_quantities (line 206-208):
+- With 15× leverage → notional = equity * 0.0666666667 * 15 ≈ 1.0 × equity.
+- MfSignalMapper._exchange_quantities:
     target_notional = equity * self.config.margin_fraction * leverage
-- The position_fraction field is an alias for margin_fraction (MfLowSweepConfig.__post_init__).
 
-Verdict: INTENTIONAL MATCH, not a bug
---------------------------------------
-CoinBacktest mf_exposure=1.5 (notional multiplier) == AetherEdge margin_fraction=0.10 at 15× leverage.
-The naming differs because CoinBacktest works in "notional space" (think of
-it as "position × leverage / equity") while AetherEdge works in "margin
-space" (what fraction of equity is used as exchange margin).
+IMPORTANT: The live config uses 1× sizing (margin_fraction=0.0666666667),
+NOT the CoinBacktest research 1.5×. This is a deliberate risk reduction
+for live trading — see the MF hard stop + cooldown deployment notes.
 
-If leverage changes:
-- CoinBacktest: mf_exposure stays 1.5 independent of leverage (it's a
-  pure sizing parameter).
-- AetherEdge: notional = equity * margin_fraction * leverage → changes with
-  leverage. This is correct: if the exchange sets 10× leverage instead of
-  15×, the same margin_fraction=0.10 gives 1.0× notional, which is the
-  safe/correct behavior for exchange-mandated leverage.
-
-Recommendation: NO CHANGE REQUIRED. The current naming is correct.
-margin_fraction=0.10 is the fraction of equity used as margin; at
-project-standard 15× leverage this equals 1.5× notional exposure,
-matching the CoinBacktest primary scenario.
-
-To avoid future confusion, the config.json could add:
-  "_sizing_note": "margin_fraction=0.10 at 15× leverage = 1.5× equity notional exposure"
+The CoinBacktest 1.5× baseline (margin_fraction=0.10) is retained in test
+helpers for entry/exit parity verification. Live sizing is tested
+separately via test_margin_fraction_1x_sizing().
 """
 
 from __future__ import annotations

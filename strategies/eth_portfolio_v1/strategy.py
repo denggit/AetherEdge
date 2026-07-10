@@ -554,6 +554,13 @@ class Strategy:
         if mf_stop_signals:
             signals.extend(mf_stop_signals)
 
+        # ── MF manual / external close detection ──
+        mf_manual_close_signals = self._handle_mf_manual_close(
+            event=event
+        )
+        if mf_manual_close_signals:
+            signals.extend(mf_manual_close_signals)
+
         if self.pending_entry is not None and _is_entry_side(event.side, self.pending_entry.side):
             if is_master:
                 signals.extend(self._handle_master_entry_fill(event=event, filled_qty=filled_qty))
@@ -715,8 +722,24 @@ class Strategy:
                 self.mf_sleeve.stop_client_order_ids_by_exchange
             )
             master_filled = _strict_result_filled_quantity(master)
-            if master is not None and master_filled is not None:
-                planned = _signal_exchange_quantities(signal)
+            # Accept master-less close for follower-only / aftermath
+            # closes where master was already closed.
+            any_filled = any(
+                _strict_result_filled_quantity(result) is not None
+                for result in results
+            )
+            if (
+                master is not None
+                and master_filled is not None
+            ) or (
+                master is None
+                and any_filled
+                and signal.metadata.get("execution_purpose")
+                in (
+                    "mf_follower_close_after_master_hard_stop",
+                    "mf_follower_close_after_master_manual_close",
+                )
+            ):
                 closed_exchanges = tuple(
                     sorted(
                         result.exchange.value
@@ -724,12 +747,14 @@ class Strategy:
                         if _strict_result_filled_quantity(result) is not None
                     )
                 )
-                if planned:
-                    self.mf_sleeve.confirm_close(
-                        closed_exchanges=closed_exchanges
-                    )
-                else:
-                    self.mf_sleeve.confirm_close()
+                if closed_exchanges:
+                    planned = _signal_exchange_quantities(signal)
+                    if planned:
+                        self.mf_sleeve.confirm_close(
+                            closed_exchanges=closed_exchanges
+                        )
+                    else:
+                        self.mf_sleeve.confirm_close()
                 follow_up: list[TradeSignal] = []
                 if (
                     was_active
@@ -744,6 +769,35 @@ class Strategy:
                             stop_order_ids=captured_stop_ids,
                             stop_client_order_ids=captured_client_ids,
                         )
+                    )
+                # ── Hard stop aftermath close: master stop fill →
+                #     follower close confirmed → all exchanges closed
+                #     → cooldown ──
+                is_aftermath_close = signal.metadata.get(
+                    "execution_purpose"
+                ) in (
+                    "mf_follower_close_after_master_hard_stop",
+                    "mf_follower_close_after_master_manual_close",
+                )
+                if is_aftermath_close and not self.mf_sleeve.active:
+                    self.mf_sleeve.set_hard_stop_cooldown(
+                        event_time_ms=int(
+                            event_time_ms
+                            or signal.metadata.get(
+                                "master_hard_stop_event_time_ms"
+                            )
+                            or signal.created_time_ms
+                        ),
+                        cooldown_hours=(
+                            self.config.mf.hard_stop_cooldown_hours
+                        ),
+                    )
+                    logger.warning(
+                        "MF cooldown started after hard stop "
+                        "aftermath close | position_id=%s "
+                        "cooldown_until_ms=%s",
+                        signal.metadata.get("position_id"),
+                        self.mf_sleeve.hard_stop_cooldown_until_ms,
                     )
                 return follow_up
             else:
@@ -910,11 +964,13 @@ class Strategy:
         if cancelled_exchanges:
             logger.info(
                 "MF hard stop cancel signals generated after "
-                "time48 exit | position_id=%s exchanges=%s",
+                "time48 exit | position_id=%s exchanges=%s "
+                "cancel_count=%s",
                 position_id,
                 sorted(cancelled_exchanges),
+                len(signals),
             )
-        self.mf_sleeve.clear_hard_stop()
+        # Do NOT clear hard stop here — wait for cancel results to confirm.
         return signals
 
     def _handle_mf_stop_placement_results(
@@ -990,23 +1046,73 @@ class Strategy:
         results: Sequence[ExchangeOrderResult],
         event_time_ms: int | None,
     ) -> None:
+        execution_purpose = (
+            signal.metadata.get("execution_purpose") or ""
+            if signal.metadata
+            else ""
+        )
+        target_exchanges = set(_target_exchanges(signal))
+        any_failure = False
+        succeeded: set[str] = set()
         for result in results:
             exchange = result.exchange.value
             if result.ok:
+                succeeded.add(exchange)
                 logger.info(
                     "MF hard stop cancelled | exchange=%s "
                     "position_id=%s",
                     exchange,
-                    signal.metadata.get("position_id"),
+                    signal.metadata.get("position_id")
+                    if signal.metadata
+                    else "",
                 )
             else:
+                any_failure = True
                 logger.warning(
                     "MF hard stop cancel failed | exchange=%s "
                     "position_id=%s error=%s",
                     exchange,
-                    signal.metadata.get("position_id"),
+                    signal.metadata.get("position_id")
+                    if signal.metadata
+                    else "",
                     result.error,
                 )
+        # Only clear stop ids on all-success, and only for time48 exit
+        # cancels (not manual-close aftermath cancels).
+        is_time48_cancel = (
+            execution_purpose
+            == "mf_cancel_hard_stop_after_time_exit"
+        )
+        if (
+            is_time48_cancel
+            and not any_failure
+            and target_exchanges
+            and target_exchanges == succeeded
+        ):
+            self.mf_sleeve.clear_hard_stop()
+            logger.info(
+                "MF hard stop cleared after all cancels succeeded | "
+                "position_id=%s exchanges=%s",
+                signal.metadata.get("position_id")
+                if signal.metadata
+                else "",
+                sorted(succeeded),
+            )
+        elif any_failure:
+            self.mf_execution_alerts.append(
+                "mf_hard_stop_cancel_failed"
+            )
+            self.recovery_manual_required = True
+            self.recovery_blocking_manual_required = True
+            logger.critical(
+                "MF hard stop cancel failed — manual required | "
+                "position_id=%s target_exchanges=%s succeeded=%s",
+                signal.metadata.get("position_id")
+                if signal.metadata
+                else "",
+                sorted(target_exchanges),
+                sorted(succeeded),
+            )
 
     def _handle_mf_hard_stop_fill(
         self, *, event: AccountEvent
@@ -1139,6 +1245,158 @@ class Strategy:
                         self.config.mf.hard_stop_cooldown_hours
                     ),
                 )
+            return []
+
+    def _handle_mf_manual_close(
+        self, *, event: AccountEvent
+    ) -> list[TradeSignal]:
+        """Detect manual/external MF position close (not strategy-initiated).
+
+        When a user manually closes MF positions on exchange, this handler:
+        - Does NOT set recovery_blocking_manual_required.
+        - Generates follower close signals if master was manually closed.
+        - Cancels remaining MF hard stops when all exchanges are closed.
+        - Does NOT start cooldown by default.
+        """
+        if not self.mf_sleeve.active:
+            return []
+        exchange = event.exchange.value
+        if exchange not in self.mf_sleeve.exchange_quantities:
+            return []
+        if event.side is not OrderSide.SELL:
+            return []
+        # Skip if this fill is a known MF hard stop fill
+        stop_ids = self.mf_sleeve.stop_order_ids_by_exchange
+        client_ids = self.mf_sleeve.stop_client_order_ids_by_exchange
+        if (
+            event.order_id
+            and event.order_id in stop_ids.values()
+        ) or (
+            event.client_order_id
+            and event.client_order_id in client_ids.values()
+        ):
+            return []
+
+        logger.warning(
+            "MF manual/external close detected | exchange=%s "
+            "position_id=%s order_id=%s client_order_id=%s "
+            "fill_price=%s filled_qty=%s",
+            exchange,
+            self.mf_sleeve.position_id,
+            event.order_id,
+            event.client_order_id,
+            event.price,
+            event.filled_quantity or event.quantity,
+        )
+        self.mf_execution_alerts.append(
+            f"mf_manual_close_detected:{exchange}"
+        )
+
+        is_master = exchange == self.config.data_exchange
+        remaining = {
+            ex: qty
+            for ex, qty in self.mf_sleeve.exchange_quantities.items()
+            if ex != exchange and qty > 0
+        }
+
+        if not remaining:
+            # All exchanges are now closed
+            position_id = self.mf_sleeve.position_id
+            self.mf_sleeve.clear()
+            # Cancel remaining MF stops (scoped, not global)
+            cancel_signals: list[TradeSignal] = []
+            for ex, sid in list(stop_ids.items()):
+                cid = client_ids.get(ex)
+                cancel_signals.append(
+                    TradeSignal(
+                        symbol=self.config.symbol,
+                        action=SignalAction.CANCEL_STOP_ORDER,
+                        client_order_id=cid or sid,
+                        reason="mf_manual_close_cancel_stop",
+                        metadata={
+                            "strategy_id": self.config.strategy_id,
+                            "sleeve_id": MF_RESERVED_SLEEVE_ID,
+                            "position_id": position_id,
+                            "execution_purpose": (
+                                "mf_cancel_hard_stop_after_manual_close"
+                            ),
+                            "target_exchanges": [ex],
+                            "stop_order_id": sid,
+                            "stop_client_order_id": cid,
+                            "cancel_scope": "mf_sleeve_only",
+                        },
+                        created_time_ms=event.event_time_ms,
+                    )
+                )
+            logger.warning(
+                "MF sleeve cleared after manual close of all "
+                "exchanges | position_id=%s cancel_count=%s",
+                position_id,
+                len(cancel_signals),
+            )
+            return cancel_signals
+
+        if is_master:
+            # Master manually closed → close followers
+            follower_signals: list[TradeSignal] = []
+            for fex in sorted(remaining):
+                fqty = remaining[fex]
+                if fqty <= 0:
+                    continue
+                follower_signals.append(
+                    TradeSignal(
+                        symbol=self.config.symbol,
+                        action=SignalAction.CLOSE_LONG,
+                        quantity=fqty,
+                        order_type=SignalOrderType.MARKET,
+                        reason=(
+                            "MF_FOLLOWER_CLOSE_AFTER_MASTER_MANUAL_CLOSE"
+                        ),
+                        metadata={
+                            "strategy_id": self.config.strategy_id,
+                            "sleeve_id": MF_RESERVED_SLEEVE_ID,
+                            "position_id": (
+                                self.mf_sleeve.position_id
+                            ),
+                            "engine": "MF_LOW_SWEEP_TIME48",
+                            "execution_purpose": (
+                                "mf_follower_close_after_master_manual_close"
+                            ),
+                            "reduce_only": True,
+                            "close_scope": "mf_sleeve_only",
+                            "quantity_scope": "mf_sleeve_quantity",
+                            "target_exchanges": [fex],
+                            "exchange_quantities_base": {
+                                fex: str(fqty)
+                            },
+                            "master_manual_close_exchange": exchange,
+                            "master_manual_close_event_time_ms": (
+                                event.event_time_ms
+                            ),
+                        },
+                        created_time_ms=event.event_time_ms,
+                    )
+                )
+            self.mf_sleeve.exchange_quantities = dict(remaining)
+            self.mf_sleeve.quantity = sum(remaining.values())
+            logger.warning(
+                "MF master manually closed, closing %s followers | "
+                "position_id=%s",
+                len(follower_signals),
+                self.mf_sleeve.position_id,
+            )
+            return follower_signals
+        else:
+            # Follower manually closed individually
+            self.mf_sleeve.exchange_quantities = dict(remaining)
+            self.mf_sleeve.quantity = sum(remaining.values())
+            logger.warning(
+                "MF follower manually closed | exchange=%s "
+                "position_id=%s master still active=%s",
+                exchange,
+                self.mf_sleeve.position_id,
+                self.config.data_exchange in remaining,
+            )
             return []
 
     def _entry_has_master_fill_event(self, events: Sequence[AccountEvent]) -> bool:
