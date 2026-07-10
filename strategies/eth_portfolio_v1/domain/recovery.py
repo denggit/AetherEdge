@@ -244,25 +244,39 @@ def _mf_plan_issues(plan_payload: Mapping[str, Any]) -> list[str]:
         metadata.get("exchange_quantities_base")
     )
     protective_stop_required = metadata.get("protective_stop_required")
-    if protective_stop_required not in (
-        False, "false", "False", 0,
-        True, "true", "True", 1,
-    ):
-        issues.append("mf_no_stop_policy_missing")
-    elif protective_stop_required in (True, "true", "True", 1):
-        # When hard stop is enabled, protective_stop_required=True is
-        # the expected live state. Validate stop fields if they are
-        # present in the metadata (old plans without stop data are
-        # tolerated to avoid blocking legacy recovery).
+    mf_hard_stop_enabled = metadata.get("mf_hard_stop_enabled")
+    if protective_stop_required in (True, "true", "True", 1):
+        # ── Hard-stop-required plan: strict validation ──
         stop_price = metadata.get("stop_price") or metadata.get(
             "hard_stop_price"
         )
+        if stop_price is None or _positive_decimal(stop_price) is None:
+            issues.append(
+                "mf_protective_stop_required_but_price_missing"
+            )
         stop_ids = metadata.get("stop_order_ids_by_exchange")
-        if stop_price is not None or stop_ids is not None:
-            if stop_price is None or _positive_decimal(stop_price) is None:
-                issues.append(
-                    "mf_protective_stop_required_but_price_missing"
-                )
+        if stop_ids is not None and (
+            not isinstance(stop_ids, Mapping)
+            or not any(
+                str(k).strip() and str(v).strip()
+                for k, v in stop_ids.items()
+            )
+        ):
+            issues.append(
+                "mf_protective_stop_required_but_stop_ids_empty"
+            )
+    elif protective_stop_required in (False, "false", "False", 0, None):
+        # ── Legacy / no-stop plan ──
+        if mf_hard_stop_enabled in (True, "true", "True", 1):
+            # Inconsistent: hard_stop is enabled but plan says not
+            # required. This means the plan was written by old code
+            # that didn't know about hard_stop. Flag as warning but
+            # don't block recovery.
+            issues.append(
+                "mf_hard_stop_enabled_but_not_required"
+            )
+    else:
+        issues.append("mf_no_stop_policy_missing")
     legs = tuple(
         dict(item)
         for item in plan_payload.get("legs", ())

@@ -144,7 +144,18 @@ class MfSignalMapper:
             "fixed_time_exit_holding_minutes": self.config.holding_minutes,
             "quantity_scope": "mf_sleeve_quantity",
             "stop_scope": decision.position_id,
-            "protective_stop_required": False,
+            "protective_stop_required": (
+                self.config.hard_stop_enabled
+            ),
+            "mf_hard_stop_enabled": self.config.hard_stop_enabled,
+            "mf_hard_stop_pct": (
+                str(self.config.hard_stop_pct)
+                if self.config.hard_stop_enabled
+                else None
+            ),
+            "mf_hard_stop_cooldown_hours": (
+                self.config.hard_stop_cooldown_hours
+            ),
             "unconfirmed_master_close_policy": "manual_required",
             "audit": _json_safe_mapping(decision.audit),
         }

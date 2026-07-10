@@ -193,7 +193,10 @@ def test_entry_signal_has_independent_mf_scope(tmp_path) -> None:
     assert signal.metadata["fixed_time_exit_holding_minutes"] == 48
     assert signal.metadata["unconfirmed_master_close_policy"] == "manual_required"
     assert signal.metadata["quantity_scope"] == "mf_sleeve_quantity"
-    assert signal.metadata["protective_stop_required"] is False
+    assert signal.metadata["protective_stop_required"] is True
+    assert signal.metadata["mf_hard_stop_enabled"] is True
+    assert signal.metadata["mf_hard_stop_pct"] == "0.0500"
+    assert signal.metadata["mf_hard_stop_cooldown_hours"] == 12
     assert signal.metadata["sizing_input"]["margin_fraction"] == "0.10"
     assert signal.metadata["sizing_input"]["available_margin_buffer"] == "0.95"
     assert signal.metadata["sizing_input"]["leverage_by_exchange"] == {

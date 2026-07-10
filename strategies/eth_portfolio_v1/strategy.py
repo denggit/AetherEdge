@@ -770,16 +770,19 @@ class Strategy:
                             stop_client_order_ids=captured_client_ids,
                         )
                     )
-                # ── Hard stop aftermath close: master stop fill →
-                #     follower close confirmed → all exchanges closed
-                #     → cooldown ──
-                is_aftermath_close = signal.metadata.get(
-                    "execution_purpose"
-                ) in (
-                    "mf_follower_close_after_master_hard_stop",
-                    "mf_follower_close_after_master_manual_close",
+                # ── Hard stop aftermath close: only for
+                #     mf_follower_close_after_master_hard_stop.
+                #     Manual close aftermath does NOT start cooldown. ──
+                execution_purpose = (
+                    signal.metadata.get("execution_purpose")
+                    if signal.metadata
+                    else ""
                 )
-                if is_aftermath_close and not self.mf_sleeve.active:
+                if (
+                    execution_purpose
+                    == "mf_follower_close_after_master_hard_stop"
+                    and not self.mf_sleeve.active
+                ):
                     self.mf_sleeve.set_hard_stop_cooldown(
                         event_time_ms=int(
                             event_time_ms
@@ -798,6 +801,20 @@ class Strategy:
                         "cooldown_until_ms=%s",
                         signal.metadata.get("position_id"),
                         self.mf_sleeve.hard_stop_cooldown_until_ms,
+                    )
+                elif (
+                    execution_purpose
+                    == "mf_follower_close_after_master_manual_close"
+                    and not self.mf_sleeve.active
+                ):
+                    logger.warning(
+                        "MF sleeve fully cleared after manual "
+                        "close aftermath — no cooldown | "
+                        "position_id=%s",
+                        signal.metadata.get("position_id"),
+                    )
+                    self.mf_execution_alerts.append(
+                        "mf_manual_close_completed"
                     )
                 return follow_up
             else:

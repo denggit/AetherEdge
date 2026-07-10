@@ -520,7 +520,8 @@ class TestSignalMetadata:
         signal = signals[0]
         assert signal.metadata["sleeve_id"] == "mf"
         assert signal.metadata["exit_variant"] == "time48"
-        assert signal.metadata["protective_stop_required"] is False
+        assert signal.metadata["protective_stop_required"] is True
+        assert signal.metadata["mf_hard_stop_enabled"] is True
         assert signal.metadata["entry_mode"] == "next_open"
         assert signal.metadata["engine"] == "MF_LOW_SWEEP_TIME48"
 

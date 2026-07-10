@@ -1121,7 +1121,328 @@ def test_manual_close_cancel_failure_is_manual_required() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 9. Import boundary check
+# 9. Manual close aftermath does NOT start cooldown
+# ---------------------------------------------------------------------------
+
+
+def test_manual_close_aftermath_no_cooldown() -> None:
+    """mf_follower_close_after_master_manual_close should NOT start
+    cooldown after follower is filled."""
+    strategy = Strategy()
+    _activate_mf_sleeve(strategy)
+
+    # Simulate: master already manually closed, only binance remains
+    strategy.mf_sleeve.exchange_quantities = {
+        "binance": Decimal("0.25")
+    }
+    strategy.mf_sleeve.quantity = Decimal("0.25")
+
+    close_signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.CLOSE_LONG,
+        quantity=Decimal("0.25"),
+        metadata={
+            "strategy_id": "eth_portfolio_v1",
+            "sleeve_id": "mf",
+            "position_id": "mf-low-sweep-time48-test",
+            "execution_purpose": (
+                "mf_follower_close_after_master_manual_close"
+            ),
+            "target_exchanges": ["binance"],
+            "exchange_quantities_base": {"binance": "0.25"},
+        },
+    )
+    results = (
+        ExchangeOrderResult(
+            exchange=ExchangeName.BINANCE,
+            ok=True,
+            status=OrderStatus.FILLED,
+            filled_quantity=Decimal("0.25"),
+        ),
+    )
+    event_time_ms = 30000
+    strategy._handle_mf_order_results(
+        signal=close_signal,
+        results=results,
+        event_time_ms=event_time_ms,
+    )
+    # Sleeve is inactive
+    assert not strategy.mf_sleeve.active
+    # Cooldown NOT started
+    assert (
+        strategy.mf_sleeve.hard_stop_cooldown_until_ms is None
+    )
+    # Alert appended
+    assert "mf_manual_close_completed" in (
+        strategy.mf_execution_alerts
+    )
+    # Does NOT set manual_required
+    assert not strategy.recovery_manual_required
+
+
+# ---------------------------------------------------------------------------
+# 10. Metadata: protective_stop_required based on hard_stop_enabled
+# ---------------------------------------------------------------------------
+
+
+def test_metadata_hard_stop_enabled_true() -> None:
+    """When hard_stop_enabled=True, metadata must reflect it."""
+    from strategies.eth_portfolio_v1.domain.mf_signal import (
+        MfLowSweepConfig,
+        MfSignalDecision,
+    )
+    from strategies.eth_portfolio_v1.execution.mf_signal_mapper import (
+        MfSignalMapper,
+    )
+
+    cfg = MfLowSweepConfig.from_mapping(
+        {
+            "margin_fraction": "0.0666666667",
+            "hard_stop_enabled": True,
+            "hard_stop_pct": "0.0500",
+            "hard_stop_cooldown_hours": 12,
+        }
+    )
+    mapper = MfSignalMapper(
+        strategy_id="eth_portfolio_v1",
+        symbol="ETH-USDT-PERP",
+        config=cfg,
+        master_exchange="okx",
+    )
+    decision = MfSignalDecision(
+        decision_type="open",
+        signal_time_ms=100,
+        decision_time_ms=100,
+        entry_execution_time_ms=101,
+        position_id="mf-low-sweep-time48-test",
+        reference_price=Decimal("3000"),
+        reason="mf_low_sweep_entry",
+    )
+    metadata = mapper._metadata(decision)
+    assert metadata["protective_stop_required"] is True
+    assert metadata["mf_hard_stop_enabled"] is True
+    assert metadata["mf_hard_stop_pct"] == "0.0500"
+    assert metadata["mf_hard_stop_cooldown_hours"] == 12
+
+
+def test_metadata_hard_stop_enabled_false() -> None:
+    """When hard_stop_enabled=False, protective_stop_required=False."""
+    from strategies.eth_portfolio_v1.domain.mf_signal import (
+        MfLowSweepConfig,
+        MfSignalDecision,
+    )
+    from strategies.eth_portfolio_v1.execution.mf_signal_mapper import (
+        MfSignalMapper,
+    )
+
+    cfg = MfLowSweepConfig.from_mapping(
+        {
+            "margin_fraction": "0.0666666667",
+            "hard_stop_enabled": False,
+        }
+    )
+    mapper = MfSignalMapper(
+        strategy_id="eth_portfolio_v1",
+        symbol="ETH-USDT-PERP",
+        config=cfg,
+        master_exchange="okx",
+    )
+    decision = MfSignalDecision(
+        decision_type="open",
+        signal_time_ms=100,
+        decision_time_ms=100,
+        entry_execution_time_ms=101,
+        position_id="mf-low-sweep-time48-test",
+        reference_price=Decimal("3000"),
+        reason="mf_low_sweep_entry",
+    )
+    metadata = mapper._metadata(decision)
+    assert metadata["protective_stop_required"] is False
+    assert metadata["mf_hard_stop_enabled"] is False
+    assert metadata["mf_hard_stop_pct"] is None
+
+
+# ---------------------------------------------------------------------------
+# 11. Recovery strict validation
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_protective_stop_required_valid() -> None:
+    """protective_stop_required=True + valid stop_price → no issue."""
+    from strategies.eth_portfolio_v1.domain.recovery import (
+        _mf_plan_issues,
+    )
+
+    plan = {
+        "position": {
+            "position_id": "mf-low-sweep-time48-valid",
+            "side": "long",
+            "master_exchange": "okx",
+            "entry_engine": "MF_LOW_SWEEP_TIME48",
+            "master_filled_qty_base": "0.5",
+            "status": "active",
+            "metadata": {
+                "average_entry_price": "2500",
+                "signal_time_ms": 1000,
+                "entry_execution_time_ms": 1001,
+                "entry_tradebar_open_time_ms": 1002,
+                "sleeve_id": "mf",
+                "engine": "MF_LOW_SWEEP_TIME48",
+                "exit_variant": "time48",
+                "quantity_scope": "mf_sleeve_quantity",
+                "time48_holding_minutes": 48,
+                "exchange_quantities_base": {"okx": "0.5"},
+                "protective_stop_required": True,
+                "mf_hard_stop_enabled": True,
+                "stop_price": "2375",
+                "hard_stop_price": "2375",
+                "stop_order_ids_by_exchange": {
+                    "okx": "okx-stop-valid"
+                },
+            },
+        },
+        "legs": [
+            {
+                "exchange": "okx",
+                "filled_qty_base": "0.5",
+                "sync_status": "open",
+            },
+        ],
+    }
+    issues = _mf_plan_issues(plan)
+    assert "mf_protective_stop_required_but_price_missing" not in issues
+    assert "mf_hard_stop_enabled_but_not_required" not in issues
+    assert "mf_no_stop_policy_missing" not in issues
+
+
+def test_recovery_protective_stop_required_price_missing() -> None:
+    """protective_stop_required=True without stop_price → issue."""
+    from strategies.eth_portfolio_v1.domain.recovery import (
+        _mf_plan_issues,
+    )
+
+    plan = {
+        "position": {
+            "position_id": "mf-low-sweep-time48-bad",
+            "side": "long",
+            "master_exchange": "okx",
+            "entry_engine": "MF_LOW_SWEEP_TIME48",
+            "master_filled_qty_base": "0.5",
+            "status": "active",
+            "metadata": {
+                "average_entry_price": "2500",
+                "signal_time_ms": 1000,
+                "entry_execution_time_ms": 1001,
+                "entry_tradebar_open_time_ms": 1002,
+                "sleeve_id": "mf",
+                "engine": "MF_LOW_SWEEP_TIME48",
+                "exit_variant": "time48",
+                "quantity_scope": "mf_sleeve_quantity",
+                "time48_holding_minutes": 48,
+                "protective_stop_required": True,
+                "mf_hard_stop_enabled": True,
+            },
+        },
+        "legs": [
+            {
+                "exchange": "okx",
+                "filled_qty_base": "0.5",
+                "sync_status": "open",
+            },
+        ],
+    }
+    issues = _mf_plan_issues(plan)
+    assert "mf_protective_stop_required_but_price_missing" in issues
+
+
+def test_recovery_hard_stop_enabled_but_not_required() -> None:
+    """mf_hard_stop_enabled=True + protective_stop_required=False →
+    flagged as inconsistency."""
+    from strategies.eth_portfolio_v1.domain.recovery import (
+        _mf_plan_issues,
+    )
+
+    plan = {
+        "position": {
+            "position_id": "mf-low-sweep-time48-inconsistent",
+            "side": "long",
+            "master_exchange": "okx",
+            "entry_engine": "MF_LOW_SWEEP_TIME48",
+            "master_filled_qty_base": "0.5",
+            "status": "active",
+            "metadata": {
+                "average_entry_price": "2500",
+                "signal_time_ms": 1000,
+                "entry_execution_time_ms": 1001,
+                "entry_tradebar_open_time_ms": 1002,
+                "sleeve_id": "mf",
+                "engine": "MF_LOW_SWEEP_TIME48",
+                "exit_variant": "time48",
+                "quantity_scope": "mf_sleeve_quantity",
+                "time48_holding_minutes": 48,
+                "protective_stop_required": False,
+                "mf_hard_stop_enabled": True,
+            },
+        },
+        "legs": [
+            {
+                "exchange": "okx",
+                "filled_qty_base": "0.5",
+                "sync_status": "open",
+            },
+        ],
+    }
+    issues = _mf_plan_issues(plan)
+    assert "mf_hard_stop_enabled_but_not_required" in issues
+
+
+def test_recovery_legacy_no_stop_allowed() -> None:
+    """Old plan with protective_stop_required=False and no
+    mf_hard_stop_enabled field → allowed."""
+    from strategies.eth_portfolio_v1.domain.recovery import (
+        _mf_plan_issues,
+    )
+
+    plan = {
+        "position": {
+            "position_id": "mf-low-sweep-time48-legacy",
+            "side": "long",
+            "master_exchange": "okx",
+            "entry_engine": "MF_LOW_SWEEP_TIME48",
+            "master_filled_qty_base": "0.5",
+            "status": "active",
+            "metadata": {
+                "average_entry_price": "2500",
+                "signal_time_ms": 1000,
+                "entry_execution_time_ms": 1001,
+                "entry_tradebar_open_time_ms": 1002,
+                "sleeve_id": "mf",
+                "engine": "MF_LOW_SWEEP_TIME48",
+                "exit_variant": "time48",
+                "quantity_scope": "mf_sleeve_quantity",
+                "time48_holding_minutes": 48,
+                "protective_stop_required": False,
+            },
+        },
+        "legs": [
+            {
+                "exchange": "okx",
+                "filled_qty_base": "0.5",
+                "sync_status": "open",
+            },
+        ],
+    }
+    issues = _mf_plan_issues(plan)
+    assert "mf_no_stop_policy_missing" not in issues
+    assert "mf_hard_stop_enabled_but_not_required" not in issues
+    assert (
+        "mf_protective_stop_required_but_price_missing"
+        not in issues
+    )
+
+
+# ---------------------------------------------------------------------------
+# 12. Import boundary check
 # ---------------------------------------------------------------------------
 
 
