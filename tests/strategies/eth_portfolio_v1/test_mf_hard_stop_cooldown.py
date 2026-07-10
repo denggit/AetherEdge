@@ -1442,7 +1442,169 @@ def test_recovery_legacy_no_stop_allowed() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 12. Import boundary check
+# 12. Recovery validation from canonical_stop_price / legs
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_stop_from_canonical_and_legs() -> None:
+    """protective_stop_required=True + canonical_stop_price + leg
+    stop_order_id → no issues."""
+    from strategies.eth_portfolio_v1.domain.recovery import (
+        _mf_plan_issues,
+    )
+
+    plan = {
+        "position": {
+            "position_id": "mf-low-sweep-time48-canonical",
+            "side": "long",
+            "master_exchange": "okx",
+            "entry_engine": "MF_LOW_SWEEP_TIME48",
+            "master_filled_qty_base": "0.5",
+            "status": "active",
+            "canonical_stop_price": "2375",
+            "metadata": {
+                "average_entry_price": "2500",
+                "signal_time_ms": 1000,
+                "entry_execution_time_ms": 1001,
+                "entry_tradebar_open_time_ms": 1002,
+                "sleeve_id": "mf",
+                "engine": "MF_LOW_SWEEP_TIME48",
+                "exit_variant": "time48",
+                "quantity_scope": "mf_sleeve_quantity",
+                "time48_holding_minutes": 48,
+                "exchange_quantities_base": {"okx": "0.5"},
+                "protective_stop_required": True,
+                "mf_hard_stop_enabled": True,
+            },
+        },
+        "legs": [
+            {
+                "exchange": "okx",
+                "filled_qty_base": "0.5",
+                "sync_status": "open",
+                "stop_order_id": "okx-stop-leg",
+                "stop_client_order_id": "client-okx-leg",
+                "stop_price": "2375",
+            },
+        ],
+    }
+    issues = _mf_plan_issues(plan)
+    assert (
+        "mf_protective_stop_required_but_price_missing"
+        not in issues
+    )
+    assert (
+        "mf_protective_stop_required_but_stop_ids_empty"
+        not in issues
+    )
+
+
+def test_recovery_no_stop_price_anywhere_is_issue() -> None:
+    """protective_stop_required=True with NO stop_price in metadata,
+    canonical_stop_price, or legs → issue."""
+    from strategies.eth_portfolio_v1.domain.recovery import (
+        _mf_plan_issues,
+    )
+
+    plan = {
+        "position": {
+            "position_id": "mf-low-sweep-time48-no-stop",
+            "side": "long",
+            "master_exchange": "okx",
+            "entry_engine": "MF_LOW_SWEEP_TIME48",
+            "master_filled_qty_base": "0.5",
+            "status": "active",
+            "canonical_stop_price": None,
+            "metadata": {
+                "average_entry_price": "2500",
+                "signal_time_ms": 1000,
+                "entry_execution_time_ms": 1001,
+                "entry_tradebar_open_time_ms": 1002,
+                "sleeve_id": "mf",
+                "engine": "MF_LOW_SWEEP_TIME48",
+                "exit_variant": "time48",
+                "quantity_scope": "mf_sleeve_quantity",
+                "time48_holding_minutes": 48,
+                "protective_stop_required": True,
+                "mf_hard_stop_enabled": True,
+            },
+        },
+        "legs": [
+            {
+                "exchange": "okx",
+                "filled_qty_base": "0.5",
+                "sync_status": "open",
+            },
+        ],
+    }
+    issues = _mf_plan_issues(plan)
+    assert "mf_protective_stop_required_but_price_missing" in issues
+
+
+# ---------------------------------------------------------------------------
+# 13. restore_from_plan from canonical_stop_price / legs
+# ---------------------------------------------------------------------------
+
+
+def test_restore_from_canonical_stop_and_leg_ids() -> None:
+    """restore_from_plan recovers hard_stop_price from
+    canonical_stop_price and stop ids from leg fields."""
+    from strategies.eth_portfolio_v1.domain.mf_sleeve import (
+        MfSleeveState,
+    )
+
+    sleeve = MfSleeveState(
+        strategy_id="eth_portfolio_v1",
+        symbol="ETH-USDT-PERP",
+        enabled=True,
+    )
+    plan = {
+        "position": {
+            "position_id": "mf-low-sweep-time48-canonical",
+            "side": "long",
+            "master_exchange": "okx",
+            "entry_engine": "MF_LOW_SWEEP_TIME48",
+            "master_filled_qty_base": "0.5",
+            "status": "active",
+            "canonical_stop_price": "2375",
+            "metadata": {
+                "average_entry_price": "2500",
+                "signal_time_ms": 1000,
+                "entry_execution_time_ms": 1001,
+                "entry_tradebar_open_time_ms": 1002,
+                "sleeve_id": "mf",
+                "engine": "MF_LOW_SWEEP_TIME48",
+                "exit_variant": "time48",
+                "quantity_scope": "mf_sleeve_quantity",
+                "time48_holding_minutes": 48,
+                "exchange_quantities_base": {"okx": "0.5"},
+                "protective_stop_required": True,
+            },
+        },
+        "legs": [
+            {
+                "exchange": "okx",
+                "filled_qty_base": "0.5",
+                "sync_status": "open",
+                "stop_order_id": "okx-stop-leg-123",
+                "stop_client_order_id": "client-okx-leg-456",
+                "stop_price": "2375",
+            },
+        ],
+    }
+    assert sleeve.restore_from_plan(plan) is True
+    assert sleeve.active
+    assert sleeve.hard_stop_price == Decimal("2375")
+    assert sleeve.stop_order_ids_by_exchange == {
+        "okx": "okx-stop-leg-123",
+    }
+    assert sleeve.stop_client_order_ids_by_exchange == {
+        "okx": "client-okx-leg-456",
+    }
+
+
+# ---------------------------------------------------------------------------
+# 14. Import boundary check
 # ---------------------------------------------------------------------------
 
 

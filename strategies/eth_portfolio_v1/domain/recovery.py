@@ -211,6 +211,96 @@ def audit_portfolio_v1_plans(
     }
 
 
+def _extract_plan_stop_price(
+    plan_payload: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> Decimal | None:
+    """Extract MF hard stop price from plan, trying all real sources.
+
+    Priority:
+    1. metadata["stop_price"] / metadata["hard_stop_price"]
+    2. position["canonical_stop_price"]
+    3. first positive legs[].stop_price
+    """
+    # 1. metadata
+    value = _positive_decimal(
+        metadata.get("stop_price") or metadata.get("hard_stop_price")
+    )
+    if value is not None:
+        return value
+    # 2. position.canonical_stop_price
+    position = _position(plan_payload)
+    value = _positive_decimal(position.get("canonical_stop_price"))
+    if value is not None:
+        return value
+    # 3. legs stop_price
+    for raw_leg in plan_payload.get("legs", ()):
+        if not isinstance(raw_leg, Mapping):
+            continue
+        value = _positive_decimal(raw_leg.get("stop_price"))
+        if value is not None:
+            return value
+    return None
+
+
+def _extract_plan_stop_ids_by_exchange(
+    plan_payload: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> dict[str, str]:
+    """Extract stop_order_id per exchange.
+
+    Priority:
+    1. metadata["stop_order_ids_by_exchange"]
+    2. legs[].stop_order_id
+    """
+    meta_ids = metadata.get("stop_order_ids_by_exchange")
+    if isinstance(meta_ids, Mapping):
+        out: dict[str, str] = {}
+        for ex, oid in meta_ids.items():
+            if str(ex).strip() and str(oid).strip():
+                out[str(ex).strip().lower()] = str(oid)
+        if out:
+            return out
+    out = {}
+    for raw_leg in plan_payload.get("legs", ()):
+        if not isinstance(raw_leg, Mapping):
+            continue
+        exchange = str(raw_leg.get("exchange") or "").strip().lower()
+        oid = str(raw_leg.get("stop_order_id") or "").strip()
+        if exchange and oid:
+            out[exchange] = oid
+    return out
+
+
+def _extract_plan_stop_client_ids_by_exchange(
+    plan_payload: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> dict[str, str]:
+    """Extract stop_client_order_id per exchange.
+
+    Priority:
+    1. metadata["stop_client_order_ids_by_exchange"]
+    2. legs[].stop_client_order_id
+    """
+    meta_ids = metadata.get("stop_client_order_ids_by_exchange")
+    if isinstance(meta_ids, Mapping):
+        out: dict[str, str] = {}
+        for ex, cid in meta_ids.items():
+            if str(ex).strip() and str(cid).strip():
+                out[str(ex).strip().lower()] = str(cid)
+        if out:
+            return out
+    out = {}
+    for raw_leg in plan_payload.get("legs", ()):
+        if not isinstance(raw_leg, Mapping):
+            continue
+        exchange = str(raw_leg.get("exchange") or "").strip().lower()
+        cid = str(raw_leg.get("stop_client_order_id") or "").strip()
+        if exchange and cid:
+            out[exchange] = cid
+    return out
+
+
 def _mf_plan_issues(plan_payload: Mapping[str, Any]) -> list[str]:
     position = _position(plan_payload)
     metadata = merged_plan_metadata(plan_payload)
@@ -247,21 +337,28 @@ def _mf_plan_issues(plan_payload: Mapping[str, Any]) -> list[str]:
     mf_hard_stop_enabled = metadata.get("mf_hard_stop_enabled")
     if protective_stop_required in (True, "true", "True", 1):
         # ── Hard-stop-required plan: strict validation ──
-        stop_price = metadata.get("stop_price") or metadata.get(
-            "hard_stop_price"
-        )
-        if stop_price is None or _positive_decimal(stop_price) is None:
+        stop_price = _extract_plan_stop_price(plan_payload, metadata)
+        if stop_price is None:
             issues.append(
                 "mf_protective_stop_required_but_price_missing"
             )
-        stop_ids = metadata.get("stop_order_ids_by_exchange")
-        if stop_ids is not None and (
-            not isinstance(stop_ids, Mapping)
-            or not any(
-                str(k).strip() and str(v).strip()
-                for k, v in stop_ids.items()
+        # Check stop ids — if the plan has them in any source,
+        # validate they are non-empty. Missing stop ids in an
+        # active plan that just opened is acceptable (stop placement
+        # may be in-flight).
+        stop_ids = _extract_plan_stop_ids_by_exchange(
+            plan_payload, metadata
+        )
+        leg_has_any_stop = any(
+            (
+                raw_leg.get("stop_order_id")
+                or raw_leg.get("stop_client_order_id")
             )
-        ):
+            for raw_leg in plan_payload.get("legs", ())
+            if isinstance(raw_leg, Mapping)
+        )
+        if stop_ids is not None and not stop_ids and leg_has_any_stop:
+            # Explicitly empty when legs claim to have stops
             issues.append(
                 "mf_protective_stop_required_but_stop_ids_empty"
             )

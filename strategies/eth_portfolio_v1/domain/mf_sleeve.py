@@ -188,29 +188,77 @@ class MfSleeveState:
         self.entry_tradebar_open_time_ms = tradebar_open_time_ms
         self.pending_open = False
         self.pending_close = False
-        # ── Restore hard stop / cooldown from plan metadata ──
-        stop_price = _positive_decimal(
-            metadata.get("stop_price")
-            or metadata.get("hard_stop_price")
+        # ── Restore hard stop / cooldown from plan ──
+        # Priority: metadata, then position.canonical_stop_price,
+        # then legs[].stop_price.
+        stop_price = (
+            _positive_decimal(
+                metadata.get("stop_price")
+                or metadata.get("hard_stop_price")
+            )
+            or _positive_decimal(
+                position.get("canonical_stop_price")
+            )
         )
+        if stop_price is None:
+            for raw_leg in payload.get("legs", ()):
+                if not isinstance(raw_leg, Mapping):
+                    continue
+                stop_price = _positive_decimal(
+                    raw_leg.get("stop_price")
+                )
+                if stop_price is not None:
+                    break
         if stop_price is not None:
             self.hard_stop_price = stop_price
-            stop_ids = metadata.get("stop_order_ids_by_exchange")
-            if isinstance(stop_ids, Mapping):
-                for ex, oid in stop_ids.items():
+            # Restore stop order ids: metadata first, then legs
+            meta_stop_ids = metadata.get(
+                "stop_order_ids_by_exchange"
+            )
+            if isinstance(meta_stop_ids, Mapping):
+                for ex, oid in meta_stop_ids.items():
                     if str(ex).strip() and str(oid).strip():
                         self.stop_order_ids_by_exchange[
                             str(ex).strip().lower()
                         ] = str(oid)
-            client_ids = metadata.get(
+            if not self.stop_order_ids_by_exchange:
+                for raw_leg in payload.get("legs", ()):
+                    if not isinstance(raw_leg, Mapping):
+                        continue
+                    exchange = str(
+                        raw_leg.get("exchange") or ""
+                    ).strip().lower()
+                    oid = str(
+                        raw_leg.get("stop_order_id") or ""
+                    ).strip()
+                    if exchange and oid:
+                        self.stop_order_ids_by_exchange[
+                            exchange
+                        ] = oid
+            # Restore client ids: metadata first, then legs
+            meta_client_ids = metadata.get(
                 "stop_client_order_ids_by_exchange"
             )
-            if isinstance(client_ids, Mapping):
-                for ex, cid in client_ids.items():
+            if isinstance(meta_client_ids, Mapping):
+                for ex, cid in meta_client_ids.items():
                     if str(ex).strip() and str(cid).strip():
                         self.stop_client_order_ids_by_exchange[
                             str(ex).strip().lower()
                         ] = str(cid)
+            if not self.stop_client_order_ids_by_exchange:
+                for raw_leg in payload.get("legs", ()):
+                    if not isinstance(raw_leg, Mapping):
+                        continue
+                    exchange = str(
+                        raw_leg.get("exchange") or ""
+                    ).strip().lower()
+                    cid = str(
+                        raw_leg.get("stop_client_order_id") or ""
+                    ).strip()
+                    if exchange and cid:
+                        self.stop_client_order_ids_by_exchange[
+                            exchange
+                        ] = cid
         cooldown_ms = _positive_int(
             metadata.get("hard_stop_cooldown_until_ms")
         )
