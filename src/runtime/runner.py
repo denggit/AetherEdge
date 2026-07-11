@@ -3704,7 +3704,6 @@ class LiveRuntimeRunner:
             self._record_order_results(results)
             self._save_order_results(signal, results)
             self._check_follower_close_failure(signal, results)
-            self._advance_follower_close_generation(signal)
             if self.requirements.account_state.post_order_sync_enabled and signal.action in {SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT, SignalAction.CLOSE_LONG, SignalAction.CLOSE_SHORT}:
                 await self._get_account_sync_service().sync_once(sync_type="post_order_account", priority=True)
             follow_up = await self._process_order_result_feedback(signal=signal, results=results, source=source, event_time_ms=event_time_ms)
@@ -3800,46 +3799,6 @@ class LiveRuntimeRunner:
                 error_str,
                 attempts,
             )
-
-    def _advance_follower_close_generation(self, signal: TradeSignal) -> None:
-        """Increment follower_close_generation in PositionPlan metadata.
-
-        Called after every follower_close signal execution (success or failure).
-        The coordinator claims the intent_id atomically, so the same generation
-        cannot be replayed.  Advancing ensures the periodic safety net uses a
-        fresh intent_id on the next cycle.
-
-        On success the plan transitions to CLOSED so the periodic check never
-        fires again.  On failure the plan stays
-        MASTER_CLOSED_FOLLOWER_CLOSE_REQUIRED and the next periodic cycle picks
-        up the new generation.
-        """
-        purpose = str(
-            signal.metadata.get("execution_purpose", "")
-            if signal.metadata else ""
-        ).strip().lower()
-        if purpose != "follower_close_after_master_close":
-            return
-        store = self._position_plan_store
-        if store is None:
-            return
-        position_id = str(
-            signal.metadata.get("position_id", "") if signal.metadata else ""
-        ).strip()
-        if not position_id:
-            return
-        plan = store.get_position(position_id)
-        if plan is None:
-            return
-        plan_meta = dict(plan.metadata or {})
-        current_gen = int(plan_meta.get("follower_close_generation", 0))
-        plan_meta["follower_close_generation"] = current_gen + 1
-        store.upsert_position(replace(plan, metadata=plan_meta))
-        logger.info(
-            "Advanced follower_close_generation | position_id=%s generation=%s",
-            position_id,
-            current_gen + 1,
-        )
 
     async def _validate_order_results_before_journal(
         self,

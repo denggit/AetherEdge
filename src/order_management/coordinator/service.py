@@ -287,6 +287,7 @@ class MultiExchangeOrderCoordinator:
                             "execution_outcome": outcome,
                         },
                     )
+            self._advance_topup_generation(intent)
         logger.info(
             "Follower recovery top-up skipped before planning | "
             "intent_id=%s targets=%s outcome=%s resolutions=%s",
@@ -424,6 +425,40 @@ class MultiExchangeOrderCoordinator:
                             },
                         )
                     )
+        if purpose == "follower_recovery_topup":
+            self._advance_topup_generation(intent)
+
+    def _advance_topup_generation(self, intent: OrderIntent) -> None:
+        signal = intent.signal
+        metadata = dict(signal.metadata or {})
+        if (
+            str(metadata.get("execution_purpose") or "").strip().lower()
+            != "follower_recovery_topup"
+        ):
+            return
+        generation = _durable_generation(metadata, "topup_generation")
+        position_id = str(metadata.get("position_id") or "").strip()
+        if generation is None or not position_id:
+            return
+        legs = {
+            leg.exchange: leg
+            for leg in self.position_plan_store.get_legs(position_id)
+        }
+        for exchange in intent.target_exchanges:
+            leg = legs.get(exchange)
+            if leg is None:
+                continue
+            leg_metadata = dict(leg.metadata or {})
+            persisted = _durable_generation(
+                leg_metadata, "topup_generation", default=0
+            )
+            next_generation = max(persisted or 0, generation + 1)
+            if persisted == next_generation:
+                continue
+            leg_metadata["topup_generation"] = next_generation
+            self.position_plan_store.upsert_leg(
+                replace(leg, metadata=leg_metadata)
+            )
 
     def _record_stop_plan(self, intent: OrderIntent, results: Sequence[ExchangeOrderResult]) -> None:
         signal = intent.signal
@@ -470,6 +505,28 @@ class MultiExchangeOrderCoordinator:
                         or result.exchange is master_exchange
                     ),
                 )
+        self._advance_stop_generation(signal)
+
+    def _advance_stop_generation(self, signal) -> None:
+        metadata = dict(signal.metadata or {})
+        generation = _durable_generation(metadata, "stop_generation")
+        position_id = str(metadata.get("position_id") or "").strip()
+        if generation is None or not position_id:
+            return
+        plan = self.position_plan_store.get_position(position_id)
+        if plan is None:
+            return
+        plan_metadata = dict(plan.metadata or {})
+        persisted = _durable_generation(
+            plan_metadata, "stop_generation", default=0
+        )
+        next_generation = max(persisted or 0, generation + 1)
+        if persisted == next_generation:
+            return
+        plan_metadata["stop_generation"] = next_generation
+        self.position_plan_store.upsert_position(
+            replace(plan, metadata=plan_metadata)
+        )
 
     def _record_close_plan(self, intent: OrderIntent, results: Sequence[ExchangeOrderResult], *, purpose: str) -> None:
         signal = intent.signal
@@ -499,6 +556,7 @@ class MultiExchangeOrderCoordinator:
                         position_id=position_id, exchange=exchange, sync_status=LegSyncStatus.FOLLOWER_CLOSE_FAILED,
                     )
             self._maybe_close_position_plan(position_id)
+            self._advance_follower_close_generation(signal)
             return
 
         if purpose == "normal_close":
@@ -594,6 +652,29 @@ class MultiExchangeOrderCoordinator:
             return
 
         self._maybe_close_position_plan(position_id)
+
+    def _advance_follower_close_generation(self, signal) -> None:
+        metadata = dict(signal.metadata or {})
+        generation = _durable_generation(
+            metadata, "follower_close_generation"
+        )
+        position_id = str(metadata.get("position_id") or "").strip()
+        if generation is None or not position_id:
+            return
+        plan = self.position_plan_store.get_position(position_id)
+        if plan is None:
+            return
+        plan_metadata = dict(plan.metadata or {})
+        persisted = _durable_generation(
+            plan_metadata, "follower_close_generation", default=0
+        )
+        next_generation = max(persisted or 0, generation + 1)
+        if persisted == next_generation:
+            return
+        plan_metadata["follower_close_generation"] = next_generation
+        self.position_plan_store.upsert_position(
+            replace(plan, metadata=plan_metadata)
+        )
 
     def _maybe_close_position_plan(self, position_id: str) -> None:
         plan = self.position_plan_store.get_position(position_id)
@@ -1156,6 +1237,22 @@ def _optional_decimal(value) -> Decimal | None:
     if value in (None, ""):
         return None
     return Decimal(str(value))
+
+
+def _durable_generation(
+    metadata: Mapping[str, Any],
+    key: str,
+    *,
+    default: int | None = None,
+) -> int | None:
+    value = metadata.get(key, default)
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        generation = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return generation if generation >= 0 else None
 
 
 def _requires_manual_on_unconfirmed_master_close(

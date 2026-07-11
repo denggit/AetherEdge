@@ -5,6 +5,17 @@ from decimal import Decimal
 import pytest
 
 from src.order_management.quantity import NativeQuantityConverter
+from src.order_management import (
+    LegPlan,
+    LegRole,
+    LegSyncStatus,
+    MasterFollowerExecutionPolicy,
+    MultiExchangeOrderCoordinator,
+    PositionPlan,
+    PositionPlanStatus,
+    SqliteOrderJournalStore,
+    SqlitePositionPlanStore,
+)
 from src.order_management.safety import RecoveryExitOrderValidator
 from src.order_management.stops import ScopedStopReplaceService, StopScope
 from src.platform import ExchangeName
@@ -17,9 +28,12 @@ from src.platform.exchanges.models import (
     PositionSide,
 )
 from src.platform.markets import get_market_profile
+from src.runtime.orders import LiveOrderIntentFactory
 from src.signals import SignalAction, TradeSignal
 from strategies.eth_lf_portfolio_v8.domain.models import Side
 from strategies.eth_lf_portfolio_v8.strategy import Strategy
+from strategies.eth_portfolio_v1.domain.models import Side as PortfolioSide
+from strategies.eth_portfolio_v1.strategy import Strategy as PortfolioStrategy
 
 
 def test_invalid_stop_replace_does_not_cancel_confirmed_stop() -> None:
@@ -267,6 +281,198 @@ def test_scoped_replace_stages_new_stop_before_scoped_old_stop_cancel() -> None:
     assert signals[1].action is SignalAction.CANCEL_STOP_ORDER
     assert signals[1].metadata["sleeve_id"] == "lf"
     assert all(signal.action is not SignalAction.CANCEL_ALL_STOP_ORDERS for signal in signals)
+
+
+class _SuccessfulStopClient:
+    symbol = "ETH-USDT-PERP"
+
+    def __init__(self, exchange: ExchangeName, *, fail: bool = False) -> None:
+        self.exchange = exchange
+        self.fail = fail
+        self.place_stop_calls = 0
+
+    async def fetch_position_mode(self):
+        return PositionMode.ONE_WAY
+
+    async def place_stop_market_order(self, request):
+        self.place_stop_calls += 1
+        if self.fail:
+            raise RuntimeError("simulated exhausted stop repair failure")
+        return Order(
+            exchange=self.exchange,
+            symbol=request.symbol,
+            raw_symbol=request.symbol,
+            order_id=f"{self.exchange.value}-new-stop",
+            client_order_id=request.client_order_id,
+            status=OrderStatus.NEW,
+            side=request.side,
+            price=request.trigger_price,
+            quantity=request.quantity,
+            raw={"confirmed_stop_price": str(request.trigger_price)},
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exchange", [ExchangeName.OKX, ExchangeName.BINANCE])
+@pytest.mark.parametrize("repair_kind", ["missing", "invalid_replace"])
+@pytest.mark.parametrize("terminal_failure", [False, True])
+async def test_production_stop_repair_persists_generation_for_master_and_follower(
+    tmp_path,
+    exchange,
+    repair_kind,
+    terminal_failure,
+) -> None:
+    position_id = f"stop-generation-{exchange.value}-{repair_kind}"
+    plan_path = tmp_path / f"{position_id}-plans.sqlite3"
+    journal_path = tmp_path / f"{position_id}-journal.sqlite3"
+    plans = SqlitePositionPlanStore(plan_path)
+    plans.upsert_position(
+        PositionPlan(
+            position_id=position_id,
+            strategy_id="eth_portfolio_v1",
+            entry_engine="BULL_RECLAIM_V2",
+            side="long",
+            status=PositionPlanStatus.ACTIVE,
+            canonical_stop_price=Decimal("1900"),
+            master_exchange=ExchangeName.OKX,
+            master_target_qty_base=Decimal("0.1"),
+            master_filled_qty_base=Decimal("0.1"),
+            metadata={"stop_generation": 0},
+        )
+    )
+    for leg_exchange, role in (
+        (ExchangeName.OKX, LegRole.MASTER),
+        (ExchangeName.BINANCE, LegRole.FOLLOWER),
+    ):
+        plans.upsert_leg(
+            LegPlan(
+                position_id=position_id,
+                exchange=leg_exchange,
+                role=role,
+                target_qty_base=Decimal("0.1"),
+                filled_qty_base=Decimal("0.1"),
+                sync_status=LegSyncStatus.OPEN,
+            )
+        )
+
+    strategy = PortfolioStrategy()
+    strategy.position.open_master(
+        side=PortfolioSide.LONG,
+        entry_time_ms=1,
+        avg_entry=Decimal("2000"),
+        qty=Decimal("0.1"),
+        stop_price=Decimal("1900"),
+        entry_engine="BULL_RECLAIM_V2",
+        position_id=position_id,
+    )
+    strategy.position.mark_leg_open(
+        exchange="okx", avg_fill_price=Decimal("2000"), base_qty=Decimal("0.1")
+    )
+    strategy.position.mark_leg_open(
+        exchange="binance", avg_fill_price=Decimal("2000"), base_qty=Decimal("0.1")
+    )
+    old_stop = ()
+    if repair_kind == "invalid_replace":
+        old_stop = (
+            Order(
+                exchange=exchange,
+                symbol="ETH-USDT-PERP",
+                raw_symbol="ETH-USDT-SWAP" if exchange is ExchangeName.OKX else "ETHUSDT",
+                order_id=f"{position_id}-old-stop",
+                client_order_id=f"{position_id}-old-client",
+                status=OrderStatus.NEW,
+                side=OrderSide.SELL,
+                price=Decimal("1850"),
+                quantity=Decimal("0.1"),
+                raw={"reduceOnly": "true", "source": "aetheredge"},
+            ),
+        )
+    validation = RecoveryExitOrderValidator().validate_stop_orders(
+        exchange=exchange,
+        symbol="ETH-USDT-PERP",
+        strategy_id=strategy.config.strategy_id,
+        position_id=position_id,
+        position_side=PositionSide.LONG,
+        position_mode=PositionMode.ONE_WAY,
+        current_position_native_quantity=Decimal("0.1"),
+        canonical_stop_price=Decimal("1900"),
+        open_stop_orders=old_stop,
+        market_profile=get_market_profile("ETH-USDT-PERP"),
+    )
+    signal_0 = strategy._signals_from_recovery_exit_validation(
+        validation=validation,
+        exchange=exchange.value,
+        quantity=Decimal("0.1"),
+        stop_price=Decimal("1900"),
+        reason="RECOVERY_STOP_GENERATION_TEST",
+        stop_generation=0,
+    )[0]
+    assert signal_0.metadata["stop_generation"] == 0
+
+    factory = LiveOrderIntentFactory(
+        strategy_id=strategy.config.strategy_id,
+        target_exchanges=(ExchangeName.OKX, ExchangeName.BINANCE),
+    )
+    intent_0 = factory.create(signal_0, source="recovery")
+    client = _SuccessfulStopClient(exchange, fail=terminal_failure)
+    coordinator = MultiExchangeOrderCoordinator(
+        clients=[client],
+        repository=SqliteOrderJournalStore(journal_path),
+        position_plan_store=plans,
+        master_follower_policy=MasterFollowerExecutionPolicy(
+            master_exchange=ExchangeName.OKX,
+            follower_exchanges=(ExchangeName.BINANCE,),
+        ),
+    )
+    results = await coordinator.execute(intent_0)
+    assert client.place_stop_calls == 1
+    assert all(result.ok == (not terminal_failure) for result in results)
+    restarted_plans = SqlitePositionPlanStore(plan_path)
+    persisted_generation = restarted_plans.get_position(position_id).metadata[
+        "stop_generation"
+    ]
+    assert persisted_generation == 1
+
+    if repair_kind == "invalid_replace" and not terminal_failure:
+        cancels = await strategy.on_order_results(
+            signal=signal_0,
+            results=results,
+            source="recovery",
+            event_time_ms=None,
+        )
+        assert cancels
+        assert all(cancel.metadata["stop_generation"] == 0 for cancel in cancels)
+        assert all(
+            cancel.metadata["stop_order_id"] == f"{position_id}-old-stop"
+            for cancel in cancels
+        )
+
+    restarted_strategy = PortfolioStrategy()
+    restarted_strategy.position.open_master(
+        side=PortfolioSide.LONG,
+        entry_time_ms=1,
+        avg_entry=Decimal("2000"),
+        qty=Decimal("0.1"),
+        stop_price=Decimal("1900"),
+        entry_engine="BULL_RECLAIM_V2",
+        position_id=position_id,
+    )
+    restarted_strategy.position.mark_leg_open(
+        exchange="okx", avg_fill_price=Decimal("2000"), base_qty=Decimal("0.1")
+    )
+    restarted_strategy.position.mark_leg_open(
+        exchange="binance", avg_fill_price=Decimal("2000"), base_qty=Decimal("0.1")
+    )
+    signal_1 = restarted_strategy._signals_from_recovery_exit_validation(
+        validation=validation,
+        exchange=exchange.value,
+        quantity=Decimal("0.1"),
+        stop_price=Decimal("1900"),
+        reason="RECOVERY_STOP_GENERATION_TEST",
+        stop_generation=persisted_generation,
+    )[0]
+    intent_1 = factory.create(signal_1, source="recovery")
+    assert intent_1.intent_id != intent_0.intent_id
 
 
 def _scoped_stop() -> StopScope:

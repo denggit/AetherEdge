@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
@@ -9,6 +11,16 @@ from typing import Any, Iterable, Mapping
 from src.order_management.models import OrderIntent
 from src.platform.exchanges.models import ExchangeName
 from src.signals.models import TradeSignal
+
+
+_GENERATION_KEYS = (
+    "retry_generation",
+    "operation_sequence",
+    "follower_close_generation",
+    "topup_generation",
+    "stop_generation",
+    "master_close_generation",
+)
 
 
 @dataclass(frozen=True)
@@ -135,12 +147,31 @@ def _intent_id(
     """
     # 1. Resolve stable canonical event time from metadata.
     canonical_time = _resolve_canonical_event_time(effective_metadata)
+    explicit_event_time = _canonical_event_time(event_time_ms)
+
+    # Follower-close retries are durable business generations.  The master
+    # close timestamp remains useful audit metadata, but the initial,
+    # recovery, and periodic builders must all resolve generation N to the
+    # same operation identity.
+    follower_close_generation = effective_metadata.get(
+        "follower_close_generation"
+    )
+    is_follower_close_generation = (
+        str(effective_metadata.get("execution_purpose") or "")
+        .strip()
+        .lower()
+        == "follower_close_after_master_close"
+        and _valid_generation(follower_close_generation)
+    )
+    if is_follower_close_generation:
+        canonical_time = None
+        explicit_event_time = None
 
     # 2. Build operation identity parts from stable business metadata.
     op_parts = _operation_identity_parts(effective_metadata)
 
     # 3. Validate minimum identity fields.
-    has_event = canonical_time is not None or event_time_ms is not None
+    has_event = canonical_time is not None or explicit_event_time is not None
     _validate_identity_fields(
         signal.action.value, source, effective_metadata,
         has_event=has_event, has_op_parts=bool(op_parts),
@@ -166,8 +197,8 @@ def _intent_id(
     ]
     if canonical_time is not None:
         parts.append(f"evt={canonical_time}")
-    elif event_time_ms is not None:
-        parts.append(f"evt={event_time_ms}")
+    elif explicit_event_time is not None:
+        parts.append(f"evt={explicit_event_time}")
     if op_parts:
         parts.append(f"op={op_parts}")
 
@@ -196,13 +227,19 @@ def _resolve_canonical_event_time(metadata: Mapping[str, Any]) -> int | None:
         "entry_execution_time_ms",
         "candidate_open_ms",
     ):
-        value = metadata.get(key)
-        if value is not None:
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                continue
+        canonical = _canonical_event_time(metadata.get(key))
+        if canonical is not None:
+            return canonical
     return None
+
+
+def _canonical_event_time(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
 def _operation_identity_parts(metadata: Mapping[str, Any]) -> str:
@@ -236,7 +273,7 @@ def _operation_identity_parts(metadata: Mapping[str, Any]) -> str:
         "stop_generation",
     ):
         raw_value = metadata.get(key)
-        if raw_value is None:
+        if not _is_present(raw_value):
             continue
         canonical = _canonical_value(raw_value)
         if canonical is None:
@@ -279,32 +316,50 @@ def _validate_identity_fields(
                     f"(action={action!r}, source={source!r})"
                 )
 
+    for key in _GENERATION_KEYS:
+        if key in metadata and not _valid_generation(metadata.get(key)):
+            raise ValueError(
+                f"order intent has invalid {key} "
+                f"(action={action!r}, source={source!r})"
+            )
+
     # If execution_purpose is present, verify additional discriminators exist.
     has_purpose = _is_present(metadata.get("execution_purpose"))
     if not has_purpose and not has_op_parts:
         return  # No operation identity to validate.
 
     has_position = _is_present(metadata.get("position_id"))
-    has_event_key = any(
-        metadata.get(k) is not None
-        for k in ("bar_close_time_ms", "signal_time_ms", "event_time_ms",
-                   "candidate_open_ms", "master_close_event_time_ms",
-                   "entry_execution_time_ms")
-    )
     has_generation = any(
-        _is_present(metadata.get(k))
-        for k in ("retry_generation", "operation_sequence",
-                   "follower_close_generation", "topup_generation",
-                   "stop_generation", "master_close_generation")
+        _valid_generation(metadata.get(k)) for k in _GENERATION_KEYS
     )
     has_operation_key = _is_present(metadata.get("operation_key"))
     has_stop_identity = any(
         _is_present(metadata.get(k))
         for k in ("stop_client_order_id", "stop_order_id", "stop_identifier")
     )
-    has_decision_type = _is_present(metadata.get("decision_type"))
+    has_explicit_operation = (
+        has_generation or has_operation_key or has_stop_identity
+    )
+    has_extra = has_event or has_explicit_operation
 
-    has_extra = has_event or has_event_key or has_generation or has_operation_key or has_stop_identity or has_decision_type
+    if not has_extra:
+        raise ValueError(
+            f"order intent has insufficient operation identity "
+            f"(action={action!r}, source={source!r}, "
+            f"missing=generation_or_event_or_key)"
+        )
+
+    if (
+        has_generation
+        and not has_position
+        and not has_operation_key
+        and not has_stop_identity
+    ):
+        raise ValueError(
+            f"order intent has insufficient generation scope "
+            f"(action={action!r}, source={source!r}, "
+            f"missing=position_id_or_operation_key)"
+        )
 
     # position_id alone is not enough.
     if has_position and not has_extra:
@@ -330,6 +385,15 @@ def _is_present(value: Any) -> bool:
     return bool(str(value).strip())
 
 
+def _valid_generation(value: Any) -> bool:
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        return int(value) >= 0
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def _canonical_value(value: Any) -> str | None:
     """Serialize an identity value to a canonical deterministic string.
 
@@ -348,38 +412,70 @@ def _canonical_value(value: Any) -> str | None:
     """
     if value is None:
         return None
-    if isinstance(value, bool):
-        return "1" if value else "0"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, str):
-        return value.strip()
-    if isinstance(value, Decimal):
-        return format(value.normalize(), "f")
-    if isinstance(value, float):
-        return repr(value)
+    return json.dumps(
+        _canonical_json_value(value),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _canonical_json_value(value: Any, *, mapping_key: bool = False) -> Any:
+    """Return a typed JSON value with unambiguous collection boundaries."""
+
     if isinstance(value, Enum):
-        return _canonical_value(value.value)
+        return ["enum", _canonical_json_value(value.value)]
+    if value is None:
+        if mapping_key:
+            raise TypeError("unsupported identity mapping key type: NoneType")
+        return ["none"]
+    if isinstance(value, bool):
+        return ["bool", value]
+    if isinstance(value, int):
+        return ["int", str(value)]
+    if isinstance(value, Decimal):
+        normalized = "0" if value == 0 else format(value.normalize(), "f")
+        return ["decimal", normalized]
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise TypeError("unsupported non-finite identity float")
+        return ["float", repr(value)]
+    if isinstance(value, str):
+        return ["str", value.strip()]
+    if mapping_key:
+        raise TypeError(
+            f"unsupported identity mapping key type: {type(value).__name__}"
+        )
     if isinstance(value, (list, tuple)):
-        items = [_canonical_value(v) for v in value]
-        return "[" + ",".join(item if item is not None else "" for item in items) + "]"
-    if isinstance(value, set):
-        items = sorted(
-            (_canonical_value(v) for v in value),
-            key=lambda x: x if x is not None else "",
-        )
-        return "{" + ",".join(item if item is not None else "" for item in items) + "}"
+        return ["sequence", [_canonical_json_value(item) for item in value]]
+    if isinstance(value, (set, frozenset)):
+        items = [_canonical_json_value(item) for item in value]
+        items.sort(key=_canonical_json_sort_key)
+        return ["set", items]
     if isinstance(value, Mapping):
-        pairs = sorted(
-            (
-                str(k).strip().lower(),
-                _canonical_value(v),
-            )
-            for k, v in value.items()
-        )
-        return "{" + ",".join(
-            f"{k}={v if v is not None else ''}" for k, v in pairs
-        ) + "}"
+        pairs = [
+            [
+                _canonical_json_value(key, mapping_key=True),
+                _canonical_json_value(item),
+            ]
+            for key, item in value.items()
+        ]
+        pairs.sort(key=lambda pair: _canonical_json_sort_key(pair[0]))
+        canonical_keys = [
+            _canonical_json_sort_key(pair[0]) for pair in pairs
+        ]
+        if len(canonical_keys) != len(set(canonical_keys)):
+            raise TypeError("ambiguous canonical identity mapping keys")
+        return ["mapping", pairs]
     raise TypeError(
         f"unsupported identity value type: {type(value).__name__}"
+    )
+
+
+def _canonical_json_sort_key(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
     )

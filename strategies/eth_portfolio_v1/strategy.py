@@ -1559,6 +1559,19 @@ class Strategy:
             # stop cancels become feedback only after every target exchange
             # confirms that new stop; a failed placement can never reach here.
             scoped_cancels = build_confirmed_scoped_cancel_signals(signal)
+            if signal.metadata and "stop_generation" in signal.metadata:
+                scoped_cancels = [
+                    replace(
+                        cancel,
+                        metadata={
+                            **dict(cancel.metadata),
+                            "stop_generation": signal.metadata[
+                                "stop_generation"
+                            ],
+                        },
+                    )
+                    for cancel in scoped_cancels
+                ]
             return [
                 *scoped_cancels,
                 *self._deferred_add_after_confirmed_stop_update_signals(),
@@ -4130,7 +4143,7 @@ class Strategy:
         stop_generation: int = 0,
     ) -> dict[str, Any] | None:
         if exchange == self.config.data_exchange:
-            return None
+            return {"stop_generation": stop_generation}
         return {
             "execution_purpose": "follower_stop_repair",
             "target_exchanges": [exchange],
@@ -4425,6 +4438,7 @@ class Strategy:
                         "execution_purpose": "follower_close_after_master_close",
                         "position_id": self.position.position_id,
                         "master_close_event_time_ms": event_time_ms,
+                        "follower_close_generation": 0,
                         "master_already_closed": True,
                         "close_required_reason": "master_closed_follower_not_closed",
                     },

@@ -801,6 +801,27 @@ def test_fail_closed_purpose_only_no_position_or_generation() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {
+            "position_id": "p1",
+            "execution_purpose": "stop_sync",
+            "bar_close_time_ms": "invalid",
+        },
+        {"decision_type": "open"},
+        {"position_id": "p1"},
+    ],
+)
+def test_fail_closed_rejects_invalid_or_generic_identity(
+    metadata,
+) -> None:
+    factory = _factory()
+
+    with pytest.raises(ValueError, match="insufficient|no stable identity"):
+        factory.create(_signal(metadata=metadata), source="recovery")
+
+
 def test_fail_closed_unserializable_object() -> None:
     """Non-serializable metadata values must fail closed."""
     from src.runtime.orders import _canonical_value
@@ -832,7 +853,9 @@ def test_canonical_serializer_set_order_independent() -> None:
 def test_canonical_serializer_enum() -> None:
     from src.runtime.orders import _canonical_value
 
-    assert _canonical_value(SignalAction.OPEN_LONG) == "open_long"
+    encoded = _canonical_value(SignalAction.OPEN_LONG)
+    assert "open_long" in encoded
+    assert "OPEN_LONG" not in encoded
 
 
 def test_canonical_serializer_decimal() -> None:
@@ -850,8 +873,8 @@ def test_canonical_serializer_list_and_tuple() -> None:
 def test_canonical_serializer_bool() -> None:
     from src.runtime.orders import _canonical_value
 
-    assert _canonical_value(True) == "1"
-    assert _canonical_value(False) == "0"
+    assert _canonical_value(True) != _canonical_value(1)
+    assert _canonical_value(False) != _canonical_value(0)
 
 
 def test_canonical_serializer_none() -> None:
@@ -863,4 +886,37 @@ def test_canonical_serializer_none() -> None:
 def test_canonical_serializer_string_strip() -> None:
     from src.runtime.orders import _canonical_value
 
-    assert _canonical_value("  hello  ") == "hello"
+    assert _canonical_value("  hello  ") == _canonical_value("hello")
+
+
+def test_canonical_serializer_has_unambiguous_sequence_boundaries() -> None:
+    from src.runtime.orders import _canonical_value
+
+    assert _canonical_value(["a,b"]) != _canonical_value(["a", "b"])
+
+
+def test_canonical_serializer_has_unambiguous_mapping_boundaries() -> None:
+    from src.runtime.orders import _canonical_value
+
+    assert _canonical_value({"a": "1,b=2"}) != _canonical_value(
+        {"a": "1", "b": "2"}
+    )
+
+
+def test_canonical_serializer_rejects_unsupported_mapping_members() -> None:
+    from src.runtime.orders import _canonical_value
+
+    class Unsupported:
+        pass
+
+    with pytest.raises(TypeError, match="mapping key"):
+        _canonical_value({Unsupported(): "value"})
+    with pytest.raises(TypeError, match="unsupported identity value"):
+        _canonical_value({"key": Unsupported()})
+
+
+def test_canonical_serializer_rejects_keys_that_normalize_to_collision() -> None:
+    from src.runtime.orders import _canonical_value
+
+    with pytest.raises(TypeError, match="ambiguous canonical"):
+        _canonical_value({" key": 1, "key ": 2})

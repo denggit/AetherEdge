@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -15,9 +16,14 @@ from src.order_management import (
     PositionPlanStatus,
     SqliteOrderJournalStore,
     SqlitePositionPlanStore,
+    MasterFollowerExecutionPolicy,
 )
+from src.order_management.idempotency import DuplicateIntentError
 from src.platform import ExchangeName, InstrumentRule, get_market_profile
+from src.runtime.orders import LiveOrderIntentFactory
 from src.signals import SignalAction, TradeSignal
+from strategies.eth_portfolio_v1.domain.models import Side
+from strategies.eth_portfolio_v1.strategy import Strategy as PortfolioStrategy
 
 
 class _NoWriteBinanceClient:
@@ -142,6 +148,12 @@ class _SuccessfulBinanceClient:
         )
 
 
+class _ExhaustedBinanceClient(_SuccessfulBinanceClient):
+    async def place_order(self, request):
+        self.place_order_calls += 1
+        raise RuntimeError("simulated exhausted topup failure")
+
+
 class _NonExecutableOkxClient:
     exchange = ExchangeName.OKX
     symbol = "ETH-USDT-PERP"
@@ -264,6 +276,214 @@ async def test_multi_exchange_recovery_topup_journal_persists_filtered_targets(
     assert saved is not None
     assert saved.target_exchanges == (ExchangeName.BINANCE,)
     assert saved.metadata.get("target_exchanges") == ["binance"]
+
+
+@pytest.mark.asyncio
+async def test_production_topup_builder_persists_retry_generation_across_restart(
+    tmp_path,
+) -> None:
+    journal_path = tmp_path / "journal-durable-topup.sqlite3"
+    plan_path = tmp_path / "plans-durable-topup.sqlite3"
+    plans = SqlitePositionPlanStore(plan_path)
+    _seed_plan_for_normalized_test(plans)
+    leg = {
+        item.exchange: item
+        for item in plans.get_legs("p-normalized-test")
+    }[ExchangeName.BINANCE]
+    plans.upsert_leg(replace(leg, metadata={"topup_generation": 0}))
+
+    strategy = PortfolioStrategy()
+    plan_payload = plans.serialize_active_positions()[0]["position"]
+    signal_0 = strategy._follower_topup_signal(
+        exchange="binance",
+        side=Side.LONG,
+        quantity=Decimal("0.0034"),
+        plan=plan_payload,
+        quantity_metadata={"reference_price": "2000"},
+        topup_generation=leg.metadata.get("topup_generation", 0),
+    )
+    factory = LiveOrderIntentFactory(
+        strategy_id=strategy.config.strategy_id,
+        target_exchanges=(ExchangeName.OKX, ExchangeName.BINANCE),
+    )
+    intent_0 = factory.create(signal_0, source="recovery")
+    client_0 = _SuccessfulBinanceClient()
+    coordinator_0 = MultiExchangeOrderCoordinator(
+        clients=[client_0],
+        repository=SqliteOrderJournalStore(journal_path),
+        position_plan_store=plans,
+        master_follower_policy=MasterFollowerExecutionPolicy(
+            master_exchange=ExchangeName.OKX,
+            follower_exchanges=(ExchangeName.BINANCE,),
+        ),
+    )
+
+    await coordinator_0.execute(intent_0)
+
+    restarted_plans = SqlitePositionPlanStore(plan_path)
+    restarted_leg = {
+        item.exchange: item
+        for item in restarted_plans.get_legs("p-normalized-test")
+    }[ExchangeName.BINANCE]
+    assert restarted_leg.metadata["topup_generation"] == 1
+
+    restarted_strategy = PortfolioStrategy()
+    signal_1 = restarted_strategy._follower_topup_signal(
+        exchange="binance",
+        side=Side.LONG,
+        quantity=Decimal("0.0034"),
+        plan=restarted_plans.serialize_active_positions()[0]["position"],
+        quantity_metadata={"reference_price": "2000"},
+        topup_generation=restarted_leg.metadata["topup_generation"],
+    )
+    intent_1 = factory.create(signal_1, source="recovery")
+    assert intent_1.intent_id != intent_0.intent_id
+
+    client_1 = _SuccessfulBinanceClient()
+    restarted_coordinator = MultiExchangeOrderCoordinator(
+        clients=[client_1],
+        repository=SqliteOrderJournalStore(journal_path),
+        position_plan_store=restarted_plans,
+        master_follower_policy=MasterFollowerExecutionPolicy(
+            master_exchange=ExchangeName.OKX,
+            follower_exchanges=(ExchangeName.BINANCE,),
+        ),
+    )
+    await restarted_coordinator.execute(intent_1)
+    replay = factory.create(signal_1, source="startup_recovery")
+    assert replay.intent_id == intent_1.intent_id
+    with pytest.raises(DuplicateIntentError):
+        await restarted_coordinator.execute(replay)
+    assert client_1.place_order_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_crash_before_topup_generation_write_replays_same_claimed_intent(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    journal_path = tmp_path / "journal-crash-topup.sqlite3"
+    plan_path = tmp_path / "plans-crash-topup.sqlite3"
+    plans = SqlitePositionPlanStore(plan_path)
+    _seed_plan_for_normalized_test(plans)
+    leg = {
+        item.exchange: item
+        for item in plans.get_legs("p-normalized-test")
+    }[ExchangeName.BINANCE]
+    plans.upsert_leg(replace(leg, metadata={"topup_generation": 0}))
+    strategy = PortfolioStrategy()
+    signal = strategy._follower_topup_signal(
+        exchange="binance",
+        side=Side.LONG,
+        quantity=Decimal("0.0034"),
+        plan=plans.serialize_active_positions()[0]["position"],
+        quantity_metadata={"reference_price": "2000"},
+        topup_generation=0,
+    )
+    factory = LiveOrderIntentFactory(
+        strategy_id=strategy.config.strategy_id,
+        target_exchanges=(ExchangeName.OKX, ExchangeName.BINANCE),
+    )
+    intent = factory.create(signal, source="recovery")
+    real_upsert_leg = plans.upsert_leg
+
+    def crash_on_generation_write(candidate):
+        if candidate.metadata.get("topup_generation") == 1:
+            raise RuntimeError("simulated crash before generation update")
+        real_upsert_leg(candidate)
+
+    monkeypatch.setattr(plans, "upsert_leg", crash_on_generation_write)
+    first_client = _SuccessfulBinanceClient()
+    coordinator = MultiExchangeOrderCoordinator(
+        clients=[first_client],
+        repository=SqliteOrderJournalStore(journal_path),
+        position_plan_store=plans,
+        master_follower_policy=MasterFollowerExecutionPolicy(
+            master_exchange=ExchangeName.OKX,
+            follower_exchanges=(ExchangeName.BINANCE,),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await coordinator.execute(intent)
+    assert first_client.place_order_calls == 1
+
+    restarted_plans = SqlitePositionPlanStore(plan_path)
+    restarted_leg = {
+        item.exchange: item
+        for item in restarted_plans.get_legs("p-normalized-test")
+    }[ExchangeName.BINANCE]
+    assert restarted_leg.metadata["topup_generation"] == 0
+    replay_signal = PortfolioStrategy()._follower_topup_signal(
+        exchange="binance",
+        side=Side.LONG,
+        quantity=Decimal("0.0034"),
+        plan=restarted_plans.serialize_active_positions()[0]["position"],
+        quantity_metadata={"reference_price": "2000"},
+        topup_generation=restarted_leg.metadata["topup_generation"],
+    )
+    replay = factory.create(replay_signal, source="startup_recovery")
+    assert replay.intent_id == intent.intent_id
+    second_client = _SuccessfulBinanceClient()
+    restarted = MultiExchangeOrderCoordinator(
+        clients=[second_client],
+        repository=SqliteOrderJournalStore(journal_path),
+        position_plan_store=restarted_plans,
+        master_follower_policy=MasterFollowerExecutionPolicy(
+            master_exchange=ExchangeName.OKX,
+            follower_exchanges=(ExchangeName.BINANCE,),
+        ),
+    )
+    with pytest.raises(DuplicateIntentError):
+        await restarted.execute(replay)
+    assert second_client.place_order_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_exhausted_production_topup_advances_durable_generation(
+    tmp_path,
+) -> None:
+    plans = SqlitePositionPlanStore(tmp_path / "plans-failed-topup.sqlite3")
+    _seed_plan_for_normalized_test(plans)
+    leg = {
+        item.exchange: item
+        for item in plans.get_legs("p-normalized-test")
+    }[ExchangeName.BINANCE]
+    plans.upsert_leg(replace(leg, metadata={"topup_generation": 0}))
+    strategy = PortfolioStrategy()
+    signal = strategy._follower_topup_signal(
+        exchange="binance",
+        side=Side.LONG,
+        quantity=Decimal("0.0034"),
+        plan=plans.serialize_active_positions()[0]["position"],
+        quantity_metadata={"reference_price": "2000"},
+        topup_generation=0,
+    )
+    intent = LiveOrderIntentFactory(
+        strategy_id=strategy.config.strategy_id,
+        target_exchanges=(ExchangeName.OKX, ExchangeName.BINANCE),
+    ).create(signal, source="recovery")
+    client = _ExhaustedBinanceClient()
+    coordinator = MultiExchangeOrderCoordinator(
+        clients=[client],
+        repository=SqliteOrderJournalStore(
+            tmp_path / "journal-failed-topup.sqlite3"
+        ),
+        position_plan_store=plans,
+        master_follower_policy=MasterFollowerExecutionPolicy(
+            master_exchange=ExchangeName.OKX,
+            follower_exchanges=(ExchangeName.BINANCE,),
+        ),
+    )
+
+    results = await coordinator.execute(intent)
+
+    assert results and results[0].ok is False
+    assert client.place_order_calls == 1
+    persisted = SqlitePositionPlanStore(plans.path).get_legs(
+        "p-normalized-test"
+    )[0]
+    assert persisted.metadata["topup_generation"] == 1
 
 
 def _seed_plan(store: SqlitePositionPlanStore) -> None:
