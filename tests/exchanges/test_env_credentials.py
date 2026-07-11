@@ -20,6 +20,31 @@ def _reset_project_env_config():
     reset_project_env_config_for_tests()
 
 
+_REQUIRED_CREDENTIAL_FIELDS = (
+    (ExchangeName.OKX, "api_key"),
+    (ExchangeName.OKX, "api_secret"),
+    (ExchangeName.OKX, "passphrase"),
+    (ExchangeName.BINANCE, "api_key"),
+    (ExchangeName.BINANCE, "api_secret"),
+)
+
+
+def _credential_config(
+    exchange: ExchangeName,
+    field: str,
+    value: object,
+) -> ExchangeConfig:
+    values = {
+        "api_key": "valid-canary-api-key-2026",
+        "api_secret": "valid-canary-api-secret-2026",
+        "passphrase": "valid-canary-passphrase-2026",
+    }
+    values[field] = value
+    if exchange is ExchangeName.BINANCE:
+        values["passphrase"] = None
+    return ExchangeConfig(**values)
+
+
 def test_load_env_config_reads_dotenv_and_process_env_wins(tmp_path):
     env_file = tmp_path / ".env"
     env_file.write_text('OKX_API_KEY="from_file"\nOKX_SECRET_KEY=file_secret\n', encoding="utf-8")
@@ -304,6 +329,175 @@ def test_private_credential_validator_rejects_documented_placeholders(
     assert exc_info.value.code == "placeholder_private_credentials"
     assert f"placeholder_fields={expected_field}" in text
     assert "canary_" not in text
+
+
+@pytest.mark.parametrize(
+    "placeholder",
+    (
+        "changeme",
+        "CHANGEME",
+        "  ChangeMe",
+        "change_me",
+        "CHANGE_ME",
+        "change-me",
+        "CHANGE-ME",
+        "placeholder",
+        "PLACEHOLDER",
+        "your_api_key",
+        "YOUR_API_KEY",
+        "your_secret_key",
+        "YOUR_SECRET_KEY",
+        "your_passphrase",
+        "YOUR_PASSPHRASE",
+        "xxx",
+        "XXX",
+    ),
+)
+@pytest.mark.parametrize(("exchange", "field"), _REQUIRED_CREDENTIAL_FIELDS)
+def test_private_credential_validator_rejects_generic_placeholders(
+    exchange,
+    field,
+    placeholder,
+):
+    with pytest.raises(PrivateCredentialValidationError) as exc_info:
+        validate_private_credentials(
+            exchange,
+            _credential_config(exchange, field, placeholder),
+        )
+
+    assert exc_info.value.code == "placeholder_private_credentials"
+    assert exc_info.value.placeholder_fields == (field,)
+    assert "valid-canary" not in str(exc_info.value)
+    assert "valid-canary" not in repr(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "placeholder",
+    (
+        "<API_KEY>",
+        "<SECRET>",
+        "<YOUR_CUSTOM_SECRET>",
+        "<...>",
+        "<>",
+        "<  >",
+        "  <API_KEY>",
+    ),
+)
+@pytest.mark.parametrize(("exchange", "field"), _REQUIRED_CREDENTIAL_FIELDS)
+def test_private_credential_validator_rejects_complete_angle_placeholders(
+    exchange,
+    field,
+    placeholder,
+):
+    with pytest.raises(PrivateCredentialValidationError) as exc_info:
+        validate_private_credentials(
+            exchange,
+            _credential_config(exchange, field, placeholder),
+        )
+
+    assert exc_info.value.code == "placeholder_private_credentials"
+    assert exc_info.value.placeholder_fields == (field,)
+
+
+@pytest.mark.parametrize(
+    "placeholder",
+    (
+        "${API_KEY}",
+        "${SECRET}",
+        "${YOUR_CUSTOM_SECRET}",
+        "${...}",
+        "${}",
+        "  ${API_KEY}",
+    ),
+)
+@pytest.mark.parametrize(("exchange", "field"), _REQUIRED_CREDENTIAL_FIELDS)
+def test_private_credential_validator_rejects_complete_env_templates(
+    exchange,
+    field,
+    placeholder,
+):
+    with pytest.raises(PrivateCredentialValidationError) as exc_info:
+        validate_private_credentials(
+            exchange,
+            _credential_config(exchange, field, placeholder),
+        )
+
+    assert exc_info.value.code == "placeholder_private_credentials"
+    assert exc_info.value.placeholder_fields == (field,)
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "prod-changeme-key-2026",
+        "change_me_now",
+        "change-me-production",
+        "placeholder_real_secret",
+        "notplaceholder",
+        "my_your_api_key_2026",
+        "your_secret_key_backup_real",
+        "your_passphrase_prod_001",
+        "xxx123",
+        "123xxx",
+        "real-key-<API_KEY>",
+        "<API_KEY>-real",
+        "prefix<secret>suffix",
+        "abc<def",
+        "abc>def",
+        "real-${API_KEY}",
+        "${API_KEY}-real",
+        "prefix${SECRET}suffix",
+        "$${API_KEY}",
+        "${API_KEY",
+        "API_KEY}",
+    ),
+)
+@pytest.mark.parametrize("field", ("api_key", "api_secret", "passphrase"))
+def test_private_credential_validator_accepts_placeholder_near_misses(
+    field,
+    value,
+):
+    validate_private_credentials(
+        ExchangeName.OKX,
+        _credential_config(ExchangeName.OKX, field, value),
+    )
+
+
+def test_private_credential_validator_preserves_mixed_error_classification():
+    config = ExchangeConfig(
+        api_key="",
+        api_secret="changeme",
+        passphrase="real-canary-pass",
+    )
+
+    with pytest.raises(PrivateCredentialValidationError) as exc_info:
+        validate_private_credentials(ExchangeName.OKX, config)
+
+    assert exc_info.value.code == "invalid_private_credentials"
+    assert exc_info.value.missing_fields == ("api_key",)
+    assert exc_info.value.placeholder_fields == ("api_secret",)
+    assert "real-canary-pass" not in str(exc_info.value)
+    assert "real-canary-pass" not in repr(exc_info.value)
+
+
+def test_generic_placeholder_failure_never_leaks_other_credentials(caplog):
+    config = ExchangeConfig(
+        api_key="changeme",
+        api_secret="unique-real-secret-canary",
+        passphrase="unique-real-pass-canary",
+    )
+
+    with pytest.raises(PrivateCredentialValidationError) as exc_info:
+        validate_private_credentials(ExchangeName.OKX, config)
+
+    for secret in (
+        "unique-real-secret-canary",
+        "unique-real-pass-canary",
+    ):
+        assert secret not in str(exc_info.value)
+        assert secret not in repr(exc_info.value)
+        assert secret not in caplog.text
+        assert secret not in repr(config)
 
 
 def test_private_credential_validator_allows_sandbox_and_testnet_values():

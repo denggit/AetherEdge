@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Protocol
 
 from src.platform.exchanges.errors import PrivateCredentialValidationError
@@ -41,6 +42,22 @@ _PLACEHOLDER_VALUES = frozenset(
     }
 )
 
+_GENERIC_PLACEHOLDER_VALUES = frozenset(
+    {
+        "changeme",
+        "change_me",
+        "change-me",
+        "placeholder",
+        "your_api_key",
+        "your_secret_key",
+        "your_passphrase",
+        "xxx",
+    }
+)
+
+_ANGLE_BRACKET_PLACEHOLDER = re.compile(r"<[^<>]*>")
+_ENV_TEMPLATE_PLACEHOLDER = re.compile(r"\$\{[^{}]*\}")
+
 
 def validate_private_credentials(
     exchange: object,
@@ -64,7 +81,7 @@ def validate_private_credentials(
         normalized = _normalized_value(value)
         if not normalized:
             missing_fields.append(field)
-        elif normalized in _PLACEHOLDER_VALUES:
+        elif _is_placeholder_value(normalized):
             placeholder_fields.append(field)
 
     if not missing_fields and not placeholder_fields:
@@ -90,6 +107,15 @@ def _exchange_name(exchange: object) -> str:
 
 def _normalized_value(value: object) -> str:
     return "" if value is None else str(value).strip().casefold()
+
+
+def _is_placeholder_value(normalized: str) -> bool:
+    return (
+        normalized in _PLACEHOLDER_VALUES
+        or normalized in _GENERIC_PLACEHOLDER_VALUES
+        or _ANGLE_BRACKET_PLACEHOLDER.fullmatch(normalized) is not None
+        or _ENV_TEMPLATE_PLACEHOLDER.fullmatch(normalized) is not None
+    )
 
 
 __all__ = ["validate_private_credentials"]
