@@ -781,8 +781,8 @@ class MultiExchangeOrderCoordinator:
             request = item.cancel_stop_request
             return None if request is None else request.client_order_id
         return self.client_order_id_factory.create(
-            strategy_id=intent.strategy_id,
-            signal=item.signal,
+            intent_id=intent.intent_id,
+            action=item.signal.action,
             exchange=client.exchange,
             sequence=sequence,
         )

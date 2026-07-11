@@ -4,7 +4,7 @@ from typing import Protocol, Sequence
 
 from src.order_management.models import ExchangeOrderResult, OrderIntent, OrderIntentStatus
 from src.platform.exchanges.models import ExchangeName
-from src.signals.models import TradeSignal
+from src.signals.models import SignalAction
 
 
 class OrderIntentRepository(Protocol):
@@ -22,7 +22,14 @@ class OrderIntentRepository(Protocol):
 
 
 class ClientOrderIdFactory(Protocol):
-    def create(self, *, strategy_id: str, signal: TradeSignal, exchange: ExchangeName, sequence: int = 0) -> str:
+    def create(
+        self,
+        *,
+        intent_id: str,
+        action: SignalAction,
+        exchange: ExchangeName,
+        sequence: int = 0,
+    ) -> str:
         ...
 
 

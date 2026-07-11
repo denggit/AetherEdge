@@ -2832,7 +2832,7 @@ class LiveRuntimeRunner:
         await self._execute_signals(
             signals_to_execute,
             source="startup_catchup",
-            event_time_ms=now_ms,
+            event_time_ms=candidate_open,
             metadata={
                 "startup_catchup": True,
                 "fresh_window_age_seconds": fresh_window_age_ms // 1000,

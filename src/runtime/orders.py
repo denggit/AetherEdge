@@ -90,19 +90,107 @@ def _normalize_target_values(raw: Any) -> list[str]:
     return values
 
 
-def _intent_id(*, strategy_id: str, signal: TradeSignal, source: str, event_time_ms: int | None, target_exchanges: tuple[ExchangeName, ...]) -> str:
+# ── Stable intent identity ───────────────────────────────────────────────────
+
+
+def _intent_id(
+    *,
+    strategy_id: str,
+    signal: TradeSignal,
+    source: str,
+    event_time_ms: int | None,
+    target_exchanges: tuple[ExchangeName, ...],
+) -> str:
+    """Generate a stable intent_id from business keys.
+
+    Does NOT use ``signal.created_time_ms``, ``time.time()``, UUID, or any
+    value that changes across replays of the same logical business event.
+    """
+    metadata = signal.metadata or {}
+
+    # 1. Resolve stable canonical event time from metadata.
+    canonical_time = _resolve_canonical_event_time(metadata)
+
+    # 2. Resolve operation identity from stable business metadata.
+    op_identity = _operation_identity(metadata)
+
+    # 3. Prefer operation identity (most specific), then canonical time, then
+    #    the event_time_ms parameter.
+    if op_identity:
+        stable_time = op_identity
+    elif canonical_time is not None:
+        stable_time = str(canonical_time)
+    else:
+        stable_time = str(event_time_ms or "")
+
+    # Target exchanges sorted for identity (set semantics).
+    sorted_exchanges = sorted(exchange.value for exchange in target_exchanges)
+
     raw = "|".join(
         [
             strategy_id,
             signal.symbol,
             signal.action.value,
-            ",".join(exchange.value for exchange in target_exchanges),
-            str(signal.created_time_ms),
-            str(event_time_ms or ""),
             source,
-            str(signal.quantity or ""),
-            str(signal.price or ""),
-            str(signal.trigger_price or ""),
+            stable_time,
+            ",".join(sorted_exchanges),
         ]
     )
     return "intent-" + hashlib.blake2b(raw.encode("utf-8"), digest_size=12).hexdigest()
+
+
+def _resolve_canonical_event_time(metadata: Mapping[str, Any]) -> int | None:
+    """Extract a stable event timestamp from signal metadata.
+
+    Priority order follows the canonical event identity chain:
+    explicit event_time_ms -> bar_close_time_ms -> signal_time_ms ->
+    master_close_event_time_ms -> entry_execution_time_ms ->
+    candidate_open_ms -> created_time_ms.
+
+    Returns ``None`` when no canonical time is available.
+    """
+    for key in (
+        "event_time_ms",
+        "bar_close_time_ms",
+        "signal_time_ms",
+        "master_close_event_time_ms",
+        "entry_execution_time_ms",
+        "candidate_open_ms",
+        "created_time_ms",
+    ):
+        value = metadata.get(key)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _operation_identity(metadata: Mapping[str, Any]) -> str:
+    """Derive a stable operation identity string from business metadata.
+
+    Only fields that describe *which business operation* this intent represents
+    are included.  Audit, logging, price-protection, and equity-snapshot fields
+    are intentionally excluded so they cannot accidentally create new identities.
+
+    Returns an empty string when no operation-identity fields are present.
+    """
+    parts: list[str] = []
+    for key in (
+        "position_id",
+        "execution_purpose",
+        "operation_key",
+        "operation_sequence",
+        "retry_generation",
+        "position_generation",
+        "decision_type",
+        "stop_identifier",
+        "stop_replace_stage",
+        "stop_client_order_id",
+        "stop_order_id",
+    ):
+        value = metadata.get(key)
+        if value is not None:
+            parts.append(f"{key}={value}")
+    return ";".join(parts)
