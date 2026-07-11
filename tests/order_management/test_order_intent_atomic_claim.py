@@ -34,6 +34,44 @@ def _intent(label: str, *, intent_id: str = "shared-intent") -> OrderIntent:
     )
 
 
+def test_update_claimed_intent_persists_normalized_signal_and_targets(
+    tmp_path,
+) -> None:
+    """update_claimed_intent must update signal, targets, status, and metadata
+    while preserving identity fields (strategy_id, created_time_ms)."""
+    db_path = tmp_path / "journal.sqlite3"
+    repository = SqliteOrderJournalStore(db_path)
+    original = _intent("first")
+    assert repository.claim_intent(original) is True
+
+    normalized_signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.OPEN_LONG,
+        quantity=Decimal("0.003"),
+        metadata={"owner": "first", "coordinator_quantity_normalized": True},
+        created_time_ms=100,
+    )
+    normalized_intent = OrderIntent(
+        intent_id="shared-intent",
+        strategy_id="strategy-first",
+        signal=normalized_signal,
+        target_exchanges=(ExchangeName.BINANCE,),
+        metadata={"claim_owner": "first", "target_exchanges": ["binance"]},
+        created_time_ms=100,
+    )
+    repository.update_claimed_intent(normalized_intent)
+
+    loaded = repository.get_intent(original.intent_id)
+    assert loaded is not None
+    assert loaded.signal.quantity == Decimal("0.003")
+    assert loaded.signal.metadata.get("coordinator_quantity_normalized") is True
+    assert loaded.target_exchanges == (ExchangeName.BINANCE,)
+    assert loaded.metadata.get("target_exchanges") == ["binance"]
+    assert loaded.strategy_id == "strategy-first"
+    assert loaded.created_time_ms == 100
+    assert _count_events(db_path, "intent_saved") == 1
+
+
 def test_duplicate_claim_does_not_overwrite_original_payload_or_add_records(
     tmp_path,
 ) -> None:

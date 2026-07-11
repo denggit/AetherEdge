@@ -56,10 +56,18 @@ class SqliteOrderJournalStore:
             cursor = conn.execute(
                 """
                 UPDATE order_intents
-                SET status = ?, metadata_json = ?
+                SET signal_json = ?,
+                    target_exchanges_json = ?,
+                    status = ?,
+                    metadata_json = ?
                 WHERE intent_id = ?
                 """,
                 (
+                    _signal_to_json(intent.signal),
+                    json.dumps(
+                        [exchange.value for exchange in intent.target_exchanges],
+                        separators=(",", ":"),
+                    ),
                     intent.status.value,
                     _json(intent.metadata),
                     intent.intent_id,
