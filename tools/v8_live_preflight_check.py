@@ -33,9 +33,12 @@ from src.order_management.quantity import NativeQuantityConverter
 from src.order_management.safety import RecoveryExitOrderValidator
 from src.platform import ExchangeName
 from src.platform.account.factory import create_account_client
+from src.platform.config import load_project_env_config, set_project_env_config
 from src.platform.data.factory import create_market_data_feed
 from src.platform.data.models import MarketTrade, TradeSide
 from src.platform.execution.factory import create_execution_client
+from src.platform.exchanges.credentials import validate_private_credentials
+from src.platform.exchanges.errors import ExchangeConfigError
 from src.platform.exchanges.models import ExchangeConfig, MarginMode, Position, PositionMode, PositionSide
 from src.platform.markets import get_market_profile
 from src.runtime import RuntimeMode, live_runtime_config_from_app, runtime_mode_from_env
@@ -117,9 +120,11 @@ async def main() -> int:
     report = PreflightReport(started_time_ms=_now_ms())
 
     try:
-        app = AppConfig.from_env(defaults_path=args.defaults, env_file=args.env_file)
-        runtime_mode = runtime_mode_from_env(defaults_path=args.defaults, env_file=args.env_file)
-        runtime = live_runtime_config_from_app(app, defaults_path=args.defaults, env_file=args.env_file)
+        project_env = load_project_env_config(env_file=args.env_file)
+        set_project_env_config(project_env)
+        app = AppConfig.from_env(defaults_path=args.defaults)
+        runtime_mode = runtime_mode_from_env(defaults_path=args.defaults)
+        runtime = live_runtime_config_from_app(app, defaults_path=args.defaults)
         strategy = load_strategy(app.strategy)
         requirements = resolve_strategy_runtime_requirements(strategy, fallback_data_streams=app.data_streams)
     except Exception as exc:
@@ -138,6 +143,20 @@ async def main() -> int:
     _check_local_writable(report, app=app)
 
     if not args.skip_api:
+        try:
+            for exchange in app.exchanges:
+                validate_private_credentials(
+                    exchange,
+                    ExchangeConfig.from_env(
+                        exchange,
+                        env=project_env.values,
+                    ),
+                )
+        except ExchangeConfigError as exc:
+            report.add("private_credentials", "fail", error=str(exc))
+            await _write_report(args.report, report)
+            logger.info("V8 live preflight report | report=%s", report.to_json())
+            return 1
         allow_recovery_start = bool(args.allow_recovery_start or args.expect_recovery_live)
         strategy_id = getattr(getattr(strategy, "config", None), "strategy_id", None)
         await _check_exchange_read_apis(

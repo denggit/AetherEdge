@@ -20,6 +20,9 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.platform import ExchangeName, RuntimeConfig, PlatformRuntime, build_runtime_context
+from src.platform.config import load_project_env_config, set_project_env_config
+from src.platform.exchanges.credentials import validate_private_credentials
+from src.platform.exchanges.models import ExchangeConfig
 from src.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -35,14 +38,28 @@ async def main() -> None:
     parser.add_argument("--max-events", type=int, default=None)
     args = parser.parse_args()
 
+    project_env = load_project_env_config(env_file=REPO_ROOT / ".env")
+    set_project_env_config(project_env)
+    exchange = ExchangeName(args.exchange)
+    exchange_config = ExchangeConfig.from_env(
+        exchange,
+        env=project_env.values,
+    )
+    validate_private_credentials(exchange, exchange_config)
     config = RuntimeConfig(
-        exchange=ExchangeName(args.exchange),
+        exchange=exchange,
         symbol=args.symbol,
         asset=args.asset,
         state_db_path=args.state_db,
         enable_private_event_stream=not args.no_event_stream,
     )
-    runtime = PlatformRuntime(config=config, context=build_runtime_context(config))
+    runtime = PlatformRuntime(
+        config=config,
+        context=build_runtime_context(
+            config,
+            exchange_config=exchange_config,
+        ),
+    )
     logger.info("Platform runtime skeleton starting | exchange=%s symbol=%s event_stream=%s", args.exchange, args.symbol, not args.no_event_stream)
     result = await runtime.run(max_account_events=args.max_events)
     logger.info(

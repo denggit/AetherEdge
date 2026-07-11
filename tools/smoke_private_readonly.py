@@ -17,8 +17,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.platform import create_account_client, create_execution_client, fetch_platform_snapshot
-from src.platform.config import load_env_config
+from src.platform.config import load_project_env_config, set_project_env_config
+from src.platform.exchanges.credentials import validate_private_credentials
 from src.platform.exchanges.errors import ExchangeApiError
+from src.platform.exchanges.models import ExchangeConfig
 from src.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -30,22 +32,39 @@ async def main() -> None:
     parser.add_argument("--symbol", default="ETH-USDT-PERP")
     parser.add_argument("--asset", default="USDT")
     args = parser.parse_args()
-    env = load_env_config()
-    exchange = args.exchange or (env.get("AETHER_EXCHANGES", "okx").split(",")[0].strip() or "okx")
+    project_env = load_project_env_config(env_file=REPO_ROOT / ".env")
+    set_project_env_config(project_env)
+    exchange = args.exchange or (
+        project_env.get("AETHER_EXCHANGES", "okx").split(",")[0].strip()
+        or "okx"
+    )
+    exchange_config = ExchangeConfig.from_env(
+        exchange,
+        env=project_env.values,
+    )
+    validate_private_credentials(exchange, exchange_config)
 
-    account = create_account_client(exchange, symbol=args.symbol)
-    execution = create_execution_client(exchange, symbol=args.symbol, validate_orders=False)
+    account = create_account_client(
+        exchange,
+        symbol=args.symbol,
+        config=exchange_config,
+    )
+    execution = create_execution_client(
+        exchange,
+        symbol=args.symbol,
+        config=exchange_config,
+        validate_orders=False,
+    )
     try:
         snapshot = await fetch_platform_snapshot(account=account, execution=execution, asset=args.asset)
     except ExchangeApiError as exc:
         logger.error(
-            "Private readonly smoke failed | exchange=%s symbol=%s status_code=%s payload=%s hint=%s error=%s",
+            "Private readonly smoke failed | exchange=%s symbol=%s status_code=%s error_type=%s hint=%s",
             exchange,
             args.symbol,
             exc.status_code,
-            exc.payload,
+            type(exc).__name__,
             "If this is OKX HTTP 403, first check API key environment mismatch, IP whitelist, and whether your server IP/User-Agent is blocked.",
-            exc,
         )
         raise SystemExit(1) from exc
     logger.info(

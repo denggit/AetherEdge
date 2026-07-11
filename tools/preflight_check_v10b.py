@@ -25,6 +25,7 @@ from strategies.eth_lf_portfolio_v10b.execution.structural_stop import (
     StructuralStopConfig,
     evaluate_swing_structural_stop,
 )
+from src.platform.config import load_project_env_config, set_project_env_config
 
 
 EXPECTED_STRATEGY = "strategies.eth_lf_portfolio_v10b:Strategy"
@@ -148,7 +149,12 @@ async def run_preflight(
         if plugin_root is not None
         else root / "strategies" / "eth_lf_portfolio_v10b"
     )
-    env = dict(os.environ if environ is None else environ)
+    project_env = load_project_env_config(
+        env_file=root / ".env",
+        process_env=os.environ if environ is None else environ,
+    )
+    set_project_env_config(project_env)
+    env = dict(project_env.values)
     report = PreflightReport(commit=git_commit(root))
 
     _check_repo_root(report, root)
@@ -679,6 +685,8 @@ async def _check_api_position_safety(
         from src.order_management.quantity import NativeQuantityConverter
         from src.order_management.safety import RecoveryExitOrderValidator
         from src.platform.account.factory import create_account_client
+        from src.platform.exchanges.credentials import validate_private_credentials
+        from src.platform.exchanges.errors import ExchangeConfigError
         from src.platform.exchanges.models import ExchangeConfig, ExchangeName, PositionSide
         from src.platform.execution.factory import create_execution_client
         from src.platform.markets import get_market_profile
@@ -706,10 +714,20 @@ async def _check_api_position_safety(
         report.add("api_position_check", "FAIL", f"master exchange must be okx, got {app.data_exchange.value}")
         return
 
+    exchange_configs = {}
+    try:
+        for exchange in app.exchanges:
+            exchange_config = ExchangeConfig.from_env(exchange, env)
+            validate_private_credentials(exchange, exchange_config)
+            exchange_configs[exchange] = exchange_config
+    except ExchangeConfigError as exc:
+        report.add("api_position_check", "FAIL", str(exc))
+        return
+
     snapshots: dict[str, Any] = {}
     for exchange in app.exchanges:
         try:
-            exchange_config = ExchangeConfig.from_env(exchange, env)
+            exchange_config = exchange_configs[exchange]
             account = create_account_client(exchange, symbol=app.symbol, config=exchange_config)
             execution = create_execution_client(exchange, symbol=app.symbol, config=exchange_config)
             snapshots[exchange.value] = await fetch_platform_snapshot(

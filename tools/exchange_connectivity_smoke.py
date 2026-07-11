@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import sys
 import time
 from dataclasses import asdict, dataclass, field, replace
@@ -28,6 +27,8 @@ from src.platform import ExchangeName
 from src.platform.account.factory import create_account_client
 from src.platform.data.factory import create_market_data_feed
 from src.platform.execution.factory import create_execution_client
+from src.platform.config import load_project_env_config, set_project_env_config
+from src.platform.exchanges.credentials import validate_private_credentials
 from src.platform.exchanges.models import (
     CancelStopOrderRequest,
     ExchangeConfig,
@@ -106,6 +107,8 @@ def parse_args() -> argparse.Namespace:
 
 async def main() -> int:
     args = parse_args()
+    project_env = load_project_env_config(env_file=REPO_ROOT / ".env")
+    set_project_env_config(project_env)
     app_config = AppConfig.from_env()
     if args.symbol:
         app_config = _replace_app_symbol(app_config, args.symbol)
@@ -125,6 +128,15 @@ async def main() -> int:
     if args.margin_usdt <= 0 or args.leverage <= 0:
         raise SystemExit("--margin-usdt and --leverage must be positive")
 
+    exchange_configs = {}
+    for exchange in app_config.exchanges:
+        exchange_config = ExchangeConfig.from_env(
+            exchange,
+            env=project_env.values,
+        )
+        validate_private_credentials(exchange, exchange_config)
+        exchange_configs[exchange] = exchange_config
+
     logger.info("Connectivity smoke config | symbol=%s", app_config.symbol)
     logger.info("Connectivity smoke config | exchanges=%s", ",".join(exchange.value for exchange in app_config.exchanges))
     logger.info("Connectivity smoke config | data_exchange=%s", app_config.data_exchange.value)
@@ -136,7 +148,11 @@ async def main() -> int:
     data_feed = create_market_data_feed(
         app_config.data_exchange,
         symbol=app_config.symbol,
-        config=ExchangeConfig.from_env(app_config.data_exchange),
+        config=exchange_configs.get(app_config.data_exchange)
+        or ExchangeConfig.from_env(
+            app_config.data_exchange,
+            env=project_env.values,
+        ),
         enable_trade_stream=False,
         enable_order_book_stream=False,
     )
@@ -188,11 +204,19 @@ async def main() -> int:
         )
 
     account_clients = {
-        exchange: create_account_client(exchange, symbol=app_config.symbol, config=ExchangeConfig.from_env(exchange))
+        exchange: create_account_client(
+            exchange,
+            symbol=app_config.symbol,
+            config=exchange_configs[exchange],
+        )
         for exchange in app_config.exchanges
     }
     execution_clients = [
-        create_execution_client(exchange, symbol=app_config.symbol, config=ExchangeConfig.from_env(exchange))
+        create_execution_client(
+            exchange,
+            symbol=app_config.symbol,
+            config=exchange_configs[exchange],
+        )
         for exchange in app_config.exchanges
     ]
 
@@ -220,7 +244,7 @@ async def main() -> int:
         logger.info("Connectivity smoke report | report=%s", report.to_json())
         return 0 if report.ok else 1
 
-    if os.getenv("AETHER_DRY_RUN", "true").strip().lower() in {"1", "true", "yes", "on"}:
+    if app_config.dry_run:
         raise SystemExit("Refusing live smoke order while AETHER_DRY_RUN=true. Set AETHER_DRY_RUN=false and pass --live.")
 
     if min_notional_warning and not args.allow_partial_entry and len(app_config.exchanges) > 1:
