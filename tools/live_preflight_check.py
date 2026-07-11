@@ -49,6 +49,8 @@ from src.platform.config import (
     load_project_env_config,
     set_project_env_config,
 )
+from src.platform.exchanges.credentials import validate_private_credentials
+from src.platform.exchanges.errors import ExchangeConfigError
 from src.platform.exchanges.models import ExchangeConfig
 from src.platform.execution.factory import create_execution_client
 from src.platform.snapshot import PlatformSnapshot, fetch_platform_snapshot
@@ -175,6 +177,26 @@ async def main() -> int:
 
     report.symbol = app_config.symbol
     report.strategy = app_config.strategy
+
+    if not args.skip_api:
+        try:
+            for exchange in app_config.exchanges:
+                validate_private_credentials(
+                    exchange,
+                    ExchangeConfig.from_env(
+                        exchange,
+                        env=project_env.values,
+                    ),
+                )
+        except ExchangeConfigError as exc:
+            report.add(
+                "private_credentials",
+                "fail",
+                error=str(exc),
+            )
+            report.verdict = "fail_config"
+            _maybe_write_report(args.report, report)
+            return EXIT_FAIL_CONFIG
 
     try:
         strategy = load_strategy(app_config.strategy)
@@ -349,6 +371,7 @@ async def _fetch_snapshots(
     for exchange in app_config.exchanges:
         try:
             config = ExchangeConfig.from_env(exchange)
+            validate_private_credentials(exchange, config)
             account = create_account_client(exchange, symbol=app_config.symbol, config=config)
             execution = create_execution_client(exchange, symbol=app_config.symbol, config=config)
             snapshot = await fetch_platform_snapshot(account=account, execution=execution)

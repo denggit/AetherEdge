@@ -12,6 +12,7 @@ from typing import Any, AsyncIterator, Mapping
 from src.platform.account.events import AccountEvent, AccountEventType
 from src.platform.data.websocket.ports import WebSocketConnector
 from src.platform.exchanges.errors import ExchangeConfigError
+from src.platform.exchanges.credentials import validate_private_credentials
 from src.platform.exchanges.models import ExchangeConfig, ExchangeName, OrderSide, OrderStatus, PositionSide
 from src.platform.exchanges.symbols import to_canonical_symbol, to_exchange_symbol
 
@@ -97,8 +98,7 @@ class OkxAccountEventStream:
         return events
 
     def _require_credentials(self) -> None:
-        if not self._config.api_key or not self._config.api_secret or not self._config.passphrase:
-            raise ExchangeConfigError("OKX private WebSocket requires api_key, api_secret and passphrase")
+        validate_private_credentials(ExchangeName.OKX, self._config)
 
 
 def _okx_login_message(config: ExchangeConfig) -> str:

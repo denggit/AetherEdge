@@ -9,6 +9,7 @@ from typing import Any, Mapping
 from urllib.parse import urlencode
 
 from src.platform.exchanges.errors import ExchangeApiError, ExchangeConfigError, ExchangeMappingError
+from src.platform.exchanges.credentials import validate_private_credentials
 from src.platform.exchanges.models import (
     AmendOrderRequest,
     Balance,
@@ -510,8 +511,7 @@ class BinanceExchangeClient:
         )
 
     def _require_credentials(self) -> None:
-        if not self._config.api_key or not self._config.api_secret:
-            raise ExchangeConfigError("Binance private API requires api_key and api_secret")
+        validate_private_credentials(ExchangeName.BINANCE, self._config)
 
 
 def _map_binance_kline(row: list[Any], *, symbol: str, raw_symbol: str, interval: str) -> Kline:

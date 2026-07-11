@@ -18,6 +18,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.platform.config import ProjectEnvConfig, load_project_env_config, set_project_env_config
+from src.platform.exchanges.credentials import validate_private_credentials
+from src.platform.exchanges.errors import ExchangeConfigError
+from src.platform.exchanges.models import ExchangeConfig
 
 
 def bootstrap_live_process_config(project_root: Path = PROJECT_ROOT) -> ProjectEnvConfig:
@@ -91,6 +94,8 @@ async def main() -> None:
                 "direct-live trading requires AETHER_REQUIRED_LIVE_STRATEGY "
                 "to be set in .env"
             )
+        if is_direct_live:
+            _validate_direct_live_private_credentials(config)
         if (
             required_strategy
             and strategy_identity(config.strategy)
@@ -160,6 +165,19 @@ async def main() -> None:
         runner = AppRunner(config=config, context=context)
         stats = await runner.run_streams(max_market_events=args.max_events)
     logger.info("Live runner stopped | stats=%s", stats)
+
+
+def _validate_direct_live_private_credentials(config: AppConfig) -> None:
+    """Fail before building strategy clients when live secrets are invalid."""
+
+    for exchange in config.exchanges:
+        try:
+            validate_private_credentials(
+                exchange,
+                ExchangeConfig.from_env(exchange),
+            )
+        except ExchangeConfigError as exc:
+            raise LiveRuntimeError(str(exc)) from exc
 
 
 if __name__ == "__main__":

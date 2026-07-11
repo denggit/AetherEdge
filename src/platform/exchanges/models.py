@@ -71,15 +71,15 @@ class ExchangeConfig:
     - Binance USD-M: ``BINANCE_API_KEY``, ``BINANCE_SECRET_KEY``
     """
 
-    api_key: str = ""
-    api_secret: str = ""
-    passphrase: str = ""  # OKX only.
+    api_key: str = field(default="", repr=False)
+    api_secret: str = field(default="", repr=False)
+    passphrase: str = field(default="", repr=False)  # OKX only.
     sandbox: bool = False
     timeout_seconds: float = 10.0
     recv_window_ms: int = 5000  # Binance signed request window.
     live_trading_enabled: bool = False
     default_margin_mode: MarginMode = MarginMode.CROSS
-    extra_headers: Mapping[str, str] = field(default_factory=dict)
+    extra_headers: Mapping[str, str] = field(default_factory=dict, repr=False)
 
     @classmethod
     def from_env(

@@ -314,6 +314,7 @@ FATAL_STARTUP_ERROR_MARKERS = (
     "live preflight/smoke report gate failed",
     "direct-live trading requires aether_required_live_strategy",
     "live strategy does not match required launch target",
+    "private_credentials",
 )
 
 

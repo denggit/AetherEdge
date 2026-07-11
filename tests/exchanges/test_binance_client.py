@@ -1,6 +1,8 @@
 import asyncio
 from decimal import Decimal
 
+import pytest
+
 from src.platform.exchanges import (
     CancelOrderRequest,
     ExchangeConfig,
@@ -12,6 +14,7 @@ from src.platform.exchanges import (
     PositionSide,
     create_exchange_client,
 )
+from src.platform.exchanges.errors import PrivateCredentialValidationError
 
 
 class FakeHttpClient:
@@ -236,3 +239,24 @@ def test_binance_account_queries_use_usdm_v3_endpoints():
     assert http.calls[1]["url"].endswith("/fapi/v3/positionRisk")
     assert balance.available == Decimal("90")
     assert positions[0].quantity == Decimal("0.1")
+
+
+def test_binance_private_request_rejects_placeholder_before_http_call():
+    http = FakeHttpClient([])
+    client = create_exchange_client(
+        "binance",
+        ExchangeConfig(
+            api_key="${BINANCE_API_KEY}",
+            api_secret="canary_binance_secret",
+        ),
+        http_client=http,
+    )
+
+    with pytest.raises(PrivateCredentialValidationError) as exc_info:
+        asyncio.run(client.fetch_balance("USDT"))
+
+    text = str(exc_info.value)
+    assert exc_info.value.code == "placeholder_private_credentials"
+    assert "placeholder_fields=api_key" in text
+    assert "canary_binance_secret" not in text
+    assert http.calls == []

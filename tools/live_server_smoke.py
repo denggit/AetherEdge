@@ -21,6 +21,10 @@ from src.platform.config import (
     load_project_env_config,
     set_project_env_config,
 )
+from src.app import AppConfig
+from src.platform.exchanges.credentials import validate_private_credentials
+from src.platform.exchanges.errors import ExchangeConfigError
+from src.platform.exchanges.models import ExchangeConfig
 from src.strategy import load_strategy
 
 
@@ -47,6 +51,32 @@ async def run_server_smoke(
                 f"{type(exc).__name__}"
             ],
         )
+    if not bool((provider_kwargs or {}).get("skip_api", False)):
+        try:
+            app_config = AppConfig.from_env(
+                defaults_path=defaults_path,
+                environ=project_env.values,
+            )
+            for exchange in app_config.exchanges:
+                validate_private_credentials(
+                    exchange,
+                    ExchangeConfig.from_env(exchange, env=project_env.values),
+                )
+        except ExchangeConfigError as exc:
+            return BootstrapFailureReport(
+                verdict="fail_config",
+                exit_code=1,
+                issues=[str(exc)],
+            )
+        except Exception as exc:
+            return BootstrapFailureReport(
+                verdict="fail_config",
+                exit_code=1,
+                issues=[
+                    "live_smoke_config_bootstrap_failed:"
+                    f"{type(exc).__name__}"
+                ],
+            )
     try:
         set_project_env_config(project_env)
         strategy = load_strategy(strategy_path)

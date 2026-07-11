@@ -17,6 +17,8 @@ from src.platform.exchanges.models import (
     ExchangeConfig,
     ExchangeName,
 )
+from src.platform.exchanges.credentials import validate_private_credentials
+from src.platform.exchanges.errors import ExchangeConfigError
 from src.platform.execution.factory import create_execution_client
 from src.runtime.account_config import (
     AccountConfigEnv,
@@ -94,6 +96,28 @@ class PortfolioV1LiveSmokeProvider:
                 ),
             )
 
+        exchange_configs = []
+        if not self.skip_api:
+            try:
+                for exchange in app_config.exchanges:
+                    exchange_config = ExchangeConfig.from_env(
+                        exchange,
+                        env=env,
+                    )
+                    validate_private_credentials(
+                        exchange,
+                        exchange_config,
+                    )
+                    exchange_configs.append((exchange, exchange_config))
+            except ExchangeConfigError as exc:
+                report = _bootstrap_failure(
+                    verdict="fail_config",
+                    exit_code=EXIT_FAIL_CONFIG,
+                    issue=str(exc),
+                )
+                _add_context(report, app_config, runtime_config)
+                return report
+
         plan_path = Path(
             env.get(
                 "AETHER_POSITION_PLAN_DB",
@@ -137,11 +161,7 @@ class PortfolioV1LiveSmokeProvider:
             accounts = []
             executions = []
             if not self.skip_api:
-                for exchange in app_config.exchanges:
-                    exchange_config = ExchangeConfig.from_env(
-                        exchange,
-                        env=env,
-                    )
+                for exchange, exchange_config in exchange_configs:
                     accounts.append(
                         create_account_client(
                             exchange,

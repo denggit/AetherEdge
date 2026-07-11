@@ -84,6 +84,24 @@ def _write_project_files(tmp_path):
     return env
 
 
+def _write_private_env(tmp_path, *, exchange: str, credentials: str):
+    env = tmp_path / f"{exchange}.env"
+    env.write_text(
+        "AETHER_MARKET=ETH-USDT-PERP\n"
+        f"AETHER_EXCHANGES={exchange}\n"
+        f"AETHER_DATA_EXCHANGE={exchange}\n"
+        "AETHER_STRATEGY=strategies.eth_portfolio_v1:Strategy\n"
+        + credentials,
+        encoding="utf-8",
+    )
+    return env
+
+
+def _clear_private_environment(monkeypatch) -> None:
+    for key in FAKE_PROCESS_CREDENTIALS:
+        monkeypatch.delenv(key, raising=False)
+
+
 @pytest.mark.asyncio
 async def test_live_preflight_entry_uses_process_env_without_example(
     tmp_path,
@@ -259,3 +277,135 @@ async def test_live_server_smoke_classifies_env_example_as_fail_config(
     assert result.issues == ["live_smoke_config_load_failed:ValueError"]
     assert fake_secret not in report_text
     assert id(platform_config._PROJECT_ENV_CONFIG) == id(None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exchange", "credentials", "expected_field", "canary"),
+    (
+        (
+            "okx",
+            "OKX_API_KEY=你的_okx_api_key\n"
+            "OKX_SECRET_KEY=canary_okx_secret\n"
+            "OKX_PASSPHRASE=canary_okx_passphrase\n",
+            "api_key",
+            "canary_okx_secret",
+        ),
+        (
+            "binance",
+            "BINANCE_API_KEY=canary_binance_key\n"
+            "BINANCE_SECRET_KEY=${BINANCE_SECRET_KEY}\n",
+            "api_secret",
+            "canary_binance_key",
+        ),
+    ),
+)
+async def test_live_server_smoke_rejects_invalid_credentials_before_provider(
+    tmp_path,
+    monkeypatch,
+    exchange,
+    credentials,
+    expected_field,
+    canary,
+):
+    import tools.live_server_smoke as smoke
+
+    _clear_private_environment(monkeypatch)
+    env = _write_private_env(
+        tmp_path,
+        exchange=exchange,
+        credentials=credentials,
+    )
+
+    def forbidden_provider_load(_path):
+        pytest.fail("provider loaded with invalid private credentials")
+
+    monkeypatch.setattr(smoke, "load_strategy", forbidden_provider_load)
+
+    result = await smoke.run_server_smoke(
+        defaults_path=tmp_path / "missing-defaults.json",
+        env_file=env,
+        strategy_name="strategies.eth_portfolio_v1:Strategy",
+        repo_root=tmp_path,
+        provider_kwargs={"skip_api": False},
+    )
+
+    report_text = result.to_json()
+    assert result.verdict == "fail_config"
+    assert result.issues[0].startswith("placeholder_private_credentials")
+    assert f"exchange={exchange}" in result.issues[0]
+    assert f"placeholder_fields={expected_field}" in result.issues[0]
+    assert canary not in result.issues[0]
+    assert canary not in report_text
+
+
+@pytest.mark.asyncio
+async def test_live_preflight_reports_invalid_credentials_without_provider_or_secret(
+    tmp_path,
+    monkeypatch,
+):
+    import tools.live_preflight_check as preflight
+    import tools.live_server_smoke as smoke
+
+    _clear_private_environment(monkeypatch)
+    env = _write_private_env(
+        tmp_path,
+        exchange="okx",
+        credentials=(
+            "OKX_API_KEY=canary_okx_key\n"
+            "OKX_SECRET_KEY=canary_okx_secret\n"
+            "OKX_PASSPHRASE=<OKX_PASSPHRASE>\n"
+        ),
+    )
+    report_path = tmp_path / "preflight-invalid-credentials.json"
+    args = argparse.Namespace(
+        strategy="strategies.eth_portfolio_v1:Strategy",
+        defaults=tmp_path / "missing-defaults.json",
+        env_file=env,
+        report=str(report_path),
+        apply_reconcile=False,
+        skip_api=False,
+        skip_kline=True,
+    )
+    monkeypatch.setattr(preflight, "parse_args", lambda: args)
+
+    def forbidden_strategy_load(_path):
+        pytest.fail("strategy loaded with invalid private credentials")
+
+    monkeypatch.setattr(preflight, "load_strategy", forbidden_strategy_load)
+    monkeypatch.setattr(smoke, "load_strategy", forbidden_strategy_load)
+
+    exit_code = await preflight.main()
+
+    report_text = report_path.read_text(encoding="utf-8")
+    assert exit_code == preflight.EXIT_FAIL_CONFIG
+    assert "fail_config" in report_text
+    assert "placeholder_fields=passphrase" in report_text
+    assert "canary_okx_key" not in report_text
+    assert "canary_okx_secret" not in report_text
+
+
+@pytest.mark.asyncio
+async def test_live_server_smoke_skip_api_allows_offline_provider_without_credentials(
+    tmp_path,
+    monkeypatch,
+):
+    import tools.live_server_smoke as smoke
+
+    _clear_private_environment(monkeypatch)
+    env = _write_private_env(tmp_path, exchange="okx", credentials="")
+    report = BootstrapFailureReport(verdict="pass", exit_code=0)
+    captured = {}
+    strategy = _Strategy(captured, report)
+    monkeypatch.setattr(smoke, "load_strategy", lambda _path: strategy)
+
+    result = await smoke.run_server_smoke(
+        defaults_path=tmp_path / "missing-defaults.json",
+        env_file=env,
+        strategy_name="strategies.eth_portfolio_v1:Strategy",
+        repo_root=tmp_path,
+        provider_kwargs={"skip_api": True},
+    )
+
+    assert result is report
+    assert captured["project_env"].get("OKX_API_KEY", "") == ""

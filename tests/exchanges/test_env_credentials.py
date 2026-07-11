@@ -8,6 +8,8 @@ from src.platform.config import (
 )
 from src.platform.exchanges import ExchangeConfig, ExchangeName
 from src.platform.exchanges.binance.credentials import resolve_binance_credentials
+from src.platform.exchanges.credentials import validate_private_credentials
+from src.platform.exchanges.errors import PrivateCredentialValidationError
 from src.platform.exchanges.okx.credentials import resolve_okx_credentials
 
 
@@ -150,3 +152,212 @@ def test_exchange_config_uses_process_keys_from_global_project_snapshot(tmp_path
         "binance_process_key",
         "binance_process_secret",
     )
+
+
+@pytest.mark.parametrize(
+    ("exchange", "factory"),
+    (
+        (
+            ExchangeName.OKX,
+            lambda: ExchangeConfig(
+                api_key="fake_okx_key",
+                api_secret="fake_okx_secret",
+                passphrase="fake_okx_passphrase",
+            ),
+        ),
+        (
+            ExchangeName.BINANCE,
+            lambda: ExchangeConfig(
+                api_key="fake_binance_key",
+                api_secret="fake_binance_secret",
+            ),
+        ),
+    ),
+)
+def test_private_credential_validator_accepts_complete_fake_credentials(
+    exchange,
+    factory,
+):
+    validate_private_credentials(exchange, factory())
+
+
+@pytest.mark.parametrize(
+    ("exchange", "factory", "expected_field"),
+    (
+        (
+            ExchangeName.OKX,
+            lambda: ExchangeConfig(
+                api_key="",
+                api_secret="canary_okx_secret",
+                passphrase="canary_okx_passphrase",
+            ),
+            "api_key",
+        ),
+        (
+            ExchangeName.OKX,
+            lambda: ExchangeConfig(
+                api_key="canary_okx_key",
+                api_secret="   ",
+                passphrase="canary_okx_passphrase",
+            ),
+            "api_secret",
+        ),
+        (
+            ExchangeName.OKX,
+            lambda: ExchangeConfig(
+                api_key="canary_okx_key",
+                api_secret="canary_okx_secret",
+                passphrase=None,
+            ),
+            "passphrase",
+        ),
+        (
+            ExchangeName.BINANCE,
+            lambda: ExchangeConfig(
+                api_key="",
+                api_secret="canary_binance_secret",
+            ),
+            "api_key",
+        ),
+        (
+            ExchangeName.BINANCE,
+            lambda: ExchangeConfig(
+                api_key="canary_binance_key",
+                api_secret="\t",
+            ),
+            "api_secret",
+        ),
+    ),
+)
+def test_private_credential_validator_rejects_missing_or_blank_fields(
+    exchange,
+    factory,
+    expected_field,
+):
+    with pytest.raises(PrivateCredentialValidationError) as exc_info:
+        validate_private_credentials(exchange, factory())
+
+    text = str(exc_info.value)
+    assert exc_info.value.code == "missing_private_credentials"
+    assert f"exchange={exchange.value}" in text
+    assert f"missing_fields={expected_field}" in text
+    assert "canary_" not in text
+
+
+@pytest.mark.parametrize(
+    ("exchange", "factory", "expected_field"),
+    (
+        (
+            ExchangeName.OKX,
+            lambda: ExchangeConfig(
+                api_key="  你的_okx_api_key  ",
+                api_secret="canary_okx_secret",
+                passphrase="canary_okx_passphrase",
+            ),
+            "api_key",
+        ),
+        (
+            ExchangeName.OKX,
+            lambda: ExchangeConfig(
+                api_key="canary_okx_key",
+                api_secret="YOUR_OKX_SECRET_KEY",
+                passphrase="canary_okx_passphrase",
+            ),
+            "api_secret",
+        ),
+        (
+            ExchangeName.OKX,
+            lambda: ExchangeConfig(
+                api_key="canary_okx_key",
+                api_secret="canary_okx_secret",
+                passphrase="<OKX_PASSPHRASE>",
+            ),
+            "passphrase",
+        ),
+        (
+            ExchangeName.BINANCE,
+            lambda: ExchangeConfig(
+                api_key="${BINANCE_API_KEY}",
+                api_secret="canary_binance_secret",
+            ),
+            "api_key",
+        ),
+        (
+            ExchangeName.BINANCE,
+            lambda: ExchangeConfig(
+                api_key="canary_binance_key",
+                api_secret="your_binance_secret_key",
+            ),
+            "api_secret",
+        ),
+    ),
+)
+def test_private_credential_validator_rejects_documented_placeholders(
+    exchange,
+    factory,
+    expected_field,
+):
+    with pytest.raises(PrivateCredentialValidationError) as exc_info:
+        validate_private_credentials(exchange, factory())
+
+    text = str(exc_info.value)
+    assert exc_info.value.code == "placeholder_private_credentials"
+    assert f"placeholder_fields={expected_field}" in text
+    assert "canary_" not in text
+
+
+def test_private_credential_validator_allows_sandbox_and_testnet_values():
+    validate_private_credentials(
+        ExchangeName.OKX,
+        ExchangeConfig(
+            api_key="sandbox-okx-key",
+            api_secret="testnet-okx-secret",
+            passphrase="demo-passphrase",
+            sandbox=True,
+        ),
+    )
+    validate_private_credentials(
+        ExchangeName.BINANCE,
+        ExchangeConfig(
+            api_key="sandbox-binance-key",
+            api_secret="testnet-binance-secret",
+            sandbox=True,
+        ),
+    )
+
+
+def test_exchange_config_repr_redacts_private_credentials_and_headers():
+    config = ExchangeConfig(
+        api_key="canary_api_key",
+        api_secret="canary_secret",
+        passphrase="canary_passphrase",
+        extra_headers={"Authorization": "canary_header"},
+    )
+
+    text = repr(config)
+
+    assert "canary_api_key" not in text
+    assert "canary_secret" not in text
+    assert "canary_passphrase" not in text
+    assert "canary_header" not in text
+
+
+def test_credential_validation_failure_never_leaks_canaries(caplog):
+    config = ExchangeConfig(
+        api_key="<OKX_API_KEY>",
+        api_secret="canary_secret",
+        passphrase="canary_passphrase",
+    )
+
+    with pytest.raises(PrivateCredentialValidationError) as exc_info:
+        validate_private_credentials(ExchangeName.OKX, config)
+
+    exception_text = str(exc_info.value)
+    exception_repr = repr(exc_info.value)
+    assert "canary_api_key" not in exception_text
+    assert "canary_secret" not in exception_text
+    assert "canary_passphrase" not in exception_text
+    assert "canary_secret" not in exception_repr
+    assert "canary_passphrase" not in exception_repr
+    assert "canary_secret" not in caplog.text
+    assert "canary_passphrase" not in caplog.text

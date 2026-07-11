@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
+
+import pytest
 
 from src.platform.account.events import AccountEventType
 from src.platform.account.websocket.binance import BinanceAccountEventStream
 from src.platform.account.websocket.okx import OkxAccountEventStream
 from src.platform.exchanges.models import ExchangeConfig, OrderStatus
+from src.platform.exchanges.errors import PrivateCredentialValidationError
 
 
 class _Connector:
@@ -16,6 +20,15 @@ class _Connector:
 class _BinanceClient:
     async def create_user_stream_listen_key(self):  # pragma: no cover - not used
         return "listen"
+
+
+class _CountingConnector:
+    def __init__(self) -> None:
+        self.connect_calls = 0
+
+    async def connect(self, _url):
+        self.connect_calls += 1
+        raise AssertionError("private WebSocket connected with invalid credentials")
 
 
 def test_okx_order_event_uses_avgpx_or_fillpx_for_market_fill() -> None:
@@ -58,3 +71,29 @@ def test_filled_event_with_missing_or_zero_price_is_not_silently_accepted() -> N
     assert okx_event.price is None
     assert binance_event.order_status is OrderStatus.FILLED
     assert binance_event.price is None
+
+
+def test_okx_private_websocket_rejects_placeholder_before_login_payload():
+    connector = _CountingConnector()
+    stream = OkxAccountEventStream(
+        symbol="ETH-USDT-PERP",
+        config=ExchangeConfig(
+            api_key="canary_okx_key",
+            api_secret="canary_okx_secret",
+            passphrase="${OKX_PASSPHRASE}",
+        ),
+        connector=connector,
+    )
+
+    async def consume_once() -> None:
+        async for _event in stream.stream_events():
+            break
+
+    with pytest.raises(PrivateCredentialValidationError) as exc_info:
+        asyncio.run(consume_once())
+
+    text = str(exc_info.value)
+    assert "placeholder_fields=passphrase" in text
+    assert "canary_okx_key" not in text
+    assert "canary_okx_secret" not in text
+    assert connector.connect_calls == 0

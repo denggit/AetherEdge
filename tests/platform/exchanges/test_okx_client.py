@@ -3,7 +3,10 @@ from decimal import Decimal
 
 import pytest
 
-from src.platform.exchanges.errors import ExchangeApiError
+from src.platform.exchanges.errors import (
+    ExchangeApiError,
+    PrivateCredentialValidationError,
+)
 from src.platform.exchanges import (
     CancelOrderRequest,
     ExchangeConfig,
@@ -224,6 +227,29 @@ def test_okx_private_requests_include_content_type_header():
     headers = http.calls[0]["headers"]
     assert headers["Content-Type"] == "application/json"
     assert "OK-ACCESS-KEY" in headers
+
+
+def test_okx_private_request_rejects_placeholder_before_signing_or_http_call():
+    http = FakeHttpClient([])
+    client = create_exchange_client(
+        ExchangeName.OKX,
+        ExchangeConfig(
+            api_key="canary_okx_key",
+            api_secret="你的_okx_secret_key",
+            passphrase="canary_okx_passphrase",
+        ),
+        http_client=http,
+    )
+
+    with pytest.raises(PrivateCredentialValidationError) as exc_info:
+        asyncio.run(client.fetch_balance("USDT"))
+
+    text = str(exc_info.value)
+    assert exc_info.value.code == "placeholder_private_credentials"
+    assert "placeholder_fields=api_secret" in text
+    assert "canary_okx_key" not in text
+    assert "canary_okx_passphrase" not in text
+    assert http.calls == []
 
 
 def test_okx_public_request_retries_rate_limited_history_trades(monkeypatch):

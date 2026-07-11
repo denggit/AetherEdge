@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import importlib
 import os
 import sys
 from contextlib import contextmanager
 
+import pytest
+
 from src.platform import config as platform_config
-from src.platform.config import get_project_env_config
+from src.platform.config import get_project_env_config, load_project_env_config
+from src.runtime.runner import LiveRuntimeError
 
 
 FAKE_PROCESS_CREDENTIALS = {
@@ -126,3 +130,77 @@ def test_bootstrap_live_process_config_uses_process_env_without_example(
     if previous_module is not None:
         assert id(previous_module.PROJECT_ENV_CONFIG) == id(previous_module_config)
         assert previous_module.load_project_env_config is previous_module_loader
+
+
+def _live_runtime_project_env(tmp_path, *, dry_run: bool):
+    env = tmp_path / "direct-live.env"
+    env.write_text("", encoding="utf-8")
+    return load_project_env_config(
+        env_file=env,
+        process_env={
+            "AETHER_RUNTIME_MODE": "live_runtime",
+            "AETHER_LIVE_TRADING": "true",
+            "AETHER_DRY_RUN": str(dry_run).lower(),
+            "AETHER_MARKET": "ETH-USDT-PERP",
+            "AETHER_EXCHANGES": "okx,binance",
+            "AETHER_DATA_EXCHANGE": "okx",
+            "AETHER_STRATEGY": "strategies.eth_portfolio_v1:Strategy",
+            "AETHER_REQUIRED_LIVE_STRATEGY": "eth_portfolio_v1",
+            "OKX_API_KEY": "你的_okx_api_key",
+            "OKX_SECRET_KEY": "canary_okx_secret",
+            "OKX_PASSPHRASE": "canary_okx_passphrase",
+            "BINANCE_API_KEY": "canary_binance_key",
+            "BINANCE_SECRET_KEY": "canary_binance_secret",
+        },
+    )
+
+
+def test_direct_live_rejects_placeholder_credentials_before_app_context(
+    tmp_path,
+    monkeypatch,
+):
+    with _isolated_run_live_import(tmp_path) as (run_live, _import_config):
+        project_env = _live_runtime_project_env(tmp_path, dry_run=False)
+        platform_config.set_project_env_config(project_env)
+        run_live.PROJECT_ENV_CONFIG = project_env
+        monkeypatch.setattr(sys, "argv", ["run_live.py"])
+        build_calls: list[object] = []
+
+        def forbidden_build(*_args, **_kwargs):
+            build_calls.append(object())
+            raise AssertionError("app context built with invalid credentials")
+
+        monkeypatch.setattr(run_live, "build_app_context", forbidden_build)
+
+        with pytest.raises(LiveRuntimeError) as exc_info:
+            asyncio.run(run_live.main())
+
+    text = str(exc_info.value)
+    assert "placeholder_private_credentials" in text
+    assert "exchange=okx" in text
+    assert "placeholder_fields=api_key" in text
+    assert "canary_okx_secret" not in text
+    assert "canary_okx_passphrase" not in text
+    assert build_calls == []
+
+
+def test_dry_run_does_not_require_private_credentials_at_live_validation_layer(
+    tmp_path,
+    monkeypatch,
+):
+    class BuildReached(RuntimeError):
+        pass
+
+    with _isolated_run_live_import(tmp_path) as (run_live, _import_config):
+        project_env = _live_runtime_project_env(tmp_path, dry_run=True)
+        platform_config.set_project_env_config(project_env)
+        run_live.PROJECT_ENV_CONFIG = project_env
+        monkeypatch.setattr(sys, "argv", ["run_live.py"])
+
+        def stop_after_validation(*_args, **_kwargs):
+            raise BuildReached("build_app_context_reached")
+
+        monkeypatch.setattr(run_live, "build_app_context", stop_after_validation)
+
+        with pytest.raises(BuildReached, match="build_app_context_reached"):
+            asyncio.run(run_live.main())

@@ -13,6 +13,7 @@ from typing import Any, Mapping
 from urllib.parse import urlencode
 
 from src.platform.exchanges.errors import ExchangeApiError, ExchangeConfigError, ExchangeMappingError
+from src.platform.exchanges.credentials import validate_private_credentials
 from src.platform.exchanges.models import (
     AmendOrderRequest,
     Balance,
@@ -873,8 +874,7 @@ class OkxExchangeClient:
         )
 
     def _require_credentials(self) -> None:
-        if not self._config.api_key or not self._config.api_secret or not self._config.passphrase:
-            raise ExchangeConfigError("OKX private API requires api_key, api_secret and passphrase")
+        validate_private_credentials(ExchangeName.OKX, self._config)
 
 
 def _is_retryable_public_error(exc: ExchangeApiError) -> bool:
