@@ -1977,7 +1977,7 @@ class LiveRuntimeRunner:
             await self._execute_signals(
                 stop_signals,
                 source="recovery",
-                event_time_ms=int(time.time() * 1000),
+                event_time_ms=None,
                 metadata={"feature_type": "recovery"},
             )
             if self.stats.failed_intents > failed_before:
@@ -1996,7 +1996,7 @@ class LiveRuntimeRunner:
             await self._execute_signals(
                 other_signals,
                 source="recovery",
-                event_time_ms=int(time.time() * 1000),
+                event_time_ms=None,
                 metadata={"feature_type": "recovery"},
             )
 
@@ -2344,7 +2344,7 @@ class LiveRuntimeRunner:
         signals = await on_start(snapshot)
         self.stats.on_start_called = True
         logger.info("Strategy on_start completed | signals=%s", len(signals or ()))
-        await self._execute_signals(signals or (), source="on_start", event_time_ms=int(time.time() * 1000))
+        await self._execute_signals(signals or (), source="on_start", event_time_ms=None)
 
     async def _fetch_current_market_price(self) -> Decimal | None:
         """Fetch current market price for price guard validation.
@@ -3083,6 +3083,7 @@ class LiveRuntimeRunner:
                             "master_already_closed": True,
                             "close_required_reason": "master_closed_follower_not_closed",
                             "trigger": "periodic_follower_close_check",
+                            "position_generation": str(plan.created_time_ms),
                         },
                     )
                 )

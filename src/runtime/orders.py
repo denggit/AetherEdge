@@ -22,14 +22,24 @@ class LiveOrderIntentFactory:
     strategy_id: str
     target_exchanges: tuple[ExchangeName, ...]
 
-    def create(self, signal: TradeSignal, *, source: str = "", event_time_ms: int | None = None, metadata: Mapping[str, Any] | None = None) -> OrderIntent:
+    def create(
+        self,
+        signal: TradeSignal,
+        *,
+        source: str = "",
+        event_time_ms: int | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> OrderIntent:
         targets = self._resolve_target_exchanges(signal)
+        # Effective metadata: signal.metadata overridden by explicit metadata.
+        effective = {**dict(signal.metadata or {}), **dict(metadata or {})}
         intent_id = _intent_id(
             strategy_id=self.strategy_id,
             signal=signal,
             source=source,
             event_time_ms=event_time_ms,
             target_exchanges=targets,
+            effective_metadata=effective,
         )
         return OrderIntent(
             intent_id=intent_id,
@@ -100,42 +110,59 @@ def _intent_id(
     source: str,
     event_time_ms: int | None,
     target_exchanges: tuple[ExchangeName, ...],
+    effective_metadata: Mapping[str, Any],
 ) -> str:
     """Generate a stable intent_id from business keys.
 
     Does NOT use ``signal.created_time_ms``, ``time.time()``, UUID, or any
     value that changes across replays of the same logical business event.
+
+    Identity is composed from ALL applicable fields (not chosen between
+    alternatives):
+
+    * Core fields: strategy_id, symbol, action, source.
+    * Canonical event identity when available (bar close time, signal time,
+      master close event, etc.).
+    * Operation identity fields when present (position_id, execution_purpose,
+      operation_key, generation, sequence, …).
+    * Target exchange set (sorted).
+
+    For durable recovery operations without a canonical event time, the
+    operation identity fields alone provide sufficient identity.
     """
-    metadata = signal.metadata or {}
-
     # 1. Resolve stable canonical event time from metadata.
-    canonical_time = _resolve_canonical_event_time(metadata)
+    canonical_time = _resolve_canonical_event_time(effective_metadata)
 
-    # 2. Resolve operation identity from stable business metadata.
-    op_identity = _operation_identity(metadata)
+    # 2. Build operation identity parts from stable business metadata.
+    op_parts = _operation_identity_parts(effective_metadata)
 
-    # 3. Prefer operation identity (most specific), then canonical time, then
-    #    the event_time_ms parameter.
-    if op_identity:
-        stable_time = op_identity
-    elif canonical_time is not None:
-        stable_time = str(canonical_time)
-    else:
-        stable_time = str(event_time_ms or "")
+    # 3. Fail closed: require at least one stable identity anchor.
+    has_event = canonical_time is not None or event_time_ms is not None
+    if not has_event and not op_parts:
+        raise ValueError(
+            f"order intent has no stable identity "
+            f"(source={source!r}, action={signal.action.value})"
+        )
 
-    # Target exchanges sorted for identity (set semantics).
+    # 4. Target exchanges sorted for identity (set semantics).
     sorted_exchanges = sorted(exchange.value for exchange in target_exchanges)
 
-    raw = "|".join(
-        [
-            strategy_id,
-            signal.symbol,
-            signal.action.value,
-            source,
-            stable_time,
-            ",".join(sorted_exchanges),
-        ]
-    )
+    # 5. Combine ALL applicable fields into a single deterministic string.
+    parts: list[str] = [
+        strategy_id,
+        signal.symbol,
+        signal.action.value,
+        source,
+        ",".join(sorted_exchanges),
+    ]
+    if canonical_time is not None:
+        parts.append(f"evt={canonical_time}")
+    elif event_time_ms is not None:
+        parts.append(f"evt={event_time_ms}")
+    if op_parts:
+        parts.append(f"op={op_parts}")
+
+    raw = "|".join(parts)
     return "intent-" + hashlib.blake2b(raw.encode("utf-8"), digest_size=12).hexdigest()
 
 
@@ -145,7 +172,10 @@ def _resolve_canonical_event_time(metadata: Mapping[str, Any]) -> int | None:
     Priority order follows the canonical event identity chain:
     explicit event_time_ms -> bar_close_time_ms -> signal_time_ms ->
     master_close_event_time_ms -> entry_execution_time_ms ->
-    candidate_open_ms -> created_time_ms.
+    candidate_open_ms.
+
+    ``created_time_ms`` is intentionally excluded — it is an audit field
+    and must never participate in identity generation.
 
     Returns ``None`` when no canonical time is available.
     """
@@ -156,7 +186,6 @@ def _resolve_canonical_event_time(metadata: Mapping[str, Any]) -> int | None:
         "master_close_event_time_ms",
         "entry_execution_time_ms",
         "candidate_open_ms",
-        "created_time_ms",
     ):
         value = metadata.get(key)
         if value is not None:
@@ -167,12 +196,13 @@ def _resolve_canonical_event_time(metadata: Mapping[str, Any]) -> int | None:
     return None
 
 
-def _operation_identity(metadata: Mapping[str, Any]) -> str:
-    """Derive a stable operation identity string from business metadata.
+def _operation_identity_parts(metadata: Mapping[str, Any]) -> str:
+    """Derive stable operation identity fields from business metadata.
 
-    Only fields that describe *which business operation* this intent represents
-    are included.  Audit, logging, price-protection, and equity-snapshot fields
-    are intentionally excluded so they cannot accidentally create new identities.
+    Only fields that describe *which business operation* this intent
+    represents are included.  Audit, logging, price-protection, and
+    equity-snapshot fields are intentionally excluded so they cannot
+    accidentally create new identities.
 
     Returns an empty string when no operation-identity fields are present.
     """
@@ -189,6 +219,7 @@ def _operation_identity(metadata: Mapping[str, Any]) -> str:
         "stop_replace_stage",
         "stop_client_order_id",
         "stop_order_id",
+        "master_close_generation",
     ):
         value = metadata.get(key)
         if value is not None:
