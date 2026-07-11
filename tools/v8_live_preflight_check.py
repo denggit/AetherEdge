@@ -10,14 +10,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import sqlite3
 import sys
 import time
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterable, Sequence
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -137,10 +136,19 @@ async def main() -> int:
     report.strategy = app.strategy
     report.runtime_mode = runtime_mode.value
 
-    _check_runtime_config(report, app=app, runtime_mode=runtime_mode, runtime=runtime, requirements=requirements, expect_real_live=args.expect_real_live)
+    env = project_env.values
+    _check_runtime_config(
+        report,
+        app=app,
+        runtime_mode=runtime_mode,
+        runtime=runtime,
+        requirements=requirements,
+        expect_real_live=args.expect_real_live,
+        env=env,
+    )
     _check_strategy_identity(report, strategy)
     _check_range_exit_config(report, strategy, requirements=requirements)
-    _check_local_writable(report, app=app)
+    _check_local_writable(report, app=app, env=env)
 
     if not args.skip_api:
         try:
@@ -167,11 +175,12 @@ async def main() -> int:
             allow_open_orders=args.allow_open_orders or allow_recovery_start,
             allow_recovery_start=allow_recovery_start,
             strategy_id=strategy_id,
+            env=env,
         )
         await _check_account_config(
             report,
             app=app,
-            env_file=args.env_file,
+            env=env,
             apply_account_config=args.apply_account_config,
         )
         await _check_follower_min_notional_balance(report, app=app, runtime=runtime)
@@ -193,7 +202,16 @@ async def main() -> int:
     return 0 if report.ok else 1
 
 
-def _check_runtime_config(report: PreflightReport, *, app: AppConfig, runtime_mode: RuntimeMode, runtime, requirements, expect_real_live: bool) -> None:
+def _check_runtime_config(
+    report: PreflightReport,
+    *,
+    app: AppConfig,
+    runtime_mode: RuntimeMode,
+    runtime,
+    requirements,
+    expect_real_live: bool,
+    env: Mapping[str, str],
+) -> None:
     detail = {
         "symbol": app.symbol,
         "strategy": app.strategy,
@@ -202,7 +220,7 @@ def _check_runtime_config(report: PreflightReport, *, app: AppConfig, runtime_mo
         "data_exchange": app.data_exchange.value,
         "data_streams": list(app.data_streams),
         "dry_run": app.dry_run,
-        "live_trading_env": os.getenv("AETHER_LIVE_TRADING"),
+        "live_trading_env": env.get("AETHER_LIVE_TRADING"),
     }
     if runtime_mode is not RuntimeMode.LIVE_RUNTIME:
         report.add("runtime_mode_live_runtime", "fail", detail=detail, error="AETHER_RUNTIME_MODE must be live_runtime for V8 live")
@@ -258,8 +276,13 @@ def _check_runtime_config(report: PreflightReport, *, app: AppConfig, runtime_mo
         else:
             report.add("master_follower_policy", "ok", detail=policy_detail)
 
-    live_trading = _bool(os.getenv("AETHER_LIVE_TRADING", "false"))
-    sandbox_values = {exchange.value: _bool(os.getenv(f"{exchange.value.upper()}_SANDBOX", "true")) for exchange in app.exchanges}
+    live_trading = _bool(env.get("AETHER_LIVE_TRADING", "false"))
+    sandbox_values = {
+        exchange.value: _bool(
+            env.get(f"{exchange.value.upper()}_SANDBOX", "true")
+        )
+        for exchange in app.exchanges
+    }
     if expect_real_live:
         if app.dry_run or not live_trading or any(sandbox_values.values()):
             report.add("real_live_safety_switches", "fail", detail={"dry_run": app.dry_run, "live_trading": live_trading, "sandbox": sandbox_values}, error="expected real live: set AETHER_DRY_RUN=false, AETHER_LIVE_TRADING=true, and *_SANDBOX=false")
@@ -297,9 +320,19 @@ def _check_range_exit_config(report: PreflightReport, strategy: Any, *, requirem
     report.add("range_exit_no_delay", "ok", detail={"delay_bars": 0})
 
 
-def _check_local_writable(report: PreflightReport, *, app: AppConfig) -> None:
+def _check_local_writable(
+    report: PreflightReport,
+    *,
+    app: AppConfig,
+    env: Mapping[str, str],
+) -> None:
     _check_writable_file(report, "state_db_writable", Path(app.state_db_path))
-    journal_path = Path(os.getenv("AETHER_ORDER_JOURNAL_DB", "data/state/aether_order_journal.sqlite3"))
+    journal_path = Path(
+        env.get(
+            "AETHER_ORDER_JOURNAL_DB",
+            "data/state/aether_order_journal.sqlite3",
+        )
+    )
     _check_writable_file(report, "order_journal_db_writable", journal_path)
 
 
@@ -324,6 +357,7 @@ async def _check_exchange_read_apis(
     allow_open_orders: bool,
     allow_recovery_start: bool = False,
     strategy_id: str | None = None,
+    env: Mapping[str, str],
 ) -> None:
     data_feed = create_market_data_feed(
         app.data_exchange,
@@ -382,6 +416,7 @@ async def _check_exchange_read_apis(
             runtime=runtime,
             snapshots=snapshots,
             strategy_id=strategy_id,
+            env=env,
         )
 
 
@@ -392,6 +427,7 @@ def _check_recovery_start_state(
     runtime,
     snapshots: dict[ExchangeName, dict[str, Any]],
     strategy_id: str | None,
+    env: Mapping[str, str],
 ) -> None:
     policy = getattr(runtime, "master_follower_policy", None)
     master_exchange = getattr(policy, "master_exchange", app.data_exchange)
@@ -402,7 +438,7 @@ def _check_recovery_start_state(
 
     active_master_positions = _active_positions(master_snapshot.get("positions", ()))
     active_master = active_master_positions[0] if active_master_positions else None
-    active_plans = _load_active_position_plan_payloads(report)
+    active_plans = _load_active_position_plan_payloads(report, env=env)
     active_plan = _find_recovery_plan(active_plans, master_exchange=master_exchange)
     _check_recoverable_stale_local_orders(report, app=app, snapshots=snapshots)
 
@@ -495,16 +531,16 @@ async def _check_account_config(
     report: PreflightReport,
     *,
     app: AppConfig,
-    env_file: str | None,
+    env: Mapping[str, str],
     apply_account_config: bool,
 ) -> None:
-    live_trading = _bool(os.getenv("AETHER_LIVE_TRADING", "false"))
+    live_trading = _bool(env.get("AETHER_LIVE_TRADING", "false"))
     require_leverage = live_trading and not app.dry_run
     try:
-        env = load_account_config_env(
+        account_env = load_account_config_env(
             exchanges=app.exchanges,
             symbol=app.symbol,
-            env_file=env_file,
+            environ=env,
             require_leverage=require_leverage,
         )
     except Exception as exc:
@@ -512,26 +548,28 @@ async def _check_account_config(
         return
 
     env_detail = {
-        "margin_mode": env.margin_mode.value,
+        "margin_mode": account_env.margin_mode.value,
         "targets": {
             target.exchange.value: {
                 "symbol": target.symbol,
                 "leverage": str(target.leverage),
             }
-            for target in env.targets
+            for target in account_env.targets
         },
-        "missing_leverage": [exchange.value for exchange in env.missing_leverage],
+        "missing_leverage": [
+            exchange.value for exchange in account_env.missing_leverage
+        ],
         "apply_account_config": apply_account_config,
         "dry_run": app.dry_run,
         "live_trading": live_trading,
     }
-    if env.missing_leverage:
+    if account_env.missing_leverage:
         status = "fail" if require_leverage else "warn"
         report.add("account_config_env_loaded", status, detail=env_detail, error="missing exchange leverage env")
     else:
         report.add("account_config_env_loaded", "ok", detail=env_detail)
 
-    target_exchanges = {target.exchange for target in env.targets}
+    target_exchanges = {target.exchange for target in account_env.targets}
     missing_status = "fail" if require_leverage else "warn"
     for exchange in app.exchanges:
         if exchange not in target_exchanges:
@@ -542,19 +580,27 @@ async def _check_account_config(
                 error=f"{exchange.value.upper()}_LEVERAGE is not configured",
             )
 
-    if not env.targets:
+    if not account_env.targets:
         return
 
     account_clients = [
-        create_account_client(exchange, symbol=app.symbol, config=ExchangeConfig.from_env(exchange))
+        create_account_client(
+            exchange,
+            symbol=app.symbol,
+            config=ExchangeConfig.from_env(exchange, env),
+        )
         for exchange in app.exchanges
     ]
     execution_clients = [
-        create_execution_client(exchange, symbol=app.symbol, config=ExchangeConfig.from_env(exchange))
+        create_execution_client(
+            exchange,
+            symbol=app.symbol,
+            config=ExchangeConfig.from_env(exchange, env),
+        )
         for exchange in app.exchanges
     ]
     results = await bootstrap_account_config(
-        targets=env.targets,
+        targets=account_env.targets,
         account_clients=account_clients,
         execution_clients=execution_clients,
         apply=apply_account_config,
@@ -623,9 +669,18 @@ def _add_account_config_result_checks(
     )
 
 
-def _load_active_position_plan_payloads(report: PreflightReport) -> list[dict[str, Any]]:
+def _load_active_position_plan_payloads(
+    report: PreflightReport,
+    *,
+    env: Mapping[str, str],
+) -> list[dict[str, Any]]:
     try:
-        path = Path(os.getenv("AETHER_POSITION_PLAN_DB", "data/state/aether_position_plan.sqlite3"))
+        path = Path(
+            env.get(
+                "AETHER_POSITION_PLAN_DB",
+                "data/state/aether_position_plan.sqlite3",
+            )
+        )
         store = SqlitePositionPlanStore(path)
         plans = store.serialize_active_positions()
         report.add("recovery_position_plan_store", "ok", detail={"path": str(path), "active_plans": len(plans)})

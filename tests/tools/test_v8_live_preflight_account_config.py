@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from pathlib import Path
 
 import pytest
 
@@ -14,18 +13,20 @@ from tools.v8_live_preflight_check import PreflightReport
 
 @pytest.mark.asyncio
 async def test_preflight_account_config_default_is_read_only(monkeypatch) -> None:
-    env_file = _write_env_file("read_only")
     account = FakeAccount(leverage=Decimal("3"), margin_mode=MarginMode.CROSS)
     execution = FakeExecution()
     monkeypatch.setattr(preflight, "create_account_client", lambda *args, **kwargs: account)
     monkeypatch.setattr(preflight, "create_execution_client", lambda *args, **kwargs: execution)
-    monkeypatch.setenv("AETHER_LIVE_TRADING", "true")
     report = PreflightReport(started_time_ms=1)
 
     await preflight._check_account_config(
         report,
         app=_app(dry_run=False),
-        env_file=str(env_file),
+        env={
+            "AETHER_LIVE_TRADING": "true",
+            "MARGIN_MODE": "isolated",
+            "OKX_LEVERAGE": "15",
+        },
         apply_account_config=False,
     )
 
@@ -38,18 +39,20 @@ async def test_preflight_account_config_default_is_read_only(monkeypatch) -> Non
 
 @pytest.mark.asyncio
 async def test_preflight_apply_account_config_writes_and_verifies(monkeypatch) -> None:
-    env_file = _write_env_file("apply")
     account = FakeAccount(leverage=Decimal("3"), margin_mode=MarginMode.CROSS)
     execution = FakeExecution()
     monkeypatch.setattr(preflight, "create_account_client", lambda *args, **kwargs: account)
     monkeypatch.setattr(preflight, "create_execution_client", lambda *args, **kwargs: execution)
-    monkeypatch.setenv("AETHER_LIVE_TRADING", "true")
     report = PreflightReport(started_time_ms=1)
 
     await preflight._check_account_config(
         report,
         app=_app(dry_run=False),
-        env_file=str(env_file),
+        env={
+            "AETHER_LIVE_TRADING": "true",
+            "MARGIN_MODE": "isolated",
+            "OKX_LEVERAGE": "15",
+        },
         apply_account_config=True,
     )
 
@@ -73,13 +76,6 @@ def _app(*, dry_run: bool) -> AppConfig:
         dry_run=dry_run,
         enable_email_alerts=False,
     )
-
-
-def _write_env_file(name: str) -> Path:
-    path = Path(".tmp_pytest") / f"preflight_account_config_{name}.env"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("MARGIN_MODE=isolated\nOKX_LEVERAGE=15\n", encoding="utf-8")
-    return path
 
 
 class FakeAccount:

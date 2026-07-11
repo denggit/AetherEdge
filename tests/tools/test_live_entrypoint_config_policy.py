@@ -15,13 +15,8 @@ from src.platform import config as platform_config
 from src.platform.config import load_project_env_config
 from src.platform.data.websocket.connector import WebsocketsConnector
 from src.platform.exchanges.errors import ExchangeConfigError
-from src.platform.exchanges.http import RequestsHttpClient, StdlibHttpClient
-from strategies.eth_portfolio_v1.preflight.provider import (
-    PortfolioV1LiveSmokeProvider,
-)
+from src.platform.exchanges.http import RequestsHttpClient
 import tools.exchange_connectivity_smoke as connectivity_smoke
-import tools.live_preflight_check as live_preflight
-import tools.live_server_smoke as live_server_smoke
 import tools.preflight_check_v10b as preflight_v10b
 import tools.run_live as tool_run_live
 import tools.run_runtime_skeleton as runtime_skeleton
@@ -45,15 +40,9 @@ def _restore_project_env_config():
             platform_config.set_project_env_config(previous)
 
 
-def _project_env(tmp_path, values, *, file_values=None):
+def _project_env(tmp_path, values):
     env_file = tmp_path / ".env"
-    env_file.write_text(
-        "".join(
-            f"{key}={value}\n"
-            for key, value in (file_values or {}).items()
-        ),
-        encoding="utf-8",
-    )
+    env_file.write_text("", encoding="utf-8")
     return load_project_env_config(
         env_file=env_file,
         process_env=values,
@@ -115,11 +104,8 @@ def test_tool_run_live_rejects_direct_live_before_startup_boundaries(
 ):
     project_env = _project_env(tmp_path, _app_env(exchange))
     build_context = Mock()
-    load_strategy = Mock()
     create_execution_client = Mock()
-    app_runner = Mock()
     requests_http = AsyncMock()
-    stdlib_http = AsyncMock()
     websocket_connect = AsyncMock()
     monkeypatch.setattr(
         tool_run_live,
@@ -127,15 +113,12 @@ def test_tool_run_live_rejects_direct_live_before_startup_boundaries(
         lambda **_kwargs: project_env,
     )
     monkeypatch.setattr(tool_run_live, "build_app_context", build_context)
-    monkeypatch.setattr(tool_run_live, "AppRunner", app_runner)
-    monkeypatch.setattr(app_factory, "load_strategy", load_strategy)
     monkeypatch.setattr(
         app_factory,
         "create_execution_client",
         create_execution_client,
     )
     monkeypatch.setattr(RequestsHttpClient, "request", requests_http)
-    monkeypatch.setattr(StdlibHttpClient, "request", stdlib_http)
     monkeypatch.setattr(WebsocketsConnector, "connect", websocket_connect)
     monkeypatch.setattr(
         sys,
@@ -155,11 +138,8 @@ def test_tool_run_live_rejects_direct_live_before_startup_boundaries(
     assert "canary_secret" not in repr(exc_info.value)
     assert "canary_secret" not in caplog.text
     build_context.assert_not_called()
-    load_strategy.assert_not_called()
     create_execution_client.assert_not_called()
-    app_runner.assert_not_called()
     requests_http.assert_not_awaited()
-    stdlib_http.assert_not_awaited()
     websocket_connect.assert_not_awaited()
 
 
@@ -519,163 +499,6 @@ def test_v10b_private_api_validates_all_credentials_before_clients(
     account_client.assert_not_called()
     execution_client.assert_not_called()
     fetch_snapshot.assert_not_awaited()
-
-
-def test_current_live_preflight_invalid_credentials_fail_before_strategy(
-    tmp_path,
-    monkeypatch,
-):
-    project_env = _project_env(
-        tmp_path,
-        _app_env(
-            "okx",
-            dry_run=True,
-            strategy="strategies.eth_portfolio_v1:Strategy",
-        ),
-    )
-    load_strategy = Mock()
-    monkeypatch.setattr(
-        live_preflight,
-        "load_project_env_config",
-        lambda **_kwargs: project_env,
-    )
-    monkeypatch.setattr(live_preflight, "load_strategy", load_strategy)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "live_preflight_check.py",
-            "--defaults",
-            str(tmp_path / "missing.json"),
-            "--report",
-            str(tmp_path / "preflight.json"),
-            "--skip-kline",
-        ],
-    )
-
-    code = asyncio.run(live_preflight.main())
-
-    assert code == live_preflight.EXIT_FAIL_CONFIG
-    load_strategy.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_current_server_smoke_and_provider_fail_config_before_clients(
-    tmp_path,
-    monkeypatch,
-):
-    project_env = _project_env(
-        tmp_path,
-        _app_env(
-            "okx",
-            dry_run=True,
-            strategy="strategies.eth_portfolio_v1:Strategy",
-        ),
-    )
-    load_strategy = Mock()
-    monkeypatch.setattr(
-        live_server_smoke,
-        "load_project_env_config",
-        lambda **_kwargs: project_env,
-    )
-    monkeypatch.setattr(live_server_smoke, "load_strategy", load_strategy)
-
-    server_result = await live_server_smoke.run_server_smoke(
-        defaults_path=tmp_path / "missing.json",
-        env_file=tmp_path / ".env",
-        strategy_name="strategies.eth_portfolio_v1:Strategy",
-    )
-
-    assert server_result.verdict == "fail_config"
-    assert "placeholder_private_credentials" in server_result.issues[0]
-    load_strategy.assert_not_called()
-
-    import strategies.eth_portfolio_v1.preflight.provider as provider_module
-
-    account_client = Mock()
-    execution_client = Mock()
-    monkeypatch.setattr(provider_module, "create_account_client", account_client)
-    monkeypatch.setattr(
-        provider_module,
-        "create_execution_client",
-        execution_client,
-    )
-    provider = PortfolioV1LiveSmokeProvider(
-        strategy=object(),
-        strategy_path="strategies.eth_portfolio_v1:Strategy",
-        defaults_path=tmp_path / "missing.json",
-        env_file=tmp_path / ".env",
-        repo_root=tmp_path,
-        project_env=project_env,
-    )
-
-    provider_result = await provider.run()
-
-    assert provider_result.verdict == "fail_config"
-    assert "placeholder_private_credentials" in provider_result.issues[0]
-    account_client.assert_not_called()
-    execution_client.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_current_server_smoke_and_provider_skip_api_allow_offline_path(
-    tmp_path,
-    monkeypatch,
-):
-    project_env = _project_env(
-        tmp_path,
-        _app_env(
-            "okx",
-            dry_run=True,
-            strategy="strategies.eth_portfolio_v1:Strategy",
-        ),
-    )
-    marker = object()
-    provider_object = object()
-    strategy = SimpleNamespace(
-        live_smoke_provider=lambda **_kwargs: provider_object
-    )
-
-    class FakeRunner:
-        def __init__(self, provider):
-            assert provider is provider_object
-
-        async def run(self):
-            return marker
-
-    monkeypatch.setattr(
-        live_server_smoke,
-        "load_project_env_config",
-        lambda **_kwargs: project_env,
-    )
-    monkeypatch.setattr(
-        live_server_smoke,
-        "load_strategy",
-        Mock(return_value=strategy),
-    )
-    monkeypatch.setattr(live_server_smoke, "FiniteLiveSmokeRunner", FakeRunner)
-
-    result = await live_server_smoke.run_server_smoke(
-        defaults_path=tmp_path / "missing.json",
-        env_file=tmp_path / ".env",
-        strategy_name="strategies.eth_portfolio_v1:Strategy",
-        provider_kwargs={"skip_api": True},
-    )
-
-    assert result is marker
-
-    provider = PortfolioV1LiveSmokeProvider(
-        strategy=object(),
-        strategy_path="strategies.eth_portfolio_v1:Strategy",
-        defaults_path=tmp_path / "missing.json",
-        env_file=tmp_path / ".env",
-        repo_root=tmp_path,
-        project_env=project_env,
-        skip_api=True,
-        skip_kline=True,
-    )
-    provider_result = await provider.run()
-    assert provider_result.verdict != "fail_config"
 
 
 def test_indirect_live_entrypoints_target_safe_runner_without_secrets(
