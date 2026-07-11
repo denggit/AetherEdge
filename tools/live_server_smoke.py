@@ -38,6 +38,16 @@ async def run_server_smoke(
         project_env = load_project_env_config(
             env_file=env_file,
         )
+    except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+        return BootstrapFailureReport(
+            verdict="fail_config",
+            exit_code=1,
+            issues=[
+                "live_smoke_config_load_failed:"
+                f"{type(exc).__name__}"
+            ],
+        )
+    try:
         set_project_env_config(project_env)
         strategy = load_strategy(strategy_path)
         provider_factory = getattr(strategy, provider_hook, None)

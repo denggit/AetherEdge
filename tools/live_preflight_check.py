@@ -143,9 +143,19 @@ class PreflightReport:
 async def main() -> int:
     args = parse_args()
     report = PreflightReport(started_time_ms=_now_ms())
-    project_env = load_project_env_config(
-        env_file=args.env_file,
-    )
+    try:
+        project_env = load_project_env_config(
+            env_file=args.env_file,
+        )
+    except (OSError, RuntimeError, UnicodeError, ValueError) as exc:
+        report.add(
+            "load_project_env_config",
+            "fail",
+            error=f"config_load_failed:{type(exc).__name__}",
+        )
+        report.verdict = "fail_config"
+        _maybe_write_report(args.report, report)
+        return EXIT_FAIL_CONFIG
     set_project_env_config(project_env)
 
     # ── 1. Load config ──

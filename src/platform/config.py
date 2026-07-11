@@ -62,7 +62,9 @@ def load_project_env_config(
     """
 
     root = Path(__file__).resolve().parents[2]
-    env_path = Path(env_file) if env_file is not None else root / ".env"
+    env_path = _runtime_env_file_path(
+        Path(env_file) if env_file is not None else root / ".env"
+    )
     config: dict[str, str] = {}
     source_files: list[str] = []
 
@@ -113,12 +115,31 @@ def load_env_config(env_file: str | Path | None = None, *, environ: Mapping[str,
     helpers. This loader intentionally stays generic.
     """
 
-    path = Path(env_file) if env_file is not None else Path(__file__).resolve().parents[2] / ".env"
+    path = _runtime_env_file_path(
+        Path(env_file)
+        if env_file is not None
+        else Path(__file__).resolve().parents[2] / ".env"
+    )
     config = _parse_env_file(path) if path.exists() else {}
 
     values = os.environ if environ is None else environ
     config.update({str(key): str(value) for key, value in values.items()})
     return config
+
+
+def _runtime_env_file_path(path: Path) -> Path:
+    """Reject the documentation template before any runtime file read."""
+
+    resolved = path.resolve()
+    if (
+        path.name.casefold() == ".env.example"
+        or resolved.name.casefold() == ".env.example"
+    ):
+        raise ValueError(
+            ".env.example is documentation-only and cannot be used as a "
+            "runtime env file"
+        )
+    return path
 
 
 def _parse_env_file(path: Path) -> dict[str, str]:

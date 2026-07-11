@@ -64,27 +64,56 @@ def test_binance_credentials_use_only_maintained_key_names():
     assert resolve_binance_credentials(cfg, env) == ("binance_key", "binance_secret")
 
 
-def test_exchange_config_from_env_resolves_okx_strict_keys(monkeypatch):
-    monkeypatch.setenv("OKX_API_KEY", "okx_key")
-    monkeypatch.setenv("OKX_SECRET_KEY", "okx_secret")
-    monkeypatch.setenv("OKX_PASSPHRASE", "okx_pass")
+def test_exchange_config_from_env_resolves_okx_strict_keys(tmp_path):
+    env_file = tmp_path / "okx.env"
+    env_file.write_text(
+        "OKX_API_KEY=fake_okx_file_key\n"
+        "OKX_SECRET_KEY=fake_okx_file_secret\n"
+        "OKX_PASSPHRASE=fake_okx_file_pass\n",
+        encoding="utf-8",
+    )
+    set_project_env_config(
+        load_project_env_config(
+            env_file=env_file,
+            process_env={
+                "OKX_API_KEY": "fake_okx_process_key",
+                "OKX_SECRET_KEY": "fake_okx_process_secret",
+                "OKX_PASSPHRASE": "fake_okx_process_pass",
+                "OKX_API_SECRET": "fake_legacy_secret",
+                "OKX_PASSPHASE": "fake_typo_passphrase",
+            },
+        )
+    )
 
     cfg = ExchangeConfig.from_env(ExchangeName.OKX)
 
-    assert cfg.api_key == "okx_key"
-    assert cfg.api_secret == "okx_secret"
-    assert cfg.passphrase == "okx_pass"
+    assert cfg.api_key == "fake_okx_process_key"
+    assert cfg.api_secret == "fake_okx_process_secret"
+    assert cfg.passphrase == "fake_okx_process_pass"
 
 
-def test_exchange_config_from_env_resolves_binance_strict_keys(monkeypatch):
-    monkeypatch.setenv("BINANCE_API_KEY", "binance_key")
-    monkeypatch.setenv("BINANCE_SECRET_KEY", "binance_secret")
-    monkeypatch.setenv("BINANCE_API_SECRET", "wrong_old_secret")
+def test_exchange_config_from_env_resolves_binance_strict_keys(tmp_path):
+    env_file = tmp_path / "binance.env"
+    env_file.write_text(
+        "BINANCE_API_KEY=fake_binance_file_key\n"
+        "BINANCE_SECRET_KEY=fake_binance_file_secret\n",
+        encoding="utf-8",
+    )
+    set_project_env_config(
+        load_project_env_config(
+            env_file=env_file,
+            process_env={
+                "BINANCE_API_KEY": "fake_binance_process_key",
+                "BINANCE_SECRET_KEY": "fake_binance_process_secret",
+                "BINANCE_API_SECRET": "fake_legacy_secret",
+            },
+        )
+    )
 
     cfg = ExchangeConfig.from_env(ExchangeName.BINANCE)
 
-    assert cfg.api_key == "binance_key"
-    assert cfg.api_secret == "binance_secret"
+    assert cfg.api_key == "fake_binance_process_key"
+    assert cfg.api_secret == "fake_binance_process_secret"
 
 
 def test_exchange_config_uses_process_keys_from_global_project_snapshot(tmp_path):

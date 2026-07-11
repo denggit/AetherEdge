@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 
 import pytest
@@ -8,15 +9,21 @@ import pytest
 from src.platform.config import (
     get_project_env_config,
     reset_project_env_config_for_tests,
+    set_project_env_config,
 )
+from src.platform import config as platform_config
 from src.runtime.live_smoke import BootstrapFailureReport
 
 
 @pytest.fixture(autouse=True)
 def _reset_project_env_config():
+    previous = platform_config._PROJECT_ENV_CONFIG
     reset_project_env_config_for_tests()
     yield
-    reset_project_env_config_for_tests()
+    if previous is None:
+        reset_project_env_config_for_tests()
+    else:
+        set_project_env_config(previous)
 
 
 class _Provider:
@@ -88,8 +95,8 @@ async def test_live_preflight_entry_uses_process_env_without_example(
     monkeypatch.setattr(preflight, "parse_args", lambda: args)
     monkeypatch.setattr(preflight, "load_strategy", lambda _path: strategy)
     monkeypatch.setattr(smoke, "load_strategy", lambda _path: strategy)
+    monkeypatch.setenv("AETHER_TEST_ENV_SENTINEL", "sentinel-before-load")
     monkeypatch.setenv("AETHER_MARKET", "from-process")
-    process_env_before = dict(os.environ)
 
     exit_code = await preflight.main()
 
@@ -101,7 +108,8 @@ async def test_live_preflight_entry_uses_process_env_without_example(
     assert project_env.source_files == (str(env),)
     assert project_env.example_file is None
     assert get_project_env_config() is project_env
-    assert dict(os.environ) == process_env_before
+    assert os.environ["AETHER_TEST_ENV_SENTINEL"] == "sentinel-before-load"
+    assert os.environ["AETHER_MARKET"] == "from-process"
 
 
 @pytest.mark.asyncio
@@ -119,8 +127,8 @@ async def test_live_server_smoke_entry_uses_process_env_without_example(
     captured = {}
     strategy = _Strategy(captured, report)
     monkeypatch.setattr(smoke, "load_strategy", lambda _path: strategy)
+    monkeypatch.setenv("AETHER_TEST_ENV_SENTINEL", "sentinel-before-load")
     monkeypatch.setenv("AETHER_MARKET", "from-process")
-    process_env_before = dict(os.environ)
 
     result = await smoke.run_server_smoke(
         defaults_path=tmp_path / "missing-defaults.json",
@@ -137,4 +145,83 @@ async def test_live_server_smoke_entry_uses_process_env_without_example(
     assert project_env.source_files == (str(env),)
     assert project_env.example_file is None
     assert get_project_env_config() is project_env
-    assert dict(os.environ) == process_env_before
+    assert os.environ["AETHER_TEST_ENV_SENTINEL"] == "sentinel-before-load"
+    assert os.environ["AETHER_MARKET"] == "from-process"
+
+
+@pytest.mark.asyncio
+async def test_live_preflight_rejects_env_example_before_strategy_or_api(
+    tmp_path,
+    monkeypatch,
+):
+    import tools.live_preflight_check as preflight
+
+    fake_secret = "FAKE_PREFLIGHT_SECRET_MUST_NOT_APPEAR"
+    example = tmp_path / ".env.example"
+    example.write_text(
+        f"OKX_API_KEY={fake_secret}\n"
+        f"BINANCE_SECRET_KEY={fake_secret}\n",
+        encoding="utf-8",
+    )
+    report_path = tmp_path / "preflight-failure.json"
+    args = argparse.Namespace(
+        strategy="strategies.eth_portfolio_v1:Strategy",
+        defaults=tmp_path / "missing-defaults.json",
+        env_file=example,
+        report=str(report_path),
+        apply_reconcile=False,
+        skip_api=False,
+        skip_kline=False,
+    )
+    monkeypatch.setattr(preflight, "parse_args", lambda: args)
+
+    def forbidden_call(*_args, **_kwargs):
+        pytest.fail("strategy or API initialization ran after config rejection")
+
+    monkeypatch.setattr(preflight, "load_strategy", forbidden_call)
+    monkeypatch.setattr(preflight, "create_account_client", forbidden_call)
+    monkeypatch.setattr(preflight, "create_execution_client", forbidden_call)
+
+    exit_code = await preflight.main()
+
+    payload_text = report_path.read_text(encoding="utf-8")
+    payload = json.loads(payload_text)
+    assert exit_code == preflight.EXIT_FAIL_CONFIG
+    assert payload["verdict"] == "fail_config"
+    assert payload["checks"][0]["error"] == "config_load_failed:ValueError"
+    assert fake_secret not in payload_text
+    assert platform_config._PROJECT_ENV_CONFIG is None
+
+
+@pytest.mark.asyncio
+async def test_live_server_smoke_classifies_env_example_as_fail_config(
+    tmp_path,
+    monkeypatch,
+):
+    import tools.live_server_smoke as smoke
+
+    fake_secret = "FAKE_SMOKE_SECRET_MUST_NOT_APPEAR"
+    example = tmp_path / ".env.example"
+    example.write_text(
+        f"OKX_API_KEY={fake_secret}\n",
+        encoding="utf-8",
+    )
+
+    def forbidden_load_strategy(_path):
+        pytest.fail("provider initialization ran after config rejection")
+
+    monkeypatch.setattr(smoke, "load_strategy", forbidden_load_strategy)
+
+    result = await smoke.run_server_smoke(
+        defaults_path=tmp_path / "missing-defaults.json",
+        env_file=example,
+        strategy_name="strategies.eth_portfolio_v1:Strategy",
+        repo_root=tmp_path,
+    )
+
+    report_text = result.to_json()
+    assert result.verdict == "fail_config"
+    assert result.exit_code == 1
+    assert result.issues == ["live_smoke_config_load_failed:ValueError"]
+    assert fake_secret not in report_text
+    assert platform_config._PROJECT_ENV_CONFIG is None

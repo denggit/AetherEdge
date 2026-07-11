@@ -89,8 +89,13 @@ def _app_config(*, dry_run: bool = False, data_streams=()) -> AppConfig:
 
 
 def _test_project_env_config() -> ProjectEnvConfig:
+    keys = (
+        "AETHER_ACCOUNT_SNAPSHOT_LOG_KEEPALIVE_SECONDS",
+        "AETHER_STOP_POST_CHECK_ATTEMPTS",
+        "AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS",
+    )
     return ProjectEnvConfig(
-        values=dict(os.environ),
+        values={key: os.environ[key] for key in keys if key in os.environ},
         source_files=(),
         env_file=Path(".env"),
         example_file=None,
