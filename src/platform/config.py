@@ -55,34 +55,32 @@ def load_project_env_config(
 ) -> ProjectEnvConfig:
     """Load a project-wide config snapshot without mutating ``os.environ``.
 
-    ``.env.example`` acts as the complete key/default registry and ``.env``
-    overlays user-specific values. Process environment overrides are opt-in so
-    live trading config is not silently changed by the shell that launches it.
+    Runtime values come from ``.env`` with the process environment overlaid.
+    ``example_file`` and ``include_process_env`` remain as compatibility-only
+    arguments: ``.env.example`` is documentation, and process values can no
+    longer be disabled.
     """
 
     root = Path(__file__).resolve().parents[2]
     env_path = Path(env_file) if env_file is not None else root / ".env"
-    example_path = Path(example_file) if example_file is not None else root / ".env.example"
     config: dict[str, str] = {}
     source_files: list[str] = []
-
-    if example_path.exists():
-        config.update(_parse_env_file(example_path))
-        source_files.append(str(example_path))
 
     if env_path.exists():
         config.update(_parse_env_file(env_path))
         source_files.append(str(env_path))
 
-    if include_process_env:
-        values = os.environ if process_env is None else process_env
-        config.update({str(key): str(value) for key, value in values.items()})
+    # ``.env.example`` is never a runtime source. Keep the legacy parameters
+    # as no-ops while enforcing one precedence rule for every caller.
+    _ = example_file, include_process_env
+    values = os.environ if process_env is None else process_env
+    config.update({str(key): str(value) for key, value in values.items()})
 
     return ProjectEnvConfig(
         values=MappingProxyType(dict(config)),
         source_files=tuple(source_files),
         env_file=env_path,
-        example_file=example_path if example_path.exists() else None,
+        example_file=None,
     )
 
 

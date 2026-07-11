@@ -23,8 +23,6 @@ from src.platform.config import ProjectEnvConfig, load_project_env_config, set_p
 def bootstrap_live_process_config(project_root: Path = PROJECT_ROOT) -> ProjectEnvConfig:
     config = load_project_env_config(
         env_file=project_root / ".env",
-        example_file=project_root / ".env.example",
-        include_process_env=False,
     )
     set_project_env_config(config)
     globals()["PROJECT_ENV_CONFIG"] = config
@@ -50,11 +48,10 @@ FATAL_STARTUP_EXIT_CODE = 78
 
 def _log_live_process_config_loaded(config: ProjectEnvConfig) -> None:
     logger.info(
-        "Live process env config loaded | example_file=%s env_file=%s key_count=%s "
+        "Live process env config loaded | source_files=%s key_count=%s "
         "runtime_mode=%s strategy=%s exchanges=%s follower_exchanges=%s data_exchange=%s "
         "live_trading=%s dry_run=%s margin_mode=%s okx_leverage=%s binance_leverage=%s",
-        config.example_file,
-        config.env_file,
+        config.source_files,
         len(config.values),
         config.get("AETHER_RUNTIME_MODE"),
         config.get("AETHER_STRATEGY"),

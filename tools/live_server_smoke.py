@@ -35,11 +35,8 @@ async def run_server_smoke(
 ):
     strategy_path = strategy_plugin_path(strategy_name)
     try:
-        root = Path(repo_root)
         project_env = load_project_env_config(
             env_file=env_file,
-            example_file=root / ".env.example",
-            include_process_env=False,
         )
         set_project_env_config(project_env)
         strategy = load_strategy(strategy_path)

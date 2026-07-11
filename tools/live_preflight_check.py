@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import sys
 import time
 from dataclasses import asdict, dataclass, field, replace
@@ -146,8 +145,6 @@ async def main() -> int:
     report = PreflightReport(started_time_ms=_now_ms())
     project_env = load_project_env_config(
         env_file=args.env_file,
-        example_file=REPO_ROOT / ".env.example",
-        include_process_env=False,
     )
     set_project_env_config(project_env)
 
@@ -240,9 +237,24 @@ async def main() -> int:
     report.add("strategy_identity", "ok", detail={"strategy_id": strategy_id})
 
     # ── 4. Local DB writability ──
-    state_db = Path(os.getenv("AETHER_STATE_DB", "data/state/aether_state.sqlite3"))
-    journal_db = Path(os.getenv("AETHER_ORDER_JOURNAL_DB", "data/state/aether_order_journal.sqlite3"))
-    plan_db = Path(os.getenv("AETHER_POSITION_PLAN_DB", "data/state/aether_position_plan.sqlite3"))
+    state_db = Path(
+        project_env.get(
+            "AETHER_STATE_DB",
+            "data/state/aether_state.sqlite3",
+        )
+    )
+    journal_db = Path(
+        project_env.get(
+            "AETHER_ORDER_JOURNAL_DB",
+            "data/state/aether_order_journal.sqlite3",
+        )
+    )
+    plan_db = Path(
+        project_env.get(
+            "AETHER_POSITION_PLAN_DB",
+            "data/state/aether_position_plan.sqlite3",
+        )
+    )
 
     for db_path, label in [(state_db, "state_db"), (journal_db, "order_journal_db"), (plan_db, "position_plan_db")]:
         try:

@@ -1,7 +1,21 @@
-from src.platform.config import load_env_config
+import pytest
+
+from src.platform.config import (
+    load_env_config,
+    load_project_env_config,
+    reset_project_env_config_for_tests,
+    set_project_env_config,
+)
 from src.platform.exchanges import ExchangeConfig, ExchangeName
 from src.platform.exchanges.binance.credentials import resolve_binance_credentials
 from src.platform.exchanges.okx.credentials import resolve_okx_credentials
+
+
+@pytest.fixture(autouse=True)
+def _reset_project_env_config():
+    reset_project_env_config_for_tests()
+    yield
+    reset_project_env_config_for_tests()
 
 
 def test_load_env_config_reads_dotenv_and_process_env_wins(tmp_path):
@@ -71,3 +85,39 @@ def test_exchange_config_from_env_resolves_binance_strict_keys(monkeypatch):
 
     assert cfg.api_key == "binance_key"
     assert cfg.api_secret == "binance_secret"
+
+
+def test_exchange_config_uses_process_keys_from_global_project_snapshot(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "OKX_API_KEY=okx_file_key\n"
+        "OKX_SECRET_KEY=okx_file_secret\n"
+        "OKX_PASSPHRASE=okx_file_pass\n"
+        "BINANCE_API_KEY=binance_file_key\n"
+        "BINANCE_SECRET_KEY=binance_file_secret\n",
+        encoding="utf-8",
+    )
+    project_env = load_project_env_config(
+        env_file=env_file,
+        process_env={
+            "OKX_API_KEY": "okx_process_key",
+            "OKX_SECRET_KEY": "okx_process_secret",
+            "OKX_PASSPHRASE": "okx_process_pass",
+            "BINANCE_API_KEY": "binance_process_key",
+            "BINANCE_SECRET_KEY": "binance_process_secret",
+        },
+    )
+    set_project_env_config(project_env)
+
+    okx = ExchangeConfig.from_env(ExchangeName.OKX)
+    binance = ExchangeConfig.from_env(ExchangeName.BINANCE)
+
+    assert (okx.api_key, okx.api_secret, okx.passphrase) == (
+        "okx_process_key",
+        "okx_process_secret",
+        "okx_process_pass",
+    )
+    assert (binance.api_key, binance.api_secret) == (
+        "binance_process_key",
+        "binance_process_secret",
+    )
