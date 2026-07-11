@@ -81,10 +81,14 @@ async def main() -> None:
     _log_live_process_config_loaded(PROJECT_ENV_CONFIG)
     config = AppConfig.from_env(defaults_path=args.defaults)
     runtime_mode = runtime_mode_from_env(defaults_path=args.defaults)
+    is_direct_live = (
+        PROJECT_ENV_CONFIG.get_bool("AETHER_LIVE_TRADING", False)
+        and not config.dry_run
+    )
+    if is_direct_live:
+        _validate_direct_live_private_credentials(config)
+
     if runtime_mode is RuntimeMode.LIVE_RUNTIME:
-        is_direct_live = PROJECT_ENV_CONFIG.get_bool(
-            "AETHER_LIVE_TRADING", False
-        ) and not PROJECT_ENV_CONFIG.get_bool("AETHER_DRY_RUN", True)
         required_strategy = PROJECT_ENV_CONFIG.get(
             "AETHER_REQUIRED_LIVE_STRATEGY",
             "",
@@ -94,8 +98,6 @@ async def main() -> None:
                 "direct-live trading requires AETHER_REQUIRED_LIVE_STRATEGY "
                 "to be set in .env"
             )
-        if is_direct_live:
-            _validate_direct_live_private_credentials(config)
         if (
             required_strategy
             and strategy_identity(config.strategy)

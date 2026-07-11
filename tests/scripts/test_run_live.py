@@ -48,6 +48,13 @@ class TestFatalStartupErrorClassification:
         )
         assert _is_fatal_startup_error(exc) is True
 
+    def test_placeholder_private_credentials_is_fatal(self):
+        exc = LiveRuntimeError(
+            "placeholder_private_credentials exchange=okx "
+            "placeholder_fields=api_key"
+        )
+        assert _is_fatal_startup_error(exc) is True
+
     def test_producer_unhealthy_is_not_fatal(self):
         exc = LiveRuntimeError("producer unhealthy: trades:failed:connection refused")
         assert _is_fatal_startup_error(exc) is False
