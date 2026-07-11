@@ -143,8 +143,8 @@ def test_event_identity_not_swallowed_by_position_purpose() -> None:
 def test_metadata_created_time_excluded_from_identity() -> None:
     """metadata['created_time_ms'] must NOT participate in identity."""
     factory = _factory()
-    metadata_a = {"position_id": "p1", "created_time_ms": 100}
-    metadata_b = {"position_id": "p1", "created_time_ms": 999}
+    metadata_a = {"position_id": "p1", "retry_generation": 0, "created_time_ms": 100}
+    metadata_b = {"position_id": "p1", "retry_generation": 0, "created_time_ms": 999}
 
     intent_a = factory.create(_signal(metadata=metadata_a), source="recovery")
     intent_b = factory.create(_signal(metadata=metadata_b), source="recovery")
@@ -164,8 +164,8 @@ def test_no_stable_identity_raises_error() -> None:
 def test_metadata_insertion_order_does_not_change_identity() -> None:
     """Dict insertion order must not affect identity."""
     factory = _factory()
-    metadata_a = {"position_id": "p1", "execution_purpose": "stop_sync"}
-    metadata_b = {"execution_purpose": "stop_sync", "position_id": "p1"}
+    metadata_a = {"position_id": "p1", "execution_purpose": "stop_sync", "stop_generation": 0}
+    metadata_b = {"execution_purpose": "stop_sync", "position_id": "p1", "stop_generation": 0}
 
     intent_a = factory.create(_signal(metadata=metadata_a), source="recovery")
     intent_b = factory.create(_signal(metadata=metadata_b), source="recovery")
@@ -176,7 +176,7 @@ def test_metadata_insertion_order_does_not_change_identity() -> None:
 def test_non_identity_audit_fields_do_not_change_id() -> None:
     """Audit fields like 'current_price' must not affect identity."""
     factory = _factory()
-    base_metadata = {"position_id": "p1"}
+    base_metadata = {"position_id": "p1", "retry_generation": 0}
     intent_a = factory.create(
         _signal(metadata={**base_metadata, "current_price": "2000"}),
         source="recovery",
@@ -218,8 +218,8 @@ def test_different_actions_produce_different_ids() -> None:
 
 def test_different_positions_produce_different_ids() -> None:
     factory = _factory()
-    intent_a = factory.create(_signal(metadata={"position_id": "p1"}), source="recovery")
-    intent_b = factory.create(_signal(metadata={"position_id": "p2"}), source="recovery")
+    intent_a = factory.create(_signal(metadata={"position_id": "p1", "retry_generation": 0}), source="recovery")
+    intent_b = factory.create(_signal(metadata={"position_id": "p2", "retry_generation": 0}), source="recovery")
     assert intent_a.intent_id != intent_b.intent_id
 
 
@@ -363,7 +363,7 @@ def test_scoped_stop_cancel_identity_stable() -> None:
 
 def test_cancel_all_stops_identity_stable() -> None:
     factory = _factory()
-    metadata = {"position_id": "p1", "execution_purpose": "stop_sync"}
+    metadata = {"position_id": "p1", "execution_purpose": "stop_sync", "stop_generation": 0}
     signal_a = TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.CANCEL_ALL_STOP_ORDERS, metadata=metadata, created_time_ms=100)
     signal_b = TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.CANCEL_ALL_STOP_ORDERS, metadata=metadata, created_time_ms=200)
     intent_a = factory.create(signal_a, source="recovery")
@@ -391,7 +391,7 @@ def test_follower_recovery_topup_identity_stable() -> None:
 
 def test_stop_sync_identity_stable() -> None:
     factory = _factory()
-    metadata = {"position_id": "p1", "execution_purpose": "stop_sync"}
+    metadata = {"position_id": "p1", "execution_purpose": "stop_sync", "stop_generation": 0}
     intent_a = factory.create(
         _signal(SignalAction.CANCEL_ALL_STOP_ORDERS, metadata=metadata, created_time_ms=100),
         source="recovery",
@@ -408,7 +408,7 @@ def test_follower_close_after_master_close_identity_stable() -> None:
     metadata = {
         "position_id": "p1",
         "execution_purpose": "follower_close_after_master_close",
-        "position_generation": "1000",
+        "follower_close_generation": 0,
         "target_exchanges": ["binance"],
     }
     intent_a = factory.create(
@@ -579,3 +579,288 @@ async def test_restart_replay_through_real_factory_and_coordinator(tmp_path) -> 
     assert planner_b.calls == 0
     assert client_b.place_order_calls == 0
     assert client_b.fetch_rule_calls == 0
+
+
+# ── cross-source replay ─────────────────────────────────────────────────────
+
+
+def test_cross_source_closed_kline_vs_startup_catchup_same_id() -> None:
+    """Same bar event via closed_kline and startup_catchup must produce same intent_id."""
+    factory = _factory()
+    metadata = {"bar_close_time_ms": 5000}
+    signal_normal = _signal(metadata=metadata, created_time_ms=100)
+    signal_catchup = _signal(metadata=metadata, created_time_ms=999)
+
+    intent_normal = factory.create(signal_normal, source="closed_kline", event_time_ms=5000)
+    intent_catchup = factory.create(signal_catchup, source="startup_catchup", event_time_ms=5000)
+
+    assert intent_normal.intent_id == intent_catchup.intent_id
+
+
+@pytest.mark.asyncio
+async def test_cross_source_replay_blocked_through_coordinator(tmp_path) -> None:
+    """Second execution with different source but same bar must be blocked."""
+    db_path = tmp_path / "journal.sqlite3"
+
+    factory = _factory()
+    client = _CountingClient()
+    planner = _CountingPlanner()
+    repo = SqliteOrderJournalStore(db_path)
+    coord = MultiExchangeOrderCoordinator(clients=[client], repository=repo, planner=planner)
+
+    metadata = {"bar_close_time_ms": 7000}
+    signal_a = _signal(metadata=metadata, created_time_ms=100)
+    intent_a = factory.create(signal_a, source="closed_kline", event_time_ms=7000)
+    await coord.execute(intent_a)
+
+    # Replay with startup_catchup source
+    signal_b = _signal(metadata=metadata, created_time_ms=999)
+    intent_b = factory.create(signal_b, source="startup_catchup", event_time_ms=7000)
+    assert intent_a.intent_id == intent_b.intent_id
+
+    with pytest.raises(DuplicateIntentError):
+        await coord.execute(intent_b)
+    assert planner.calls == 1  # Only first execution planned
+
+
+# ── follower close retry lifecycle ────────────────────────────────────────
+
+
+def test_follower_close_generation_0_vs_1_different_ids() -> None:
+    factory = _factory()
+    metadata_0 = {
+        "position_id": "p1",
+        "execution_purpose": "follower_close_after_master_close",
+        "follower_close_generation": 0,
+        "target_exchanges": ["binance"],
+    }
+    metadata_1 = {**metadata_0, "follower_close_generation": 1}
+    intent_0 = factory.create(
+        _signal(SignalAction.CLOSE_LONG, metadata=metadata_0),
+        source="follower_close_periodic_check",
+    )
+    intent_1 = factory.create(
+        _signal(SignalAction.CLOSE_LONG, metadata=metadata_1),
+        source="follower_close_periodic_check",
+    )
+    assert intent_0.intent_id != intent_1.intent_id
+
+
+def test_follower_close_same_generation_replay_same_id() -> None:
+    factory = _factory()
+    metadata = {
+        "position_id": "p1",
+        "execution_purpose": "follower_close_after_master_close",
+        "follower_close_generation": 0,
+        "target_exchanges": ["binance"],
+    }
+    intent_a = factory.create(
+        _signal(SignalAction.CLOSE_LONG, metadata=metadata, created_time_ms=100),
+        source="follower_close_periodic_check",
+    )
+    intent_b = factory.create(
+        _signal(SignalAction.CLOSE_LONG, metadata=metadata, created_time_ms=999),
+        source="recovery",
+    )
+    assert intent_a.intent_id == intent_b.intent_id
+
+
+def test_recovery_and_periodic_same_generation_same_id() -> None:
+    """source=recovery and source=follower_close_periodic_check with same gen must match."""
+    factory = _factory()
+    metadata = {
+        "position_id": "p1",
+        "execution_purpose": "follower_close_after_master_close",
+        "follower_close_generation": 2,
+        "target_exchanges": ["binance"],
+    }
+    intent_recovery = factory.create(
+        _signal(SignalAction.CLOSE_LONG, metadata=metadata),
+        source="recovery",
+    )
+    intent_periodic = factory.create(
+        _signal(SignalAction.CLOSE_LONG, metadata=metadata),
+        source="follower_close_periodic_check",
+    )
+    assert intent_recovery.intent_id == intent_periodic.intent_id
+
+
+# ── production top-up builder ──────────────────────────────────────────────
+
+
+def test_production_topup_generation_takes_effect() -> None:
+    factory = _factory()
+    base = {
+        "position_id": "p1",
+        "execution_purpose": "follower_recovery_topup",
+    }
+    intent_0 = factory.create(
+        _signal(metadata={**base, "topup_generation": 0}),
+        source="recovery",
+    )
+    intent_1 = factory.create(
+        _signal(metadata={**base, "topup_generation": 1}),
+        source="recovery",
+    )
+    assert intent_0.intent_id != intent_1.intent_id
+
+
+def test_production_topup_same_generation_same_id() -> None:
+    factory = _factory()
+    metadata = {
+        "position_id": "p1",
+        "execution_purpose": "follower_recovery_topup",
+        "topup_generation": 0,
+    }
+    intent_a = factory.create(
+        _signal(metadata=metadata, created_time_ms=100, quantity=Decimal("0.01")),
+        source="recovery",
+    )
+    intent_b = factory.create(
+        _signal(metadata=metadata, created_time_ms=200, quantity=Decimal("0.02")),
+        source="recovery",
+    )
+    assert intent_a.intent_id == intent_b.intent_id
+
+
+# ── production stop repair builder ───────────────────────────────────────
+
+
+def test_production_stop_generation_takes_effect() -> None:
+    factory = _factory()
+    base = {
+        "position_id": "p1",
+        "execution_purpose": "follower_stop_repair",
+    }
+    intent_0 = factory.create(
+        _signal(SignalAction.PLACE_STOP_LOSS_LONG, metadata={**base, "stop_generation": 0}, trigger_price=Decimal("1500")),
+        source="recovery",
+    )
+    intent_1 = factory.create(
+        _signal(SignalAction.PLACE_STOP_LOSS_LONG, metadata={**base, "stop_generation": 1}, trigger_price=Decimal("1500")),
+        source="recovery",
+    )
+    assert intent_0.intent_id != intent_1.intent_id
+
+
+def test_production_stop_same_generation_same_id() -> None:
+    factory = _factory()
+    metadata = {
+        "position_id": "p1",
+        "execution_purpose": "follower_stop_repair",
+        "stop_generation": 0,
+    }
+    intent_a = factory.create(
+        _signal(SignalAction.PLACE_STOP_LOSS_LONG, metadata=metadata, created_time_ms=100, trigger_price=Decimal("1500")),
+        source="recovery",
+    )
+    intent_b = factory.create(
+        _signal(SignalAction.PLACE_STOP_LOSS_LONG, metadata=metadata, created_time_ms=200, trigger_price=Decimal("1500")),
+        source="recovery",
+    )
+    assert intent_a.intent_id == intent_b.intent_id
+
+
+# ── fail-closed ────────────────────────────────────────────────────────────
+
+
+def test_fail_closed_empty_execution_purpose() -> None:
+    factory = _factory()
+    with pytest.raises(ValueError):
+        factory.create(
+            _signal(metadata={"execution_purpose": "", "position_id": "p1", "retry_generation": 0}),
+            source="recovery",
+        )
+
+
+def test_fail_closed_whitespace_execution_purpose() -> None:
+    factory = _factory()
+    with pytest.raises(ValueError):
+        factory.create(
+            _signal(metadata={"execution_purpose": "   ", "position_id": "p1", "retry_generation": 0}),
+            source="recovery",
+        )
+
+
+def test_fail_closed_empty_position_id() -> None:
+    factory = _factory()
+    with pytest.raises(ValueError, match="empty position_id"):
+        factory.create(
+            _signal(metadata={"position_id": "", "execution_purpose": "stop_sync", "stop_generation": 0}),
+            source="recovery",
+        )
+
+
+def test_fail_closed_purpose_only_no_position_or_generation() -> None:
+    """execution_purpose alone without position_id/generation must fail."""
+    factory = _factory()
+    with pytest.raises(ValueError):
+        factory.create(
+            _signal(metadata={"execution_purpose": "stop_sync"}),
+            source="recovery",
+        )
+
+
+def test_fail_closed_unserializable_object() -> None:
+    """Non-serializable metadata values must fail closed."""
+    from src.runtime.orders import _canonical_value
+
+    class Unserializable:
+        pass
+
+    with pytest.raises(TypeError, match="unsupported identity value type"):
+        _canonical_value(Unserializable())
+
+
+# ── canonical serializer ─────────────────────────────────────────────────
+
+
+def test_canonical_serializer_mapping_order_independent() -> None:
+    from src.runtime.orders import _canonical_value
+
+    a = {"b": 1, "a": 2}
+    b = {"a": 2, "b": 1}
+    assert _canonical_value(a) == _canonical_value(b)
+
+
+def test_canonical_serializer_set_order_independent() -> None:
+    from src.runtime.orders import _canonical_value
+
+    assert _canonical_value({"c", "a", "b"}) == _canonical_value({"a", "b", "c"})
+
+
+def test_canonical_serializer_enum() -> None:
+    from src.runtime.orders import _canonical_value
+
+    assert _canonical_value(SignalAction.OPEN_LONG) == "open_long"
+
+
+def test_canonical_serializer_decimal() -> None:
+    from src.runtime.orders import _canonical_value
+
+    assert _canonical_value(Decimal("1.10")) == _canonical_value(Decimal("1.1"))
+
+
+def test_canonical_serializer_list_and_tuple() -> None:
+    from src.runtime.orders import _canonical_value
+
+    assert _canonical_value([1, 2, 3]) == _canonical_value((1, 2, 3))
+
+
+def test_canonical_serializer_bool() -> None:
+    from src.runtime.orders import _canonical_value
+
+    assert _canonical_value(True) == "1"
+    assert _canonical_value(False) == "0"
+
+
+def test_canonical_serializer_none() -> None:
+    from src.runtime.orders import _canonical_value
+
+    assert _canonical_value(None) is None
+
+
+def test_canonical_serializer_string_strip() -> None:
+    from src.runtime.orders import _canonical_value
+
+    assert _canonical_value("  hello  ") == "hello"

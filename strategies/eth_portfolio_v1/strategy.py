@@ -3456,6 +3456,8 @@ class Strategy:
         plan = dict(plan_payload.get("position", {}))
         legs = [dict(item) for item in plan_payload.get("legs", [])]
         side = _side_from_plan(plan.get("side"))
+        plan_meta = dict(plan.get("metadata") or {})
+        stop_generation = int(plan_meta.get("stop_generation", 0))
         actual_side = _side_from_position(master)
         if side is Side.FLAT or actual_side is Side.FLAT or side is not actual_side:
             self.recovery_alerts.append("master_active_plan_side_mismatch_manual_required")
@@ -3516,6 +3518,7 @@ class Strategy:
                 quantity=qty,
                 stop_price=stop_price,
                 reason="RECOVERY_MASTER_STOP_SYNC",
+                stop_generation=stop_generation,
             )
         )
         for leg in legs:
@@ -3616,6 +3619,7 @@ class Strategy:
                         native_quantity=same_native_qty,
                         stop_price=stop_price,
                         market_profile=market_profile,
+                        stop_generation=stop_generation,
                     )
                 )
                 continue
@@ -3666,6 +3670,7 @@ class Strategy:
                         native_quantity=same_native_qty,
                         stop_price=stop_price,
                         market_profile=market_profile,
+                        stop_generation=stop_generation,
                     )
                 )
                 continue
@@ -3690,6 +3695,7 @@ class Strategy:
                     quantity_converter=converter,
                 )
                 if not self.recovery_manual_required and missing_resolution.executable:
+                    leg_meta = dict(leg.get("metadata") or {})
                     signals.append(
                         self._follower_topup_signal(
                             exchange=exchange,
@@ -3709,6 +3715,7 @@ class Strategy:
                                 delta_resolution=missing_resolution,
                                 reason="executable_missing_quantity",
                             ),
+                            topup_generation=int(leg_meta.get("topup_generation", 0)),
                         )
                     )
             elif same_qty < expected_existing_qty:
@@ -3758,9 +3765,11 @@ class Strategy:
                         native_quantity=same_native_qty,
                         stop_price=stop_price,
                         market_profile=market_profile,
+                        stop_generation=stop_generation,
                     )
                 )
                 if delta_resolution.executable:
+                    leg_meta = dict(leg.get("metadata") or {})
                     signals.append(
                         self._follower_topup_signal(
                             exchange=exchange,
@@ -3768,6 +3777,7 @@ class Strategy:
                             quantity=delta_resolution.normalized_base_quantity,
                             plan=plan,
                             quantity_metadata=resolution_metadata,
+                            topup_generation=int(leg_meta.get("topup_generation", 0)),
                         )
                     )
                 else:
@@ -3790,6 +3800,7 @@ class Strategy:
                         native_quantity=same_native_qty,
                         stop_price=stop_price,
                         market_profile=market_profile,
+                        stop_generation=stop_generation,
                     )
                 )
             elif same_qty > 0:
@@ -3804,6 +3815,7 @@ class Strategy:
                         native_quantity=same_native_qty,
                         stop_price=stop_price,
                         market_profile=market_profile,
+                        stop_generation=stop_generation,
                     )
                 )
         return signals
@@ -3819,6 +3831,7 @@ class Strategy:
         native_quantity: Decimal,
         stop_price: Decimal,
         market_profile,
+        stop_generation: int = 0,
     ) -> list[TradeSignal]:
         if snapshot is None or base_quantity <= 0:
             return []
@@ -3842,6 +3855,7 @@ class Strategy:
             quantity=base_quantity,
             stop_price=stop_price,
             reason="RECOVERY_FOLLOWER_STOP_SYNC",
+            stop_generation=stop_generation,
         )
 
     def _follower_quantity_resolution_metadata(
@@ -3953,6 +3967,8 @@ class Strategy:
         if side is Side.FLAT:
             return []
         signals: list[TradeSignal] = []
+        plan_meta = dict(plan.get("metadata") or {})
+        current_gen = int(plan_meta.get("follower_close_generation", 0))
         for leg in plan_payload.get("legs", []):
             exchange = str(dict(leg).get("exchange") or "").lower()
             if not exchange or exchange == self.config.data_exchange:
@@ -3973,7 +3989,7 @@ class Strategy:
                             "reduce_only": True,
                             "execution_purpose": "follower_close_after_master_close",
                             "position_id": plan.get("position_id"),
-                            "position_generation": str(plan.get("created_time_ms") or ""),
+                            "follower_close_generation": current_gen,
                         },
                     )
                 )
@@ -3988,6 +4004,7 @@ class Strategy:
         quantity: Decimal,
         stop_price: Decimal,
         reason: str,
+        stop_generation: int = 0,
     ) -> list[TradeSignal]:
         signals: list[TradeSignal] = []
         for check in validation.checks:
@@ -4034,7 +4051,7 @@ class Strategy:
                 )
         if validation.should_keep_existing_stop:
             return signals
-        repair_metadata = self._follower_stop_repair_metadata(validation=validation, exchange=exchange)
+        repair_metadata = self._follower_stop_repair_metadata(validation=validation, exchange=exchange, stop_generation=stop_generation)
         if validation.should_cancel_and_replace_bot_stops:
             action = "manual_required" if validation.has_unknown_exit_orders else "cancel_replace"
             logger.info(
@@ -4110,6 +4127,7 @@ class Strategy:
         *,
         validation: RecoveryExitValidationResult,
         exchange: str,
+        stop_generation: int = 0,
     ) -> dict[str, Any] | None:
         if exchange == self.config.data_exchange:
             return None
@@ -4121,6 +4139,7 @@ class Strategy:
             "follower_position_native_quantity": str(validation.current_position_native_quantity),
             "follower_position_base_quantity": str(validation.current_position_base_quantity),
             "repair_reason": _follower_stop_repair_reason(validation),
+            "stop_generation": stop_generation,
         }
 
     def _cleanup_missing_follower_stops(self, *, snapshot: PlatformSnapshot | None, exchange: str, position_id: str | None) -> list[TradeSignal]:
@@ -4195,6 +4214,7 @@ class Strategy:
         quantity: Decimal,
         plan: Mapping[str, Any],
         quantity_metadata: Mapping[str, Any] | None = None,
+        topup_generation: int = 0,
     ) -> TradeSignal:
         return TradeSignal(
             symbol=self.config.symbol,
@@ -4208,6 +4228,7 @@ class Strategy:
                 "execution_purpose": "follower_recovery_topup",
                 "position_id": plan.get("position_id"),
                 "engine": plan.get("entry_engine"),
+                "topup_generation": topup_generation,
                 **dict(quantity_metadata or {}),
             },
         )

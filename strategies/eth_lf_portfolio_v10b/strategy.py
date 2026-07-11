@@ -1937,7 +1937,6 @@ class Strategy:
                             "reduce_only": True,
                             "execution_purpose": "follower_close_after_master_close",
                             "position_id": plan.get("position_id"),
-                            "position_generation": str(plan.get("created_time_ms") or ""),
                         },
                     )
                 )
