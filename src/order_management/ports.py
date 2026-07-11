@@ -8,7 +8,10 @@ from src.signals.models import TradeSignal
 
 
 class OrderIntentRepository(Protocol):
-    def save_intent(self, intent: OrderIntent) -> None:
+    def claim_intent(self, intent: OrderIntent) -> bool:
+        ...
+
+    def update_claimed_intent(self, intent: OrderIntent) -> None:
         ...
 
     def update_status(self, *, intent_id: str, status: OrderIntentStatus) -> None:
@@ -24,7 +27,7 @@ class ClientOrderIdFactory(Protocol):
 
 
 class DuplicateOrderGuard(Protocol):
-    def assert_not_duplicate(self, intent: OrderIntent) -> None:
+    def claim_or_raise(self, intent: OrderIntent) -> None:
         ...
 
 

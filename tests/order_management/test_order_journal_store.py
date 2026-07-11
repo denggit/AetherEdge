@@ -12,7 +12,7 @@ def test_sqlite_order_journal_store_roundtrips_intent_status_and_results(tmp_pat
     signal = TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.OPEN_SHORT, quantity=Decimal("0.2"), reason="test", created_time_ms=100)
     intent = OrderIntent(intent_id="intent-1", strategy_id="v8", signal=signal, target_exchanges=(ExchangeName.OKX, ExchangeName.BINANCE))
 
-    repo.save_intent(intent)
+    assert repo.claim_intent(intent) is True
     repo.update_status(intent_id="intent-1", status=OrderIntentStatus.SUBMITTED)
     repo.save_result(
         intent_id="intent-1",
@@ -57,7 +57,7 @@ def test_order_journal_has_intent_with_position_id_from_signal_metadata(tmp_path
         target_exchanges=(ExchangeName.OKX,),
         status=OrderIntentStatus.SUBMITTED,
     )
-    repo.save_intent(intent)
+    assert repo.claim_intent(intent) is True
 
     assert repo.has_intent_with_position_id("v9c-test-position") is True
     assert repo.has_intent_with_position_id("missing-position") is False
@@ -80,7 +80,7 @@ def test_order_journal_has_intent_with_position_id_ignores_inactive_status(tmp_p
         target_exchanges=(ExchangeName.OKX,),
         status=OrderIntentStatus.CANCELED,
     )
-    repo.save_intent(intent)
+    assert repo.claim_intent(intent) is True
 
     assert repo.has_intent_with_position_id("v9c-canceled-position") is False
 
@@ -104,6 +104,6 @@ def test_order_journal_has_intent_with_position_id_from_intent_metadata(tmp_path
         status=OrderIntentStatus.SUBMITTED,
         metadata={"position_id": "v9c-intent-meta-position"},
     )
-    repo.save_intent(intent)
+    assert repo.claim_intent(intent) is True
 
     assert repo.has_intent_with_position_id("v9c-intent-meta-position") is True

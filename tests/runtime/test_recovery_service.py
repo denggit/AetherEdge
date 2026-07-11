@@ -99,7 +99,7 @@ def test_runtime_recovery_collects_snapshot_reconciles_loads_intents_and_calls_s
     journal = SqliteOrderJournalStore(tmp_path / "journal.sqlite3")
     signal = TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.CANCEL_ALL_ORDERS, created_time_ms=1)
     intent = OrderIntent(intent_id="intent-1", strategy_id="v8", signal=signal, target_exchanges=(ExchangeName.OKX,))
-    journal.save_intent(intent)
+    assert journal.claim_intent(intent) is True
     strategy = RecoverableStrategy()
     service = RuntimeRecoveryService(
         exchange_contexts=(RecoveryExchangeContext(account=FakeAccount(), execution=FakeExecution(), state_store=state_store),),

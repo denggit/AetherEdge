@@ -20,17 +20,15 @@ class SqliteOrderJournalStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
-    def save_intent(self, intent: OrderIntent) -> None:
+    def claim_intent(self, intent: OrderIntent) -> bool:
         with self._connect() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT INTO order_intents (
                     intent_id, strategy_id, signal_json, target_exchanges_json,
                     status, created_time_ms, metadata_json
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(intent_id) DO UPDATE SET
-                    status=excluded.status,
-                    metadata_json=excluded.metadata_json
+                ON CONFLICT(intent_id) DO NOTHING
                 """,
                 (
                     intent.intent_id,
@@ -42,6 +40,35 @@ class SqliteOrderJournalStore:
                     _json(intent.metadata),
                 ),
             )
+            if cursor.rowcount != 1:
+                return False
+            conn.execute(
+                """
+                INSERT INTO order_journal_events (intent_id, status, message, exchange, created_time_ms, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (intent.intent_id, intent.status.value, "intent_claimed", None, intent.created_time_ms, _json({})),
+            )
+        return True
+
+    def update_claimed_intent(self, intent: OrderIntent) -> None:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE order_intents
+                SET status = ?, metadata_json = ?
+                WHERE intent_id = ?
+                """,
+                (
+                    intent.status.value,
+                    _json(intent.metadata),
+                    intent.intent_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    f"order intent must be claimed before update: {intent.intent_id}"
+                )
             conn.execute(
                 """
                 INSERT INTO order_journal_events (intent_id, status, message, exchange, created_time_ms, metadata_json)
@@ -221,6 +248,7 @@ class SqliteOrderJournalStore:
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS order_intents (
@@ -274,8 +302,8 @@ class SqliteOrderJournalStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_order_events_intent ON order_journal_events(intent_id)")
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn = sqlite3.connect(self.path, timeout=30.0)
+        conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA temp_store=MEMORY")
         return conn

@@ -28,7 +28,16 @@ class MemoryOrderJournal:
         self.results: list[tuple[str, ExchangeOrderResult]] = []
         self.events: list[OrderJournalEvent] = []
 
-    def save_intent(self, intent: OrderIntent) -> None:
+    def claim_intent(self, intent: OrderIntent) -> bool:
+        if intent.intent_id in self.intents:
+            return False
+        self.intents[intent.intent_id] = intent
+        self.statuses[intent.intent_id] = intent.status
+        return True
+
+    def update_claimed_intent(self, intent: OrderIntent) -> None:
+        if intent.intent_id not in self.intents:
+            raise ValueError(f"intent not claimed: {intent.intent_id}")
         self.intents[intent.intent_id] = intent
         self.statuses[intent.intent_id] = intent.status
 

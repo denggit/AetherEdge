@@ -2818,7 +2818,7 @@ async def test_startup_catchup_order_journal_duplicate_restores_pending_entry(tm
         target_exchanges=(ExchangeName.OKX,),
         status=OrderIntentStatus.SUBMITTED,
     )
-    journal.save_intent(dup_intent)
+    assert journal.claim_intent(dup_intent) is True
 
     executed_signals = []
 

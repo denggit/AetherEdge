@@ -9,11 +9,11 @@ class DuplicateIntentError(RuntimeError):
 
 
 class RepositoryDuplicateOrderGuard:
-    """Prevent resubmitting an already journaled intent."""
+    """Atomically claim an intent before any execution work begins."""
 
     def __init__(self, repository: OrderIntentRepository) -> None:
         self.repository = repository
 
-    def assert_not_duplicate(self, intent: OrderIntent) -> None:
-        if self.repository.get_intent(intent.intent_id) is not None:
+    def claim_or_raise(self, intent: OrderIntent) -> None:
+        if not self.repository.claim_intent(intent):
             raise DuplicateIntentError(f"duplicate order intent: {intent.intent_id}")

@@ -7,6 +7,7 @@ from enum import Enum
 from typing import Any, Mapping, Sequence
 
 from src.order_management.idempotency.client_order_id import DeterministicClientOrderIdFactory
+from src.order_management.idempotency.duplicate_guard import RepositoryDuplicateOrderGuard
 from src.order_management.models import ExchangeOrderResult, OrderIntent, OrderIntentStatus, OrderJournalEvent
 from src.order_management.position_plan import LegPlan, LegRole, LegSyncStatus, PositionPlan, PositionPlanStatus
 from src.order_management.ports import ClientOrderIdFactory, DuplicateOrderGuard, OrderIntentRepository
@@ -58,7 +59,9 @@ class MultiExchangeOrderCoordinator:
         self.repository = repository
         self.planner = planner or ExecutionPlanner()
         self.client_order_id_factory = client_order_id_factory or DeterministicClientOrderIdFactory()
-        self.duplicate_guard = duplicate_guard
+        self.duplicate_guard = duplicate_guard or RepositoryDuplicateOrderGuard(
+            repository
+        )
         self.quantity_converter = quantity_converter or NativeQuantityConverter()
         self.exit_safety_guard = exit_safety_guard or ExitSafetyGuard(quantity_converter=self.quantity_converter)
         self.order_status_synchronizer = order_status_synchronizer or OrderStatusSynchronizer()
@@ -69,11 +72,10 @@ class MultiExchangeOrderCoordinator:
         self._position_mode_cache: dict[ExchangeName, PositionMode] = {}
 
     async def execute(self, intent: OrderIntent) -> list[ExchangeOrderResult]:
+        self.duplicate_guard.claim_or_raise(intent)
         intent, skipped = await self._normalize_recovery_topup_intent(intent)
         if skipped is not None:
             return skipped
-        if self.duplicate_guard is not None:
-            self.duplicate_guard.assert_not_duplicate(intent)
         plan = self.planner.plan(intent.signal)
         target_values = {exchange.value for exchange in intent.target_exchanges}
         clients = [client for client in self.clients if client.exchange.value in target_values]
@@ -86,7 +88,7 @@ class MultiExchangeOrderCoordinator:
             len(plan.items),
             self.master_follower_policy is not None,
         )
-        self.repository.save_intent(intent)
+        self.repository.update_claimed_intent(intent)
         self.repository.update_status(intent_id=intent.intent_id, status=OrderIntentStatus.PLANNED)
         if self.master_follower_policy is not None:
             results = await self._execute_master_follower(clients, intent, plan.items)
@@ -242,7 +244,7 @@ class MultiExchangeOrderCoordinator:
                 "quantity_resolutions": resolution_metadata,
             },
         )
-        self.repository.save_intent(recovered_intent)
+        self.repository.update_claimed_intent(recovered_intent)
         self.repository.update_status(
             intent_id=intent.intent_id, status=OrderIntentStatus.RECOVERED
         )
