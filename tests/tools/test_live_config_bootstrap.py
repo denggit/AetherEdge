@@ -15,6 +15,21 @@ from src.platform import config as platform_config
 from src.runtime.live_smoke import BootstrapFailureReport
 
 
+FAKE_PROCESS_CREDENTIALS = {
+    "OKX_API_KEY": "fake_process_okx_key",
+    "OKX_SECRET_KEY": "fake_process_okx_secret",
+    "OKX_PASSPHRASE": "fake_process_okx_passphrase",
+    "BINANCE_API_KEY": "fake_process_binance_key",
+    "BINANCE_SECRET_KEY": "fake_process_binance_secret",
+}
+
+
+def _set_fake_process_credentials(monkeypatch) -> None:
+    for key, value in FAKE_PROCESS_CREDENTIALS.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("AETHER_EXAMPLE_ONLY", raising=False)
+
+
 @pytest.fixture(autouse=True)
 def _reset_project_env_config():
     previous = platform_config._PROJECT_ENV_CONFIG
@@ -52,15 +67,18 @@ def _write_project_files(tmp_path):
     example = tmp_path / ".env.example"
     env = tmp_path / ".env"
     example.write_text(
-        "AETHER_EXAMPLE_ONLY=not-runtime-config\n"
-        "OKX_API_KEY=placeholder-api-key\n",
+        "AETHER_EXAMPLE_ONLY=example-only-value\n"
+        "OKX_API_KEY=fake_example_placeholder_okx_key\n"
+        "BINANCE_API_KEY=fake_example_placeholder_binance_key\n",
         encoding="utf-8",
     )
     env.write_text(
         "AETHER_MARKET=from-file\n"
         "AETHER_EXCHANGES=okx\n"
         "AETHER_DATA_EXCHANGE=okx\n"
-        "AETHER_STRATEGY=strategies.eth_portfolio_v1:Strategy\n",
+        "AETHER_STRATEGY=strategies.eth_portfolio_v1:Strategy\n"
+        "OKX_API_KEY=fake_file_okx_key\n"
+        "BINANCE_API_KEY=fake_file_binance_key\n",
         encoding="utf-8",
     )
     return env
@@ -95,19 +113,27 @@ async def test_live_preflight_entry_uses_process_env_without_example(
     monkeypatch.setattr(preflight, "parse_args", lambda: args)
     monkeypatch.setattr(preflight, "load_strategy", lambda _path: strategy)
     monkeypatch.setattr(smoke, "load_strategy", lambda _path: strategy)
+    _set_fake_process_credentials(monkeypatch)
     monkeypatch.setenv("AETHER_TEST_ENV_SENTINEL", "sentinel-before-load")
     monkeypatch.setenv("AETHER_MARKET", "from-process")
 
     exit_code = await preflight.main()
 
     project_env = captured["project_env"]
+    missing = object()
     assert exit_code == 0
     assert project_env.get("AETHER_MARKET") == "from-process"
-    assert "AETHER_EXAMPLE_ONLY" not in project_env.values
-    assert "OKX_API_KEY" not in project_env.values
+    assert project_env.get("OKX_API_KEY") == "fake_process_okx_key"
+    assert project_env.get("OKX_SECRET_KEY") == "fake_process_okx_secret"
+    assert project_env.get("OKX_PASSPHRASE") == "fake_process_okx_passphrase"
+    assert project_env.get("BINANCE_API_KEY") == "fake_process_binance_key"
+    assert project_env.get("BINANCE_SECRET_KEY") == "fake_process_binance_secret"
+    assert project_env.get("OKX_API_KEY") != "fake_example_placeholder_okx_key"
+    assert project_env.get("BINANCE_API_KEY") != "fake_example_placeholder_binance_key"
+    assert project_env.get("AETHER_EXAMPLE_ONLY", missing) is missing
     assert project_env.source_files == (str(env),)
     assert project_env.example_file is None
-    assert get_project_env_config() is project_env
+    assert id(get_project_env_config()) == id(project_env)
     assert os.environ["AETHER_TEST_ENV_SENTINEL"] == "sentinel-before-load"
     assert os.environ["AETHER_MARKET"] == "from-process"
 
@@ -127,6 +153,7 @@ async def test_live_server_smoke_entry_uses_process_env_without_example(
     captured = {}
     strategy = _Strategy(captured, report)
     monkeypatch.setattr(smoke, "load_strategy", lambda _path: strategy)
+    _set_fake_process_credentials(monkeypatch)
     monkeypatch.setenv("AETHER_TEST_ENV_SENTINEL", "sentinel-before-load")
     monkeypatch.setenv("AETHER_MARKET", "from-process")
 
@@ -138,13 +165,20 @@ async def test_live_server_smoke_entry_uses_process_env_without_example(
     )
 
     project_env = captured["project_env"]
+    missing = object()
     assert result is report
     assert project_env.get("AETHER_MARKET") == "from-process"
-    assert "AETHER_EXAMPLE_ONLY" not in project_env.values
-    assert "OKX_API_KEY" not in project_env.values
+    assert project_env.get("OKX_API_KEY") == "fake_process_okx_key"
+    assert project_env.get("OKX_SECRET_KEY") == "fake_process_okx_secret"
+    assert project_env.get("OKX_PASSPHRASE") == "fake_process_okx_passphrase"
+    assert project_env.get("BINANCE_API_KEY") == "fake_process_binance_key"
+    assert project_env.get("BINANCE_SECRET_KEY") == "fake_process_binance_secret"
+    assert project_env.get("OKX_API_KEY") != "fake_example_placeholder_okx_key"
+    assert project_env.get("BINANCE_API_KEY") != "fake_example_placeholder_binance_key"
+    assert project_env.get("AETHER_EXAMPLE_ONLY", missing) is missing
     assert project_env.source_files == (str(env),)
     assert project_env.example_file is None
-    assert get_project_env_config() is project_env
+    assert id(get_project_env_config()) == id(project_env)
     assert os.environ["AETHER_TEST_ENV_SENTINEL"] == "sentinel-before-load"
     assert os.environ["AETHER_MARKET"] == "from-process"
 
@@ -190,7 +224,7 @@ async def test_live_preflight_rejects_env_example_before_strategy_or_api(
     assert payload["verdict"] == "fail_config"
     assert payload["checks"][0]["error"] == "config_load_failed:ValueError"
     assert fake_secret not in payload_text
-    assert platform_config._PROJECT_ENV_CONFIG is None
+    assert id(platform_config._PROJECT_ENV_CONFIG) == id(None)
 
 
 @pytest.mark.asyncio
@@ -224,4 +258,4 @@ async def test_live_server_smoke_classifies_env_example_as_fail_config(
     assert result.exit_code == 1
     assert result.issues == ["live_smoke_config_load_failed:ValueError"]
     assert fake_secret not in report_text
-    assert platform_config._PROJECT_ENV_CONFIG is None
+    assert id(platform_config._PROJECT_ENV_CONFIG) == id(None)

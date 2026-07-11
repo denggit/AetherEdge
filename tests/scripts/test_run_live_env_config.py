@@ -9,6 +9,21 @@ from src.platform import config as platform_config
 from src.platform.config import get_project_env_config
 
 
+FAKE_PROCESS_CREDENTIALS = {
+    "OKX_API_KEY": "fake_process_okx_key",
+    "OKX_SECRET_KEY": "fake_process_okx_secret",
+    "OKX_PASSPHRASE": "fake_process_okx_passphrase",
+    "BINANCE_API_KEY": "fake_process_binance_key",
+    "BINANCE_SECRET_KEY": "fake_process_binance_secret",
+}
+
+
+def _set_fake_process_credentials(monkeypatch) -> None:
+    for key, value in FAKE_PROCESS_CREDENTIALS.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("AETHER_EXAMPLE_ONLY", raising=False)
+
+
 @contextmanager
 def _isolated_run_live_import(tmp_path):
     module_name = "scripts.run_live"
@@ -66,36 +81,48 @@ def test_bootstrap_live_process_config_uses_process_env_without_example(
     project_root = tmp_path / "runtime-project"
     project_root.mkdir()
     (project_root / ".env.example").write_text(
-        "AETHER_EXAMPLE_ONLY=not-runtime-config\n"
-        "OKX_API_KEY=fake-placeholder-api-key\n",
+        "AETHER_EXAMPLE_ONLY=example-only-value\n"
+        "OKX_API_KEY=fake_example_placeholder_okx_key\n"
+        "BINANCE_API_KEY=fake_example_placeholder_binance_key\n",
         encoding="utf-8",
     )
     (project_root / ".env").write_text(
-        "AETHER_LIVE_TRADING=false\nAETHER_EXCHANGES=okx,binance\n",
+        "AETHER_LIVE_TRADING=false\n"
+        "AETHER_EXCHANGES=okx,binance\n"
+        "OKX_API_KEY=fake_file_okx_key\n"
+        "BINANCE_API_KEY=fake_file_binance_key\n",
         encoding="utf-8",
     )
+    _set_fake_process_credentials(monkeypatch)
     monkeypatch.setenv("AETHER_TEST_ENV_SENTINEL", "sentinel-before-load")
     monkeypatch.setenv("AETHER_LIVE_TRADING", "true")
 
     with _isolated_run_live_import(tmp_path) as (run_live, import_config):
-        assert run_live.PROJECT_ENV_CONFIG is import_config
+        assert id(run_live.PROJECT_ENV_CONFIG) == id(import_config)
 
         config = run_live.bootstrap_live_process_config(project_root)
+        missing = object()
 
         assert config.get("AETHER_LIVE_TRADING") == "true"
         assert config.get("AETHER_EXCHANGES") == "okx,binance"
-        assert "AETHER_EXAMPLE_ONLY" not in config.values
-        assert "OKX_API_KEY" not in config.values
+        assert config.get("OKX_API_KEY") == "fake_process_okx_key"
+        assert config.get("OKX_SECRET_KEY") == "fake_process_okx_secret"
+        assert config.get("OKX_PASSPHRASE") == "fake_process_okx_passphrase"
+        assert config.get("BINANCE_API_KEY") == "fake_process_binance_key"
+        assert config.get("BINANCE_SECRET_KEY") == "fake_process_binance_secret"
+        assert config.get("OKX_API_KEY") != "fake_example_placeholder_okx_key"
+        assert config.get("BINANCE_API_KEY") != "fake_example_placeholder_binance_key"
+        assert config.get("AETHER_EXAMPLE_ONLY", missing) is missing
         assert config.source_files == (str(project_root / ".env"),)
         assert config.example_file is None
-        assert get_project_env_config() is config
-        assert run_live.PROJECT_ENV_CONFIG is config
+        assert id(get_project_env_config()) == id(config)
+        assert id(run_live.PROJECT_ENV_CONFIG) == id(config)
         assert os.environ["AETHER_TEST_ENV_SENTINEL"] == "sentinel-before-load"
         assert os.environ["AETHER_LIVE_TRADING"] == "true"
 
-    assert platform_config._PROJECT_ENV_CONFIG is previous_project_env
+    assert id(platform_config._PROJECT_ENV_CONFIG) == id(previous_project_env)
     assert platform_config.load_project_env_config is previous_platform_loader
     assert sys.modules.get("scripts.run_live") is previous_module
     if previous_module is not None:
-        assert previous_module.PROJECT_ENV_CONFIG is previous_module_config
+        assert id(previous_module.PROJECT_ENV_CONFIG) == id(previous_module_config)
         assert previous_module.load_project_env_config is previous_module_loader
