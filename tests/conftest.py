@@ -54,6 +54,9 @@ def pytest_configure(config: pytest.Config) -> None:
         "AETHER_PYTEST_SYSTEM_TEMP_ROOT",
         "AETHER_PYTEST_RUNTIME_HEARTBEAT_DB",
         "PYTHONPATH",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
     )
     for key in keys:
         _saved_environment[key] = os.environ.get(key)
@@ -61,6 +64,9 @@ def pytest_configure(config: pytest.Config) -> None:
     os.environ["AETHER_PYTEST_ALLOWED_TEMP_ROOT"] = str(allowed_temp_root)
     os.environ["AETHER_PYTEST_SYSTEM_TEMP_ROOT"] = str(system_temp_root)
     tempfile.tempdir = str(allowed_temp_root)
+    os.environ["TMPDIR"] = str(allowed_temp_root)
+    os.environ["TEMP"] = str(allowed_temp_root)
+    os.environ["TMP"] = str(allowed_temp_root)
     _apply_isolated_environment(_session_root)
     install_sqlite_guard(repo_root=REPO_ROOT, pytest_root=allowed_temp_root)
     from src.platform.config import reset_project_env_config_for_tests

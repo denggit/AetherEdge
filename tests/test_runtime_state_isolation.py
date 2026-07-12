@@ -116,6 +116,52 @@ def test_subprocess_blocks_system_temp_database_outside_pytest_basetemp() -> Non
     )
 
 
+def test_subprocess_allows_tempfile_sqlite_inside_pytest_basetemp() -> None:
+    """Child process must be able to create SQLite databases under pytest basetemp."""
+    expected_root = Path(os.environ["AETHER_PYTEST_ALLOWED_TEMP_ROOT"]).resolve()
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import gc
+import os
+import shutil
+import sqlite3
+import tempfile
+from pathlib import Path
+
+root = Path(tempfile.gettempdir()).resolve()
+d = tempfile.mkdtemp()
+try:
+    db = Path(d) / "child.sqlite3"
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute("CREATE TABLE sentinel(value TEXT)")
+        conn.execute("INSERT INTO sentinel VALUES ('ok')")
+        conn.commit()
+    finally:
+        conn.close()
+    gc.collect()
+    assert db.is_file()
+    assert db.resolve().is_relative_to(root)
+finally:
+    shutil.rmtree(d, ignore_errors=True)
+print(root)
+""",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, f"stdout={result.stdout} stderr={result.stderr}"
+    output_root = Path(result.stdout.strip()).resolve()
+    assert output_root == expected_root, (
+        f"tempfile.gettempdir()={output_root} != "
+        f"AETHER_PYTEST_ALLOWED_TEMP_ROOT={expected_root}"
+    )
+
+
 @pytest.mark.parametrize("use_other_cwd", (False, True))
 def test_python_subprocess_inherits_repository_sqlite_guard(
     tmp_path,

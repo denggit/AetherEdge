@@ -224,6 +224,7 @@ async def main() -> int:
     state_db = database_sources["state"]
     journal_db = database_sources["order_journal"]
     plan_db = database_sources["position_plan"]
+    mf_db = database_sources["mf_feature"]
     database_targets = tuple(
         (
             f"{name}_db",
@@ -394,12 +395,25 @@ async def main() -> int:
                 apply_reconcile=True,
             )
             _check_fake_order_ids(report, plan_store)
+            # ── 8. Kline warmup check (mf snapshot even in apply mode) ──
+            if not args.skip_kline:
+                with _stable_sqlite_snapshot(mf_db) as mf_snapshot:
+                    await _check_kline_warmup(
+                        app_config=app_config,
+                        strategy=strategy,
+                        report=report,
+                        market_data_db_path=mf_snapshot,
+                    )
         else:
             with ExitStack() as stack:
                 snapshot_plan = stack.enter_context(_stable_sqlite_snapshot(plan_db))
                 snapshot_journal = stack.enter_context(
                     _stable_sqlite_snapshot(journal_db)
                 )
+                if not args.skip_kline:
+                    snapshot_mf = stack.enter_context(
+                        _stable_sqlite_snapshot(mf_db)
+                    )
                 plan_store = _SnapshotPositionPlanStore(snapshot_plan)
                 journal = _SnapshotOrderJournalStore(snapshot_journal)
                 try:
@@ -411,6 +425,14 @@ async def main() -> int:
                         apply_reconcile=False,
                     )
                     _check_fake_order_ids(report, plan_store)
+                    # ── 8. Kline warmup check ──
+                    if not args.skip_kline:
+                        await _check_kline_warmup(
+                            app_config=app_config,
+                            strategy=strategy,
+                            report=report,
+                            market_data_db_path=snapshot_mf,
+                        )
                 finally:
                     journal.close_snapshot_connections()
                     plan_store.close_snapshot_connections()
@@ -423,11 +445,6 @@ async def main() -> int:
         report.verdict = "fail_config"
         _maybe_write_report(args.report, report)
         return EXIT_FAIL_CONFIG
-
-    # ── 7. Check for fake order IDs ──
-    # ── 8. Kline warmup check ──
-    if not args.skip_kline:
-        await _check_kline_warmup(app_config, report)
 
     # ── Determine final verdict ──
     _finalize_verdict(report)
@@ -841,14 +858,21 @@ def _check_fake_order_ids(
         report.add("fake_order_id_detection", "ok", detail={"count": 0})
 
 
-async def _check_kline_warmup(app_config: AppConfig, report: PreflightReport) -> None:
-    """Verify closed-kline warmup data is available."""
+async def _check_kline_warmup(
+    *,
+    app_config: AppConfig,
+    strategy: object,
+    report: PreflightReport,
+    market_data_db_path: str | Path,
+) -> None:
+    """Verify closed-kline warmup data is available using a snapshot path."""
+    import gc
+
     try:
         from src.market_data.storage import SqliteKlineStore
         from src.market_data.warmup.gap_detector import interval_to_ms
         from src.runtime.requirements import resolve_strategy_runtime_requirements
 
-        strategy = load_strategy(app_config.strategy)
         requirements = resolve_strategy_runtime_requirements(
             strategy, fallback_data_streams=app_config.data_streams
         )
@@ -861,33 +885,38 @@ async def _check_kline_warmup(app_config: AppConfig, report: PreflightReport) ->
         end_open = closed_bar_open_time_ms(int(time.time() * 1000), interval_ms=interval_ms, close_buffer_ms=60000)
         start_open = max(0, end_open - int(requirements.closed_kline.warmup_days) * 24 * 60 * 60_000)
 
-        store = SqliteKlineStore()
-        from src.market_data.models import TimeRange
-        rows = store.load(
-            symbol=app_config.symbol,
-            interval=interval,
-            time_range=TimeRange(start_open, end_open),
-        )
-        available = sum(1 for r in rows if r.is_closed)
-        min_records = max(1, int(requirements.closed_kline.min_records or 1))
+        store = SqliteKlineStore(market_data_db_path)
+        try:
+            from src.market_data.models import TimeRange
 
-        if available >= min_records:
-            report.add(
-                "kline_warmup",
-                "ok",
-                detail={"available": available, "min_records": min_records, "interval": interval},
+            rows = store.load(
+                symbol=app_config.symbol,
+                interval=interval,
+                time_range=TimeRange(start_open, end_open),
             )
-        else:
-            report.add(
-                "kline_warmup",
-                "fail",
-                detail={
-                    "available": available,
-                    "min_records": min_records,
-                    "interval": interval,
-                    "action": "Run warmup before starting live trading",
-                },
-            )
+            available = sum(1 for r in rows if r.is_closed)
+            min_records = max(1, int(requirements.closed_kline.min_records or 1))
+
+            if available >= min_records:
+                report.add(
+                    "kline_warmup",
+                    "ok",
+                    detail={"available": available, "min_records": min_records, "interval": interval},
+                )
+            else:
+                report.add(
+                    "kline_warmup",
+                    "fail",
+                    detail={
+                        "available": available,
+                        "min_records": min_records,
+                        "interval": interval,
+                        "action": "Run warmup before starting live trading",
+                    },
+                )
+        finally:
+            del store
+            gc.collect()
     except Exception as exc:
         report.add("kline_warmup", "fail", error=str(exc))
 

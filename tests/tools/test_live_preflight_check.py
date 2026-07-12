@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -785,3 +786,500 @@ def _directory_manifest(
 def _fingerprint(path: Path) -> tuple[str, int, int]:
     stat = path.stat()
     return hashlib.sha256(path.read_bytes()).hexdigest(), stat.st_size, stat.st_mtime_ns
+
+
+# ── Generic (non-provider) Preflight + Kline warmup tests ──────────────
+
+
+def _seed_generic_databases(
+    state_db: Path,
+    journal_db: Path,
+    plan_db: Path,
+) -> None:
+    SqliteStateStore(state_db)
+    SqliteOrderJournalStore(journal_db)
+    SqlitePositionPlanStore(plan_db)
+
+
+def _recent_kline_timestamps(*, count: int = 5) -> list[int]:
+    """Return *count* closed 4h-bar open_time_ms values ending near now."""
+    import time
+
+    interval_ms = 4 * 60 * 60_000
+    now_ms = int(time.time() * 1000)
+    latest_closed = (now_ms // interval_ms) * interval_ms
+    return [latest_closed - (count - i) * interval_ms for i in range(count)]
+
+
+def _seed_market_data_kline_db(
+    path: Path,
+    *,
+    open_times_ms: list[int] | None = None,
+) -> SqliteKlineStore:
+    if open_times_ms is None:
+        open_times_ms = _recent_kline_timestamps(count=5)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    store = SqliteKlineStore(path)
+    klines = [
+        MarketKline(
+            exchange=ExchangeName.OKX,
+            symbol="ETH-USDT-PERP",
+            raw_symbol="ETH-USDT-SWAP",
+            interval="4h",
+            open_time_ms=ot,
+            close_time_ms=ot + 4 * 60 * 60_000 - 1,
+            open=Decimal(str(2000 + i * 10)),
+            high=Decimal(str(2010 + i * 10)),
+            low=Decimal(str(1990 + i * 10)),
+            close=Decimal(str(2005 + i * 10)),
+            volume=Decimal("10"),
+            is_closed=True,
+            source=MarketDataSource.REST,
+        )
+        for i, ot in enumerate(open_times_ms)
+    ]
+    store.save(klines)
+    return store
+
+
+def _source_db_manifest(source_dir: Path) -> dict[str, tuple[str, int, int]]:
+    return {
+        path.name: _fingerprint(path)
+        for path in sorted(source_dir.iterdir())
+        if path.is_file()
+    }
+
+
+@pytest.mark.asyncio
+async def test_generic_readonly_preflight_kline_warmup_uses_snapshot_and_preserves_source(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Generic (non-provider) read-only Preflight: Kline warmup reads snapshot."""
+    import tools.live_preflight_check as preflight
+
+    # ── Seed source databases ────────────────────────────────────────
+    source_dir = tmp_path / "source"
+    source_mf = source_dir / "market-data.sqlite3"
+    state_db, journal_db, plan_db = _seed_preflight_databases(
+        tmp_path / "dbs"
+    )
+    open_times = _recent_kline_timestamps(count=5)
+    _seed_market_data_kline_db(source_mf, open_times_ms=open_times)
+
+    # Pin a connection to prevent WAL checkpoint on writer close (Windows)
+    _pin = sqlite3.connect(str(source_mf))
+    _pin.execute("PRAGMA journal_mode=WAL")
+    # Write one uncheckpointed WAL record (update the last kline)
+    latest_open_ms = open_times[-1] + 4 * 60 * 60_000
+    writer = sqlite3.connect(str(source_mf))
+    try:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute(
+            "UPDATE klines SET open_time_ms=?, close_time_ms=? WHERE rowid=1",
+            (latest_open_ms, latest_open_ms + 4 * 60 * 60_000 - 1),
+        )
+        writer.commit()
+        wal_path = Path(f"{source_mf}-wal")
+        assert wal_path.exists(), "WAL file must exist after uncheckpointed write"
+    finally:
+        writer.close()
+
+    source_before = _source_db_manifest(source_dir)
+    repo_before = _runtime_repo_manifest()
+
+    # ── Guard: reject direct connections to source mf DB ─────────────
+    source_mf_resolved = source_mf.resolve()
+    original_connect = sqlite3.connect
+
+    def reject_source_mf_connect(database, *args, **kwargs):
+        from tests._support.runtime_state_guard import resolve_sqlite_target
+
+        path, read_only = resolve_sqlite_target(
+            database, uri=bool(kwargs.get("uri", False)),
+        )
+        if path is not None and path == source_mf_resolved and not read_only:
+            raise AssertionError(
+                f"source market-data DB opened for write: {path}"
+            )
+        return original_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", reject_source_mf_connect)
+    # Also guard SqliteKlineStore.__init__ path parameter
+    original_kline_init = SqliteKlineStore.__init__
+
+    def guarded_kline_init(self, path, *args, **kwargs):
+        resolved = Path(path).resolve()
+        if resolved == source_mf_resolved:
+            raise AssertionError(
+                f"SqliteKlineStore constructed with source path: {path}"
+            )
+        return original_kline_init(self, path, *args, **kwargs)
+
+    monkeypatch.setattr(SqliteKlineStore, "__init__", guarded_kline_init)
+
+    # ── Build args and env ───────────────────────────────────────────
+    env_file = tmp_path / "generic-readonly.env"
+    env_file.write_text(
+        "\n".join(
+            (
+                "AETHER_RUNTIME_MODE=live_runtime",
+                "AETHER_MARKET=ETH-USDT-PERP",
+                "AETHER_EXCHANGES=okx",
+                "AETHER_DATA_EXCHANGE=okx",
+                "AETHER_STRATEGY=tests.fake:Strategy",
+                "OKX_API_KEY=test-okx-api-key",
+                "OKX_SECRET_KEY=test-okx-api-secret",
+                "OKX_PASSPHRASE=test-okx-passphrase",
+                f"AETHER_STATE_DB={state_db}",
+                f"AETHER_ORDER_JOURNAL_DB={journal_db}",
+                f"AETHER_POSITION_PLAN_DB={plan_db}",
+                f"AETHER_MARKET_DATA_DB={source_mf}",
+            )
+        ),
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        strategy="tests.fake:Strategy",
+        defaults=tmp_path / "missing-defaults.json",
+        env_file=env_file,
+        report=str(tmp_path / "generic-readonly-report.json"),
+        apply_reconcile=False,
+        confirm_reconcile_write=None,
+        confirm_position_plan_db=None,
+        confirm_order_journal_db=None,
+        skip_api=True,
+        skip_kline=False,
+    )
+
+    # ── Install environment ──────────────────────────────────────────
+    values = {}
+    for line in Path(args.env_file).read_text(encoding="utf-8").splitlines():
+        if line and not line.startswith("#"):
+            key, value = line.split("=", 1)
+            values[key] = value
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(preflight, "parse_args", lambda: args)
+    monkeypatch.setattr(
+        preflight,
+        "runtime_mode_from_env",
+        lambda: RuntimeMode.LIVE_RUNTIME,
+    )
+    # DO NOT monkeypatch _check_kline_warmup — test the real function
+    # DO NOT replace SqliteKlineStore with a fake
+
+    # Mock external exchange API
+    async def fake_snapshots(*_args, **_kwargs):
+        return (_flat_snapshot(),)
+
+    monkeypatch.setattr(preflight, "_fetch_snapshots", fake_snapshots)
+
+    # ── Run ──────────────────────────────────────────────────────────
+    exit_code = await preflight.main()
+
+    # ── Assertions ───────────────────────────────────────────────────
+    payload = json.loads(Path(args.report).read_text(encoding="utf-8"))
+    kline_checks = [c for c in payload["checks"] if c["name"] == "kline_warmup"]
+    assert len(kline_checks) == 1, f"expected kline_warmup check, got {[c['name'] for c in payload['checks']]}"
+    kline_check = kline_checks[0]
+    assert kline_check["status"] == "ok", f"kline_warmup failed: {kline_check}"
+    assert kline_check["detail"]["available"] >= 1
+
+    # Source DB/WAL/SHM completely unchanged
+    source_after = _source_db_manifest(source_dir)
+    assert source_after == source_before, (
+        f"source DB changed:\nbefore={source_before}\nafter={source_after}"
+    )
+
+    # Repository runtime manifest unchanged
+    repo_after = _runtime_repo_manifest()
+    assert repo_after == repo_before, (
+        f"repo manifest changed:\nbefore={repo_before}\nafter={repo_after}"
+    )
+
+    # Verify kline store path was in a snapshot temp (not source)
+    database_paths = {
+        item["label"]: item for item in payload.get("database_paths", [])
+    }
+    mf_entry = database_paths.get("mf_feature_db")
+    assert mf_entry is not None, "mf_feature_db missing from database_paths"
+    assert mf_entry["write_target"] is False
+
+    _pin.close()
+
+
+@pytest.mark.asyncio
+async def test_generic_apply_preflight_kline_warmup_preserves_market_data_source(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Generic apply mode: only PositionPlan+Journal modified; mf source untouched."""
+    import tools.live_preflight_check as preflight
+
+    # ── Seed source databases ────────────────────────────────────────
+    source_dir = tmp_path / "source"
+    source_mf = source_dir / "market-data.sqlite3"
+    state_db, journal_db, plan_db = _seed_preflight_databases(
+        tmp_path / "dbs"
+    )
+    _seed_market_data_kline_db(source_mf, open_times_ms=_recent_kline_timestamps(count=5))
+
+    # Add a stale plan with fake order IDs
+    plans = SqlitePositionPlanStore(plan_db)
+    plans.upsert_position(_plan("stale-plan", strategy_id="strategy"))
+    plans.upsert_leg(
+        LegPlan(
+            position_id="stale-plan",
+            exchange=ExchangeName.OKX,
+            role=LegRole.MASTER,
+            target_qty_base=Decimal("0.1"),
+            entry_order_id="okx-order-1",
+            stop_order_id="okx-stop-1",
+            sync_status=LegSyncStatus.OPEN,
+        )
+    )
+    gc.collect()
+
+    source_before = _source_db_manifest(source_dir)
+    source_mf_resolved = source_mf.resolve()
+    original_connect = sqlite3.connect
+
+    def reject_source_mf_connect(database, *args, **kwargs):
+        from tests._support.runtime_state_guard import resolve_sqlite_target
+
+        path, read_only = resolve_sqlite_target(
+            database, uri=bool(kwargs.get("uri", False)),
+        )
+        if path is not None and path == source_mf_resolved and not read_only:
+            raise AssertionError(
+                f"source market-data DB opened for write in apply mode: {path}"
+            )
+        return original_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", reject_source_mf_connect)
+
+    # ── Build args ───────────────────────────────────────────────────
+    env_file = tmp_path / "generic-apply.env"
+    env_file.write_text(
+        "\n".join(
+            (
+                "AETHER_RUNTIME_MODE=live_runtime",
+                "AETHER_MARKET=ETH-USDT-PERP",
+                "AETHER_EXCHANGES=okx",
+                "AETHER_DATA_EXCHANGE=okx",
+                "AETHER_STRATEGY=tests.fake:Strategy",
+                "OKX_API_KEY=test-okx-api-key",
+                "OKX_SECRET_KEY=test-okx-api-secret",
+                "OKX_PASSPHRASE=test-okx-passphrase",
+                f"AETHER_STATE_DB={state_db}",
+                f"AETHER_ORDER_JOURNAL_DB={journal_db}",
+                f"AETHER_POSITION_PLAN_DB={plan_db}",
+                f"AETHER_MARKET_DATA_DB={source_mf}",
+            )
+        ),
+        encoding="utf-8",
+    )
+    args = argparse.Namespace(
+        strategy="tests.fake:Strategy",
+        defaults=tmp_path / "missing-defaults.json",
+        env_file=env_file,
+        report=str(tmp_path / "generic-apply-report.json"),
+        apply_reconcile=True,
+        confirm_reconcile_write=preflight.RECONCILE_WRITE_CONFIRMATION,
+        confirm_position_plan_db=str(plan_db.resolve()),
+        confirm_order_journal_db=str(journal_db.resolve()),
+        skip_api=False,
+        skip_kline=False,
+    )
+
+    values = {}
+    for line in Path(args.env_file).read_text(encoding="utf-8").splitlines():
+        if line and not line.startswith("#"):
+            key, value = line.split("=", 1)
+            values[key] = value
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(preflight, "parse_args", lambda: args)
+    monkeypatch.setattr(
+        preflight,
+        "runtime_mode_from_env",
+        lambda: RuntimeMode.LIVE_RUNTIME,
+    )
+
+    async def fake_snapshots(*_args, **_kwargs):
+        return (_flat_snapshot(),)
+
+    monkeypatch.setattr(preflight, "_fetch_snapshots", fake_snapshots)
+
+    # ── Run ──────────────────────────────────────────────────────────
+    exit_code = await preflight.main()
+
+    # ── Assertions ───────────────────────────────────────────────────
+    payload = json.loads(Path(args.report).read_text(encoding="utf-8"))
+    # PositionPlan was modified (stale plan closed)
+    persisted = SqlitePositionPlanStore(plan_db).get_position("stale-plan")
+    assert persisted.status == PositionPlanStatus.CLOSED
+
+    # market-data source DB unchanged
+    source_after = _source_db_manifest(source_dir)
+    assert source_after == source_before, (
+        f"source mf DB changed in apply mode:\nbefore={source_before}\nafter={source_after}"
+    )
+
+    # Kline warmup check ran and passed
+    kline_checks = [c for c in payload["checks"] if c["name"] == "kline_warmup"]
+    assert len(kline_checks) == 1
+    assert kline_checks[0]["status"] == "ok"
+
+    # mf_feature write_target is false
+    database_paths = {
+        item["label"]: item for item in payload.get("database_paths", [])
+    }
+    mf_entry = database_paths.get("mf_feature_db")
+    assert mf_entry is not None
+    assert mf_entry["write_target"] is False
+
+    # No new WAL/SHM for source mf
+    for suffix in ("-wal", "-shm"):
+        assert not Path(f"{source_mf}{suffix}").exists(), (
+            f"source mf {suffix} should not exist"
+        )
+
+    # PositionPlan and Journal ARE write targets
+    plan_entry = database_paths.get("position_plan_db")
+    journal_entry = database_paths.get("order_journal_db")
+    assert plan_entry["write_target"] is True
+    assert journal_entry["write_target"] is True
+
+
+def test_cli_subprocess_readonly_preflight_uses_pytest_basetemp(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Real subprocess CLI Preflight: snapshots land in pytest basetemp."""
+    import tools.live_preflight_check as preflight
+
+    allowed_root = Path(os.environ["AETHER_PYTEST_ALLOWED_TEMP_ROOT"]).resolve()
+    repo_root = Path(os.environ["AETHER_PYTEST_REPO_ROOT"]).resolve()
+
+    # ── Seed databases in tmp_path ───────────────────────────────────
+    source_dir = tmp_path / "source"
+    source_mf = source_dir / "market-data.sqlite3"
+    state_db = tmp_path / "dbs" / "state.sqlite3"
+    journal_db = tmp_path / "dbs" / "journal.sqlite3"
+    plan_db = tmp_path / "dbs" / "plans.sqlite3"
+    _seed_generic_databases(state_db, journal_db, plan_db)
+    _seed_market_data_kline_db(source_mf, open_times_ms=_recent_kline_timestamps(count=5))
+    gc.collect()
+
+    source_before = _source_db_manifest(source_dir)
+    repo_before = _runtime_repo_manifest()
+    report_path = tmp_path / "cli-preflight-report.json"
+
+    # CLI subprocess should log to tmp, not the repo
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    env_file = tmp_path / "cli-generic.env"
+    env_file.write_text(
+        "\n".join(
+            (
+                "AETHER_RUNTIME_MODE=live_runtime",
+                "AETHER_MARKET=ETH-USDT-PERP",
+                "AETHER_EXCHANGES=okx",
+                "AETHER_DATA_EXCHANGE=okx",
+                "AETHER_STRATEGY=tests.fake:Strategy",
+                "OKX_API_KEY=test-okx-api-key",
+                "OKX_SECRET_KEY=test-okx-api-secret",
+                "OKX_PASSPHRASE=test-okx-passphrase",
+                f"AETHER_STATE_DB={state_db}",
+                f"AETHER_ORDER_JOURNAL_DB={journal_db}",
+                f"AETHER_POSITION_PLAN_DB={plan_db}",
+                f"AETHER_MARKET_DATA_DB={source_mf}",
+                f"AETHER_LIVE_PREFLIGHT_REPORT={report_path}",
+                f"LOG_DIR={log_dir}",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    # ── Run CLI as subprocess ────────────────────────────────────────
+    script = str(repo_root / "tools" / "live_preflight_check.py")
+    # Build a clean env: keep PYTEST guard vars, clear AETHER_* so the
+    # env file is the sole source of database paths.
+    child_env = {
+        key: value
+        for key, value in os.environ.items()
+        if key.startswith("AETHER_PYTEST_")
+        or key in ("PYTHONPATH", "SYSTEMROOT", "SystemRoot", "PATH", "TEMP", "TMP", "TMPDIR",
+                   "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA")
+        or key.startswith("OKX_")
+        or key.startswith("BINANCE_")
+    }
+    # Preserve required PYTEST vars for guard + sitecustomize
+    for required in (
+        "AETHER_PYTEST_SQLITE_GUARD",
+        "AETHER_PYTEST_REPO_ROOT",
+        "AETHER_PYTEST_STATE_ROOT",
+        "AETHER_PYTEST_ALLOWED_TEMP_ROOT",
+        "AETHER_PYTEST_SYSTEM_TEMP_ROOT",
+        "AETHER_PYTEST_RUNTIME_HEARTBEAT_DB",
+    ):
+        if required in os.environ:
+            child_env[required] = os.environ[required]
+    child_env["LOG_DIR"] = str(log_dir)
+    result = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--strategy", "tests.fake:Strategy",
+            "--defaults", str(repo_root / "config" / "aether_defaults.json"),
+            "--env-file", str(env_file),
+            "--report", str(report_path),
+            "--skip-api",
+        ],
+        cwd=str(repo_root),
+        text=True,
+        capture_output=True,
+        check=False,
+        env=child_env,
+    )
+
+    # ── Assertions ───────────────────────────────────────────────────
+    output = result.stdout + result.stderr
+    # Exit code 0 or 1 acceptable (0=pass, 1=needs reconcile with stale state)
+    assert result.returncode in (0, 1), (
+        f"CLI Preflight failed with code {result.returncode}:\n{output}"
+    )
+    # Must not fail on guard outside-temp rule
+    assert "blocked write access outside the temporary directory" not in output, (
+        f"guard blocked legitimate snapshot:\n{output}"
+    )
+    assert "blocked write access to repository runtime database" not in output, (
+        f"guard blocked repo path:\n{output}"
+    )
+
+    # Report written
+    assert report_path.is_file(), f"report not written: {output}"
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+
+    # Kline warmup was not skipped
+    kline_checks = [c for c in payload["checks"] if c["name"] == "kline_warmup"]
+    assert len(kline_checks) == 1, (
+        f"expected kline_warmup check, got {[c['name'] for c in payload['checks']]}"
+    )
+
+    # Source database unchanged
+    source_after = _source_db_manifest(source_dir)
+    assert source_after == source_before, (
+        f"source DB changed during subprocess CLI:\n"
+        f"before={source_before}\nafter={source_after}"
+    )
+
+    # Repo manifest unchanged
+    repo_after = _runtime_repo_manifest()
+    assert repo_after == repo_before, (
+        f"repo manifest changed during subprocess CLI:\n"
+        f"before={repo_before}\nafter={repo_after}"
+    )
