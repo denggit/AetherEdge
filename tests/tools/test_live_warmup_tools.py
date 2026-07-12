@@ -15,8 +15,13 @@ TOOL_PATH = REPO_ROOT / "tools" / "check_live_warmup_data.py"
 def _run_tool(args: list[str], **kwargs) -> subprocess.CompletedProcess:
     env = os.environ.copy()
     env.setdefault("PYTHONPATH", str(REPO_ROOT))
+    resolved_args = list(args)
+    if "--kline-store-path" not in resolved_args:
+        resolved_args.extend(
+            ["--kline-store-path", env["AETHER_MARKET_DATA_DB"]]
+        )
     return subprocess.run(
-        [sys.executable, str(TOOL_PATH)] + args,
+        [sys.executable, str(TOOL_PATH)] + resolved_args,
         capture_output=True,
         text=True,
         timeout=60,

@@ -540,8 +540,8 @@ def test_trade_feature_store_has_no_raw_trade_table(tmp_path: Path) -> None:
         conn.close()
 
 
-def test_store_has_no_save_raw_trades_parameter() -> None:
-    store = SqliteTradeFeatureStore()
+def test_store_has_no_save_raw_trades_parameter(tmp_path) -> None:
+    store = SqliteTradeFeatureStore(tmp_path / "features.sqlite3")
     assert not hasattr(store, "save_raw_trades")
 
 

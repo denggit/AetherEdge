@@ -362,6 +362,7 @@ def _runner(
         "runtime_requirements": requirements,
         "recovery_service": None,
         "snapshot": _snapshot(),
+        "range_bar_store": _MemoryRangeBarStore(),
     }
     resolved_services.update(services or {})
     return LiveRuntimeRunner(

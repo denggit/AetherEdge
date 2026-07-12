@@ -28,7 +28,8 @@ class _BlockLegacyPortfolioImports(importlib.abc.MetaPathFinder):
         return None
 
 
-def test_v1_loads_when_v8_and_v10b_imports_are_blocked(monkeypatch) -> None:
+def test_v1_loads_when_v8_and_v10b_imports_are_blocked(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
     prefixes_to_clear = (V1_PREFIX, *BLOCKED_PREFIXES)
     for module_name in tuple(sys.modules):
         if any(module_name == prefix or module_name.startswith(f"{prefix}.") for prefix in prefixes_to_clear):

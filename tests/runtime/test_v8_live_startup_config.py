@@ -34,6 +34,7 @@ def test_v8_live_env_loads_strategy_and_runtime_roles(tmp_path) -> None:
         "AETHER_DATA_STREAMS": "trades",
         "AETHER_DRY_RUN": "true",
         "AETHER_LIVE_TRADING": "false",
+        "AETHER_STATE_DB": str(tmp_path / "state.sqlite3"),
     }
 
     app = AppConfig.from_env(env_file=env_file, environ=environ)

@@ -18,6 +18,8 @@ from src.market_data.derived import RangeBarAggregator, RangeBarBuilder
 from src.market_data.events import MarketFeatureEvent, MarketFeatureEventType
 from src.market_data.models import MarketDataSet, RangeBar, RangeBarAggregate, TimeRange, WarmupRequest, WarmupResult
 from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
+from src.market_data.range_repair.store import SqliteRangeRepairJournalStore
+from src.market_data.storage import SqliteRangeBarStore
 from src.market_data.storage import SqliteTradeStore
 from src.market_data.warmup.current_rangebar import CurrentRangeBarWarmupResult
 from src.platform import Balance, ExchangeName, InstrumentRule, LeverageInfo, MarginMode, Order, OrderSide, OrderStatus, Position, PositionMode, PositionSide
@@ -88,14 +90,30 @@ def _app_config(*, dry_run: bool = False, data_streams=()) -> AppConfig:
     )
 
 
-def _test_project_env_config() -> ProjectEnvConfig:
+def _test_project_env_config(runtime_root: Path) -> ProjectEnvConfig:
     keys = (
         "AETHER_ACCOUNT_SNAPSHOT_LOG_KEEPALIVE_SECONDS",
         "AETHER_STOP_POST_CHECK_ATTEMPTS",
         "AETHER_STOP_POST_CHECK_RETRY_DELAY_SECONDS",
     )
+    values = {key: os.environ[key] for key in keys if key in os.environ}
+    values.update(
+        {
+            "AETHER_STATE_DB": str(runtime_root / "state.sqlite3"),
+            "AETHER_ORDER_JOURNAL_DB": str(runtime_root / "order-journal.sqlite3"),
+            "AETHER_POSITION_PLAN_DB": str(runtime_root / "position-plan.sqlite3"),
+            "AETHER_RANGE_CHECKPOINT_DB": str(runtime_root / "range-checkpoint.sqlite3"),
+            "AETHER_RANGE_REPAIR_JOURNAL_DB": str(runtime_root / "repair-journal.sqlite3"),
+            "AETHER_MARKET_DATA_DB": str(runtime_root / "market-data.sqlite3"),
+            "AETHER_RANGE_MICRO_REPAIR_STATUS_PATH": str(runtime_root / "micro-repair-status.json"),
+            "AETHER_RANGE_MICRO_REPAIR_LOCK_PATH": str(runtime_root / "micro-repair.lock"),
+            "AETHER_RANGE_BACKFILL_STATUS_PATH": str(runtime_root / "backfill-status.json"),
+            "AETHER_RANGE_BACKFILL_LOCK_PATH": str(runtime_root / "backfill.lock"),
+            "AETHER_RANGE_BACKFILL_RAW_ROOT": str(runtime_root / "raw"),
+        }
+    )
     return ProjectEnvConfig(
-        values={key: os.environ[key] for key in keys if key in os.environ},
+        values=values,
         source_files=(),
         env_file=Path(".env"),
         example_file=None,
@@ -378,6 +396,8 @@ class RangeAuditStrategy(FeatureStrategy):
 
 
 def _runner(strategy, *, data=None, services=None, dry_run=False, data_streams=()):
+    pytest_root = Path(os.environ["AETHER_PYTEST_STATE_ROOT"])
+    runtime_root = Path(tempfile.mkdtemp(prefix="live-runtime-glue-", dir=pytest_root))
     cfg = _app_config(dry_run=dry_run, data_streams=data_streams)
     context = AppContext(
         data=data or FakeData(),
@@ -387,9 +407,41 @@ def _runner(strategy, *, data=None, services=None, dry_run=False, data_streams=(
         planner=ExecutionPlanner(),
         alerts=AsyncAlertDispatcher(NoopAlertSink()),
     )
-    runtime_config = LiveRuntimeConfig(app=cfg, mode=RuntimeMode.LIVE_RUNTIME, closed_bar_buffer_ms=60_000)
+    runtime_config = LiveRuntimeConfig(
+        app=cfg,
+        mode=RuntimeMode.LIVE_RUNTIME,
+        closed_bar_buffer_ms=60_000,
+        range_checkpoint_db_path=str(runtime_root / "range-checkpoint.sqlite3"),
+        range_repair_journal_db=str(runtime_root / "repair-journal.sqlite3"),
+        range_micro_repair_status_path=str(runtime_root / "micro-repair-status.json"),
+        range_micro_repair_lock_path=str(runtime_root / "micro-repair.lock"),
+        range_backfill_status_path=str(runtime_root / "backfill-status.json"),
+        range_backfill_lock_path=str(runtime_root / "backfill.lock"),
+        range_backfill_raw_root=str(runtime_root / "raw"),
+        market_data_db_path=str(runtime_root / "market-data.sqlite3"),
+    )
     resolved_services = dict(services or {})
-    resolved_services.setdefault("project_env_config", _test_project_env_config())
+    resolved_services.setdefault("project_env_config", _test_project_env_config(runtime_root))
+    resolved_services.setdefault(
+        "order_journal",
+        SqliteOrderJournalStore(runtime_root / "order-journal.sqlite3"),
+    )
+    resolved_services.setdefault(
+        "position_plan_store",
+        SqlitePositionPlanStore(runtime_root / "position-plan.sqlite3"),
+    )
+    resolved_services.setdefault(
+        "range_bar_store",
+        SqliteRangeBarStore(runtime_root / "market-data.sqlite3"),
+    )
+    resolved_services.setdefault(
+        "range_checkpoint_store",
+        SqliteRangeCheckpointStore(runtime_root / "range-checkpoint.sqlite3"),
+    )
+    resolved_services.setdefault(
+        "range_repair_journal_store",
+        SqliteRangeRepairJournalStore(runtime_root / "repair-journal.sqlite3"),
+    )
     if data_streams or "range_bar_builder" in resolved_services or "range_bar_store" in resolved_services:
         resolved_services.setdefault("runtime_requirements", _feature_requirements())
     return LiveRuntimeRunner(app_config=cfg, app_context=context, runtime_config=runtime_config, services=resolved_services)

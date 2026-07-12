@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from decimal import Decimal
 
 import pytest
@@ -8,7 +9,7 @@ import pytest
 from src.app import AppConfig, AppContext
 from src.market_data.events import MarketFeatureEvent
 from src.market_data.models import TimeRange
-from src.market_data.storage import SqliteKlineStore
+from src.market_data.storage import SqliteKlineStore, SqliteRangeBarStore
 from src.platform import Balance, ExchangeName, LeverageInfo, PositionMode
 from src.platform.data.models import MarketKline
 from src.platform.markets import get_market_profile
@@ -242,6 +243,9 @@ def _runner(
             "recovery_service": None,
             "snapshot": _snapshot(),
             "kline_store": resolved_kline_store,
+            "range_bar_store": SqliteRangeBarStore(
+                os.environ["AETHER_MARKET_DATA_DB"]
+            ),
         },
     )
 

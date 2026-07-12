@@ -19,9 +19,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
+import os
+import shutil
 import sys
+import tempfile
 import time
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
@@ -58,7 +63,6 @@ from src.runtime import RuntimeMode, runtime_mode_from_env
 from src.runtime.live_smoke import (
     BootstrapFailureReport,
     strategy_plugin_path,
-    write_live_smoke_report,
 )
 from src.runtime.tasks.scheduler import closed_bar_open_time_ms
 from src.strategy import load_strategy
@@ -88,6 +92,9 @@ class PreflightReport:
     runtime_mode: str | None = None
     checks: list[CheckResult] = field(default_factory=list)
     reconciliation: LiveStateReconciliationReport | None = None
+    reconciliation_mode: str = "read_only"
+    confirmation_accepted: bool = False
+    database_paths: list[dict[str, Any]] = field(default_factory=list)
     verdict: str = "pass"
 
     @property
@@ -122,6 +129,9 @@ class PreflightReport:
             "symbol": self.symbol,
             "strategy": self.strategy,
             "runtime_mode": self.runtime_mode,
+            "reconciliation_mode": self.reconciliation_mode,
+            "confirmation_accepted": self.confirmation_accepted,
+            "database_paths": self.database_paths,
             "verdict": self.verdict,
             "ok": self.ok,
             "checks": [asdict(c) for c in self.checks],
@@ -144,7 +154,14 @@ class PreflightReport:
 
 async def main() -> int:
     args = parse_args()
-    report = PreflightReport(started_time_ms=_now_ms())
+    report = PreflightReport(
+        started_time_ms=_now_ms(),
+        reconciliation_mode=("apply" if args.apply_reconcile else "read_only"),
+    )
+    logger.info(
+        "Preflight reconciliation mode | reconciliation_mode=%s",
+        report.reconciliation_mode,
+    )
     try:
         project_env = load_project_env_config(
             env_file=args.env_file,
@@ -241,7 +258,12 @@ async def main() -> int:
                     "skip_kline": args.skip_kline,
                 },
             )
-        write_live_smoke_report(args.report, final_report)
+        _write_provider_preflight_report(
+            args.report,
+            final_report,
+            reconciliation_mode=report.reconciliation_mode,
+            confirmation_accepted=False,
+        )
         return int(final_report.exit_code)
 
     runtime_mode = runtime_mode_from_env()
@@ -288,19 +310,45 @@ async def main() -> int:
         )
     )
 
-    for db_path, label in [(state_db, "state_db"), (journal_db, "order_journal_db"), (plan_db, "position_plan_db")]:
-        try:
-            db_path.parent.mkdir(parents=True, exist_ok=True)
-            import sqlite3
-            conn = sqlite3.connect(str(db_path))
-            conn.execute("SELECT 1")
-            conn.close()
-            report.add(f"{label}_writable", "ok", detail={"path": str(db_path)})
-        except Exception as exc:
-            report.add(f"{label}_writable", "fail", error=str(exc))
-            report.verdict = "fail_config"
-            _maybe_write_report(args.report, report)
-            return EXIT_FAIL_CONFIG
+    database_targets = (
+        ("state_db", state_db, False),
+        ("order_journal_db", journal_db, args.apply_reconcile),
+        ("position_plan_db", plan_db, args.apply_reconcile),
+    )
+    report.database_paths = [
+        _database_path_detail(label, path, write_target=write_target)
+        for label, path, write_target in database_targets
+    ]
+    for detail in report.database_paths:
+        logger.warning(
+            "Preflight database target | reconciliation_mode=%s label=%s "
+            "absolute_path=%s exists=%s size_bytes=%s write_target=%s",
+            report.reconciliation_mode,
+            detail["label"],
+            detail["absolute_path"],
+            detail["exists"],
+            detail["size_bytes"],
+            detail["write_target"],
+        )
+
+    if args.apply_reconcile and not _accept_reconcile_write_confirmation(
+        args,
+        report,
+        position_plan_db=plan_db,
+        order_journal_db=journal_db,
+    ):
+        report.verdict = "fail_config"
+        _maybe_write_report(args.report, report)
+        return EXIT_FAIL_CONFIG
+
+    if not _check_database_paths(
+        report,
+        database_targets=database_targets,
+        apply_reconcile=args.apply_reconcile,
+    ):
+        report.verdict = "fail_config"
+        _maybe_write_report(args.report, report)
+        return EXIT_FAIL_CONFIG
 
     # ── 5. Read exchange snapshots ──
     if not args.skip_api:
@@ -313,20 +361,49 @@ async def main() -> int:
         report.add("exchange_snapshots", "warn", detail={"skipped": True})
 
     # ── 6. Check local PositionPlan store for stale state ──
-    plan_store = SqlitePositionPlanStore(str(plan_db))
-    journal = SqliteOrderJournalStore(str(journal_db))
-
-    await _check_stale_state(
-        report,
-        plan_store=plan_store,
-        order_journal=journal,
-        snapshots=snapshots,
-        apply_reconcile=args.apply_reconcile,
-    )
+    try:
+        if args.apply_reconcile:
+            plan_store = SqlitePositionPlanStore(str(plan_db.resolve()))
+            journal = SqliteOrderJournalStore(str(journal_db.resolve()))
+            await _check_stale_state(
+                report,
+                plan_store=plan_store,
+                order_journal=journal,
+                snapshots=snapshots,
+                apply_reconcile=True,
+            )
+            _check_fake_order_ids(report, plan_store)
+        else:
+            with ExitStack() as stack:
+                snapshot_plan = stack.enter_context(_stable_sqlite_snapshot(plan_db))
+                snapshot_journal = stack.enter_context(
+                    _stable_sqlite_snapshot(journal_db)
+                )
+                plan_store = _SnapshotPositionPlanStore(snapshot_plan)
+                journal = _SnapshotOrderJournalStore(snapshot_journal)
+                try:
+                    await _check_stale_state(
+                        report,
+                        plan_store=plan_store,
+                        order_journal=journal,
+                        snapshots=snapshots,
+                        apply_reconcile=False,
+                    )
+                    _check_fake_order_ids(report, plan_store)
+                finally:
+                    journal.close_snapshot_connections()
+                    plan_store.close_snapshot_connections()
+    except ReadOnlySnapshotError as exc:
+        report.add(
+            "read_only_reconciliation_snapshot",
+            "fail",
+            error=f"read_only_snapshot_unstable:{exc}",
+        )
+        report.verdict = "fail_config"
+        _maybe_write_report(args.report, report)
+        return EXIT_FAIL_CONFIG
 
     # ── 7. Check for fake order IDs ──
-    _check_fake_order_ids(report, plan_store)
-
     # ── 8. Kline warmup check ──
     if not args.skip_kline:
         await _check_kline_warmup(app_config, report)
@@ -358,6 +435,213 @@ async def main() -> int:
         "fail_config": EXIT_FAIL_CONFIG,
     }
     return exit_map.get(report.verdict, EXIT_FAIL_CONFIG)
+
+
+RECONCILE_WRITE_CONFIRMATION = "APPLY_LIVE_STATE_RECONCILIATION"
+
+
+class ReadOnlySnapshotError(RuntimeError):
+    pass
+
+
+class _SnapshotPositionPlanStore(SqlitePositionPlanStore):
+    def __init__(self, path: str | Path) -> None:
+        self._snapshot_connections: list[Any] = []
+        super().__init__(path)
+
+    def _connect(self):
+        connection = super()._connect()
+        self._snapshot_connections.append(connection)
+        return connection
+
+    def close_snapshot_connections(self) -> None:
+        for connection in reversed(self._snapshot_connections):
+            connection.close()
+        self._snapshot_connections.clear()
+
+
+class _SnapshotOrderJournalStore(SqliteOrderJournalStore):
+    def __init__(self, path: str | Path) -> None:
+        self._snapshot_connections: list[Any] = []
+        super().__init__(path)
+
+    def _connect(self):
+        connection = super()._connect()
+        self._snapshot_connections.append(connection)
+        return connection
+
+    def close_snapshot_connections(self) -> None:
+        for connection in reversed(self._snapshot_connections):
+            connection.close()
+        self._snapshot_connections.clear()
+
+
+def _database_path_detail(
+    label: str,
+    path: Path,
+    *,
+    write_target: bool,
+) -> dict[str, Any]:
+    resolved = path.expanduser().resolve(strict=False)
+    exists = resolved.exists()
+    return {
+        "label": label,
+        "absolute_path": str(resolved),
+        "exists": exists,
+        "size_bytes": resolved.stat().st_size if exists else None,
+        "write_target": write_target,
+        "confirmed_absolute_path": None,
+    }
+
+
+def _accept_reconcile_write_confirmation(
+    args: argparse.Namespace,
+    report: PreflightReport,
+    *,
+    position_plan_db: Path,
+    order_journal_db: Path,
+) -> bool:
+    token = getattr(args, "confirm_reconcile_write", None)
+    supplied_plan = getattr(args, "confirm_position_plan_db", None)
+    supplied_journal = getattr(args, "confirm_order_journal_db", None)
+    actual_plan = position_plan_db.expanduser().resolve(strict=False)
+    actual_journal = order_journal_db.expanduser().resolve(strict=False)
+
+    reason: str | None = None
+    confirmed_plan: Path | None = None
+    confirmed_journal: Path | None = None
+    if token != RECONCILE_WRITE_CONFIRMATION:
+        reason = "confirmation_token_mismatch"
+    elif not supplied_plan or not supplied_journal:
+        reason = "confirmed_database_path_missing"
+    else:
+        raw_plan = Path(supplied_plan).expanduser()
+        raw_journal = Path(supplied_journal).expanduser()
+        if not raw_plan.is_absolute() or not raw_journal.is_absolute():
+            reason = "confirmed_database_path_must_be_absolute"
+        else:
+            confirmed_plan = raw_plan.resolve(strict=False)
+            confirmed_journal = raw_journal.resolve(strict=False)
+            if actual_plan == actual_journal or confirmed_plan == confirmed_journal:
+                reason = "confirmed_database_paths_are_ambiguous"
+            elif confirmed_plan != actual_plan or confirmed_journal != actual_journal:
+                reason = "confirmed_database_path_mismatch"
+
+    if reason is not None:
+        report.confirmation_accepted = False
+        report.add(
+            "reconciliation_write_confirmation",
+            "fail",
+            detail={"confirmation_accepted": False, "reason": reason},
+            error="write_not_applied",
+        )
+        return False
+
+    report.confirmation_accepted = True
+    for detail in report.database_paths:
+        if detail["label"] == "position_plan_db":
+            detail["confirmed_absolute_path"] = str(confirmed_plan)
+        elif detail["label"] == "order_journal_db":
+            detail["confirmed_absolute_path"] = str(confirmed_journal)
+    report.add(
+        "reconciliation_write_confirmation",
+        "ok",
+        detail={
+            "confirmation_accepted": True,
+            "position_plan_db": str(confirmed_plan),
+            "order_journal_db": str(confirmed_journal),
+        },
+    )
+    logger.warning(
+        "Reconciliation write confirmed | confirmation_accepted=true "
+        "position_plan_db=%s order_journal_db=%s",
+        confirmed_plan,
+        confirmed_journal,
+    )
+    return True
+
+
+def _check_database_paths(
+    report: PreflightReport,
+    *,
+    database_targets: tuple[tuple[str, Path, bool], ...],
+    apply_reconcile: bool,
+) -> bool:
+    ok = True
+    for label, path, write_target in database_targets:
+        resolved = path.expanduser().resolve(strict=False)
+        parent = resolved.parent
+        if apply_reconcile:
+            parent_exists = parent.exists()
+            writable = parent_exists and os.access(parent, os.W_OK)
+            status = "ok" if writable else "fail"
+            report.add(
+                f"{label}_writable",
+                status,
+                detail={
+                    "absolute_path": str(resolved),
+                    "parent_writable": writable,
+                    "write_target": write_target,
+                    "probe_created": False,
+                },
+                error=None if writable else "database_parent_not_writable",
+            )
+            ok = ok and writable
+            continue
+
+        exists = resolved.is_file()
+        status = "ok" if exists else ("warn" if label == "state_db" else "fail")
+        report.add(
+            f"{label}_readable",
+            status,
+            detail={
+                "absolute_path": str(resolved),
+                "exists": exists,
+                "parent_writable": parent.exists() and os.access(parent, os.W_OK),
+                "probe_created": False,
+            },
+            error=None if exists else "database_missing",
+        )
+        if label != "state_db":
+            ok = ok and exists
+    return ok
+
+
+@contextmanager
+def _stable_sqlite_snapshot(source: str | Path, *, attempts: int = 3):
+    source_path = Path(source).expanduser().resolve(strict=False)
+    if not source_path.is_file():
+        raise ReadOnlySnapshotError(f"database_missing:{source_path}")
+
+    source_files = tuple(
+        Path(f"{source_path}{suffix}") for suffix in ("", "-wal", "-shm")
+    )
+    with tempfile.TemporaryDirectory(prefix="aether-preflight-sqlite-") as raw_temp:
+        temp_root = Path(raw_temp)
+        for _ in range(attempts):
+            before = _sqlite_file_manifest(source_files)
+            for old in temp_root.iterdir():
+                old.unlink()
+            for source_file in source_files:
+                if source_file.exists():
+                    shutil.copy2(source_file, temp_root / source_file.name)
+            after = _sqlite_file_manifest(source_files)
+            if before == after:
+                yield temp_root / source_path.name
+                return
+        raise ReadOnlySnapshotError(f"database_changed_during_snapshot:{source_path}")
+
+
+def _sqlite_file_manifest(paths: tuple[Path, ...]) -> tuple[tuple[Any, ...], ...]:
+    records: list[tuple[Any, ...]] = []
+    for path in paths:
+        if not path.exists():
+            records.append((path.name, False, None, None, None))
+            continue
+        stat = path.stat()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        records.append((path.name, True, stat.st_size, stat.st_mtime_ns, digest))
+    return tuple(records)
 
 
 # ── Checks ──────────────────────────────────────────────────────────────
@@ -609,6 +893,24 @@ def _maybe_write_report(path: str, report: PreflightReport) -> None:
         logger.error("Failed to write preflight report | path=%s error=%s", path, exc)
 
 
+def _write_provider_preflight_report(
+    path: str | Path,
+    report: Any,
+    *,
+    reconciliation_mode: str,
+    confirmation_accepted: bool,
+) -> None:
+    payload = json.loads(report.to_json())
+    payload["reconciliation_mode"] = reconciliation_mode
+    payload["confirmation_accepted"] = confirmation_accepted
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -656,6 +958,24 @@ def parse_args() -> argparse.Namespace:
         "--apply-reconcile",
         action="store_true",
         help="Apply reconciliation to clean up stale state and fake order IDs",
+    )
+    parser.add_argument(
+        "--confirm-reconcile-write",
+        default=None,
+        help=(
+            "Required with --apply-reconcile; must equal "
+            f"{RECONCILE_WRITE_CONFIRMATION}"
+        ),
+    )
+    parser.add_argument(
+        "--confirm-position-plan-db",
+        default=None,
+        help="Required absolute PositionPlan database path for apply mode",
+    )
+    parser.add_argument(
+        "--confirm-order-journal-db",
+        default=None,
+        help="Required absolute order-journal database path for apply mode",
     )
     parser.add_argument(
         "--skip-api",
