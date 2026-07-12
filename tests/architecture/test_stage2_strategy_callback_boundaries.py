@@ -20,15 +20,21 @@ CALLBACK_ALLOWLIST = {
     "recover": {"src/runtime/recovery/service.py"},
 }
 
-FORBIDDEN_STRATEGY_IMPORTS = (
-    "strategies.eth_portfolio_v1",
-    "strategies.eth_lf_portfolio_v8",
-    "strategies.eth_lf_portfolio_v10b",
-)
 FORBIDDEN_EXCHANGE_IMPORTS = (
     "src.platform.exchanges.okx",
     "src.platform.exchanges.binance",
+    "src.platform.data.websocket.okx",
+    "src.platform.data.websocket.binance",
+    "src.platform.account.websocket.okx",
+    "src.platform.account.websocket.binance",
 )
+
+# These are generic runtime collaborators whose method names happen to match
+# controlled Strategy callback names. Keep each exception exact so a new
+# reference still requires an architecture review.
+NON_STRATEGY_CALLBACK_REFERENCES = {
+    ("recover", "src/runtime/runner.py", 1953),
+}
 
 
 def _runtime_files() -> tuple[Path, ...]:
@@ -43,10 +49,12 @@ def _relative(path: Path) -> str:
     return path.relative_to(ROOT).as_posix()
 
 
-def _callback_references(path: Path) -> set[str]:
+def _callback_references(tree: ast.AST) -> tuple[tuple[str, int], ...]:
     callbacks = set(CALLBACK_ALLOWLIST)
-    found: set[str] = set()
-    for node in ast.walk(_tree(path)):
+    found: set[tuple[str, int]] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in callbacks:
+            found.add((node.attr, node.lineno))
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
@@ -55,8 +63,8 @@ def _callback_references(path: Path) -> set[str]:
             and isinstance(node.args[1], ast.Constant)
             and node.args[1].value in callbacks
         ):
-            found.add(str(node.args[1].value))
-    return found
+            found.add((str(node.args[1].value), node.lineno))
+    return tuple(sorted(found, key=lambda item: (item[1], item[0])))
 
 
 def _imports(path: Path) -> set[str]:
@@ -69,12 +77,28 @@ def _imports(path: Path) -> set[str]:
     return modules
 
 
+def _module_is_or_below(module: str, prefix: str) -> bool:
+    return module == prefix or module.startswith(f"{prefix}.")
+
+
 def test_direct_strategy_callback_locations_match_explicit_allowlist() -> None:
     actual = {name: set() for name in CALLBACK_ALLOWLIST}
+    violations: list[str] = []
     for path in _runtime_files():
-        for callback in _callback_references(path):
-            actual[callback].add(_relative(path))
+        relative_path = _relative(path)
+        for callback, line in _callback_references(_tree(path)):
+            reference = (callback, relative_path, line)
+            if reference in NON_STRATEGY_CALLBACK_REFERENCES:
+                continue
+            actual[callback].add(relative_path)
+            if relative_path not in CALLBACK_ALLOWLIST[callback]:
+                violations.append(
+                    f"callback={callback} path={relative_path} line={line}"
+                )
 
+    assert violations == [], "Unexpected Strategy callback references:\n" + "\n".join(
+        violations
+    )
     assert actual == CALLBACK_ALLOWLIST
 
 
@@ -82,7 +106,7 @@ def test_runtime_has_no_concrete_strategy_imports() -> None:
     violations = []
     for path in _runtime_files():
         for module in _imports(path):
-            if module.startswith(FORBIDDEN_STRATEGY_IMPORTS):
+            if _module_is_or_below(module, "strategies"):
                 violations.append((_relative(path), module))
 
     assert violations == []
@@ -92,7 +116,27 @@ def test_runtime_has_no_concrete_exchange_client_imports() -> None:
     violations = []
     for path in _runtime_files():
         for module in _imports(path):
-            if module.startswith(FORBIDDEN_EXCHANGE_IMPORTS):
+            if any(
+                _module_is_or_below(module, prefix)
+                for prefix in FORBIDDEN_EXCHANGE_IMPORTS
+            ):
                 violations.append((_relative(path), module))
 
     assert violations == []
+
+
+def test_callback_scanner_recognizes_attribute_calls_references_and_getattr() -> None:
+    tree = ast.parse(
+        """
+strategy.on_trade(event)
+handler = strategy.on_order_results
+callback = getattr(strategy, "recover", None)
+ordinary = strategy.metadata
+"""
+    )
+
+    assert _callback_references(tree) == (
+        ("on_trade", 2),
+        ("on_order_results", 3),
+        ("recover", 4),
+    )
