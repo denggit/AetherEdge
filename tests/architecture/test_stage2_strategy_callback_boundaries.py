@@ -6,15 +6,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_ROOT = ROOT / "src" / "runtime"
+STRATEGY_HOST = RUNTIME_ROOT / "strategy_host.py"
 
 CALLBACK_ALLOWLIST = {
-    "on_start": {"src/runtime/runner.py"},
-    "on_kline": {"src/runtime/runner.py"},
-    "on_ticker": {"src/runtime/runner.py"},
-    "on_trade": {"src/runtime/runner.py"},
-    "on_order_book": {"src/runtime/runner.py"},
-    "on_account_event": {"src/runtime/runner.py"},
-    "on_account_snapshot": {"src/runtime/runner.py"},
+    "on_start": {"src/runtime/strategy_host.py"},
+    "on_kline": {"src/runtime/strategy_host.py"},
+    "on_ticker": {"src/runtime/strategy_host.py"},
+    "on_trade": {"src/runtime/strategy_host.py"},
+    "on_order_book": {"src/runtime/strategy_host.py"},
+    "on_account_event": {"src/runtime/strategy_host.py"},
+    "on_account_snapshot": {"src/runtime/strategy_host.py"},
     "on_order_results": {"src/runtime/runner.py"},
     "on_market_feature": {"src/runtime/market_features.py"},
     "recover": {"src/runtime/recovery/service.py"},
@@ -33,7 +34,11 @@ FORBIDDEN_EXCHANGE_IMPORTS = (
 # controlled Strategy callback names. Keep each exception exact so a new
 # reference still requires an architecture review.
 NON_STRATEGY_CALLBACK_REFERENCES = {
-    ("recover", "src/runtime/runner.py", 1953),
+    ("recover", "src/runtime/runner.py", 1960),
+    ("on_trade", "src/runtime/runner.py", 3414),
+    ("on_trade", "src/runtime/runner.py", 3475),
+    ("on_trade", "src/runtime/runner.py", 3476),
+    ("on_trade", "src/runtime/runner.py", 3477),
 }
 
 
@@ -54,6 +59,11 @@ def _callback_references(tree: ast.AST) -> tuple[tuple[str, int], ...]:
     found: set[tuple[str, int]] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute) and node.attr in callbacks:
+            if (
+                isinstance(node.value, ast.Attribute)
+                and node.value.attr == "_strategy_host"
+            ):
+                continue
             found.add((node.attr, node.lineno))
         if (
             isinstance(node, ast.Call)
@@ -121,6 +131,25 @@ def test_runtime_has_no_concrete_exchange_client_imports() -> None:
                 for prefix in FORBIDDEN_EXCHANGE_IMPORTS
             ):
                 violations.append((_relative(path), module))
+
+    assert violations == []
+
+
+def test_strategy_host_has_no_execution_or_business_implementation_imports() -> None:
+    forbidden_prefixes = (
+        "strategies",
+        "src.order_management",
+        "src.reconcile",
+        *FORBIDDEN_EXCHANGE_IMPORTS,
+    )
+    violations = [
+        module
+        for module in _imports(STRATEGY_HOST)
+        if any(
+            _module_is_or_below(module, prefix)
+            for prefix in forbidden_prefixes
+        )
+    ]
 
     assert violations == []
 

@@ -108,6 +108,7 @@ from src.runtime.strategy_positions import (
     StrategyPositionSnapshotIndex,
     resolve_strategy_position_snapshot_index,
 )
+from src.runtime.strategy_host import StrategyHost
 from src.runtime.orders import LiveOrderIntentFactory
 from src.runtime.recovery.service import RecoveryExchangeContext, RuntimeRecoveryService
 from src.runtime.recovery.models import RecoveryReport
@@ -355,6 +356,12 @@ class LiveRuntimeRunner:
         self.runtime_config = runtime_config or live_runtime_config_from_app(app_config)
         self.context = app_context
         self.services = dict(services or {})
+        injected_strategy_host = self.services.get("strategy_host")
+        self._strategy_host = (
+            injected_strategy_host
+            if injected_strategy_host is not None
+            else StrategyHost(app_context.strategy)
+        )
         self._project_env: ProjectEnvConfig = self.services.get("project_env_config") or get_project_env_config()
         self._account_config_env: AccountConfigEnv | None = None
         self._account_config_new_entries_blocked: bool = False
@@ -2338,10 +2345,7 @@ class LiveRuntimeRunner:
                 )
 
     async def _call_on_start(self, snapshot: PlatformSnapshot) -> None:
-        on_start = getattr(self.context.strategy, "on_start", None)
-        if not callable(on_start):
-            return
-        signals = await on_start(snapshot)
+        signals = await self._strategy_host.on_start(snapshot)
         self.stats.on_start_called = True
         logger.info("Strategy on_start completed | signals=%s", len(signals or ()))
         await self._execute_signals(signals or (), source="on_start", event_time_ms=None)
@@ -3225,10 +3229,7 @@ class LiveRuntimeRunner:
         save = getattr(self.context.state_store, "save_account_event", None)
         if callable(save):
             await asyncio.to_thread(save, event)
-        handler = getattr(self.context.strategy, "on_account_event", None)
-        if not callable(handler):
-            return
-        signals = await handler(event)
+        signals = await self._strategy_host.on_account_event(event)
         await self._execute_signals(signals or (), source=f"account:{event.exchange.value}", event_time_ms=event.event_time_ms)
 
     async def _on_account_snapshot_synced(self, snapshot: PlatformSnapshot, sync_type: str) -> None:
@@ -3242,10 +3243,7 @@ class LiveRuntimeRunner:
         if snapshot.balance.exchange == self.app_config.data_exchange:
             self._last_snapshot = snapshot
 
-        handler = getattr(self.context.strategy, "on_account_snapshot", None)
-        if not callable(handler):
-            return
-        await handler(snapshot)
+        await self._strategy_host.on_account_snapshot(snapshot)
 
         exchange = snapshot.balance.exchange.value
         key = (exchange, sync_type)
@@ -3596,20 +3594,7 @@ class LiveRuntimeRunner:
             del self._range_bars_by_bucket[k]
 
     async def _call_strategy_market_event(self, event: MarketEvent) -> Sequence[TradeSignal]:
-        strategy = self.context.strategy
-        if isinstance(event, MarketKline) or event.event_type is MarketEventType.KLINE:
-            handler = getattr(strategy, "on_kline", None)
-        elif isinstance(event, MarketTicker) or event.event_type is MarketEventType.TICKER:
-            handler = getattr(strategy, "on_ticker", None)
-        elif isinstance(event, MarketTrade) or event.event_type is MarketEventType.TRADE:
-            handler = getattr(strategy, "on_trade", None)
-        elif isinstance(event, MarketOrderBook) or event.event_type is MarketEventType.ORDER_BOOK:
-            handler = getattr(strategy, "on_order_book", None)
-        else:
-            handler = None
-        if not callable(handler):
-            return ()
-        return await handler(event) or ()
+        return await self._strategy_host.on_market_event(event)
 
     def _trade_events_are_range_only(self) -> bool:
         strategy = self.context.strategy
