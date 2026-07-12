@@ -87,6 +87,35 @@ def test_memory_and_pytest_temporary_databases_remain_usable(tmp_path) -> None:
     assert Path(market.path).is_file()
 
 
+def test_system_temp_database_outside_this_pytest_basetemp_is_blocked() -> None:
+    allowed = Path(os.environ["AETHER_PYTEST_ALLOWED_TEMP_ROOT"]).resolve()
+    target = Path(os.environ["AETHER_PYTEST_SYSTEM_TEMP_ROOT"]).resolve() / "aether-outside-basetemp.sqlite3"
+    assert not target.is_relative_to(allowed)
+    with pytest.raises(
+        RuntimeError,
+        match="pytest blocked write access outside the temporary directory",
+    ):
+        sqlite3.connect(target)
+
+
+def test_subprocess_blocks_system_temp_database_outside_pytest_basetemp() -> None:
+    target = Path(os.environ["AETHER_PYTEST_SYSTEM_TEMP_ROOT"]).resolve() / "aether-child-outside-basetemp.sqlite3"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import sqlite3; sqlite3.connect({str(target)!r})",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "pytest blocked write access outside the temporary directory" in (
+        result.stdout + result.stderr
+    )
+
+
 @pytest.mark.parametrize("use_other_cwd", (False, True))
 def test_python_subprocess_inherits_repository_sqlite_guard(
     tmp_path,

@@ -12,6 +12,7 @@ from tests._support.runtime_state_guard import install_sqlite_guard, uninstall_s
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_ROOTS = ("data/state", "data/market_data", "data/reports", "logs")
+_DEFAULT_MF_STORE_PATH = Path("data/market_data/aether_market_data.sqlite3")
 _PATH_ENV = {
     "AETHER_STATE_DB": "state/aether_state.sqlite3",
     "AETHER_ORDER_JOURNAL_DB": "state/aether_order_journal.sqlite3",
@@ -33,28 +34,34 @@ _PATH_ENV = {
 _saved_environment: dict[str, str | None] = {}
 _session_root: Path | None = None
 _before_manifest: dict[str, dict[str, int | str]] = {}
+_saved_tempdir: str | None = None
 
 
 @pytest.hookimpl(trylast=True)
 def pytest_configure(config: pytest.Config) -> None:
     """Install isolation after pytest's TempPathFactory exists, before collection."""
 
-    global _session_root
+    global _session_root, _saved_tempdir
     factory = config._tmp_path_factory  # pytest test infrastructure API; unavailable in production code.
+    system_temp_root = Path(tempfile.gettempdir()).resolve()
+    allowed_temp_root = factory.getbasetemp().resolve()
     _session_root = factory.mktemp("aether-runtime-state", numbered=True)
     keys = tuple(_PATH_ENV) + (
         "AETHER_PYTEST_SQLITE_GUARD",
         "AETHER_PYTEST_REPO_ROOT",
         "AETHER_PYTEST_STATE_ROOT",
         "AETHER_PYTEST_ALLOWED_TEMP_ROOT",
+        "AETHER_PYTEST_SYSTEM_TEMP_ROOT",
         "AETHER_PYTEST_RUNTIME_HEARTBEAT_DB",
         "PYTHONPATH",
     )
     for key in keys:
         _saved_environment[key] = os.environ.get(key)
-    _apply_isolated_environment(_session_root)
-    allowed_temp_root = Path(tempfile.gettempdir()).resolve()
+    _saved_tempdir = tempfile.tempdir
     os.environ["AETHER_PYTEST_ALLOWED_TEMP_ROOT"] = str(allowed_temp_root)
+    os.environ["AETHER_PYTEST_SYSTEM_TEMP_ROOT"] = str(system_temp_root)
+    tempfile.tempdir = str(allowed_temp_root)
+    _apply_isolated_environment(_session_root)
     install_sqlite_guard(repo_root=REPO_ROOT, pytest_root=allowed_temp_root)
     from src.platform.config import reset_project_env_config_for_tests
 
@@ -92,14 +99,18 @@ def _isolate_runtime_state_per_test(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     original_mf_buffer_init = MfDataBuffer.__init__
 
     def isolated_mf_buffer_init(self, *args, **kwargs):
-        kwargs.setdefault("store_path", os.environ["AETHER_MARKET_DATA_DB"])
+        raw_store_path = kwargs.get("store_path")
+        if raw_store_path is None or Path(raw_store_path) == _DEFAULT_MF_STORE_PATH:
+            kwargs["store_path"] = os.environ["AETHER_MARKET_DATA_DB"]
         return original_mf_buffer_init(self, *args, **kwargs)
 
     monkeypatch.setattr(MfDataBuffer, "__init__", isolated_mf_buffer_init)
     original_mf_readiness_init = MfDataReadiness.__init__
 
     def isolated_mf_readiness_init(self, *args, **kwargs):
-        kwargs.setdefault("store_path", os.environ["AETHER_MARKET_DATA_DB"])
+        raw_store_path = kwargs.get("store_path")
+        if raw_store_path is None or Path(raw_store_path) == _DEFAULT_MF_STORE_PATH:
+            kwargs["store_path"] = os.environ["AETHER_MARKET_DATA_DB"]
         return original_mf_readiness_init(self, *args, **kwargs)
 
     monkeypatch.setattr(MfDataReadiness, "__init__", isolated_mf_readiness_init)
@@ -110,6 +121,7 @@ def _isolate_runtime_state_per_test(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    global _saved_tempdir
     after = build_manifest(repo_root=REPO_ROOT, roots=RUNTIME_ROOTS)
     if after != _before_manifest:
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
@@ -119,6 +131,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
             reporter.write_line(f"before={_before_manifest}")
             reporter.write_line(f"after={after}")
     uninstall_sqlite_guard()
+    tempfile.tempdir = _saved_tempdir
     for key, original in _saved_environment.items():
         if original is None:
             os.environ.pop(key, None)
@@ -141,10 +154,6 @@ def _apply_isolated_environment(root: Path) -> None:
     os.environ["AETHER_PYTEST_SQLITE_GUARD"] = "1"
     os.environ["AETHER_PYTEST_REPO_ROOT"] = str(REPO_ROOT)
     os.environ["AETHER_PYTEST_STATE_ROOT"] = str(root)
-    os.environ.setdefault(
-        "AETHER_PYTEST_ALLOWED_TEMP_ROOT",
-        str(Path(tempfile.gettempdir()).resolve()),
-    )
     support = str(REPO_ROOT / "tests" / "_support" / "sqlite_guard")
     current = os.environ.get("PYTHONPATH", "")
     parts = [part for part in current.split(os.pathsep) if part and part != support]

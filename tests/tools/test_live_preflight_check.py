@@ -6,10 +6,13 @@ import argparse
 import gc
 import hashlib
 import json
+import os
 import sqlite3
+import sys
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -23,16 +26,24 @@ from src.order_management.position_plan.models import (
 from src.order_management.position_plan.store import SqlitePositionPlanStore
 from src.order_management.journal.store import SqliteOrderJournalStore
 from src.order_management.reconciliation.validation import is_fake_order_id
+from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
+from src.market_data.storage import (
+    SqliteKlineStore,
+    SqliteRangeBarStore,
+)
+from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
 from src.platform import Balance, LeverageInfo, PlatformSnapshot, PositionMode
+from src.platform.data.models import MarketDataSource, MarketKline
 from src.platform.exchanges.models import ExchangeName
 from src.platform.state.sqlite_store import SqliteStateStore
 from src.runtime import RuntimeMode
+from src.strategy import load_strategy
+from tests._support.runtime_manifest import build_manifest
 
 
-def test_preflight_detects_fake_order_ids_in_position_plan():
+def test_preflight_detects_fake_order_ids_in_position_plan(tmp_path):
     """Verify a PositionPlan with fake order IDs is detected."""
-    import tempfile
-    store_path = Path(tempfile.mkdtemp()) / "test_plans.sqlite3"
+    store_path = tmp_path / "test_plans.sqlite3"
     store = SqlitePositionPlanStore(str(store_path))
 
     plan = PositionPlan(
@@ -67,10 +78,9 @@ def test_preflight_detects_fake_order_ids_in_position_plan():
     assert any(f.field == "stop_order_id" and f.value == "okx-stop-1" for f in fake_refs)
 
 
-def test_preflight_clean_plan_no_fakes():
+def test_preflight_clean_plan_no_fakes(tmp_path):
     """A clean plan with real numeric IDs should have no fake detections."""
-    import tempfile
-    store_path = Path(tempfile.mkdtemp()) / "test_clean_plans.sqlite3"
+    store_path = tmp_path / "test_clean_plans.sqlite3"
     store = SqlitePositionPlanStore(str(store_path))
 
     plan = PositionPlan(
@@ -244,6 +254,12 @@ async def test_apply_reconcile_rejects_incomplete_or_ambiguous_confirmation_befo
         journal_confirmation, journal_db, tmp_path / "other-journal.sqlite3"
     )
     _install_generic_preflight(monkeypatch, preflight, args)
+    load_spy = Mock(side_effect=AssertionError("strategy loaded before confirmation"))
+    plan_spy = Mock(side_effect=AssertionError("plan store opened before confirmation"))
+    journal_spy = Mock(side_effect=AssertionError("journal opened before confirmation"))
+    monkeypatch.setattr(preflight, "load_strategy", load_spy)
+    monkeypatch.setattr(preflight, "SqlitePositionPlanStore", plan_spy)
+    monkeypatch.setattr(preflight, "SqliteOrderJournalStore", journal_spy)
 
     exit_code = await preflight.main()
 
@@ -253,6 +269,9 @@ async def test_apply_reconcile_rejects_incomplete_or_ambiguous_confirmation_befo
     assert payload["confirmation_accepted"] is False
     assert "write_not_applied" in Path(args.report).read_text(encoding="utf-8")
     assert after == before
+    load_spy.assert_not_called()
+    plan_spy.assert_not_called()
+    journal_spy.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -325,12 +344,8 @@ async def test_direct_live_provider_still_rejects_apply_before_write_confirmatio
         plan_db=plan_db,
         apply=True,
     )
+    args.strategy = "strategies.eth_portfolio_v1:Strategy"
     _install_generic_preflight(monkeypatch, preflight, args)
-    provider_strategy = SimpleNamespace(
-        config=SimpleNamespace(strategy_id="portfolio-v1"),
-        live_preflight_provider=lambda: None,
-    )
-    monkeypatch.setattr(preflight, "load_strategy", lambda _path: provider_strategy)
     monkeypatch.setattr(
         smoke,
         "run_server_smoke",
@@ -344,6 +359,287 @@ async def test_direct_live_provider_still_rejects_apply_before_write_confirmatio
     assert "direct_live_preflight_disallows:--apply-reconcile" in report_text
     assert '"reconciliation_mode": "apply"' in report_text
     assert '"confirmation_accepted": false' in report_text
+
+
+@pytest.mark.asyncio
+async def test_real_portfolio_v1_preflight_uses_five_stable_snapshots_and_reads_wal(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import tools.live_preflight_check as preflight
+
+    sources = _seed_real_portfolio_sources(tmp_path / "source")
+    latest_open_ms = 1_700_100_000_000
+    writer = sqlite3.connect(sources["mf_feature"])
+    try:
+        writer.execute("PRAGMA journal_mode=WAL")
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.execute(
+            "UPDATE klines SET open_time_ms=?, close_time_ms=?",
+            (latest_open_ms, latest_open_ms + 4 * 60 * 60_000 - 1),
+        )
+        writer.commit()
+        assert Path(f"{sources['mf_feature']}-wal").exists()
+        args = _real_portfolio_args(tmp_path, sources=sources, apply=False)
+        _install_real_portfolio_env(monkeypatch, preflight, args, sources)
+        guarded_connect = sqlite3.connect
+        forbidden_store_sources = {
+            sources["position_plan"].resolve(),
+            sources["order_journal"].resolve(),
+        }
+
+        def reject_source_store_connections(database, *connect_args, **connect_kwargs):
+            from tests._support.runtime_state_guard import resolve_sqlite_target
+
+            path, _read_only = resolve_sqlite_target(
+                database,
+                uri=bool(connect_kwargs.get("uri", False)),
+            )
+            if path in forbidden_store_sources:
+                raise AssertionError(f"provider opened source store: {path}")
+            return guarded_connect(database, *connect_args, **connect_kwargs)
+
+        monkeypatch.setattr(sqlite3, "connect", reject_source_store_connections)
+        source_before = _tree_manifest(tmp_path / "source")
+        repo_before = _runtime_repo_manifest()
+
+        exit_code = await preflight.main()
+
+        source_after = _tree_manifest(tmp_path / "source")
+        repo_after = _runtime_repo_manifest()
+    finally:
+        writer.close()
+
+    payload = json.loads(Path(args.report).read_text(encoding="utf-8"))
+    assert exit_code != preflight.EXIT_FAIL_CONFIG
+    assert payload["strategy"] == "eth_portfolio_v1"
+    assert payload["report_kind"] == "preflight"
+    assert payload["reconciliation_mode"] == "read_only"
+    assert (
+        payload["lf_data_readiness"]["latest_closed_kline_open_time_ms"]
+        == latest_open_ms
+    )
+    assert source_after == source_before
+    assert repo_after == repo_before
+    database_paths = payload["database_paths"]
+    allowed = Path(os.environ["AETHER_PYTEST_ALLOWED_TEMP_ROOT"]).resolve()
+    for name, source_path in sources.items():
+        assert database_paths[f"{name}_source"] == str(source_path.resolve())
+        snapshot_path = Path(database_paths[name])
+        snapshot_path.relative_to(allowed)
+        assert not snapshot_path.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "confirmation_mode",
+    ("none", "token", "token_and_paths"),
+)
+async def test_real_portfolio_v1_apply_is_rejected_before_strategy_construction(
+    tmp_path,
+    monkeypatch,
+    confirmation_mode: str,
+) -> None:
+    import tools.live_preflight_check as preflight
+    from strategies.eth_portfolio_v1.domain.mf_data import MfDataBuffer
+    from strategies.eth_portfolio_v1.strategy import Strategy
+
+    sources = _real_portfolio_source_paths(tmp_path / "source")
+    args = _real_portfolio_args(tmp_path, sources=sources, apply=True)
+    if confirmation_mode in {"token", "token_and_paths"}:
+        args.confirm_reconcile_write = preflight.RECONCILE_WRITE_CONFIRMATION
+    if confirmation_mode == "token_and_paths":
+        args.confirm_position_plan_db = str(sources["position_plan"].resolve())
+        args.confirm_order_journal_db = str(sources["order_journal"].resolve())
+    _install_real_portfolio_env(monkeypatch, preflight, args, sources)
+    load_spy = Mock(wraps=preflight.load_strategy)
+    monkeypatch.setattr(preflight, "load_strategy", load_spy)
+
+    with (
+        patch.object(Strategy, "__init__", side_effect=AssertionError("Strategy constructed")) as strategy_init,
+        patch.object(MfDataBuffer, "__init__", side_effect=AssertionError("MF buffer constructed")) as mf_init,
+        patch.object(preflight, "SqlitePositionPlanStore", side_effect=AssertionError("plan store constructed")) as plan_init,
+        patch.object(preflight, "SqliteOrderJournalStore", side_effect=AssertionError("journal store constructed")) as journal_init,
+    ):
+        exit_code = await preflight.main()
+
+    report_text = Path(args.report).read_text(encoding="utf-8")
+    assert exit_code != preflight.EXIT_PASS
+    assert "direct_live_preflight_disallows:--apply-reconcile" in report_text
+    load_spy.assert_not_called()
+    strategy_init.assert_not_called()
+    mf_init.assert_not_called()
+    plan_init.assert_not_called()
+    journal_init.assert_not_called()
+    assert not (tmp_path / "source").exists()
+
+
+def test_real_portfolio_strategy_accepts_explicit_mf_snapshot_path(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    working = tmp_path / "working"
+    working.mkdir()
+    monkeypatch.chdir(working)
+    snapshot = tmp_path / "snapshot" / "market.sqlite3"
+
+    strategy = load_strategy(
+        "strategies.eth_portfolio_v1:Strategy",
+        mf_store_path=snapshot,
+    )
+
+    assert strategy.mf_data_buffer._store.path.resolve() == snapshot.resolve()
+    assert strategy.mf_data_readiness._store.path.resolve() == snapshot.resolve()
+    assert not (working / "data/market_data/aether_market_data.sqlite3").exists()
+
+
+@pytest.mark.asyncio
+async def test_preflight_and_server_smoke_default_reports_honor_environment(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import tools.live_preflight_check as preflight
+    import tools.live_server_smoke as smoke
+
+    invalid_env = tmp_path / ".env.example"
+    invalid_env.write_text("AETHER_MARKET=ETH-USDT-PERP\n", encoding="utf-8")
+    preflight_report = tmp_path / "reports" / "preflight.json"
+    smoke_report = tmp_path / "reports" / "smoke.json"
+    repo_before = _runtime_repo_manifest()
+
+    monkeypatch.setenv("AETHER_LIVE_PREFLIGHT_REPORT", str(preflight_report))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["live_preflight_check.py", "--env-file", str(invalid_env)],
+    )
+    assert await preflight.main() == preflight.EXIT_FAIL_CONFIG
+
+    monkeypatch.setenv("AETHER_LIVE_SMOKE_REPORT", str(smoke_report))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "live_server_smoke.py",
+            "--strategy",
+            "strategies.eth_portfolio_v1:Strategy",
+            "--env-file",
+            str(invalid_env),
+        ],
+    )
+    assert await smoke.main() != 0
+
+    assert preflight_report.is_file()
+    assert smoke_report.is_file()
+    assert _runtime_repo_manifest() == repo_before
+
+
+def _real_portfolio_source_paths(root: Path) -> dict[str, Path]:
+    return {
+        "state": root / "state.sqlite3",
+        "position_plan": root / "position-plan.sqlite3",
+        "order_journal": root / "order-journal.sqlite3",
+        "range_checkpoint": root / "range-checkpoint.sqlite3",
+        "mf_feature": root / "market-data.sqlite3",
+    }
+
+
+def _seed_real_portfolio_sources(root: Path) -> dict[str, Path]:
+    paths = _real_portfolio_source_paths(root)
+    root.mkdir(parents=True, exist_ok=True)
+    SqliteStateStore(paths["state"])
+    SqlitePositionPlanStore(paths["position_plan"])
+    SqliteOrderJournalStore(paths["order_journal"])
+    SqliteRangeCheckpointStore(paths["range_checkpoint"])
+    SqliteRangeBarStore(paths["mf_feature"])
+    SqliteTradeFeatureStore(paths["mf_feature"])
+    SqliteKlineStore(paths["mf_feature"]).save(
+        [
+            MarketKline(
+                exchange=ExchangeName.OKX,
+                symbol="ETH-USDT-PERP",
+                raw_symbol="ETH-USDT-SWAP",
+                interval="4h",
+                open_time_ms=1_700_000_000_000,
+                close_time_ms=1_700_000_000_000 + 4 * 60 * 60_000 - 1,
+                open=Decimal("2000"),
+                high=Decimal("2010"),
+                low=Decimal("1990"),
+                close=Decimal("2005"),
+                volume=Decimal("10"),
+                is_closed=True,
+                source=MarketDataSource.REST,
+            )
+        ]
+    )
+    gc.collect()
+    return paths
+
+
+def _real_portfolio_args(
+    tmp_path: Path,
+    *,
+    sources: dict[str, Path],
+    apply: bool,
+) -> argparse.Namespace:
+    env_file = tmp_path / "portfolio-v1.env"
+    env_file.write_text("AETHER_MARKET=ETH-USDT-PERP\n", encoding="utf-8")
+    return argparse.Namespace(
+        strategy="strategies.eth_portfolio_v1:Strategy",
+        defaults=Path(__file__).resolve().parents[2] / "config/aether_defaults.json",
+        env_file=env_file,
+        report=str(tmp_path / "portfolio-v1-preflight.json"),
+        apply_reconcile=apply,
+        confirm_reconcile_write=None,
+        confirm_position_plan_db=None,
+        confirm_order_journal_db=None,
+        skip_api=True,
+        skip_kline=False,
+    )
+
+
+def _install_real_portfolio_env(
+    monkeypatch,
+    preflight,
+    args: argparse.Namespace,
+    sources: dict[str, Path],
+) -> None:
+    values = {
+        "AETHER_RUNTIME_MODE": "live_runtime",
+        "AETHER_MARKET": "ETH-USDT-PERP",
+        "AETHER_STRATEGY": "strategies.eth_portfolio_v1:Strategy",
+        "AETHER_EXCHANGES": "okx,binance",
+        "AETHER_DATA_EXCHANGE": "okx",
+        "AETHER_MASTER_EXCHANGE": "okx",
+        "AETHER_FOLLOWER_EXCHANGES": "binance",
+        "AETHER_DRY_RUN": "false",
+        "AETHER_LIVE_TRADING": "true",
+        "AETHER_STATE_DB": str(sources["state"]),
+        "AETHER_POSITION_PLAN_DB": str(sources["position_plan"]),
+        "AETHER_ORDER_JOURNAL_DB": str(sources["order_journal"]),
+        "AETHER_RANGE_CHECKPOINT_DB": str(sources["range_checkpoint"]),
+        "AETHER_MARKET_DATA_DB": str(sources["mf_feature"]),
+        "AETHER_RANGE_BACKFILL_ENABLED": "false",
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(preflight, "parse_args", lambda: args)
+
+
+def _tree_manifest(root: Path) -> dict[str, tuple[str, int, int]]:
+    return {
+        path.relative_to(root).as_posix(): _fingerprint(path)
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _runtime_repo_manifest() -> dict[str, dict[str, int | str]]:
+    repo_root = Path(__file__).resolve().parents[2]
+    return build_manifest(
+        repo_root=repo_root,
+        roots=("data/state", "data/market_data", "data/reports", "logs"),
+    )
 
 
 def _plan(position_id: str, *, strategy_id: str) -> PositionPlan:
@@ -386,7 +682,7 @@ def _preflight_args(
                 "AETHER_MARKET=ETH-USDT-PERP",
                 "AETHER_EXCHANGES=okx",
                 "AETHER_DATA_EXCHANGE=okx",
-                "AETHER_STRATEGY=tests.fake:Strategy",
+                "AETHER_STRATEGY=strategies.empty_strategy:Strategy",
                 "OKX_API_KEY=test-okx-api-key",
                 "OKX_SECRET_KEY=test-okx-api-secret",
                 "OKX_PASSPHRASE=test-okx-passphrase",
@@ -423,7 +719,9 @@ def _install_generic_preflight(monkeypatch, preflight, args) -> None:
     monkeypatch.setattr(
         preflight,
         "load_strategy",
-        lambda _path: SimpleNamespace(config=SimpleNamespace(strategy_id="test")),
+        lambda _path, **_kwargs: SimpleNamespace(
+            config=SimpleNamespace(strategy_id="test")
+        ),
     )
     monkeypatch.setattr(
         preflight,

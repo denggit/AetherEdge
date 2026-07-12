@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -130,11 +132,23 @@ async def test_live_preflight_entry_uses_process_env_without_example(
     monkeypatch.setattr(preflight, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(preflight, "parse_args", lambda: args)
     monkeypatch.setattr(preflight, "load_strategy", lambda _path: strategy)
-    monkeypatch.setattr(smoke, "load_strategy", lambda _path: strategy)
+    monkeypatch.setattr(smoke, "load_strategy", lambda _path, **_kwargs: strategy)
     _set_fake_process_credentials(monkeypatch)
     monkeypatch.setenv("AETHER_TEST_ENV_SENTINEL", "sentinel-before-load")
     monkeypatch.setenv("AETHER_MARKET", "from-process")
-
+    for key in (
+        "AETHER_STATE_DB",
+        "AETHER_ORDER_JOURNAL_DB",
+        "AETHER_POSITION_PLAN_DB",
+        "AETHER_RANGE_CHECKPOINT_DB",
+        "AETHER_MARKET_DATA_DB",
+    ):
+        path = Path(os.environ[key])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(path)
+        connection.execute("CREATE TABLE IF NOT EXISTS bootstrap(id INTEGER)")
+        connection.commit()
+        connection.close()
     exit_code = await preflight.main()
 
     project_env = captured["project_env"]
@@ -180,6 +194,7 @@ async def test_live_server_smoke_entry_uses_process_env_without_example(
         env_file=env,
         strategy_name="strategies.eth_portfolio_v1:Strategy",
         repo_root=tmp_path,
+        read_only_state=False,
     )
 
     project_env = captured["project_env"]
@@ -269,6 +284,7 @@ async def test_live_server_smoke_classifies_env_example_as_fail_config(
         env_file=example,
         strategy_name="strategies.eth_portfolio_v1:Strategy",
         repo_root=tmp_path,
+        read_only_state=False,
     )
 
     report_text = result.to_json()
@@ -328,6 +344,7 @@ async def test_live_server_smoke_rejects_invalid_credentials_before_provider(
         strategy_name="strategies.eth_portfolio_v1:Strategy",
         repo_root=tmp_path,
         provider_kwargs={"skip_api": False},
+        read_only_state=False,
     )
 
     report_text = result.to_json()
@@ -405,6 +422,7 @@ async def test_live_server_smoke_skip_api_allows_offline_provider_without_creden
         strategy_name="strategies.eth_portfolio_v1:Strategy",
         repo_root=tmp_path,
         provider_kwargs={"skip_api": True},
+        read_only_state=False,
     )
 
     assert result is report

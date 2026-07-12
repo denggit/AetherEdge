@@ -19,14 +19,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
+import importlib
 import json
 import os
-import shutil
 import sys
-import tempfile
 import time
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
@@ -59,7 +57,11 @@ from src.platform.exchanges.errors import ExchangeConfigError
 from src.platform.exchanges.models import ExchangeConfig
 from src.platform.execution.factory import create_execution_client
 from src.platform.snapshot import PlatformSnapshot, fetch_platform_snapshot
-from src.runtime import RuntimeMode, runtime_mode_from_env
+from src.runtime import (
+    RuntimeMode,
+    live_runtime_config_from_app,
+    runtime_mode_from_env,
+)
 from src.runtime.live_smoke import (
     BootstrapFailureReport,
     strategy_plugin_path,
@@ -67,6 +69,10 @@ from src.runtime.live_smoke import (
 from src.runtime.tasks.scheduler import closed_bar_open_time_ms
 from src.strategy import load_strategy
 from src.utils.log import get_logger
+from tools._sqlite_readonly_snapshot import (
+    ReadOnlySnapshotError,
+    stable_sqlite_snapshot as _stable_sqlite_snapshot,
+)
 
 logger = get_logger(__name__)
 
@@ -195,6 +201,91 @@ async def main() -> int:
     report.symbol = app_config.symbol
     report.strategy = app_config.strategy
 
+    try:
+        database_sources = _resolve_database_source_paths(
+            app_config=app_config,
+            project_env=project_env,
+            defaults_path=args.defaults,
+        )
+        provider_declared = _strategy_class_declares_provider(
+            app_config.strategy,
+            "live_preflight_provider",
+        )
+    except Exception as exc:
+        report.add(
+            "strategy_provider_inspection",
+            "fail",
+            error=f"provider_inspection_failed:{type(exc).__name__}",
+        )
+        report.verdict = "fail_config"
+        _maybe_write_report(args.report, report)
+        return EXIT_FAIL_CONFIG
+
+    state_db = database_sources["state"]
+    journal_db = database_sources["order_journal"]
+    plan_db = database_sources["position_plan"]
+    database_targets = tuple(
+        (
+            f"{name}_db",
+            path,
+            bool(
+                args.apply_reconcile
+                and name in {"position_plan", "order_journal"}
+            ),
+        )
+        for name, path in database_sources.items()
+    )
+    generic_database_targets = tuple(
+        target
+        for target in database_targets
+        if target[0]
+        in {"state_db", "position_plan_db", "order_journal_db"}
+    )
+    report.database_paths = [
+        _database_path_detail(label, path, write_target=write_target)
+        for label, path, write_target in database_targets
+    ]
+    for detail in report.database_paths:
+        logger.warning(
+            "Preflight database target | reconciliation_mode=%s label=%s "
+            "absolute_path=%s exists=%s size_bytes=%s write_target=%s",
+            report.reconciliation_mode,
+            detail["label"],
+            detail["absolute_path"],
+            detail["exists"],
+            detail["size_bytes"],
+            detail["write_target"],
+        )
+
+    if provider_declared and args.apply_reconcile:
+        final_report = BootstrapFailureReport(
+            verdict="fail_config",
+            exit_code=1,
+            issues=["direct_live_preflight_disallows:--apply-reconcile"],
+        )
+        _write_provider_preflight_report(
+            args.report,
+            final_report,
+            reconciliation_mode=report.reconciliation_mode,
+            confirmation_accepted=False,
+        )
+        return int(final_report.exit_code)
+
+    if args.apply_reconcile:
+        if not _accept_reconcile_write_confirmation(
+            args,
+            report,
+            position_plan_db=plan_db,
+            order_journal_db=journal_db,
+        ) or not _check_database_paths(
+            report,
+            database_targets=generic_database_targets,
+            apply_reconcile=True,
+        ):
+            report.verdict = "fail_config"
+            _maybe_write_report(args.report, report)
+            return EXIT_FAIL_CONFIG
+
     if not args.skip_api:
         try:
             for exchange in app_config.exchanges:
@@ -215,49 +306,21 @@ async def main() -> int:
             _maybe_write_report(args.report, report)
             return EXIT_FAIL_CONFIG
 
-    try:
-        strategy = load_strategy(app_config.strategy)
-    except Exception as exc:
-        report.add("load_strategy", "fail", error=str(exc))
-        report.verdict = "fail_config"
-        _maybe_write_report(args.report, report)
-        return EXIT_FAIL_CONFIG
-
-    provider_factory = getattr(
-        strategy,
-        "live_preflight_provider",
-        None,
-    )
-    if callable(provider_factory):
+    if provider_declared:
         from tools.live_server_smoke import run_server_smoke
 
-        forbidden_flags = [
-            name
-            for name, active in (
-                ("--apply-reconcile", args.apply_reconcile),
-            )
-            if active
-        ]
-        if forbidden_flags:
-            final_report = BootstrapFailureReport(
-                verdict="fail_config",
-                exit_code=1,
-                issues=[
-                    "direct_live_preflight_disallows:"
-                    + ",".join(forbidden_flags)
-                ],
-            )
-        else:
-            final_report = await run_server_smoke(
-                defaults_path=args.defaults,
-                env_file=args.env_file,
-                strategy_name=args.strategy or app_config.strategy,
-                provider_hook="live_preflight_provider",
-                provider_kwargs={
-                    "skip_api": args.skip_api,
-                    "skip_kline": args.skip_kline,
-                },
-            )
+        final_report = await run_server_smoke(
+            defaults_path=args.defaults,
+            env_file=args.env_file,
+            strategy_name=args.strategy or app_config.strategy,
+            provider_hook="live_preflight_provider",
+            provider_kwargs={
+                "skip_api": args.skip_api,
+                "skip_kline": args.skip_kline,
+            },
+            read_only_state=True,
+            database_source_paths=database_sources,
+        )
         _write_provider_preflight_report(
             args.report,
             final_report,
@@ -265,6 +328,14 @@ async def main() -> int:
             confirmation_accepted=False,
         )
         return int(final_report.exit_code)
+
+    try:
+        strategy = load_strategy(app_config.strategy)
+    except Exception as exc:
+        report.add("load_strategy", "fail", error=str(exc))
+        report.verdict = "fail_config"
+        _maybe_write_report(args.report, report)
+        return EXIT_FAIL_CONFIG
 
     runtime_mode = runtime_mode_from_env()
     report.runtime_mode = runtime_mode.value
@@ -291,60 +362,10 @@ async def main() -> int:
     report.add("strategy_identity", "ok", detail={"strategy_id": strategy_id})
 
     # ── 4. Local DB writability ──
-    state_db = Path(
-        project_env.get(
-            "AETHER_STATE_DB",
-            "data/state/aether_state.sqlite3",
-        )
-    )
-    journal_db = Path(
-        project_env.get(
-            "AETHER_ORDER_JOURNAL_DB",
-            "data/state/aether_order_journal.sqlite3",
-        )
-    )
-    plan_db = Path(
-        project_env.get(
-            "AETHER_POSITION_PLAN_DB",
-            "data/state/aether_position_plan.sqlite3",
-        )
-    )
-
-    database_targets = (
-        ("state_db", state_db, False),
-        ("order_journal_db", journal_db, args.apply_reconcile),
-        ("position_plan_db", plan_db, args.apply_reconcile),
-    )
-    report.database_paths = [
-        _database_path_detail(label, path, write_target=write_target)
-        for label, path, write_target in database_targets
-    ]
-    for detail in report.database_paths:
-        logger.warning(
-            "Preflight database target | reconciliation_mode=%s label=%s "
-            "absolute_path=%s exists=%s size_bytes=%s write_target=%s",
-            report.reconciliation_mode,
-            detail["label"],
-            detail["absolute_path"],
-            detail["exists"],
-            detail["size_bytes"],
-            detail["write_target"],
-        )
-
-    if args.apply_reconcile and not _accept_reconcile_write_confirmation(
-        args,
+    if not args.apply_reconcile and not _check_database_paths(
         report,
-        position_plan_db=plan_db,
-        order_journal_db=journal_db,
-    ):
-        report.verdict = "fail_config"
-        _maybe_write_report(args.report, report)
-        return EXIT_FAIL_CONFIG
-
-    if not _check_database_paths(
-        report,
-        database_targets=database_targets,
-        apply_reconcile=args.apply_reconcile,
+        database_targets=generic_database_targets,
+        apply_reconcile=False,
     ):
         report.verdict = "fail_config"
         _maybe_write_report(args.report, report)
@@ -440,8 +461,50 @@ async def main() -> int:
 RECONCILE_WRITE_CONFIRMATION = "APPLY_LIVE_STATE_RECONCILIATION"
 
 
-class ReadOnlySnapshotError(RuntimeError):
-    pass
+def _strategy_class_declares_provider(
+    strategy_path: str,
+    provider_name: str,
+) -> bool:
+    if ":" not in strategy_path:
+        raise ValueError("strategy path must be 'module:attribute'")
+    module_name, attribute_name = strategy_path.split(":", 1)
+    module = importlib.import_module(module_name)
+    strategy_attribute = getattr(module, attribute_name)
+    return callable(getattr(strategy_attribute, provider_name, None))
+
+
+def _resolve_database_source_paths(
+    *,
+    app_config: AppConfig,
+    project_env,
+    defaults_path: str | Path,
+) -> dict[str, Path]:
+    runtime_config = live_runtime_config_from_app(
+        app_config,
+        defaults_path=defaults_path,
+        environ=project_env.values,
+    )
+    return {
+        "state": Path(app_config.state_db_path).expanduser().resolve(strict=False),
+        "position_plan": Path(
+            project_env.get(
+                "AETHER_POSITION_PLAN_DB",
+                "data/state/aether_position_plan.sqlite3",
+            )
+        ).expanduser().resolve(strict=False),
+        "order_journal": Path(
+            project_env.get(
+                "AETHER_ORDER_JOURNAL_DB",
+                "data/state/aether_order_journal.sqlite3",
+            )
+        ).expanduser().resolve(strict=False),
+        "range_checkpoint": Path(
+            runtime_config.range_checkpoint_db_path
+        ).expanduser().resolve(strict=False),
+        "mf_feature": Path(
+            runtime_config.market_data_db_path
+        ).expanduser().resolve(strict=False),
+    }
 
 
 class _SnapshotPositionPlanStore(SqlitePositionPlanStore):
@@ -572,6 +635,17 @@ def _check_database_paths(
         resolved = path.expanduser().resolve(strict=False)
         parent = resolved.parent
         if apply_reconcile:
+            if not write_target:
+                report.add(
+                    f"{label}_not_write_target",
+                    "ok",
+                    detail={
+                        "absolute_path": str(resolved),
+                        "write_target": False,
+                        "probe_created": False,
+                    },
+                )
+                continue
             parent_exists = parent.exists()
             writable = parent_exists and os.access(parent, os.W_OK)
             status = "ok" if writable else "fail"
@@ -605,43 +679,6 @@ def _check_database_paths(
         if label != "state_db":
             ok = ok and exists
     return ok
-
-
-@contextmanager
-def _stable_sqlite_snapshot(source: str | Path, *, attempts: int = 3):
-    source_path = Path(source).expanduser().resolve(strict=False)
-    if not source_path.is_file():
-        raise ReadOnlySnapshotError(f"database_missing:{source_path}")
-
-    source_files = tuple(
-        Path(f"{source_path}{suffix}") for suffix in ("", "-wal", "-shm")
-    )
-    with tempfile.TemporaryDirectory(prefix="aether-preflight-sqlite-") as raw_temp:
-        temp_root = Path(raw_temp)
-        for _ in range(attempts):
-            before = _sqlite_file_manifest(source_files)
-            for old in temp_root.iterdir():
-                old.unlink()
-            for source_file in source_files:
-                if source_file.exists():
-                    shutil.copy2(source_file, temp_root / source_file.name)
-            after = _sqlite_file_manifest(source_files)
-            if before == after:
-                yield temp_root / source_path.name
-                return
-        raise ReadOnlySnapshotError(f"database_changed_during_snapshot:{source_path}")
-
-
-def _sqlite_file_manifest(paths: tuple[Path, ...]) -> tuple[tuple[Any, ...], ...]:
-    records: list[tuple[Any, ...]] = []
-    for path in paths:
-        if not path.exists():
-            records.append((path.name, False, None, None, None))
-            continue
-        stat = path.stat()
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        records.append((path.name, True, stat.st_size, stat.st_mtime_ns, digest))
-    return tuple(records)
 
 
 # ── Checks ──────────────────────────────────────────────────────────────
@@ -945,12 +982,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--report",
-        default=str(
-            REPO_ROOT
-            / "data"
-            / "reports"
-            / "preflight"
-            / "portfolio_v1_preflight.json"
+        default=os.environ.get(
+            "AETHER_LIVE_PREFLIGHT_REPORT",
+            str(
+                REPO_ROOT
+                / "data"
+                / "reports"
+                / "preflight"
+                / "portfolio_v1_preflight.json"
+            ),
         ),
         help="Output report path",
     )

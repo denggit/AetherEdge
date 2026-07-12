@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from typing import Mapping
 
 from src.app import AppConfig
 from src.order_management import (
@@ -55,6 +56,8 @@ class PortfolioV1LiveSmokeProvider:
         report_kind: str = "smoke",
         skip_api: bool = False,
         skip_kline: bool = False,
+        database_path_overrides: Mapping[str, str | Path] | None = None,
+        database_source_paths: Mapping[str, str | Path] | None = None,
     ) -> None:
         self.strategy = strategy
         self.strategy_path = strategy_path
@@ -69,6 +72,16 @@ class PortfolioV1LiveSmokeProvider:
         self.report_kind = str(report_kind)
         self.skip_api = bool(skip_api)
         self.skip_kline = bool(skip_kline)
+        self.database_path_overrides = (
+            None
+            if database_path_overrides is None
+            else dict(database_path_overrides)
+        )
+        self.database_source_paths = (
+            None
+            if database_source_paths is None
+            else dict(database_source_paths)
+        )
 
     async def run(self) -> PortfolioV1LiveGateReport:
         try:
@@ -130,7 +143,7 @@ class PortfolioV1LiveSmokeProvider:
                 "data/state/aether_order_journal.sqlite3",
             )
         )
-        database_paths = {
+        source_database_paths = {
             "state": Path(app_config.state_db_path),
             "position_plan": plan_path,
             "order_journal": journal_path,
@@ -139,6 +152,31 @@ class PortfolioV1LiveSmokeProvider:
             ),
             "mf_feature": Path(runtime_config.market_data_db_path),
         }
+        database_paths, override_issue = _resolve_database_paths(
+            report_kind=self.report_kind,
+            source_paths=source_database_paths,
+            overrides=self.database_path_overrides,
+        )
+        report_database_paths = _report_database_paths(
+            snapshot_paths=database_paths,
+            source_paths=(
+                source_database_paths
+                if self.database_source_paths is None
+                else {
+                    name: Path(path)
+                    for name, path in self.database_source_paths.items()
+                }
+            ),
+        )
+        if override_issue is not None:
+            report = _bootstrap_failure(
+                verdict="fail_config",
+                exit_code=EXIT_FAIL_CONFIG,
+                issue=override_issue,
+            )
+            report.database_paths = report_database_paths
+            _add_context(report, app_config, runtime_config)
+            return report
         missing = [
             name
             for name, path in database_paths.items()
@@ -150,10 +188,7 @@ class PortfolioV1LiveSmokeProvider:
                 exit_code=EXIT_FAIL_STATE,
                 issue="database_missing:" + ",".join(missing),
             )
-            report.database_paths = {
-                name: str(path)
-                for name, path in database_paths.items()
-            }
+            report.database_paths = report_database_paths
             _add_context(report, app_config, runtime_config)
             return report
 
@@ -176,8 +211,12 @@ class PortfolioV1LiveSmokeProvider:
                             symbol=app_config.symbol,
                         )
                     )
-            plan_store = SqlitePositionPlanStore(plan_path)
-            journal = SqliteOrderJournalStore(journal_path)
+            plan_store = SqlitePositionPlanStore(
+                database_paths["position_plan"]
+            )
+            journal = SqliteOrderJournalStore(
+                database_paths["order_journal"]
+            )
         except Exception as exc:
             report = _bootstrap_failure(
                 verdict="fail_api",
@@ -197,9 +236,9 @@ class PortfolioV1LiveSmokeProvider:
         )
         inspector = PortfolioV1ReadinessInspector(
             symbol=app_config.symbol,
-            market_data_db_path=runtime_config.market_data_db_path,
+            market_data_db_path=database_paths["mf_feature"],
             range_checkpoint_db_path=(
-                runtime_config.range_checkpoint_db_path
+                database_paths["range_checkpoint"]
             ),
             exchange=app_config.data_exchange.value,
             range_pct=str(config.mf.range_pct),
@@ -270,7 +309,64 @@ class PortfolioV1LiveSmokeProvider:
             ),
             account_config_env=account_config_env,
         )
-        return await gate.run()
+        report = await gate.run()
+        report.database_paths = report_database_paths
+        return report
+
+
+_REQUIRED_DATABASE_PATHS = frozenset(
+    {
+        "state",
+        "position_plan",
+        "order_journal",
+        "range_checkpoint",
+        "mf_feature",
+    }
+)
+
+
+def _resolve_database_paths(
+    *,
+    report_kind: str,
+    source_paths: Mapping[str, Path],
+    overrides: Mapping[str, str | Path] | None,
+) -> tuple[dict[str, Path], str | None]:
+    if overrides is None:
+        if report_kind == "preflight":
+            return dict(source_paths), "read_only_database_overrides_required"
+        return dict(source_paths), None
+
+    missing = sorted(_REQUIRED_DATABASE_PATHS - set(overrides))
+    extra = sorted(set(overrides) - _REQUIRED_DATABASE_PATHS)
+    if missing:
+        return {}, "database_override_missing:" + ",".join(missing)
+    if extra:
+        return {}, "database_override_unknown:" + ",".join(extra)
+    resolved: dict[str, Path] = {}
+    for name in sorted(_REQUIRED_DATABASE_PATHS):
+        raw_path = Path(overrides[name]).expanduser()
+        if not raw_path.is_absolute():
+            return {}, f"database_override_not_absolute:{name}"
+        resolved[name] = raw_path.resolve(strict=False)
+    return resolved, None
+
+
+def _report_database_paths(
+    *,
+    snapshot_paths: Mapping[str, Path],
+    source_paths: Mapping[str, Path],
+) -> dict[str, str]:
+    report_paths = {
+        name: str(path.expanduser().resolve(strict=False))
+        for name, path in snapshot_paths.items()
+    }
+    report_paths.update(
+        {
+            f"{name}_source": str(path.expanduser().resolve(strict=False))
+            for name, path in source_paths.items()
+        }
+    )
+    return report_paths
 
 
 def _bootstrap_failure(

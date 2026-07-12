@@ -204,8 +204,18 @@ class Strategy:
 
     raw_trade_callbacks_enabled = False
 
-    def __init__(self, config_path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        config_path: str | Path | None = None,
+        *,
+        mf_store_path: str | Path | None = None,
+    ) -> None:
         self.config = V10BConfig.from_file(config_path or DEFAULT_CONFIG_PATH)
+        resolved_mf_store_path = (
+            mf_store_path
+            if mf_store_path is not None
+            else "data/market_data/aether_market_data.sqlite3"
+        )
         self.buffer = V8FeatureBuffer()
         self.micro_engine = MicroContextEngine(self.config.micro_context)
         self.range_speed_tracker = PastOnlyRangeSpeedTracker(
@@ -233,6 +243,7 @@ class Strategy:
         self.mf_data_buffer = MfDataBuffer(
             symbol=self.config.symbol,
             exchange=self.config.data_exchange,
+            store_path=resolved_mf_store_path,
             decision_buffer_minutes=self.config.mf.decision_buffer_minutes,
             decision_buffer_max_minutes=(
                 self.config.mf.decision_buffer_max_minutes
@@ -246,6 +257,7 @@ class Strategy:
         self.mf_data_readiness = MfDataReadiness(
             symbol=self.config.symbol,
             exchange=self.config.data_exchange,
+            store_path=resolved_mf_store_path,
             required_minutes=max(
                 self.config.mf.decision_buffer_minutes,
                 self.config.mf.large_share_min_samples,
