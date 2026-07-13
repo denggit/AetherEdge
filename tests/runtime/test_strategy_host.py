@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from src.order_management.models import ExchangeOrderResult
 from src.platform import ExchangeName
 from src.platform.account.events import AccountEvent, AccountEventType
 from src.platform.data.models import (
@@ -231,3 +232,101 @@ async def test_host_does_not_invoke_signal_execution_or_order_behavior() -> None
             raise AssertionError("host must not place orders")
 
     assert await StrategyHost(Strategy()).on_start(object()) is signals
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("container_type", [tuple, list])
+async def test_order_results_preserves_arguments_and_follow_up_sequence(
+    container_type,
+) -> None:
+    signal = _signals()[0]
+    results = container_type(
+        [ExchangeOrderResult(exchange=ExchangeName.OKX, ok=True)]
+    )
+    follow_up = container_type(_signals())
+    received = []
+
+    class Strategy:
+        async def on_order_results(self, **kwargs):
+            received.append(kwargs)
+            return follow_up
+
+    returned = await StrategyHost(Strategy()).on_order_results(
+        signal=signal,
+        results=results,
+        source="root_source",
+        event_time_ms=1234,
+    )
+
+    assert returned is follow_up
+    assert list(returned) == list(follow_up)
+    assert received[0]["signal"] is signal
+    assert received[0]["results"] is results
+    assert received[0]["source"] == "root_source"
+    assert received[0]["event_time_ms"] == 1234
+
+
+@pytest.mark.asyncio
+async def test_order_results_missing_or_none_returns_empty_sequence() -> None:
+    class ReturnsNone:
+        async def on_order_results(self, **kwargs):
+            return None
+
+    kwargs = {
+        "signal": _signals()[0],
+        "results": (),
+        "source": "test",
+        "event_time_ms": None,
+    }
+
+    assert await StrategyHost(object()).on_order_results(**kwargs) == ()
+    assert await StrategyHost(ReturnsNone()).on_order_results(**kwargs) == ()
+
+
+@pytest.mark.asyncio
+async def test_order_results_exception_is_not_swallowed() -> None:
+    expected = RuntimeError("feedback failed")
+
+    class Strategy:
+        async def on_order_results(self, **kwargs):
+            raise expected
+
+    with pytest.raises(RuntimeError) as raised:
+        await StrategyHost(Strategy()).on_order_results(
+            signal=_signals()[0],
+            results=(),
+            source="test",
+            event_time_ms=None,
+        )
+
+    assert raised.value is expected
+
+
+@pytest.mark.asyncio
+async def test_order_results_host_has_no_execution_side_effects() -> None:
+    follow_up = _signals()
+
+    class Strategy:
+        async def on_order_results(self, **kwargs):
+            return follow_up
+
+        def coordinator(self):
+            raise AssertionError("host must not call coordinator")
+
+        def sync(self):
+            raise AssertionError("host must not call sync")
+
+        def save_order(self):
+            raise AssertionError("host must not save orders")
+
+        def emit(self):
+            raise AssertionError("host must not emit alerts")
+
+    returned = await StrategyHost(Strategy()).on_order_results(
+        signal=_signals()[0],
+        results=(),
+        source="test",
+        event_time_ms=None,
+    )
+
+    assert returned is follow_up

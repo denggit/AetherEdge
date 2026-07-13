@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from src.order_management.models import ExchangeOrderResult
 from src.platform.account.events import AccountEvent
 from src.platform.data.models import (
     MarketEvent,
@@ -59,6 +60,24 @@ class StrategyHost:
         if not callable(handler):
             return
         await handler(snapshot)
+
+    async def on_order_results(
+        self,
+        *,
+        signal: TradeSignal,
+        results: Sequence[ExchangeOrderResult],
+        source: str,
+        event_time_ms: int | None,
+    ) -> Sequence[TradeSignal]:
+        handler = getattr(self._strategy, "on_order_results", None)
+        if not callable(handler):
+            return ()
+        return await handler(
+            signal=signal,
+            results=results,
+            source=source,
+            event_time_ms=event_time_ms,
+        ) or ()
 
 
 __all__ = ["StrategyHost"]

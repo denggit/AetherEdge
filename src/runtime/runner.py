@@ -4199,10 +4199,12 @@ class LiveRuntimeRunner:
         source: str,
         event_time_ms: int | None,
     ) -> Sequence[TradeSignal]:
-        handler = getattr(self.context.strategy, "on_order_results", None)
-        if not callable(handler):
-            return ()
-        follow_up = await handler(signal=signal, results=results, source=source, event_time_ms=event_time_ms)
+        follow_up = await self._strategy_host.on_order_results(
+            signal=signal,
+            results=results,
+            source=source,
+            event_time_ms=event_time_ms,
+        )
         follow_up_count = len(follow_up or ())
         if follow_up_count > 0:
             logger.info("Strategy order results processed | action=%s results=%s follow_up_signals=%s", signal.action.value, len(results), follow_up_count)

@@ -531,6 +531,57 @@ async def test_signal_execution_feedback_order_is_characterized(monkeypatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_injected_strategy_host_owns_order_result_feedback() -> None:
+    calls: list[str] = []
+    strategy = FakeStrategy(calls)
+
+    async def direct_feedback(**kwargs):
+        raise AssertionError("Runner must not call Strategy feedback directly")
+
+    strategy.on_order_results = direct_feedback
+    signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.CLOSE_LONG,
+        quantity=Decimal("0.1"),
+    )
+    results = (
+        ExchangeOrderResult(exchange=ExchangeName.OKX, ok=True),
+    )
+    follow_up = (
+        TradeSignal(
+            symbol="ETH-USDT-PERP",
+            action=SignalAction.CLOSE_LONG,
+            quantity=Decimal("0.05"),
+        ),
+    )
+    received = []
+
+    class InjectedStrategyHost:
+        async def on_order_results(self, **kwargs):
+            received.append(kwargs)
+            return follow_up
+
+    runner = _runner(
+        strategy,
+        calls=calls,
+        services={"strategy_host": InjectedStrategyHost()},
+    )
+
+    returned = await runner._process_order_result_feedback(
+        signal=signal,
+        results=results,
+        source="root_source",
+        event_time_ms=4321,
+    )
+
+    assert returned is follow_up
+    assert received[0]["signal"] is signal
+    assert received[0]["results"] is results
+    assert received[0]["source"] == "root_source"
+    assert received[0]["event_time_ms"] == 4321
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("consumer_error", [False, True])
 async def test_run_lifecycle_and_cleanup_order_is_characterized(
     monkeypatch, consumer_error

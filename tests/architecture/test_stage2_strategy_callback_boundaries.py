@@ -16,7 +16,7 @@ CALLBACK_ALLOWLIST = {
     "on_order_book": {"src/runtime/strategy_host.py"},
     "on_account_event": {"src/runtime/strategy_host.py"},
     "on_account_snapshot": {"src/runtime/strategy_host.py"},
-    "on_order_results": {"src/runtime/runner.py"},
+    "on_order_results": {"src/runtime/strategy_host.py"},
     "on_market_feature": {"src/runtime/market_features.py"},
     "recover": {"src/runtime/recovery/service.py"},
 }
@@ -138,18 +138,21 @@ def test_runtime_has_no_concrete_exchange_client_imports() -> None:
 def test_strategy_host_has_no_execution_or_business_implementation_imports() -> None:
     forbidden_prefixes = (
         "strategies",
-        "src.order_management",
         "src.reconcile",
         *FORBIDDEN_EXCHANGE_IMPORTS,
     )
-    violations = [
-        module
-        for module in _imports(STRATEGY_HOST)
+    violations = []
+    for module in _imports(STRATEGY_HOST):
         if any(
             _module_is_or_below(module, prefix)
             for prefix in forbidden_prefixes
-        )
-    ]
+        ):
+            violations.append(module)
+        if (
+            _module_is_or_below(module, "src.order_management")
+            and module != "src.order_management.models"
+        ):
+            violations.append(module)
 
     assert violations == []
 
