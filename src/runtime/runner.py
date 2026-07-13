@@ -398,7 +398,13 @@ class LiveRuntimeRunner:
         )
         self.services["runtime_health_state"] = self._runtime_health_state
         self._health = self._runtime_health_state.current
-        self._heartbeat_service = RuntimeHeartbeatService()
+        injected_heartbeat_service = self.services.get("heartbeat_service")
+        self._heartbeat_service = (
+            injected_heartbeat_service
+            if injected_heartbeat_service is not None
+            else RuntimeHeartbeatService()
+        )
+        self.services["heartbeat_service"] = self._heartbeat_service
         self._startup_catchup_decision: StartupCatchupDecision | None = None
         self._startup_catchup_evaluated = False
         self._range_speed_warmup_excluded_previous = False
