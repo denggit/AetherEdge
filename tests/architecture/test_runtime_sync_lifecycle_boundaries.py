@@ -105,6 +105,7 @@ def test_sync_lifecycle_owns_only_task_list_without_business_vocabulary() -> Non
         "Strategy",
         "AccountStateSyncService",
         "OrderStateSyncService",
+        "RuntimeSyncServiceRegistry",
         "RuntimeHeartbeatService",
         "requirements",
         "services",
@@ -112,6 +113,9 @@ def test_sync_lifecycle_owns_only_task_list_without_business_vocabulary() -> Non
         "alerts",
         "_execute_signals",
         "PositionPlanStore",
+        "_sync_service_registry",
+        "_account_sync_service",
+        "_order_sync_service",
     }
     used = {
         node.id

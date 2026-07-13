@@ -98,6 +98,7 @@ from src.runtime.strategy_positions import (
 )
 from src.runtime.strategy_host import StrategyHost
 from src.runtime.sync_lifecycle import RuntimeSyncLifecycle, SyncTaskFactory
+from src.runtime.sync_services import RuntimeSyncServiceRegistry
 from src.runtime.orders import LiveOrderIntentFactory
 from src.runtime.recovery.service import RecoveryExchangeContext, RuntimeRecoveryService
 from src.runtime.recovery.models import RecoveryReport
@@ -250,6 +251,18 @@ class LiveRuntimeRunner:
         self._order_coordinator = self.services.get("order_coordinator")
         self._account_sync_service = self.services.get("account_sync_service")
         self._order_sync_service = self.services.get("order_sync_service")
+        injected_sync_service_registry = self.services.get(
+            "sync_service_registry"
+        )
+        self._sync_service_registry = (
+            injected_sync_service_registry
+            if injected_sync_service_registry is not None
+            else RuntimeSyncServiceRegistry(
+                account_service=self._account_sync_service,
+                order_service=self._order_sync_service,
+            )
+        )
+        self.services["sync_service_registry"] = self._sync_service_registry
         self._request_sync_throttle = self.services.get("request_sync_throttle") or RequestThrottle(min_interval_seconds=0.25)
         self._recovery_service = self.services.get("recovery_service", "__default__")
         self._reconciliation_service = self.services.get("reconciliation_service", "__default__")
@@ -4406,28 +4419,38 @@ class LiveRuntimeRunner:
             )
         return self._account_config_env
 
+    def _build_account_sync_service(self):
+        return AccountStateSyncService(
+            contexts=self._get_sync_contexts(),
+            config=self.requirements.account_state,
+            alert_sink=self.context.alerts,
+            throttle=self._request_sync_throttle,
+            snapshot_callback=self._on_account_snapshot_synced,
+        )
+
     def _get_account_sync_service(self):
-        if self._account_sync_service is None:
-            self._account_sync_service = AccountStateSyncService(
-                contexts=self._get_sync_contexts(),
-                config=self.requirements.account_state,
-                alert_sink=self.context.alerts,
-                throttle=self._request_sync_throttle,
-                snapshot_callback=self._on_account_snapshot_synced,
-            )
-        return self._account_sync_service
+        service = self._sync_service_registry.get_account(
+            self._build_account_sync_service
+        )
+        self._account_sync_service = service
+        return service
+
+    def _build_order_sync_service(self):
+        return OrderStateSyncService(
+            contexts=self._get_sync_contexts(),
+            config=self.requirements.order_state,
+            alert_sink=self.context.alerts,
+            throttle=self._request_sync_throttle,
+            active_check=self._order_sync_active,
+            position_plan_store=self._get_position_plan_store(),
+        )
 
     def _get_order_sync_service(self):
-        if self._order_sync_service is None:
-            self._order_sync_service = OrderStateSyncService(
-                contexts=self._get_sync_contexts(),
-                config=self.requirements.order_state,
-                alert_sink=self.context.alerts,
-                throttle=self._request_sync_throttle,
-                active_check=self._order_sync_active,
-                position_plan_store=self._get_position_plan_store(),
-            )
-        return self._order_sync_service
+        service = self._sync_service_registry.get_order(
+            self._build_order_sync_service
+        )
+        self._order_sync_service = service
+        return service
 
     def _order_sync_active(self) -> bool:
         strategy = self.context.strategy
