@@ -71,6 +71,7 @@ from src.runtime.position_mode_gate import (
     resolve_position_mode_requirements,
 )
 from src.runtime.persistence import BackgroundWriteItem, BackgroundWriteQueue
+from src.runtime.persistence_service import RuntimePersistenceService
 from src.runtime.market_features import MarketFeaturePipeline
 from src.runtime.models import RuntimeHealth, RuntimeMode, RuntimePhase
 from src.runtime.range_backfill_supervisor import RangeBackfillSupervisor, RangeBackfillSupervisorConfig
@@ -247,6 +248,21 @@ class LiveRuntimeRunner:
         self._range_bar_builder = self.services.get("range_bar_builder")
         self._range_bar_aggregator = self.services.get("range_bar_aggregator")
         self._live_persistence_writer = self.services.get("live_persistence_writer")
+        injected_persistence_service = self.services.get(
+            "runtime_persistence_service"
+        )
+        self._runtime_persistence_service = (
+            injected_persistence_service
+            if injected_persistence_service is not None
+            else RuntimePersistenceService(
+                writer=self._live_persistence_writer,
+                max_pending=int(self.runtime_config.background_queue_maxsize),
+                writer_name="live-persistence-writer",
+            )
+        )
+        self.services["runtime_persistence_service"] = (
+            self._runtime_persistence_service
+        )
         self._persistence_alert_loop: asyncio.AbstractEventLoop | None = None
         self._fixed_time_trade_bar_builder_compat = self.services.get(
             "fixed_time_trade_bar_builder"
@@ -4434,8 +4450,9 @@ class LiveRuntimeRunner:
             legacy_base_quantity=Decimal("0"),
         )
 
-    def _get_live_persistence_writer(self) -> _BackgroundWriteQueue:
-        if self._live_persistence_writer is None:
+    def _get_runtime_persistence_service(self) -> RuntimePersistenceService:
+        service = getattr(self, "_runtime_persistence_service", None)
+        if service is None:
             max_pending = int(
                 getattr(
                     getattr(self, "runtime_config", None),
@@ -4443,14 +4460,22 @@ class LiveRuntimeRunner:
                     1000,
                 )
             )
-            self._live_persistence_writer = _BackgroundWriteQueue(
-                name="live-persistence-writer",
+            service = RuntimePersistenceService(
+                writer=getattr(self, "_live_persistence_writer", None),
                 max_pending=max_pending,
+                writer_name="live-persistence-writer",
             )
-            self.services["live_persistence_writer"] = (
-                self._live_persistence_writer
-            )
-        return self._live_persistence_writer
+            self._runtime_persistence_service = service
+            if not hasattr(self, "services"):
+                self.services = {}
+            self.services["runtime_persistence_service"] = service
+        return service
+
+    def _get_live_persistence_writer(self) -> _BackgroundWriteQueue:
+        writer = self._get_runtime_persistence_service().get_writer()
+        self._live_persistence_writer = writer
+        self.services["live_persistence_writer"] = writer
+        return writer  # type: ignore[return-value]
 
     def _submit_live_persistence_write(
         self,
@@ -4463,38 +4488,30 @@ class LiveRuntimeRunner:
             self._persistence_alert_loop = asyncio.get_running_loop()
         except RuntimeError:
             pass
-        writer = self._get_live_persistence_writer()
-        accepted = writer.submit(
-            _BackgroundWriteItem(
-                description=description,
-                write=write,
-                on_error=on_error,
-            )
+        service = self._get_runtime_persistence_service()
+        self._get_live_persistence_writer()
+        accepted = service.submit(
+            description=description,
+            write=write,
+            on_error=on_error,
         )
         if not accepted:
+            metrics = service.metrics()
             logger.warning(
                 "Live persistence write dropped | description=%s pending=%s dropped=%s",
                 description,
-                writer.pending_count,
-                writer.dropped,
+                metrics.pending_count,
+                metrics.dropped,
             )
         return accepted
 
     async def _stop_live_persistence_writer(
         self, *, flush: bool = True
     ) -> None:
-        writer = getattr(self, "_live_persistence_writer", None)
-        if writer is None:
+        service = getattr(self, "_runtime_persistence_service", None)
+        if service is None and getattr(self, "_live_persistence_writer", None) is None:
             return
-        stop = getattr(writer, "stop", None)
-        if not callable(stop):
-            return
-        if isinstance(writer, _BackgroundWriteQueue):
-            await asyncio.to_thread(stop, flush=flush)
-            return
-        result = stop(flush=flush)
-        if inspect.isawaitable(result):
-            await result
+        await self._get_runtime_persistence_service().stop(flush=flush)
 
     def _emit_alert_threadsafe(self, alert: AppAlert) -> None:
         try:
@@ -4534,32 +4551,12 @@ class LiveRuntimeRunner:
             else None
         )
         mf_audit = self._mf_observer_audit()
-        writer = getattr(self, "_live_persistence_writer", None)
-        pending = (
-            writer.pending_count
-            if isinstance(writer, _BackgroundWriteQueue)
-            else None
-        )
-        writer_dropped = (
-            writer.dropped
-            if isinstance(writer, _BackgroundWriteQueue)
-            else None
-        )
-        writer_failures = (
-            writer.failures
-            if isinstance(writer, _BackgroundWriteQueue)
-            else None
-        )
-        writer_written = (
-            writer.written
-            if isinstance(writer, _BackgroundWriteQueue)
-            else None
-        )
-        writer_submitted = (
-            writer.submitted
-            if isinstance(writer, _BackgroundWriteQueue)
-            else None
-        )
+        persistence_metrics = self._get_runtime_persistence_service().metrics()
+        pending = persistence_metrics.pending_count
+        writer_dropped = persistence_metrics.dropped
+        writer_failures = persistence_metrics.failures
+        writer_written = persistence_metrics.written
+        writer_submitted = persistence_metrics.submitted
         logger.info(
             "Live data path stats | market_events_seen=%s feature_events_seen=%s latest_fixed_time_trade_bar_open_time_ms=%s mf_tradebar_count=%s mf_range_footprint_count=%s current_range_bucket_start_ms=%s range_bars_by_bucket_current_count=%s live_persistence_pending=%s live_persistence_dropped=%s live_persistence_failures=%s live_persistence_written=%s live_persistence_submitted=%s",
             getattr(getattr(self, "stats", None), "market_events_seen", None),
