@@ -15,6 +15,7 @@ from src.platform.config import ProjectEnvConfig
 from src.platform.data.models import MarketTrade, TradeSide
 from src.planner import ExecutionPlanner
 from src.runtime import LiveRuntimeConfig, LiveRuntimeRunner, RuntimeMode
+from src.runtime import runner as runner_module
 from src.signals import SignalAction, TradeSignal
 
 
@@ -395,6 +396,80 @@ async def test_market_feature_dispatch_precedes_signal_execution(monkeypatch) ->
     await runner.process_market_feature(event)
 
     assert calls == ["strategy.on_market_feature", "_execute_signals"]
+    assert executed == [
+        (
+            (signal,),
+            {
+                "source": event.type_value,
+                "event_time_ms": event.event_time_ms,
+                "metadata": {"feature_type": event.type_value},
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_injected_market_feature_pipeline_preserves_runner_order(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+    signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.OPEN_LONG,
+        quantity=Decimal("0.1"),
+    )
+
+    class InjectedPipeline:
+        runner = None
+
+        async def dispatch(self, event):
+            assert self.runner.stats.feature_events_seen == 1
+            calls.append("pipeline.dispatch")
+            return (signal,)
+
+    pipeline = InjectedPipeline()
+    runner = _runner(
+        calls=calls,
+        services={"market_feature_pipeline": pipeline},
+    )
+    pipeline.runner = runner
+
+    class Heartbeat:
+        def note_closed_bar(self, open_time_ms):
+            assert open_time_ms == 4321
+            calls.append("heartbeat.note_closed_bar")
+
+    runner._heartbeat_service = Heartbeat()
+    executed = []
+
+    async def execute(signals, **kwargs):
+        calls.append("_execute_signals")
+        executed.append((signals, kwargs))
+
+    monkeypatch.setattr(runner, "_execute_signals", execute)
+    monkeypatch.setattr(
+        runner,
+        "_maybe_log_live_data_path_stats",
+        lambda: calls.append("data_path_log"),
+    )
+    event = MarketFeatureEvent(
+        event_type=MarketFeatureEventType.CLOSED_KLINE,
+        symbol="ETH-USDT-PERP",
+        exchange=ExchangeName.OKX,
+        timeframe="4h",
+        event_time_ms=5678,
+        data={"open_time_ms": 4321},
+    )
+
+    await runner.process_market_feature(event)
+
+    assert not hasattr(runner_module, "dispatch_market_feature_event")
+    assert calls == [
+        "heartbeat.note_closed_bar",
+        "pipeline.dispatch",
+        "_execute_signals",
+        "data_path_log",
+    ]
     assert executed == [
         (
             (signal,),

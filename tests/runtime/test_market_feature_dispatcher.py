@@ -9,6 +9,7 @@ import pytest
 from src.market_data.events import MarketFeatureEvent, MarketFeatureEventType
 from src.platform.exchanges.models import ExchangeName
 from src.runtime.market_features import (
+    MarketFeaturePipeline,
     dispatch_market_feature_event,
     resolve_market_feature_observers,
 )
@@ -61,6 +62,151 @@ def test_provider_resolution_is_ordered_filters_disabled_and_has_priority() -> N
             raise AssertionError("legacy handler must not be resolved")
 
     assert resolve_market_feature_observers(Strategy()) == (first, second)
+
+
+@pytest.mark.asyncio
+async def test_pipeline_holds_only_strategy_and_resolves_observers_each_time() -> None:
+    calls: list[str] = []
+    seen_events: list[MarketFeatureEvent] = []
+    provider_calls = 0
+
+    class First:
+        enabled = True
+
+        def on_market_feature(self, event):
+            calls.append("first")
+            seen_events.append(event)
+            return (_signal("first"),)
+
+    class Disabled:
+        enabled = False
+
+        def on_market_feature(self, event):
+            raise AssertionError("disabled observer must not be dispatched")
+
+    class AsyncSecond:
+        enabled = None
+
+        async def on_market_feature(self, event):
+            calls.append("async_second")
+            seen_events.append(event)
+            return [_signal("async_second")]
+
+    class NoneResult:
+        def on_market_feature(self, event):
+            calls.append("none")
+            seen_events.append(event)
+            return None
+
+    class Dynamic:
+        enabled = True
+
+        def on_market_feature(self, event):
+            calls.append("dynamic")
+            seen_events.append(event)
+            return (_signal("dynamic"),)
+
+    class Strategy:
+        def market_feature_observers(self):
+            nonlocal provider_calls
+            provider_calls += 1
+            if provider_calls == 1:
+                return (First(), Disabled(), AsyncSecond(), NoneResult())
+            return (Dynamic(),)
+
+        def on_market_feature(self, event):
+            raise AssertionError("provider must take priority over legacy callback")
+
+    strategy = Strategy()
+    pipeline = MarketFeaturePipeline(strategy)
+    event = _event()
+
+    first_signals = await pipeline.dispatch(event)
+    second_signals = await pipeline.dispatch(event)
+
+    assert vars(pipeline) == {"_strategy": strategy}
+    assert provider_calls == 2
+    assert calls == ["first", "async_second", "none", "dynamic"]
+    assert all(seen is event for seen in seen_events)
+    assert tuple(signal.reason for signal in first_signals) == (
+        "first",
+        "async_second",
+    )
+    assert tuple(signal.reason for signal in second_signals) == ("dynamic",)
+
+
+@pytest.mark.asyncio
+async def test_pipeline_rejects_non_sequence_provider_result() -> None:
+    class Strategy:
+        def market_feature_observers(self):
+            return object()
+
+    with pytest.raises(TypeError, match="sequence of observers"):
+        await MarketFeaturePipeline(Strategy()).dispatch(_event())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result",
+    [123, "not-signals", b"not-signals", bytearray(b"not-signals")],
+)
+async def test_pipeline_rejects_invalid_observer_results(result) -> None:
+    observer = _Observer("invalid", result=result)
+
+    class Strategy:
+        def market_feature_observers(self):
+            return (observer,)
+
+    with pytest.raises(TypeError, match="sequence of signals"):
+        await MarketFeaturePipeline(Strategy()).dispatch(_event())
+
+
+@pytest.mark.asyncio
+async def test_pipeline_rejects_missing_handler_and_propagates_callback_error() -> None:
+    missing = SimpleNamespace(enabled=True)
+
+    class MissingStrategy:
+        def market_feature_observers(self):
+            return (missing,)
+
+    with pytest.raises(TypeError, match="callable on_market_feature"):
+        await MarketFeaturePipeline(MissingStrategy()).dispatch(_event())
+
+    class BrokenStrategy:
+        def on_market_feature(self, event):
+            raise RuntimeError("observer failed")
+
+    with pytest.raises(RuntimeError, match="observer failed"):
+        await MarketFeaturePipeline(BrokenStrategy()).dispatch(_event())
+
+
+@pytest.mark.asyncio
+async def test_pipeline_does_not_invoke_runtime_side_effect_boundaries() -> None:
+    signal = _signal("pipeline-only")
+
+    class Strategy:
+        def on_market_feature(self, event):
+            return (signal,)
+
+        def _execute_signals(self, *args, **kwargs):
+            raise AssertionError("Pipeline must not execute signals")
+
+        def coordinator(self, *args, **kwargs):
+            raise AssertionError("Pipeline must not coordinate orders")
+
+        def sync(self, *args, **kwargs):
+            raise AssertionError("Pipeline must not sync state")
+
+        def persist(self, *args, **kwargs):
+            raise AssertionError("Pipeline must not persist state")
+
+        def alerts(self, *args, **kwargs):
+            raise AssertionError("Pipeline must not emit alerts")
+
+    dispatched = await MarketFeaturePipeline(Strategy()).dispatch(_event())
+
+    assert dispatched == (signal,)
+    assert dispatched[0] is signal
 
 
 @pytest.mark.asyncio
@@ -184,34 +330,32 @@ async def test_dispatcher_preserves_signal_and_metadata_identity() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runner_process_market_feature_uses_dispatcher(monkeypatch) -> None:
+async def test_runner_process_market_feature_uses_pipeline() -> None:
     strategy = object()
     signal = _signal("runner")
-    dispatched: list[tuple[object, MarketFeatureEvent]] = []
+    dispatched: list[MarketFeatureEvent] = []
     executed: list[tuple[tuple[TradeSignal, ...], dict]] = []
 
-    async def fake_dispatch(target, event):
-        dispatched.append((target, event))
-        return (signal,)
+    class FakePipeline:
+        async def dispatch(self, event):
+            dispatched.append(event)
+            return (signal,)
 
     async def fake_execute(signals, **kwargs):
         executed.append((tuple(signals), kwargs))
 
-    monkeypatch.setattr(
-        runner_module,
-        "dispatch_market_feature_event",
-        fake_dispatch,
-    )
     runner = object.__new__(runner_module.LiveRuntimeRunner)
     runner.context = SimpleNamespace(strategy=strategy)
     runner.stats = SimpleNamespace(feature_events_seen=0)
     runner._heartbeat_service = None
+    runner._market_feature_pipeline = FakePipeline()
     runner._execute_signals = fake_execute
+    runner._maybe_log_live_data_path_stats = lambda: None
     event = _event()
 
     await runner.process_market_feature(event)
 
-    assert dispatched == [(strategy, event)]
+    assert dispatched == [event]
     assert runner.stats.feature_events_seen == 1
     assert executed == [
         (
@@ -226,23 +370,17 @@ async def test_runner_process_market_feature_uses_dispatcher(monkeypatch) -> Non
 
 
 @pytest.mark.asyncio
-async def test_startup_preview_uses_same_dispatcher(monkeypatch) -> None:
-    strategy = object()
+async def test_startup_preview_uses_same_pipeline() -> None:
     events = (_event(100), _event(200))
     calls: list[MarketFeatureEvent] = []
 
-    async def fake_dispatch(target, event):
-        assert target is strategy
-        calls.append(event)
-        return (_signal(str(event.event_time_ms)),)
+    class FakePipeline:
+        async def dispatch(self, event):
+            calls.append(event)
+            return (_signal(str(event.event_time_ms)),)
 
-    monkeypatch.setattr(
-        runner_module,
-        "dispatch_market_feature_event",
-        fake_dispatch,
-    )
     runner = object.__new__(runner_module.LiveRuntimeRunner)
-    runner.context = SimpleNamespace(strategy=strategy)
+    runner._market_feature_pipeline = FakePipeline()
 
     signals = await runner._preview_strategy_market_features(events)
 

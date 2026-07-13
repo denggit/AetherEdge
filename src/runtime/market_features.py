@@ -41,6 +41,15 @@ async def dispatch_market_feature_event(
 ) -> tuple[TradeSignal, ...]:
     """Dispatch one normalized feature event to each resolved observer."""
 
+    return await _dispatch_to_strategy_observers(strategy, event)
+
+
+async def _dispatch_to_strategy_observers(
+    strategy: object,
+    event: MarketFeatureEvent,
+) -> tuple[TradeSignal, ...]:
+    """Dispatch through the dynamically resolved observer boundary."""
+
     signals: list[TradeSignal] = []
     for observer in resolve_market_feature_observers(strategy):
         handler = getattr(observer, "on_market_feature", None)
@@ -65,7 +74,24 @@ async def dispatch_market_feature_event(
     return tuple(signals)
 
 
+class MarketFeaturePipeline:
+    """Resolve and dispatch normalized market features to Strategy observers."""
+
+    def __init__(self, strategy: object) -> None:
+        self._strategy = strategy
+
+    def resolve_observers(self) -> tuple[MarketFeatureObserver, ...]:
+        return resolve_market_feature_observers(self._strategy)
+
+    async def dispatch(
+        self,
+        event: MarketFeatureEvent,
+    ) -> tuple[TradeSignal, ...]:
+        return await _dispatch_to_strategy_observers(self._strategy, event)
+
+
 __all__ = [
+    "MarketFeaturePipeline",
     "dispatch_market_feature_event",
     "resolve_market_feature_observers",
 ]

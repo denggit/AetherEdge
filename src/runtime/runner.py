@@ -72,10 +72,7 @@ from src.runtime.position_mode_gate import (
     fetch_position_mode_statuses,
     resolve_position_mode_requirements,
 )
-from src.runtime.market_features import (
-    dispatch_market_feature_event,
-    resolve_market_feature_observers,
-)
+from src.runtime.market_features import MarketFeaturePipeline
 from src.runtime.models import RuntimeHealth, RuntimeMode, RuntimePhase
 from src.runtime.range_backfill_supervisor import RangeBackfillSupervisor, RangeBackfillSupervisorConfig
 from src.runtime.range_micro_repair_supervisor import (
@@ -352,6 +349,14 @@ class LiveRuntimeRunner:
             if injected_strategy_host is not None
             else StrategyHost(app_context.strategy)
         )
+        injected_market_feature_pipeline = self.services.get(
+            "market_feature_pipeline"
+        )
+        self._market_feature_pipeline = (
+            injected_market_feature_pipeline
+            if injected_market_feature_pipeline is not None
+            else MarketFeaturePipeline(app_context.strategy)
+        )
         self._project_env: ProjectEnvConfig = self.services.get("project_env_config") or get_project_env_config()
         self._account_config_env: AccountConfigEnv | None = None
         self._account_config_new_entries_blocked: bool = False
@@ -585,7 +590,7 @@ class LiveRuntimeRunner:
             open_ms = event.data.get("open_time_ms") if isinstance(event.data, dict) else None
             if isinstance(open_ms, int):
                 hb.note_closed_bar(open_ms)
-        signals = await dispatch_market_feature_event(self.context.strategy, event)
+        signals = await self._get_market_feature_pipeline().dispatch(event)
         await self._execute_signals(signals, source=event.type_value, event_time_ms=event.event_time_ms, metadata={"feature_type": event.type_value})
         self._maybe_log_live_data_path_stats()
 
@@ -1943,7 +1948,7 @@ class LiveRuntimeRunner:
                         )
 
     async def _hydrate_strategy_closed_klines(self, repository, *, time_range: TimeRange) -> None:
-        if not resolve_market_feature_observers(self.context.strategy):
+        if not self._get_market_feature_pipeline().resolve_observers():
             return
         rows = repository.load(symbol=self.app_config.symbol, interval=self._closed_bar_interval, time_range=time_range)
         for row in rows:
@@ -2440,9 +2445,7 @@ class LiveRuntimeRunner:
         """
         signals: list[TradeSignal] = []
         for event in events:
-            signals.extend(
-                await dispatch_market_feature_event(self.context.strategy, event)
-            )
+            signals.extend(await self._get_market_feature_pipeline().dispatch(event))
         return signals
 
     def _capture_startup_preview_state(self) -> StartupPreviewState:
@@ -4712,11 +4715,16 @@ class LiveRuntimeRunner:
             writer_submitted,
         )
 
+    def _get_market_feature_pipeline(self) -> MarketFeaturePipeline:
+        pipeline = getattr(self, "_market_feature_pipeline", None)
+        if pipeline is None:
+            pipeline = MarketFeaturePipeline(self.context.strategy)
+            self._market_feature_pipeline = pipeline
+        return pipeline
+
     def _mf_observer_audit(self) -> Mapping[str, Any]:
         try:
-            observers = resolve_market_feature_observers(
-                self.context.strategy
-            )
+            observers = self._get_market_feature_pipeline().resolve_observers()
         except Exception as exc:
             logger.debug("MF observer audit unavailable | error=%s", exc)
             return {}
