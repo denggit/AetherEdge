@@ -65,6 +65,7 @@ from src.runtime.account_sync import AccountStateSyncService, OrderStateSyncServ
 from src.runtime.config import LiveRuntimeConfig, live_runtime_config_from_app
 from src.runtime.features import closed_kline_feature, range_aggregate_feature, range_aggregate_unavailable_feature, range_bar_closed_feature
 from src.runtime.feature_pipeline import TradeDerivedFeaturePipeline
+from src.runtime.health_state import RuntimeHealthState
 from src.runtime.heartbeat import RuntimeHeartbeatService
 from src.runtime.market_data_persistence import RuntimeMarketDataPersistence
 from src.runtime.position_mode_gate import (
@@ -383,12 +384,20 @@ class LiveRuntimeRunner:
         self._range_context_degraded_buckets: dict[int, str] = {}
         self._executed_range_aggregate_buckets: set[tuple[str, str, int]] = set()
         self._follower_close_alert_last_ms: dict[str, int] = {}
-        self._health = RuntimeHealth(
+        initial_health = RuntimeHealth(
             phase=RuntimePhase.CREATED,
             warmup_complete=not self.runtime_config.warmup_enabled,
             caught_up=not self.runtime_config.warmup_enabled,
             metadata={"runtime_mode": self.runtime_config.mode.value, "strategy": self.app_config.strategy},
         )
+        injected_health_state = self.services.get("runtime_health_state")
+        self._runtime_health_state = (
+            injected_health_state
+            if injected_health_state is not None
+            else RuntimeHealthState(initial_health)
+        )
+        self.services["runtime_health_state"] = self._runtime_health_state
+        self._health = self._runtime_health_state.current
         self._heartbeat_service = RuntimeHeartbeatService()
         self._startup_catchup_decision: StartupCatchupDecision | None = None
         self._startup_catchup_evaluated = False
@@ -5123,14 +5132,14 @@ class LiveRuntimeRunner:
         error: str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> None:
-        self._health = RuntimeHealth(
-            phase=phase,
-            healthy=self._health.healthy if healthy is None else healthy,
-            warmup_complete=self._health.warmup_complete if warmup_complete is None else warmup_complete,
-            caught_up=self._health.caught_up if caught_up is None else caught_up,
-            last_market_event_time_ms=self._health.last_market_event_time_ms if last_market_event_time_ms is None else last_market_event_time_ms,
-            error=error if error is not None else self._health.error,
-            metadata=dict(self._health.metadata if metadata is None else metadata),
+        self._health = self._runtime_health_state.update(
+            phase,
+            healthy=healthy,
+            warmup_complete=warmup_complete,
+            caught_up=caught_up,
+            last_market_event_time_ms=last_market_event_time_ms,
+            error=error,
+            metadata=metadata,
         )
 
 
