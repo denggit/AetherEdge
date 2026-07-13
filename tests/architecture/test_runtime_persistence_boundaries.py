@@ -8,6 +8,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = PROJECT_ROOT / "src"
 PERSISTENCE = SOURCE_ROOT / "runtime" / "persistence.py"
 PERSISTENCE_SERVICE = SOURCE_ROOT / "runtime" / "persistence_service.py"
+MARKET_DATA_PERSISTENCE = (
+    SOURCE_ROOT / "runtime" / "market_data_persistence.py"
+)
 RUNNER = SOURCE_ROOT / "runtime" / "runner.py"
 
 
@@ -49,6 +52,19 @@ def test_runtime_persistence_service_has_one_definition() -> None:
                 definitions.append(path.relative_to(PROJECT_ROOT).as_posix())
 
     assert definitions == ["src/runtime/persistence_service.py"]
+
+
+def test_runtime_market_data_persistence_has_one_definition() -> None:
+    definitions = []
+    for path in sorted(SOURCE_ROOT.rglob("*.py")):
+        for node in ast.walk(_tree(path)):
+            if (
+                isinstance(node, ast.ClassDef)
+                and node.name == "RuntimeMarketDataPersistence"
+            ):
+                definitions.append(path.relative_to(PROJECT_ROOT).as_posix())
+
+    assert definitions == ["src/runtime/market_data_persistence.py"]
 
 
 def test_runner_keeps_aliases_without_private_class_definitions() -> None:
@@ -201,6 +217,179 @@ def test_persistence_service_has_no_runtime_business_dependencies() -> None:
         for module in _imports(PERSISTENCE_SERVICE)
         for prefix in forbidden_import_prefixes
     )
+
+
+def test_market_data_persistence_has_only_gateway_dependencies() -> None:
+    assert _imports(MARKET_DATA_PERSISTENCE) <= {
+        "__future__",
+        "collections.abc",
+        "typing",
+        "src.market_data.models",
+        "src.platform.data.models",
+        "src.runtime.persistence_service",
+    }
+
+
+def test_market_data_persistence_has_no_runtime_or_business_ownership() -> None:
+    tree = _tree(MARKET_DATA_PERSISTENCE)
+    forbidden_names = {
+        "LiveRuntimeRunner",
+        "AppContext",
+        "AppAlert",
+        "Strategy",
+        "SqliteKlineStore",
+        "SqliteRangeBarStore",
+        "SqliteRangeCheckpointStore",
+        "OrderJournal",
+        "PositionPlanStore",
+        "RangeCheckpointWriter",
+        "RangeRepairJournalWriter",
+        "_execute_signals",
+        "process_market_feature",
+    }
+    used_names = {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and node.id in forbidden_names
+    }
+    used_names.update(
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr in forbidden_names
+    )
+    forbidden_import_prefixes = (
+        "src.app",
+        "src.order_management",
+        "src.reconcile",
+        "src.platform.exchanges",
+        "src.signals",
+        "src.strategy",
+        "strategies",
+    )
+
+    assert used_names == set()
+    assert not any(
+        module == prefix or module.startswith(f"{prefix}.")
+        for module in _imports(MARKET_DATA_PERSISTENCE)
+        for prefix in forbidden_import_prefixes
+    )
+
+
+def test_market_data_persistence_holds_only_explicit_dependencies() -> None:
+    gateway_class = next(
+        node
+        for node in _tree(MARKET_DATA_PERSISTENCE).body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "RuntimeMarketDataPersistence"
+    )
+    initializer = next(
+        node
+        for node in gateway_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    assigned_attributes = {
+        target.attr
+        for node in ast.walk(initializer)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "self"
+    }
+
+    assert assigned_attributes == {
+        "_persistence_service",
+        "_kline_store_provider",
+        "_range_bar_store_provider",
+        "_completed_aggregate_store_provider",
+        "_exchange",
+        "_clock_ms",
+    }
+
+
+def test_runner_market_data_persistence_wrappers_only_delegate() -> None:
+    runner_class = next(
+        node
+        for node in _tree(RUNNER).body
+        if isinstance(node, ast.ClassDef) and node.name == "LiveRuntimeRunner"
+    )
+    methods = {
+        node.name: node
+        for node in runner_class.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    wrapper_names = {
+        "_persist_closed_kline",
+        "_persist_range_bar",
+        "_persist_completed_range_aggregate",
+    }
+    forbidden_calls = {"save", "save_completed_aggregate", "submit"}
+
+    for name in wrapper_names:
+        method = methods[name]
+        assert not any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in forbidden_calls
+            for node in ast.walk(method)
+        )
+
+
+def test_market_data_descriptions_are_owned_only_by_gateway() -> None:
+    descriptions = {
+        "closed_kline",
+        "range_bar",
+        "completed_range_aggregate",
+    }
+
+    def description_keywords(path: Path) -> set[str]:
+        return {
+            keyword.value.value
+            for call in ast.walk(_tree(path))
+            if isinstance(call, ast.Call)
+            for keyword in call.keywords
+            if keyword.arg == "description"
+            and isinstance(keyword.value, ast.Constant)
+            and isinstance(keyword.value.value, str)
+            and keyword.value.value in descriptions
+        }
+
+    assert description_keywords(MARKET_DATA_PERSISTENCE) == descriptions
+    assert description_keywords(RUNNER) == set()
+
+
+def test_gateway_excludes_error_handlers_checkpoint_and_repair_writers() -> None:
+    gateway_tree = _tree(MARKET_DATA_PERSISTENCE)
+    runner_tree = _tree(RUNNER)
+    gateway_methods = {
+        node.name
+        for node in ast.walk(gateway_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    runner_methods = {
+        node.name
+        for node in ast.walk(runner_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    error_handlers = {
+        "_on_closed_kline_persist_error",
+        "_on_range_bar_persist_error",
+        "_on_completed_range_aggregate_persist_error",
+    }
+    excluded_writer_names = {
+        "RangeCheckpointWriter",
+        "RangeRepairJournalWriter",
+        "_get_range_checkpoint_writer",
+        "_append_range_repair_trade",
+        "_finalize_range_repair_journal",
+    }
+    gateway_names = {
+        node.id for node in ast.walk(gateway_tree) if isinstance(node, ast.Name)
+    } | gateway_methods
+
+    assert error_handlers <= runner_methods
+    assert error_handlers.isdisjoint(gateway_methods)
+    assert excluded_writer_names.isdisjoint(gateway_names)
 
 
 def test_runner_delegates_item_construction_submit_and_stop_to_service() -> None:

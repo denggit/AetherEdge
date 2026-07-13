@@ -66,6 +66,7 @@ from src.runtime.config import LiveRuntimeConfig, live_runtime_config_from_app
 from src.runtime.features import closed_kline_feature, range_aggregate_feature, range_aggregate_unavailable_feature, range_bar_closed_feature
 from src.runtime.feature_pipeline import TradeDerivedFeaturePipeline
 from src.runtime.heartbeat import RuntimeHeartbeatService
+from src.runtime.market_data_persistence import RuntimeMarketDataPersistence
 from src.runtime.position_mode_gate import (
     fetch_position_mode_statuses,
     resolve_position_mode_requirements,
@@ -284,6 +285,10 @@ class LiveRuntimeRunner:
             )
         )
         self._range_checkpoint_store = self.services.get("range_checkpoint_store")
+        self._market_data_persistence = self.services.get(
+            "market_data_persistence"
+        )
+        self._get_market_data_persistence()
         self._range_checkpoint_writer = self.services.get("range_checkpoint_writer")
         self._range_repair_journal_store = self.services.get(
             "range_repair_journal_store"
@@ -767,18 +772,8 @@ class LiveRuntimeRunner:
     def _persist_closed_kline(self, kline: MarketKline) -> None:
         """Queue one confirmed live closed kline after decisions complete."""
 
-        def write() -> None:
-            repository = self.services.get("kline_store")
-            if repository is None:
-                repository = SqliteKlineStore(
-                    self.runtime_config.market_data_db_path
-                )
-                self.services["kline_store"] = repository
-            repository.save([kline])
-
-        self._submit_live_persistence_write(
-            description="closed_kline",
-            write=write,
+        self._get_market_data_persistence().persist_closed_kline(
+            kline,
             on_error=lambda exc: self._on_closed_kline_persist_error(
                 kline, exc
             ),
@@ -819,12 +814,8 @@ class LiveRuntimeRunner:
     def _persist_range_bar(self, bar: RangeBar) -> None:
         """Queue one closed range bar after feature dispatch."""
 
-        def write() -> None:
-            self._get_range_bar_store().save([bar])
-
-        self._submit_live_persistence_write(
-            description="range_bar",
-            write=write,
+        self._get_market_data_persistence().persist_range_bar(
+            bar,
             on_error=lambda exc: self._on_range_bar_persist_error(bar, exc),
         )
 
@@ -861,18 +852,10 @@ class LiveRuntimeRunner:
         coverage_status: str,
         missing_gap_ms: int,
     ) -> None:
-        def write() -> None:
-            self._get_range_checkpoint_store().save_completed_aggregate(
-                exchange=self.app_config.data_exchange.value,
-                aggregate=aggregate,
-                coverage_status=coverage_status,
-                missing_gap_ms=missing_gap_ms,
-                completed_at_ms=int(time.time() * 1000),
-            )
-
-        self._submit_live_persistence_write(
-            description="completed_range_aggregate",
-            write=write,
+        self._get_market_data_persistence().persist_completed_range_aggregate(
+            aggregate,
+            coverage_status=coverage_status,
+            missing_gap_ms=missing_gap_ms,
             on_error=lambda exc: self._on_completed_range_aggregate_persist_error(
                 aggregate, exc
             ),
@@ -4471,6 +4454,31 @@ class LiveRuntimeRunner:
             self.services["runtime_persistence_service"] = service
         return service
 
+    def _get_market_data_persistence(self) -> RuntimeMarketDataPersistence:
+        try:
+            self._persistence_alert_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        persistence = getattr(self, "_market_data_persistence", None)
+        if persistence is None:
+            if not hasattr(self, "services"):
+                self.services = {}
+            persistence = self.services.get("market_data_persistence")
+            if persistence is None:
+                persistence = RuntimeMarketDataPersistence(
+                    persistence_service=self._get_runtime_persistence_service(),
+                    kline_store_provider=self._get_live_kline_store,
+                    range_bar_store_provider=self._get_range_bar_store,
+                    completed_aggregate_store_provider=(
+                        self._get_range_checkpoint_store
+                    ),
+                    exchange=self.app_config.data_exchange.value,
+                    clock_ms=lambda: int(time.time() * 1000),
+                )
+                self.services["market_data_persistence"] = persistence
+            self._market_data_persistence = persistence
+        return persistence
+
     def _get_live_persistence_writer(self) -> _BackgroundWriteQueue:
         writer = self._get_runtime_persistence_service().get_writer()
         self._live_persistence_writer = writer
@@ -4618,6 +4626,15 @@ class LiveRuntimeRunner:
             contract_value = profile.contract_value(self.app_config.data_exchange) or Decimal("1")
             self._range_bar_builder = RangeBarBuilder(range_pct=self._range_pct, contract_value=contract_value)
         return self._range_bar_builder
+
+    def _get_live_kline_store(self):
+        repository = self.services.get("kline_store")
+        if repository is None:
+            repository = SqliteKlineStore(
+                self.runtime_config.market_data_db_path
+            )
+            self.services["kline_store"] = repository
+        return repository
 
     def _get_range_bar_store(self):
         if self._range_bar_store is None:
