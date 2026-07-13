@@ -83,6 +83,7 @@ from src.runtime.range_micro_repair_supervisor import (
 from src.runtime.range_repair_bootstrap import RangeRepairBootstrapService
 from src.runtime.range_speed_history import RangeSpeedHistoryRefresher
 from src.runtime.requirements import StrategyRuntimeRequirements, resolve_strategy_runtime_requirements
+from src.runtime.shutdown_coordinator import RuntimeShutdownCoordinator
 from src.runtime.startup_catchup import (
     StartupCatchupConfig,
     StartupCatchupDecision,
@@ -405,6 +406,15 @@ class LiveRuntimeRunner:
             else RuntimeHeartbeatService()
         )
         self.services["heartbeat_service"] = self._heartbeat_service
+        injected_shutdown_coordinator = self.services.get(
+            "shutdown_coordinator"
+        )
+        self._shutdown_coordinator = (
+            injected_shutdown_coordinator
+            if injected_shutdown_coordinator is not None
+            else RuntimeShutdownCoordinator()
+        )
+        self.services["shutdown_coordinator"] = self._shutdown_coordinator
         self._startup_catchup_decision: StartupCatchupDecision | None = None
         self._startup_catchup_evaluated = False
         self._range_speed_warmup_excluded_previous = False
@@ -454,13 +464,7 @@ class LiveRuntimeRunner:
             self.context.alerts.emit(AppAlert(subject="AetherEdge live runtime error", content=str(exc), severity="error"))
             raise
         finally:
-            await self._stop_range_speed_background_services()
-            await self._stop_sync_tasks()
-            await self._stop_producers()
-            await self._stop_live_persistence_writer()
-            await self._stop_range_repair_journal_writer()
-            await self._stop_range_checkpoint_writer()
-            await self.context.alerts.stop()
+            await self._run_finally_shutdown()
 
     async def start(self) -> RuntimeHealth:
         self._set_health(RuntimePhase.RUNNING, healthy=True, warmup_complete=True, caught_up=True)
@@ -468,12 +472,37 @@ class LiveRuntimeRunner:
 
     async def stop(self) -> RuntimeHealth:
         self._stop_event.set()
-        await self._stop_range_speed_background_services()
-        await self._stop_producers()
-        await self._stop_live_persistence_writer()
-        await self._stop_range_repair_journal_writer()
+        await self._explicit_stop_shutdown()
         self._set_health(RuntimePhase.STOPPED, healthy=True)
         return self._health
+
+    async def _run_finally_shutdown(self) -> None:
+        await self._shutdown_coordinator.execute(
+            (
+                self._stop_range_speed_background_services,
+                self._stop_sync_tasks,
+                self._stop_producers,
+                self._stop_live_persistence_writer,
+                self._stop_range_repair_journal_writer,
+                self._stop_range_checkpoint_writer,
+                self.context.alerts.stop,
+            )
+        )
+
+    async def _explicit_stop_shutdown(self) -> None:
+        coordinator = getattr(
+            self,
+            "_shutdown_coordinator",
+            RuntimeShutdownCoordinator,
+        )
+        await coordinator.execute(
+            (
+                self._stop_range_speed_background_services,
+                self._stop_producers,
+                self._stop_live_persistence_writer,
+                self._stop_range_repair_journal_writer,
+            )
+        )
 
     async def health(self) -> RuntimeHealth:
         return self._health

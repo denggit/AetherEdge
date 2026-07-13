@@ -358,29 +358,15 @@ def test_run_finally_and_explicit_stop_order_remain_unchanged() -> None:
     methods = _methods(_class(RUNNER, "LiveRuntimeRunner"))
     run = methods["run"]
     try_node = next(node for node in run.body if isinstance(node, ast.Try))
-    assert [
-        ast.unparse(statement.value.value.func)
-        for statement in try_node.finalbody
-        if isinstance(statement, ast.Expr)
-        and isinstance(statement.value, ast.Await)
-        and isinstance(statement.value.value, ast.Call)
-    ] == [
-        "self._stop_range_speed_background_services",
-        "self._stop_sync_tasks",
-        "self._stop_producers",
-        "self._stop_live_persistence_writer",
-        "self._stop_range_repair_journal_writer",
-        "self._stop_range_checkpoint_writer",
-        "self.context.alerts.stop",
-    ]
+    assert len(try_node.finalbody) == 1
+    assert ast.unparse(try_node.finalbody[0]) == (
+        "await self._run_finally_shutdown()"
+    )
 
     stop = methods["stop"]
     assert [ast.unparse(statement) for statement in stop.body] == [
         "self._stop_event.set()",
-        "await self._stop_range_speed_background_services()",
-        "await self._stop_producers()",
-        "await self._stop_live_persistence_writer()",
-        "await self._stop_range_repair_journal_writer()",
+        "await self._explicit_stop_shutdown()",
         "self._set_health(RuntimePhase.STOPPED, healthy=True)",
         "return self._health",
     ]

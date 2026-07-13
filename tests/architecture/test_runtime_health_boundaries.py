@@ -380,10 +380,7 @@ def test_run_start_and_stop_keep_existing_health_and_shutdown_order() -> None:
     stop_statements = [ast.unparse(statement) for statement in stop.body]
     assert stop_statements == [
         "self._stop_event.set()",
-        "await self._stop_range_speed_background_services()",
-        "await self._stop_producers()",
-        "await self._stop_live_persistence_writer()",
-        "await self._stop_range_repair_journal_writer()",
+        "await self._explicit_stop_shutdown()",
         "self._set_health(RuntimePhase.STOPPED, healthy=True)",
         "return self._health",
     ]
@@ -420,18 +417,7 @@ def test_run_start_and_stop_keep_existing_health_and_shutdown_order() -> None:
     )
     assert error_call.lineno < alert_emit.lineno
 
-    assert [
-        ast.unparse(statement.value.value.func)
-        for statement in try_node.finalbody
-        if isinstance(statement, ast.Expr)
-        and isinstance(statement.value, ast.Await)
-        and isinstance(statement.value.value, ast.Call)
-    ] == [
-        "self._stop_range_speed_background_services",
-        "self._stop_sync_tasks",
-        "self._stop_producers",
-        "self._stop_live_persistence_writer",
-        "self._stop_range_repair_journal_writer",
-        "self._stop_range_checkpoint_writer",
-        "self.context.alerts.stop",
-    ]
+    assert len(try_node.finalbody) == 1
+    assert ast.unparse(try_node.finalbody[0]) == (
+        "await self._run_finally_shutdown()"
+    )
