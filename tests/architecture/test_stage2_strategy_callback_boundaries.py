@@ -36,9 +36,6 @@ FORBIDDEN_EXCHANGE_IMPORTS = (
 NON_STRATEGY_CALLBACK_REFERENCES = {
     ("recover", "src/runtime/runner.py", 1830),
     ("on_trade", "src/runtime/runner.py", 3282),
-    ("on_trade", "src/runtime/runner.py", 3475),
-    ("on_trade", "src/runtime/runner.py", 3476),
-    ("on_trade", "src/runtime/runner.py", 3477),
     # Generic Trade Feature Builder callback, not a Strategy callback.
     ("on_trade", "src/runtime/feature_pipeline.py", 103),
 }
@@ -79,6 +76,22 @@ def _callback_references(tree: ast.AST) -> tuple[tuple[str, int], ...]:
     return tuple(sorted(found, key=lambda item: (item[1], item[0])))
 
 
+def _all_runtime_callback_references() -> set[tuple[str, str, int]]:
+    references: set[tuple[str, str, int]] = set()
+    for path in _runtime_files():
+        relative_path = _relative(path)
+        for callback, line in _callback_references(_tree(path)):
+            references.add((callback, relative_path, line))
+    return references
+
+
+def _stale_non_strategy_callback_references(
+    exceptions: set[tuple[str, str, int]],
+    discovered: set[tuple[str, str, int]],
+) -> set[tuple[str, str, int]]:
+    return exceptions - discovered
+
+
 def _imports(path: Path) -> set[str]:
     modules: set[str] = set()
     for node in ast.walk(_tree(path)):
@@ -96,22 +109,49 @@ def _module_is_or_below(module: str, prefix: str) -> bool:
 def test_direct_strategy_callback_locations_match_explicit_allowlist() -> None:
     actual = {name: set() for name in CALLBACK_ALLOWLIST}
     violations: list[str] = []
-    for path in _runtime_files():
-        relative_path = _relative(path)
-        for callback, line in _callback_references(_tree(path)):
-            reference = (callback, relative_path, line)
-            if reference in NON_STRATEGY_CALLBACK_REFERENCES:
-                continue
-            actual[callback].add(relative_path)
-            if relative_path not in CALLBACK_ALLOWLIST[callback]:
-                violations.append(
-                    f"callback={callback} path={relative_path} line={line}"
-                )
+    for callback, relative_path, line in sorted(_all_runtime_callback_references()):
+        reference = (callback, relative_path, line)
+        if reference in NON_STRATEGY_CALLBACK_REFERENCES:
+            continue
+        actual[callback].add(relative_path)
+        if relative_path not in CALLBACK_ALLOWLIST[callback]:
+            violations.append(
+                f"callback={callback} path={relative_path} line={line}"
+            )
 
     assert violations == [], "Unexpected Strategy callback references:\n" + "\n".join(
         violations
     )
     assert actual == CALLBACK_ALLOWLIST
+
+
+def test_non_strategy_callback_exceptions_are_live_and_exact() -> None:
+    discovered = _all_runtime_callback_references()
+    stale = _stale_non_strategy_callback_references(
+        NON_STRATEGY_CALLBACK_REFERENCES,
+        discovered,
+    )
+
+    assert stale == set(), (
+        "Stale NON_STRATEGY_CALLBACK_REFERENCES entries:\n"
+        + "\n".join(
+            f"callback={callback} path={path} line={line}"
+            for callback, path, line in sorted(stale)
+        )
+    )
+
+
+def test_stale_exception_detection_checks_callback_path_and_line() -> None:
+    live = ("on_trade", "src/runtime/feature_pipeline.py", 103)
+    missing_line = ("on_trade", "src/runtime/feature_pipeline.py", 104)
+    missing_path = ("on_trade", "src/runtime/missing.py", 103)
+    discovered = _all_runtime_callback_references()
+
+    assert live in discovered
+    assert _stale_non_strategy_callback_references(
+        {live, missing_line, missing_path},
+        discovered,
+    ) == {missing_line, missing_path}
 
 
 def test_runtime_has_no_concrete_strategy_imports() -> None:
