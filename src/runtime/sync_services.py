@@ -19,6 +19,14 @@ class RuntimeSyncServiceRegistry:
         self._account_service = account_service
         self._order_service = order_service
 
+    @property
+    def account_service(self) -> object | None:
+        return self._account_service
+
+    @property
+    def order_service(self) -> object | None:
+        return self._order_service
+
     def get_account(self, factory: SyncServiceFactory) -> object:
         if self._account_service is None:
             self._account_service = factory()

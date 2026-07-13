@@ -263,6 +263,16 @@ class LiveRuntimeRunner:
             )
         )
         self.services["sync_service_registry"] = self._sync_service_registry
+        self._account_sync_service = getattr(
+            self._sync_service_registry,
+            "account_service",
+            None,
+        )
+        self._order_sync_service = getattr(
+            self._sync_service_registry,
+            "order_service",
+            None,
+        )
         self._request_sync_throttle = self.services.get("request_sync_throttle") or RequestThrottle(min_interval_seconds=0.25)
         self._recovery_service = self.services.get("recovery_service", "__default__")
         self._reconciliation_service = self.services.get("reconciliation_service", "__default__")

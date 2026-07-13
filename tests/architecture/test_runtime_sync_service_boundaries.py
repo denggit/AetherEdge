@@ -153,6 +153,42 @@ def test_registry_owns_only_account_and_order_service_slots() -> None:
     assert forbidden_strings.isdisjoint(strings)
 
 
+def test_registry_exposes_read_only_service_slots_without_calls() -> None:
+    registry_class = _class(
+        SYNC_SERVICES,
+        "RuntimeSyncServiceRegistry",
+    )
+    methods = _methods(registry_class)
+
+    for property_name, slot in (
+        ("account_service", "_account_service"),
+        ("order_service", "_order_service"),
+    ):
+        method = methods[property_name]
+        assert len(method.decorator_list) == 1
+        assert isinstance(method.decorator_list[0], ast.Name)
+        assert method.decorator_list[0].id == "property"
+        assert len(method.body) == 1
+        assert isinstance(method.body[0], ast.Return)
+        assert ast.unparse(method.body[0].value) == f"self.{slot}"
+        assert not any(
+            isinstance(node, ast.Call) for node in ast.walk(method)
+        )
+        assert _self_assignments(method) == set()
+
+    setters = {
+        ast.unparse(decorator)
+        for node in registry_class.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for decorator in node.decorator_list
+        if isinstance(decorator, ast.Attribute)
+        and decorator.attr == "setter"
+    }
+    assert setters.isdisjoint(
+        {"account_service.setter", "order_service.setter"}
+    )
+
+
 def test_registry_getters_only_invoke_their_factory() -> None:
     methods = _methods(
         _class(SYNC_SERVICES, "RuntimeSyncServiceRegistry")
@@ -167,6 +203,76 @@ def test_registry_getters_only_invoke_their_factory() -> None:
         assert isinstance(calls[0].func, ast.Name)
         assert calls[0].func.id == "factory"
         assert _self_assignments(method) == {slot}
+
+
+def test_runner_init_syncs_compatibility_fields_from_selected_registry() -> None:
+    initializer = _methods(_class(RUNNER, "LiveRuntimeRunner"))["__init__"]
+    assignments = [
+        node
+        for node in ast.walk(initializer)
+        if isinstance(node, ast.Assign) and len(node.targets) == 1
+    ]
+
+    registry_assignment = next(
+        node
+        for node in assignments
+        if ast.unparse(node.targets[0]) == "self._sync_service_registry"
+    )
+    registry_writeback = next(
+        node
+        for node in assignments
+        if ast.unparse(node.targets[0])
+        == "self.services['sync_service_registry']"
+    )
+    for field, property_name in (
+        ("_account_sync_service", "account_service"),
+        ("_order_sync_service", "order_service"),
+    ):
+        candidates = [
+            node
+            for node in assignments
+            if ast.unparse(node.targets[0]) == f"self.{field}"
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "getattr"
+        ]
+        assert len(candidates) == 1
+        assignment = candidates[0]
+        assert [ast.unparse(argument) for argument in assignment.value.args] == [
+            "self._sync_service_registry",
+            repr(property_name),
+            "None",
+        ]
+        assert registry_assignment.lineno < registry_writeback.lineno
+        assert registry_writeback.lineno < assignment.lineno
+
+    forbidden_constructor_calls = {
+        "get_account",
+        "get_order",
+        "_build_account_sync_service",
+        "_build_order_sync_service",
+    }
+    called_attributes = {
+        node.func.attr
+        for node in ast.walk(initializer)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+    }
+    assert forbidden_constructor_calls.isdisjoint(called_attributes)
+
+    overwritten_service_keys = {
+        target.slice.value
+        for node in assignments
+        for target in node.targets
+        if isinstance(target, ast.Subscript)
+        and ast.unparse(target.value) == "self.services"
+        and isinstance(target.slice, ast.Constant)
+        and target.slice.value in {
+            "account_sync_service",
+            "order_sync_service",
+        }
+    }
+    assert overwritten_service_keys == set()
 
 
 def test_runner_owns_exact_account_and_order_service_builders() -> None:

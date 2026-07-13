@@ -60,6 +60,24 @@ def test_registry_initial_state_and_owned_fields() -> None:
     }
 
 
+def test_registry_properties_expose_current_slots_without_side_effects() -> None:
+    account = Mock()
+    order = Mock()
+    registry = RuntimeSyncServiceRegistry(
+        account_service=account,
+        order_service=order,
+    )
+
+    assert registry.account_service is account
+    assert registry.order_service is order
+    assert vars(registry) == {
+        "_account_service": account,
+        "_order_service": order,
+    }
+    account.assert_not_called()
+    order.assert_not_called()
+
+
 def test_account_and_order_factories_are_independent_and_called_once() -> None:
     registry = RuntimeSyncServiceRegistry()
     account = object()
@@ -137,10 +155,104 @@ def test_complete_registry_injection_overrides_legacy_services() -> None:
 
     assert runner._sync_service_registry is registry
     assert runner.services["sync_service_registry"] is registry
+    assert runner._account_sync_service is registry_account
+    assert runner._order_sync_service is registry_order
+    assert runner._account_sync_service is not legacy_account
+    assert runner._order_sync_service is not legacy_order
+    assert runner.services["account_sync_service"] is legacy_account
+    assert runner.services["order_sync_service"] is legacy_order
     assert runner._get_account_sync_service() is registry_account
     assert runner._get_order_sync_service() is registry_order
     assert runner._account_sync_service is registry_account
     assert runner._order_sync_service is registry_order
+
+
+def test_empty_registry_overrides_legacy_compatibility_fields() -> None:
+    registry = RuntimeSyncServiceRegistry()
+    legacy_account = object()
+    legacy_order = object()
+
+    runner = _runner(
+        services={
+            "sync_service_registry": registry,
+            "account_sync_service": legacy_account,
+            "order_sync_service": legacy_order,
+        }
+    )
+
+    assert runner._account_sync_service is None
+    assert runner._order_sync_service is None
+    assert runner.services["account_sync_service"] is legacy_account
+    assert runner.services["order_sync_service"] is legacy_order
+
+
+@pytest.mark.parametrize(
+    ("registry_account", "registry_order"),
+    ((object(), None), (None, object())),
+)
+def test_partial_registry_immediately_controls_compatibility_fields(
+    registry_account: object | None,
+    registry_order: object | None,
+) -> None:
+    legacy_account = object()
+    legacy_order = object()
+    registry = RuntimeSyncServiceRegistry(
+        account_service=registry_account,
+        order_service=registry_order,
+    )
+
+    runner = _runner(
+        services={
+            "sync_service_registry": registry,
+            "account_sync_service": legacy_account,
+            "order_sync_service": legacy_order,
+        }
+    )
+
+    assert runner._account_sync_service is registry_account
+    assert runner._order_sync_service is registry_order
+    assert runner.services["account_sync_service"] is legacy_account
+    assert runner.services["order_sync_service"] is legacy_order
+
+
+def test_empty_registry_construction_keeps_sync_dependencies_lazy(
+    monkeypatch,
+) -> None:
+    account_factory = Mock(return_value=object())
+    order_factory = Mock(return_value=object())
+    get_contexts = Mock(return_value=(object(),))
+    get_position_plan_store = Mock(return_value=object())
+    monkeypatch.setattr(
+        runner_module,
+        "AccountStateSyncService",
+        account_factory,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "OrderStateSyncService",
+        order_factory,
+    )
+    monkeypatch.setattr(
+        LiveRuntimeRunner,
+        "_get_sync_contexts",
+        get_contexts,
+    )
+    monkeypatch.setattr(
+        LiveRuntimeRunner,
+        "_get_position_plan_store",
+        get_position_plan_store,
+    )
+
+    runner = _runner(
+        services={"sync_service_registry": RuntimeSyncServiceRegistry()}
+    )
+
+    assert runner._account_sync_service is None
+    assert runner._order_sync_service is None
+    account_factory.assert_not_called()
+    order_factory.assert_not_called()
+    get_contexts.assert_not_called()
+    get_position_plan_store.assert_not_called()
 
 
 def test_complete_registry_injection_does_not_create_default(
