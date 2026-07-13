@@ -738,3 +738,50 @@ async def test_run_lifecycle_and_cleanup_order_is_characterized(
         "stop_range_checkpoint_writer",
         "alerts.stop",
     ]
+
+
+def test_sync_task_factory_order_is_characterized() -> None:
+    runner = _runner()
+    stop_event = runner._stop_event
+    created: list[tuple[str, object]] = []
+
+    def task(label: str):
+        def create(event):
+            created.append((label, event))
+            return object()
+
+        return create
+
+    class CapturingLifecycle:
+        def start(self, factories):
+            return [factory() for factory in factories]
+
+    runner.requirements = SimpleNamespace(
+        account_state=SimpleNamespace(poll_enabled=True),
+        order_state=SimpleNamespace(poll_when_position_enabled=True),
+    )
+    runner._sync_lifecycle = CapturingLifecycle()
+    runner._get_account_sync_service = lambda: SimpleNamespace(
+        run_periodic=task("account")
+    )
+    runner._get_order_sync_service = lambda: SimpleNamespace(
+        run_periodic=task("order")
+    )
+    runner._periodic_follower_close_check = task("follower_close")
+    runner._heartbeat_service = SimpleNamespace(
+        run_periodic=task("heartbeat")
+    )
+    runner._get_startup_feature_backfill_providers = lambda: (object(),)
+    runner._periodic_feature_readiness_refresh = task("feature_readiness")
+
+    tasks = runner._start_sync_tasks()
+
+    assert [label for label, _ in created] == [
+        "account",
+        "order",
+        "follower_close",
+        "heartbeat",
+        "feature_readiness",
+    ]
+    assert all(event is stop_event for _, event in created)
+    assert runner._sync_tasks is tasks

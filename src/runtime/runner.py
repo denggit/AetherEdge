@@ -97,6 +97,7 @@ from src.runtime.strategy_positions import (
     resolve_strategy_position_snapshot_index,
 )
 from src.runtime.strategy_host import StrategyHost
+from src.runtime.sync_lifecycle import RuntimeSyncLifecycle, SyncTaskFactory
 from src.runtime.orders import LiveOrderIntentFactory
 from src.runtime.recovery.service import RecoveryExchangeContext, RuntimeRecoveryService
 from src.runtime.recovery.models import RecoveryReport
@@ -235,6 +236,13 @@ class LiveRuntimeRunner:
         self._stop_event = asyncio.Event()
         self._producer_tasks: list[asyncio.Task] = []
         self._sync_tasks: list[asyncio.Task] = []
+        injected_sync_lifecycle = self.services.get("sync_lifecycle")
+        self._sync_lifecycle = (
+            injected_sync_lifecycle
+            if injected_sync_lifecycle is not None
+            else RuntimeSyncLifecycle()
+        )
+        self.services["sync_lifecycle"] = self._sync_lifecycle
         self._execution_clients: tuple[ExecutionClient, ...] | None = None
         self._account_clients: tuple[AccountClient, ...] | None = None
         self._order_journal = self.services.get("order_journal")
@@ -2795,22 +2803,34 @@ class LiveRuntimeRunner:
         )
 
     def _start_sync_tasks(self) -> list[asyncio.Task]:
-        tasks: list[asyncio.Task] = []
+        task_factories: list[SyncTaskFactory] = []
         if self.requirements.account_state.poll_enabled:
-            tasks.append(asyncio.create_task(self._get_account_sync_service().run_periodic(self._stop_event)))
-        if self.requirements.order_state.poll_when_position_enabled:
-            tasks.append(asyncio.create_task(self._get_order_sync_service().run_periodic(self._stop_event)))
-            tasks.append(asyncio.create_task(self._periodic_follower_close_check(self._stop_event)))
-        # Heartbeat periodic task
-        tasks.append(asyncio.create_task(self._heartbeat_service.run_periodic(self._stop_event)))
-        if self._get_startup_feature_backfill_providers():
-            tasks.append(
-                asyncio.create_task(
-                    self._periodic_feature_readiness_refresh(
-                        self._stop_event
-                    )
+            task_factories.append(
+                lambda: self._get_account_sync_service().run_periodic(
+                    self._stop_event
                 )
             )
+        if self.requirements.order_state.poll_when_position_enabled:
+            task_factories.append(
+                lambda: self._get_order_sync_service().run_periodic(
+                    self._stop_event
+                )
+            )
+            task_factories.append(
+                lambda: self._periodic_follower_close_check(self._stop_event)
+            )
+        # Heartbeat periodic task
+        task_factories.append(
+            lambda: self._heartbeat_service.run_periodic(self._stop_event)
+        )
+        if self._get_startup_feature_backfill_providers():
+            task_factories.append(
+                lambda: self._periodic_feature_readiness_refresh(
+                    self._stop_event
+                )
+            )
+        tasks = self._sync_lifecycle.start(task_factories)
+        self._sync_tasks = tasks
         return tasks
 
     async def _periodic_feature_readiness_refresh(
@@ -4066,10 +4086,7 @@ class LiveRuntimeRunner:
         self._producer_tasks = []
 
     async def _stop_sync_tasks(self) -> None:
-        for task in self._sync_tasks:
-            task.cancel()
-        if self._sync_tasks:
-            await asyncio.gather(*self._sync_tasks, return_exceptions=True)
+        await self._sync_lifecycle.stop()
         self._sync_tasks = []
 
     def _raise_on_unhealthy_producer(self) -> None:
