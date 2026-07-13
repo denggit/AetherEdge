@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from typing import Protocol
 
 from src.market_data.derived import (
     FixedTimeTradeBarBuilder,
@@ -14,6 +15,10 @@ from src.runtime.features import (
     range_footprint_feature,
     trade_footprint_feature,
 )
+
+
+class _TradeFeatureBuilder(Protocol):
+    def on_trade(self, trade: MarketTrade) -> Sequence[object]: ...
 
 
 class TradeDerivedFeaturePipeline:
@@ -91,8 +96,11 @@ class TradeDerivedFeaturePipeline:
             )
 
 
-def _feed_trade(builder: object, trade: MarketTrade):
-    return getattr(builder, "on_" + "trade")(trade)
+def _feed_trade(
+    builder: _TradeFeatureBuilder,
+    trade: MarketTrade,
+) -> Sequence[object]:
+    return builder.on_trade(trade)
 
 
 __all__ = ["TradeDerivedFeaturePipeline"]

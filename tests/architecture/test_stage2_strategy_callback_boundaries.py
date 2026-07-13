@@ -39,6 +39,8 @@ NON_STRATEGY_CALLBACK_REFERENCES = {
     ("on_trade", "src/runtime/runner.py", 3475),
     ("on_trade", "src/runtime/runner.py", 3476),
     ("on_trade", "src/runtime/runner.py", 3477),
+    # Generic Trade Feature Builder callback, not a Strategy callback.
+    ("on_trade", "src/runtime/feature_pipeline.py", 103),
 }
 
 

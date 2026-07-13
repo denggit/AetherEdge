@@ -9,7 +9,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 STRATEGY_PORT = PROJECT_ROOT / "src" / "strategy" / "market_features.py"
 RUNTIME_DISPATCHER = PROJECT_ROOT / "src" / "runtime" / "market_features.py"
 TRADE_FEATURE_PIPELINE = PROJECT_ROOT / "src" / "runtime" / "feature_pipeline.py"
-NEW_SOURCE_FILES = (STRATEGY_PORT, RUNTIME_DISPATCHER)
+NEW_SOURCE_FILES = (
+    STRATEGY_PORT,
+    RUNTIME_DISPATCHER,
+    TRADE_FEATURE_PIPELINE,
+)
 
 
 def _imports(path: Path) -> tuple[str, ...]:
@@ -67,6 +71,57 @@ def test_trade_feature_pipeline_has_no_business_or_execution_dependencies() -> N
         and node.attr in {"on_market_feature", "_execute_signals", "execute"}
     }
     assert forbidden_calls == set()
+
+
+def test_trade_feature_pipeline_has_one_static_builder_on_trade_boundary() -> None:
+    tree = ast.parse(
+        TRADE_FEATURE_PIPELINE.read_text(encoding="utf-8"),
+        filename=str(TRADE_FEATURE_PIPELINE),
+    )
+    helper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_feed_trade"
+    )
+    direct_on_trade = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr == "on_trade"
+    ]
+    helper_on_trade = [
+        node
+        for node in ast.walk(helper)
+        if isinstance(node, ast.Attribute) and node.attr == "on_trade"
+    ]
+
+    assert len(direct_on_trade) == 1
+    assert helper_on_trade == direct_on_trade
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func is direct_on_trade[0]
+        for node in ast.walk(helper)
+    )
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "getattr"
+        for node in ast.walk(helper)
+    )
+    assert not any(isinstance(node, ast.BinOp) for node in ast.walk(helper))
+
+    forbidden_names = {"eval", "exec", "__getattribute__", "methodcaller"}
+    bypasses = {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and node.id in forbidden_names
+    }
+    bypasses.update(
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr in forbidden_names
+    )
+    assert bypasses == set()
 
 
 def test_new_public_boundary_sources_have_no_strategy_specific_vocabulary() -> None:
