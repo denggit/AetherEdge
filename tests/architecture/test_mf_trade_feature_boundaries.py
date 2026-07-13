@@ -6,6 +6,8 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+RUNTIME_RUNNER = PROJECT_ROOT / "src" / "runtime" / "runner.py"
+TRADE_FEATURE_PIPELINE = PROJECT_ROOT / "src" / "runtime" / "feature_pipeline.py"
 
 # Files that must NOT contain strategy-specific vocabulary
 PUBLIC_MF_SOURCES = (
@@ -45,6 +47,28 @@ def _imports(path: Path) -> tuple[str, ...]:
         if isinstance(node, ast.ImportFrom) and node.module is not None
     )
     return tuple(modules)
+
+
+def _constructed_names(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+
+
+def _getattr_names(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return {
+        str(node.args[1].value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "getattr"
+        and len(node.args) >= 2
+        and isinstance(node.args[1], ast.Constant)
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +124,28 @@ def test_bar_builder_has_no_runtime_or_strategy_imports() -> None:
             f"{builder_path.name} imports strategies"
         assert not any(m.startswith("src.platform.exchanges.okx") for m in imports), \
             f"{builder_path.name} imports platform exchanges"
+
+
+def test_trade_builder_creation_and_config_resolution_live_only_in_pipeline() -> None:
+    builder_names = {
+        "FixedTimeTradeBarBuilder",
+        "TradeFootprintBuilder",
+        "RangeFootprintBuilder",
+    }
+
+    assert builder_names <= _constructed_names(TRADE_FEATURE_PIPELINE)
+    assert builder_names.isdisjoint(_constructed_names(RUNTIME_RUNNER))
+    assert "trade_feature_runtime_config" in _getattr_names(
+        TRADE_FEATURE_PIPELINE
+    )
+    assert "trade_feature_runtime_config" not in _getattr_names(RUNTIME_RUNNER)
+
+
+def test_range_bar_builders_remain_owned_by_runner() -> None:
+    constructed = _constructed_names(RUNTIME_RUNNER)
+
+    assert "RangeBarBuilder" in constructed
+    assert "RangeBarAggregator" in constructed
 
 
 # ---------------------------------------------------------------------------

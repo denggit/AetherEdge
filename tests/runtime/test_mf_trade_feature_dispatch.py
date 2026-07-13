@@ -7,6 +7,7 @@ import pytest
 
 from src.platform.data.models import MarketTrade, TradeSide
 from src.platform.exchanges.models import ExchangeName
+from src.runtime.feature_pipeline import TradeDerivedFeaturePipeline
 from src.runtime.runner import LiveRuntimeRunner
 
 
@@ -42,15 +43,16 @@ async def test_runtime_dispatches_all_trade_derived_feature_types() -> None:
     runner = object.__new__(LiveRuntimeRunner)
     runner.context = SimpleNamespace(strategy=_Strategy())
     runner._project_env = _Env()
-    runner._fixed_time_trade_bar_builder = None
-    runner._trade_footprint_builder = None
-    runner._range_footprint_builder = None
     events = []
 
     async def capture(event):
         events.append(event)
 
     runner.process_market_feature = capture
+    runner._trade_derived_feature_pipeline = TradeDerivedFeaturePipeline(
+        strategy=runner.context.strategy,
+        emit_feature=runner.process_market_feature,
+    )
     base = 1_700_000_000_000
     await runner._dispatch_trade_derived_features(
         _trade(time_ms=base + 1_000, price="100", side=TradeSide.BUY)
@@ -82,15 +84,16 @@ async def test_runtime_bridge_is_inert_when_strategy_disables_it() -> None:
     runner = object.__new__(LiveRuntimeRunner)
     runner.context = SimpleNamespace(strategy=Disabled())
     runner._project_env = _Env()
-    runner._fixed_time_trade_bar_builder = None
-    runner._trade_footprint_builder = None
-    runner._range_footprint_builder = None
     events = []
 
     async def capture(event):
         events.append(event)
 
     runner.process_market_feature = capture
+    runner._trade_derived_feature_pipeline = TradeDerivedFeaturePipeline(
+        strategy=runner.context.strategy,
+        emit_feature=runner.process_market_feature,
+    )
     await runner._dispatch_trade_derived_features(
         _trade(
             time_ms=1_700_000_000_000,

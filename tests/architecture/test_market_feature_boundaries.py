@@ -8,6 +8,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 STRATEGY_PORT = PROJECT_ROOT / "src" / "strategy" / "market_features.py"
 RUNTIME_DISPATCHER = PROJECT_ROOT / "src" / "runtime" / "market_features.py"
+TRADE_FEATURE_PIPELINE = PROJECT_ROOT / "src" / "runtime" / "feature_pipeline.py"
 NEW_SOURCE_FILES = (STRATEGY_PORT, RUNTIME_DISPATCHER)
 
 
@@ -44,6 +45,28 @@ def test_runtime_dispatcher_has_no_concrete_or_execution_dependencies() -> None:
     assert not any(module.startswith("src.order_management") for module in imports)
     assert not any(module.startswith("src.platform.exchanges.okx") for module in imports)
     assert not any(module.startswith("src.platform.exchanges.binance") for module in imports)
+
+
+def test_trade_feature_pipeline_has_no_business_or_execution_dependencies() -> None:
+    imports = _imports(TRADE_FEATURE_PIPELINE)
+
+    assert not any(module.startswith("strategies") for module in imports)
+    assert not any(module.startswith("src.order_management") for module in imports)
+    assert not any(module.startswith("src.reconcile") for module in imports)
+    assert not any(module.startswith("src.platform.exchanges.okx") for module in imports)
+    assert not any(module.startswith("src.platform.exchanges.binance") for module in imports)
+
+    tree = ast.parse(
+        TRADE_FEATURE_PIPELINE.read_text(encoding="utf-8"),
+        filename=str(TRADE_FEATURE_PIPELINE),
+    )
+    forbidden_calls = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and node.attr in {"on_market_feature", "_execute_signals", "execute"}
+    }
+    assert forbidden_calls == set()
 
 
 def test_new_public_boundary_sources_have_no_strategy_specific_vocabulary() -> None:

@@ -345,6 +345,26 @@ async def test_range_only_trade_skips_raw_strategy_callback_and_execution(monkey
 
 
 @pytest.mark.asyncio
+async def test_injected_trade_derived_feature_pipeline_owns_runner_dispatch() -> None:
+    calls: list[str] = []
+    trade = _trade()
+
+    class InjectedPipeline:
+        async def process_trade(self, value):
+            calls.append("pipeline.process_trade")
+            assert value is trade
+
+    runner = _runner(
+        calls=calls,
+        services={"trade_derived_feature_pipeline": InjectedPipeline()},
+    )
+
+    await runner._dispatch_trade_derived_features(trade)
+
+    assert calls == ["pipeline.process_trade"]
+
+
+@pytest.mark.asyncio
 async def test_market_feature_dispatch_precedes_signal_execution(monkeypatch) -> None:
     calls: list[str] = []
     strategy = FakeStrategy(calls)

@@ -15,11 +15,8 @@ from typing import Any, Callable, Mapping, Sequence
 from src.app import AppConfig, AppContext
 from src.app.alerts import AppAlert
 from src.market_data.derived import (
-    FixedTimeTradeBarBuilder,
     RangeBarAggregator,
     RangeBarBuilder,
-    RangeFootprintBuilder,
-    TradeFootprintBuilder,
 )
 from src.market_data.events import MarketFeatureEvent
 from src.market_data.models import MarketDataSet, RangeBar, RangeBarAggregate, RangeCoverageStatus, TimeRange, WarmupRequest
@@ -68,15 +65,8 @@ from src.runtime.account_config import (
 )
 from src.runtime.account_sync import AccountStateSyncService, OrderStateSyncService, RequestThrottle, SyncExchangeContext
 from src.runtime.config import LiveRuntimeConfig, live_runtime_config_from_app
-from src.runtime.features import (
-    closed_kline_feature,
-    fixed_time_trade_bar_feature,
-    range_aggregate_feature,
-    range_aggregate_unavailable_feature,
-    range_bar_closed_feature,
-    range_footprint_feature,
-    trade_footprint_feature,
-)
+from src.runtime.features import closed_kline_feature, range_aggregate_feature, range_aggregate_unavailable_feature, range_bar_closed_feature
+from src.runtime.feature_pipeline import TradeDerivedFeaturePipeline
 from src.runtime.heartbeat import RuntimeHeartbeatService
 from src.runtime.position_mode_gate import (
     fetch_position_mode_statuses,
@@ -388,14 +378,24 @@ class LiveRuntimeRunner:
         self._range_bar_aggregator = self.services.get("range_bar_aggregator")
         self._live_persistence_writer = self.services.get("live_persistence_writer")
         self._persistence_alert_loop: asyncio.AbstractEventLoop | None = None
-        self._fixed_time_trade_bar_builder = self.services.get(
+        self._fixed_time_trade_bar_builder_compat = self.services.get(
             "fixed_time_trade_bar_builder"
         )
-        self._trade_footprint_builder = self.services.get(
-            "trade_footprint_builder"
+        self._trade_footprint_builder_compat = self.services.get("trade_footprint_builder")
+        self._range_footprint_builder_compat = self.services.get("range_footprint_builder")
+        injected_trade_pipeline = self.services.get(
+            "trade_derived_feature_pipeline"
         )
-        self._range_footprint_builder = self.services.get(
-            "range_footprint_builder"
+        self._trade_derived_feature_pipeline = (
+            injected_trade_pipeline
+            if injected_trade_pipeline is not None
+            else TradeDerivedFeaturePipeline(
+                strategy=self.context.strategy,
+                emit_feature=self.process_market_feature,
+                fixed_time_trade_bar_builder=self._fixed_time_trade_bar_builder_compat,
+                trade_footprint_builder=self._trade_footprint_builder_compat,
+                range_footprint_builder=self._range_footprint_builder_compat,
+            )
         )
         self._range_checkpoint_store = self.services.get("range_checkpoint_store")
         self._range_checkpoint_writer = self.services.get("range_checkpoint_writer")
@@ -3431,73 +3431,49 @@ class LiveRuntimeRunner:
     async def _dispatch_trade_derived_features(
         self, trade: MarketTrade
     ) -> None:
-        config_provider = getattr(
-            self.context.strategy, "trade_feature_runtime_config", None
-        )
-        if not callable(config_provider):
-            return
-        raw_config = config_provider()
-        if not isinstance(raw_config, Mapping) or not bool(
-            raw_config.get("enabled", False)
-        ):
-            return
+        await self._trade_derived_feature_pipeline.process_trade(trade)
 
-        contract_value = str(
-            raw_config.get("contract_value", "0.01")
-        )
-        price_bucket_size = str(
-            raw_config.get("price_bucket_size", "1")
-        )
-        if self._fixed_time_trade_bar_builder is None:
-            self._fixed_time_trade_bar_builder = FixedTimeTradeBarBuilder(
-                contract_value=contract_value,
-                large_trade_threshold_notional=str(
-                    raw_config.get(
-                        "large_trade_threshold",
-                        "10000",
-                    )
-                ),
-            )
-        if self._trade_footprint_builder is None:
-            self._trade_footprint_builder = TradeFootprintBuilder(
-                contract_value=contract_value,
-                price_bucket_size=price_bucket_size,
-            )
-        if self._range_footprint_builder is None:
-            self._range_footprint_builder = RangeFootprintBuilder(
-                contract_value=contract_value,
-                range_pct=str(raw_config.get("range_pct", "0.002")),
-                price_step=str(
-                    raw_config.get("range_price_step", "1")
-                ),
-            )
+    @property
+    def _fixed_time_trade_bar_builder(self):
+        pipeline = getattr(self, "_trade_derived_feature_pipeline", None)
+        if isinstance(pipeline, TradeDerivedFeaturePipeline):
+            return pipeline.fixed_time_trade_bar_builder
+        return getattr(self, "_fixed_time_trade_bar_builder_compat", None)
 
-        range_features = self._range_footprint_builder.on_trade(trade)
-        tradebars = self._fixed_time_trade_bar_builder.on_trade(trade)
-        footprints = self._trade_footprint_builder.on_trade(trade)
-        for feature in range_features:
-            await self.process_market_feature(
-                range_footprint_feature(
-                    feature, exchange=trade.exchange
-                )
-            )
-        for bar in tradebars:
-            await self.process_market_feature(
-                fixed_time_trade_bar_feature(
-                    bar,
-                    exchange=trade.exchange,
-                    next_open_price=trade.price,
-                    next_open_time_ms=(
-                        trade.trade_time_ms or trade.event_time_ms
-                    ),
-                )
-            )
-        for feature in footprints:
-            await self.process_market_feature(
-                trade_footprint_feature(
-                    feature, exchange=trade.exchange
-                )
-            )
+    @_fixed_time_trade_bar_builder.setter
+    def _fixed_time_trade_bar_builder(self, value) -> None:
+        self._fixed_time_trade_bar_builder_compat = value
+        pipeline = getattr(self, "_trade_derived_feature_pipeline", None)
+        if isinstance(pipeline, TradeDerivedFeaturePipeline):
+            pipeline.fixed_time_trade_bar_builder = value
+
+    @property
+    def _trade_footprint_builder(self):
+        pipeline = getattr(self, "_trade_derived_feature_pipeline", None)
+        if isinstance(pipeline, TradeDerivedFeaturePipeline):
+            return pipeline.trade_footprint_builder
+        return getattr(self, "_trade_footprint_builder_compat", None)
+
+    @_trade_footprint_builder.setter
+    def _trade_footprint_builder(self, value) -> None:
+        self._trade_footprint_builder_compat = value
+        pipeline = getattr(self, "_trade_derived_feature_pipeline", None)
+        if isinstance(pipeline, TradeDerivedFeaturePipeline):
+            pipeline.trade_footprint_builder = value
+
+    @property
+    def _range_footprint_builder(self):
+        pipeline = getattr(self, "_trade_derived_feature_pipeline", None)
+        if isinstance(pipeline, TradeDerivedFeaturePipeline):
+            return pipeline.range_footprint_builder
+        return getattr(self, "_range_footprint_builder_compat", None)
+
+    @_range_footprint_builder.setter
+    def _range_footprint_builder(self, value) -> None:
+        self._range_footprint_builder_compat = value
+        pipeline = getattr(self, "_trade_derived_feature_pipeline", None)
+        if isinstance(pipeline, TradeDerivedFeaturePipeline):
+            pipeline.range_footprint_builder = value
 
     def _submit_range_checkpoint_if_due(self, trade: MarketTrade) -> bool:
         now_ms = int(time.time() * 1000)
