@@ -35,32 +35,44 @@ class RuntimeMarketDataPersistence:
         kline: MarketKline,
         *,
         on_error: Callable[[BaseException], None] | None,
+        on_rejected: Callable[[str], None] | None = None,
     ) -> bool:
+        description = "closed_kline"
+
         def write() -> None:
             repository = self._kline_store_provider()
             repository.save([kline])
 
-        return self._persistence_service.submit(
-            description="closed_kline",
+        accepted = self._persistence_service.submit(
+            description=description,
             write=write,
             on_error=on_error,
         )
+        if not accepted and on_rejected is not None:
+            on_rejected(description)
+        return accepted
 
     def persist_range_bar(
         self,
         bar: RangeBar,
         *,
         on_error: Callable[[BaseException], None] | None,
+        on_rejected: Callable[[str], None] | None = None,
     ) -> bool:
+        description = "range_bar"
+
         def write() -> None:
             repository = self._range_bar_store_provider()
             repository.save([bar])
 
-        return self._persistence_service.submit(
-            description="range_bar",
+        accepted = self._persistence_service.submit(
+            description=description,
             write=write,
             on_error=on_error,
         )
+        if not accepted and on_rejected is not None:
+            on_rejected(description)
+        return accepted
 
     def persist_completed_range_aggregate(
         self,
@@ -69,7 +81,10 @@ class RuntimeMarketDataPersistence:
         coverage_status: str,
         missing_gap_ms: int,
         on_error: Callable[[BaseException], None] | None,
+        on_rejected: Callable[[str], None] | None = None,
     ) -> bool:
+        description = "completed_range_aggregate"
+
         def write() -> None:
             repository = self._completed_aggregate_store_provider()
             repository.save_completed_aggregate(
@@ -80,11 +95,14 @@ class RuntimeMarketDataPersistence:
                 completed_at_ms=self._clock_ms(),
             )
 
-        return self._persistence_service.submit(
-            description="completed_range_aggregate",
+        accepted = self._persistence_service.submit(
+            description=description,
             write=write,
             on_error=on_error,
         )
+        if not accepted and on_rejected is not None:
+            on_rejected(description)
+        return accepted
 
 
 __all__ = ["RuntimeMarketDataPersistence"]

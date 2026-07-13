@@ -777,6 +777,7 @@ class LiveRuntimeRunner:
             on_error=lambda exc: self._on_closed_kline_persist_error(
                 kline, exc
             ),
+            on_rejected=self._on_live_persistence_write_rejected,
         )
 
     def _on_closed_kline_persist_error(
@@ -817,6 +818,7 @@ class LiveRuntimeRunner:
         self._get_market_data_persistence().persist_range_bar(
             bar,
             on_error=lambda exc: self._on_range_bar_persist_error(bar, exc),
+            on_rejected=self._on_live_persistence_write_rejected,
         )
 
     def _on_range_bar_persist_error(
@@ -859,6 +861,7 @@ class LiveRuntimeRunner:
             on_error=lambda exc: self._on_completed_range_aggregate_persist_error(
                 aggregate, exc
             ),
+            on_rejected=self._on_live_persistence_write_rejected,
         )
 
     def _on_completed_range_aggregate_persist_error(
@@ -4484,6 +4487,15 @@ class LiveRuntimeRunner:
         self._live_persistence_writer = writer
         self.services["live_persistence_writer"] = writer
         return writer  # type: ignore[return-value]
+
+    def _on_live_persistence_write_rejected(self, description: str) -> None:
+        metrics = self._get_runtime_persistence_service().metrics()
+        logger.warning(
+            "Live persistence write dropped | description=%s pending=%s dropped=%s",
+            description,
+            metrics.pending_count,
+            metrics.dropped,
+        )
 
     def _submit_live_persistence_write(
         self,

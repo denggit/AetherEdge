@@ -15,10 +15,15 @@ class _CapturingPersistenceService:
     def __init__(self, *, accepted: bool = True) -> None:
         self.accepted = accepted
         self.submissions: list[dict[str, object]] = []
+        self.metrics_calls = 0
 
     def submit(self, **kwargs) -> bool:
         self.submissions.append(kwargs)
         return self.accepted
+
+    def metrics(self):
+        self.metrics_calls += 1
+        return SimpleNamespace(pending_count=3, dropped=2)
 
 
 class _SaveStore:
@@ -179,6 +184,85 @@ def test_completed_aggregate_write_is_lazy_and_uses_execution_time_clock(
 
 
 @pytest.mark.parametrize(
+    ("method_name", "description"),
+    (
+        ("persist_closed_kline", "closed_kline"),
+        ("persist_range_bar", "range_bar"),
+        (
+            "persist_completed_range_aggregate",
+            "completed_range_aggregate",
+        ),
+    ),
+)
+@pytest.mark.parametrize("accepted", (True, False))
+def test_gateway_reports_rejection_once_without_triggering_lazy_dependencies(
+    method_name: str,
+    description: str,
+    accepted: bool,
+) -> None:
+    service = _CapturingPersistenceService(accepted=accepted)
+    kline_provider = Mock()
+    range_bar_provider = Mock()
+    aggregate_provider = Mock()
+    clock_ms = Mock()
+    gateway = _gateway(
+        service,
+        kline_provider=kline_provider,
+        range_bar_provider=range_bar_provider,
+        aggregate_provider=aggregate_provider,
+        clock_ms=clock_ms,
+    )
+    on_rejected = Mock()
+    kwargs = {"on_error": Mock(), "on_rejected": on_rejected}
+    if method_name == "persist_completed_range_aggregate":
+        kwargs.update(coverage_status="complete", missing_gap_ms=0)
+
+    result = getattr(gateway, method_name)(object(), **kwargs)
+
+    assert result is accepted
+    if accepted:
+        on_rejected.assert_not_called()
+    else:
+        on_rejected.assert_called_once_with(description)
+        assert (
+            on_rejected.call_args.args[0]
+            is service.submissions[0]["description"]
+        )
+    kline_provider.assert_not_called()
+    range_bar_provider.assert_not_called()
+    aggregate_provider.assert_not_called()
+    clock_ms.assert_not_called()
+
+
+def test_gateway_does_not_swallow_rejection_callback_errors() -> None:
+    service = _CapturingPersistenceService(accepted=False)
+    provider = Mock()
+    clock_ms = Mock()
+    gateway = _gateway(
+        service,
+        kline_provider=provider,
+        range_bar_provider=provider,
+        aggregate_provider=provider,
+        clock_ms=clock_ms,
+    )
+    error = RuntimeError("rejection handler failed")
+
+    def fail_on_rejected(description: str) -> None:
+        raise error
+
+    with pytest.raises(RuntimeError) as raised:
+        gateway.persist_closed_kline(
+            object(),  # type: ignore[arg-type]
+            on_error=Mock(),
+            on_rejected=fail_on_rejected,
+        )
+
+    assert raised.value is error
+    provider.assert_not_called()
+    clock_ms.assert_not_called()
+
+
+@pytest.mark.parametrize(
     "method_name",
     (
         "persist_closed_kline",
@@ -244,6 +328,8 @@ def test_runner_wrappers_use_one_injected_gateway_and_keep_none_return() -> None
     runner._on_completed_range_aggregate_persist_error = (
         lambda model, exc: handled.append(("aggregate", model, exc))
     )
+    rejected: list[str] = []
+    runner._on_live_persistence_write_rejected = rejected.append
     kline = object()
     bar = object()
     aggregate = object()
@@ -263,11 +349,64 @@ def test_runner_wrappers_use_one_injected_gateway_and_keep_none_return() -> None
     assert [call[1][0] for call in gateway.calls] == [kline, bar, aggregate]
     assert gateway.calls[2][2]["coverage_status"] == "complete"
     assert gateway.calls[2][2]["missing_gap_ms"] == 789
+    assert all(
+        call[2]["on_rejected"] is runner._on_live_persistence_write_rejected
+        for call in gateway.calls
+    )
     error = RuntimeError("write failed")
     for _, args, kwargs in gateway.calls:
         kwargs["on_error"](error)  # type: ignore[operator]
         assert handled[-1][1] is args[0]
         assert handled[-1][2] is error
+
+
+def test_runner_logs_one_exact_warning_for_each_gateway_rejection(
+    monkeypatch,
+) -> None:
+    service = _CapturingPersistenceService(accepted=False)
+    kline_provider = Mock()
+    range_bar_provider = Mock()
+    aggregate_provider = Mock()
+    clock_ms = Mock()
+    gateway = _gateway(
+        service,
+        kline_provider=kline_provider,
+        range_bar_provider=range_bar_provider,
+        aggregate_provider=aggregate_provider,
+        clock_ms=clock_ms,
+    )
+    runner = object.__new__(LiveRuntimeRunner)
+    runner.services = {"runtime_persistence_service": service}
+    runner._runtime_persistence_service = service
+    runner._market_data_persistence = gateway
+    rendered_warnings: list[str] = []
+
+    def capture_warning(message: str, *args) -> None:
+        rendered_warnings.append(message % args)
+
+    monkeypatch.setattr(runner_module.logger, "warning", capture_warning)
+
+    assert runner._persist_closed_kline(object()) is None  # type: ignore[arg-type]
+    assert runner._persist_range_bar(object()) is None  # type: ignore[arg-type]
+    assert (
+        runner._persist_completed_range_aggregate(  # type: ignore[arg-type]
+            object(),
+            coverage_status="partial",
+            missing_gap_ms=12,
+        )
+        is None
+    )
+
+    assert rendered_warnings == [
+        "Live persistence write dropped | description=closed_kline pending=3 dropped=2",
+        "Live persistence write dropped | description=range_bar pending=3 dropped=2",
+        "Live persistence write dropped | description=completed_range_aggregate pending=3 dropped=2",
+    ]
+    assert service.metrics_calls == 3
+    kline_provider.assert_not_called()
+    range_bar_provider.assert_not_called()
+    aggregate_provider.assert_not_called()
+    clock_ms.assert_not_called()
 
 
 @pytest.mark.asyncio
