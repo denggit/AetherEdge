@@ -84,6 +84,10 @@ from src.runtime.range_repair_bootstrap import RangeRepairBootstrapService
 from src.runtime.range_speed_history import RangeSpeedHistoryRefresher
 from src.runtime.requirements import StrategyRuntimeRequirements, resolve_strategy_runtime_requirements
 from src.runtime.shutdown_coordinator import RuntimeShutdownCoordinator
+from src.runtime.startup_phase_coordinator import (
+    RuntimeStartupPhaseCoordinator,
+    RuntimeStartupPhasePlan,
+)
 from src.runtime.startup_catchup import (
     StartupCatchupConfig,
     StartupCatchupDecision,
@@ -415,6 +419,17 @@ class LiveRuntimeRunner:
             else RuntimeShutdownCoordinator()
         )
         self.services["shutdown_coordinator"] = self._shutdown_coordinator
+        injected_startup_phase_coordinator = self.services.get(
+            "startup_phase_coordinator"
+        )
+        self._startup_phase_coordinator = (
+            injected_startup_phase_coordinator
+            if injected_startup_phase_coordinator is not None
+            else RuntimeStartupPhaseCoordinator()
+        )
+        self.services["startup_phase_coordinator"] = (
+            self._startup_phase_coordinator
+        )
         self._startup_catchup_decision: StartupCatchupDecision | None = None
         self._startup_catchup_evaluated = False
         self._range_speed_warmup_excluded_previous = False
@@ -1062,12 +1077,74 @@ class LiveRuntimeRunner:
 
     async def _startup(self) -> None:
         logger.info("Live runtime startup phase started")
-        self._initialize_rangebar_trust_window()
+
+        await self._startup_phase_coordinator.execute(
+            RuntimeStartupPhasePlan(
+                initialize_rangebar_trust_window=(
+                    self._initialize_rangebar_trust_window
+                ),
+                enter_warming_up=self._enter_startup_warming_up,
+                bootstrap_account_config=(
+                    self._bootstrap_account_config_if_enabled
+                ),
+                check_position_mode=(
+                    self._check_strategy_position_mode_requirements
+                ),
+                run_warmup=self._run_warmup,
+                warmup_range_speed_history=(
+                    self._warmup_range_speed_history
+                ),
+                handle_range_speed_history_result=(
+                    self._handle_startup_range_speed_history_result
+                ),
+                check_feature_backfills=(
+                    self._check_startup_feature_backfills
+                ),
+                enter_catching_up=self._enter_startup_catching_up,
+                run_recovery=self._run_recovery,
+                run_post_recovery_checks=(
+                    self._run_startup_post_recovery_checks
+                ),
+                run_reconciliation=self._run_reconciliation,
+                call_strategy_on_start=self._call_on_start,
+                evaluate_startup_catchup=(
+                    self._evaluate_startup_catchup_once
+                ),
+                finish_range_speed_warmup=(
+                    self._finish_range_speed_warmup_after_catchup
+                ),
+                start_heartbeat=self._start_runtime_heartbeat,
+                start_range_speed_background_services=(
+                    self._start_range_speed_background_services
+                ),
+                enter_running=self._enter_startup_running,
+            )
+        )
+
+        logger.info("Live runtime startup phase completed")
+
+    def _enter_startup_warming_up(self) -> None:
         self._set_health(RuntimePhase.WARMING_UP, healthy=True)
-        await self._bootstrap_account_config_if_enabled()
-        await self._check_strategy_position_mode_requirements()
-        await self._run_warmup()
-        loaded_range_speed_history = await self._warmup_range_speed_history()
+
+    def _enter_startup_catching_up(self) -> None:
+        self._set_health(
+            RuntimePhase.CATCHING_UP,
+            healthy=True,
+            warmup_complete=True,
+        )
+
+    def _enter_startup_running(self) -> None:
+        self._set_health(
+            RuntimePhase.RUNNING,
+            healthy=True,
+            warmup_complete=True,
+            caught_up=True,
+        )
+
+    def _handle_startup_range_speed_history_result(
+        self,
+        loaded_range_speed_history: int,
+    ) -> None:
         if (
             self._range_speed_min_periods > 0
             and loaded_range_speed_history < self._range_speed_min_periods
@@ -1078,30 +1155,18 @@ class LiveRuntimeRunner:
                 self._range_speed_min_periods,
                 self._range_speed_min_periods - loaded_range_speed_history,
             )
-        await self._check_startup_feature_backfills()
-        self._set_health(RuntimePhase.CATCHING_UP, healthy=True, warmup_complete=True)
-        snapshots = await self._run_recovery()
-        # ── Post-recovery: re-check account config if entries were blocked ──
+
+    async def _run_startup_post_recovery_checks(
+        self,
+        snapshots: tuple[object, ...],
+    ) -> None:
         if self._account_config_new_entries_blocked:
             await self._recheck_account_config_after_recovery()
-        # ── State convergence: reconcile exchange truth against local state ──
-        #     CRITICAL: must reconcile ALL exchange snapshots, not just one.
-        #     A single-exchange view can miss follower positions and wrongly
-        #     close active PositionPlans (master/follower safety violation).
-        await self._run_reconciliation(snapshots)
-        await self._call_on_start(snapshots[0])
-        # ── Startup catch-up: one-time guarded check for the most recent
-        #     closed 4H bar.  Only eligible inside the fresh-open window
-        #     (first 5 min of a new 4H candle). ──
-        await self._evaluate_startup_catchup_once(snapshots[0])
-        await self._finish_range_speed_warmup_after_catchup()
-        # ── Start heartbeat service ──
+
+    def _start_runtime_heartbeat(self) -> None:
         self._heartbeat_service.start(
             runtime_id=f"{self.app_config.strategy}::{self.app_config.symbol}",
         )
-        self._start_range_speed_background_services()
-        self._set_health(RuntimePhase.RUNNING, healthy=True, warmup_complete=True, caught_up=True)
-        logger.info("Live runtime startup phase completed")
 
     async def _check_startup_feature_backfills(self) -> None:
         providers = self._get_startup_feature_backfill_providers()

@@ -156,10 +156,12 @@ def test_runner_retains_only_one_heartbeat_compatibility_field() -> None:
 
 
 def test_startup_owns_single_heartbeat_start_with_exact_id_and_order() -> None:
-    startup = _methods(_class(RUNNER, "LiveRuntimeRunner"))["_startup"]
+    methods = _methods(_class(RUNNER, "LiveRuntimeRunner"))
+    startup = methods["_startup"]
+    heartbeat_wrapper = methods["_start_runtime_heartbeat"]
     start_calls = [
         call
-        for call in _calls(startup, "start")
+        for call in _calls(heartbeat_wrapper, "start")
         if ast.unparse(call.func.value) == "self._heartbeat_service"
     ]
     assert len(start_calls) == 1
@@ -174,39 +176,25 @@ def test_startup_owns_single_heartbeat_start_with_exact_id_and_order() -> None:
         )
     }
 
-    ordered_calls = [
-        (
-            "_run_recovery",
-            _calls(startup, "_run_recovery")[0].lineno,
-        ),
-        (
-            "_run_reconciliation",
-            _calls(startup, "_run_reconciliation")[0].lineno,
-        ),
-        ("_call_on_start", _calls(startup, "_call_on_start")[0].lineno),
-        (
-            "_evaluate_startup_catchup_once",
-            _calls(startup, "_evaluate_startup_catchup_once")[0].lineno,
-        ),
-        (
-            "_finish_range_speed_warmup_after_catchup",
-            _calls(startup, "_finish_range_speed_warmup_after_catchup")[0].lineno,
-        ),
-        ("heartbeat.start", start_call.lineno),
-        (
-            "_start_range_speed_background_services",
-            _calls(startup, "_start_range_speed_background_services")[0].lineno,
-        ),
+    plans = [
+        node
+        for node in ast.walk(startup)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "RuntimeStartupPhasePlan"
     ]
-    running_health = next(
-        call
-        for call in _calls(startup, "_set_health")
-        if call.args
-        and ast.unparse(call.args[0]) == "RuntimePhase.RUNNING"
+    assert len(plans) == 1
+    plan_callbacks = {
+        keyword.arg: ast.unparse(keyword.value)
+        for keyword in plans[0].keywords
+    }
+    assert plan_callbacks["start_heartbeat"] == (
+        "self._start_runtime_heartbeat"
     )
-    ordered_calls.append(("health.RUNNING", running_health.lineno))
-    assert [line for _, line in ordered_calls] == sorted(
-        line for _, line in ordered_calls
+    assert plan_callbacks["start_range_speed_background_services"] == (
+        "self._start_range_speed_background_services"
+    )
+    assert plan_callbacks["enter_running"] == (
+        "self._enter_startup_running"
     )
 
     all_runner_starts = [

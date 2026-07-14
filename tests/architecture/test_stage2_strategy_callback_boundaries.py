@@ -34,8 +34,8 @@ FORBIDDEN_EXCHANGE_IMPORTS = (
 # controlled Strategy callback names. Keep each exception exact so a new
 # reference still requires an architecture review.
 NON_STRATEGY_CALLBACK_REFERENCES = {
-    ("recover", "src/runtime/runner.py", 1907),
-    ("on_trade", "src/runtime/runner.py", 3371),
+    ("recover", "src/runtime/runner.py", 1972),
+    ("on_trade", "src/runtime/runner.py", 3436),
     # Generic Trade Feature Builder callback, not a Strategy callback.
     ("on_trade", "src/runtime/feature_pipeline.py", 103),
 }
