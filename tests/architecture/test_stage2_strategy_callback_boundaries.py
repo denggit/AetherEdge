@@ -35,7 +35,7 @@ FORBIDDEN_EXCHANGE_IMPORTS = (
 # reference still requires an architecture review.
 NON_STRATEGY_CALLBACK_REFERENCES = {
     ("recover", "src/runtime/runner.py", 2047),
-    ("on_trade", "src/runtime/runner.py", 3553),
+    ("on_trade", "src/runtime/runner.py", 3559),
     # Generic Trade Feature Builder callback, not a Strategy callback.
     ("on_trade", "src/runtime/feature_pipeline.py", 103),
 }

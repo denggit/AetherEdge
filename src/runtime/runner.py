@@ -2475,6 +2475,8 @@ class LiveRuntimeRunner:
 
     async def _call_on_start(self, snapshot: PlatformSnapshot) -> None:
         signals = await self._strategy_host.on_start(snapshot)
+        if signals is None:
+            return
         self.stats.on_start_called = True
         logger.info("Strategy on_start completed | signals=%s", len(signals or ()))
         await self._execute_signals(signals or (), source="on_start", event_time_ms=None)
@@ -3369,6 +3371,8 @@ class LiveRuntimeRunner:
         if callable(save):
             await asyncio.to_thread(save, event)
         signals = await self._strategy_host.on_account_event(event)
+        if signals is None:
+            return
         await self._execute_signals(signals or (), source=f"account:{event.exchange.value}", event_time_ms=event.event_time_ms)
 
     async def _on_account_snapshot_synced(self, snapshot: PlatformSnapshot, sync_type: str) -> None:
@@ -3382,7 +3386,9 @@ class LiveRuntimeRunner:
         if snapshot.balance.exchange == self.app_config.data_exchange:
             self._last_snapshot = snapshot
 
-        await self._strategy_host.on_account_snapshot(snapshot)
+        callback_called = await self._strategy_host.on_account_snapshot(snapshot)
+        if not callback_called:
+            return
 
         exchange = snapshot.balance.exchange.value
         key = (exchange, sync_type)
@@ -4442,6 +4448,8 @@ class LiveRuntimeRunner:
             source=source,
             event_time_ms=event_time_ms,
         )
+        if follow_up is None:
+            return ()
         follow_up_count = len(follow_up or ())
         if follow_up_count > 0:
             logger.info("Strategy order results processed | action=%s results=%s follow_up_signals=%s", signal.action.value, len(results), follow_up_count)

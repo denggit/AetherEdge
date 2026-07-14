@@ -108,6 +108,22 @@ def _calls(node: ast.AST, attribute: str) -> list[ast.Call]:
     ]
 
 
+def _is_none_return(statement: ast.stmt, name: str) -> bool:
+    return (
+        isinstance(statement, ast.If)
+        and isinstance(statement.test, ast.Compare)
+        and isinstance(statement.test.left, ast.Name)
+        and statement.test.left.id == name
+        and len(statement.test.ops) == 1
+        and isinstance(statement.test.ops[0], ast.Is)
+        and len(statement.test.comparators) == 1
+        and isinstance(statement.test.comparators[0], ast.Constant)
+        and statement.test.comparators[0].value is None
+        and len(statement.body) == 1
+        and isinstance(statement.body[0], ast.Return)
+    )
+
+
 def _assert_acyclic(graph: dict[str, set[str]]) -> None:
     visiting: set[str] = set()
     visited: set[str] = set()
@@ -404,6 +420,94 @@ def test_strategy_callback_receivers_remain_explicit_and_not_strategy_direct() -
     assert not any(
         receiver.startswith("self.context.strategy")
         for _, _, receiver in references
+    )
+
+
+def test_optional_strategy_callback_early_returns_precede_side_effects() -> None:
+    methods = _methods(_class(RUNNER, "LiveRuntimeRunner"))
+
+    on_start = methods["_call_on_start"]
+    assert _is_none_return(on_start.body[1], "signals")
+    assert isinstance(on_start.body[0], ast.Assign)
+    assert ast.unparse(on_start.body[0].value).startswith(
+        "await self._strategy_host.on_start("
+    )
+    assert isinstance(on_start.body[2], ast.Assign)
+    assert ast.unparse(on_start.body[2].targets[0]) == (
+        "self.stats.on_start_called"
+    )
+    assert _calls(on_start.body[3], "info")
+    assert _calls(on_start.body[4], "_execute_signals")
+
+    account_event = methods["_process_account_event"]
+    signals_index = next(
+        index
+        for index, statement in enumerate(account_event.body)
+        if isinstance(statement, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "signals"
+            for target in statement.targets
+        )
+    )
+    assert signals_index > 0
+    assert "save_account_event" in ast.unparse(
+        ast.Module(body=account_event.body[:signals_index], type_ignores=[])
+    )
+    assert _is_none_return(account_event.body[signals_index + 1], "signals")
+    assert _calls(
+        account_event.body[signals_index + 2],
+        "_execute_signals",
+    )
+
+    snapshot = methods["_on_account_snapshot_synced"]
+    callback_index = next(
+        index
+        for index, statement in enumerate(snapshot.body)
+        if isinstance(statement, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "callback_called"
+            for target in statement.targets
+        )
+    )
+    cache_prefix = ast.unparse(
+        ast.Module(body=snapshot.body[:callback_index], type_ignores=[])
+    )
+    assert "self._last_snapshots" in cache_prefix
+    assert "self._last_snapshot" in cache_prefix
+    callback_guard = snapshot.body[callback_index + 1]
+    assert isinstance(callback_guard, ast.If)
+    assert isinstance(callback_guard.test, ast.UnaryOp)
+    assert isinstance(callback_guard.test.op, ast.Not)
+    assert isinstance(callback_guard.test.operand, ast.Name)
+    assert callback_guard.test.operand.id == "callback_called"
+    assert len(callback_guard.body) == 1
+    assert isinstance(callback_guard.body[0], ast.Return)
+    logging_suffix = ast.unparse(
+        ast.Module(body=snapshot.body[callback_index + 2 :], type_ignores=[])
+    )
+    assert "_last_account_snapshot_log_state" in logging_suffix
+    assert "_last_account_snapshot_log_ms" in logging_suffix
+
+    order_results = methods["_process_order_result_feedback"]
+    assert isinstance(order_results.body[0], ast.Assign)
+    assert ast.unparse(order_results.body[0].value).startswith(
+        "await self._strategy_host.on_order_results("
+    )
+    assert _is_none_return(order_results.body[1], "follow_up")
+    assert "follow_up_count" in ast.unparse(order_results.body[2])
+    assert _calls(order_results.body[3], "info")
+    assert _calls(order_results.body[3], "debug")
+
+    assert not any(
+        isinstance(node, ast.Attribute) and node.attr == "_strategy"
+        for method_name in (
+            "_call_on_start",
+            "_process_account_event",
+            "_on_account_snapshot_synced",
+            "_process_order_result_feedback",
+        )
+        for node in ast.walk(methods[method_name])
     )
 
 

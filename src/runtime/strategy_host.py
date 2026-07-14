@@ -24,11 +24,12 @@ class StrategyHost:
 
     async def on_start(
         self, snapshot: PlatformSnapshot
-    ) -> Sequence[TradeSignal]:
+    ) -> Sequence[TradeSignal] | None:
         handler = getattr(self._strategy, "on_start", None)
         if not callable(handler):
-            return ()
-        return await handler(snapshot) or ()
+            return None
+        signals = await handler(snapshot)
+        return () if signals is None else signals
 
     async def on_market_event(
         self, event: MarketEvent
@@ -49,17 +50,19 @@ class StrategyHost:
 
     async def on_account_event(
         self, event: AccountEvent
-    ) -> Sequence[TradeSignal]:
+    ) -> Sequence[TradeSignal] | None:
         handler = getattr(self._strategy, "on_account_event", None)
         if not callable(handler):
-            return ()
-        return await handler(event) or ()
+            return None
+        signals = await handler(event)
+        return () if signals is None else signals
 
-    async def on_account_snapshot(self, snapshot: PlatformSnapshot) -> None:
+    async def on_account_snapshot(self, snapshot: PlatformSnapshot) -> bool:
         handler = getattr(self._strategy, "on_account_snapshot", None)
         if not callable(handler):
-            return
+            return False
         await handler(snapshot)
+        return True
 
     async def on_order_results(
         self,
@@ -68,16 +71,17 @@ class StrategyHost:
         results: Sequence[ExchangeOrderResult],
         source: str,
         event_time_ms: int | None,
-    ) -> Sequence[TradeSignal]:
+    ) -> Sequence[TradeSignal] | None:
         handler = getattr(self._strategy, "on_order_results", None)
         if not callable(handler):
-            return ()
-        return await handler(
+            return None
+        signals = await handler(
             signal=signal,
             results=results,
             source=source,
             event_time_ms=event_time_ms,
-        ) or ()
+        )
+        return () if signals is None else signals
 
 
 __all__ = ["StrategyHost"]

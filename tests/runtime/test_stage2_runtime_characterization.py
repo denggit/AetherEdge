@@ -3,6 +3,7 @@ from __future__ import annotations
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -141,6 +142,83 @@ def _async_stage(calls: list[str], name: str, result=None):
         return result
 
     return stage
+
+
+@pytest.mark.asyncio
+async def test_missing_on_start_is_a_runner_noop(caplog) -> None:
+    host = SimpleNamespace(on_start=AsyncMock(return_value=None))
+    signal_service = SimpleNamespace(execute=AsyncMock())
+    runner = _runner(
+        services={
+            "strategy_host": host,
+            "signal_execution_service": signal_service,
+        }
+    )
+    snapshot = object()
+    caplog.set_level("INFO", logger=runner_module.logger.name)
+
+    await runner._call_on_start(snapshot)
+
+    host.on_start.assert_awaited_once_with(snapshot)
+    assert runner.stats.on_start_called is False
+    signal_service.execute.assert_not_awaited()
+    assert not any(
+        "Strategy on_start completed" in message
+        for message in caplog.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_called_on_start_with_no_signals_keeps_stage1_side_effects(
+    caplog,
+) -> None:
+    host = SimpleNamespace(on_start=AsyncMock(return_value=()))
+    signal_service = SimpleNamespace(execute=AsyncMock())
+    runner = _runner(
+        services={
+            "strategy_host": host,
+            "signal_execution_service": signal_service,
+        }
+    )
+    snapshot = object()
+    caplog.set_level("INFO", logger=runner_module.logger.name)
+
+    await runner._call_on_start(snapshot)
+
+    assert runner.stats.on_start_called is True
+    signal_service.execute.assert_awaited_once()
+    request = signal_service.execute.await_args.args[0]
+    assert request.signals == ()
+    assert request.source == "on_start"
+    assert request.event_time_ms is None
+    assert "Strategy on_start completed | signals=0" in caplog.messages
+
+
+@pytest.mark.asyncio
+async def test_on_start_exception_preserves_identity_and_stats(
+    caplog,
+) -> None:
+    expected = RuntimeError("on_start failed")
+    host = SimpleNamespace(on_start=AsyncMock(side_effect=expected))
+    signal_service = SimpleNamespace(execute=AsyncMock())
+    runner = _runner(
+        services={
+            "strategy_host": host,
+            "signal_execution_service": signal_service,
+        }
+    )
+    caplog.set_level("INFO", logger=runner_module.logger.name)
+
+    with pytest.raises(RuntimeError) as raised:
+        await runner._call_on_start(object())
+
+    assert raised.value is expected
+    assert runner.stats.on_start_called is False
+    signal_service.execute.assert_not_awaited()
+    assert not any(
+        "Strategy on_start completed" in message
+        for message in caplog.messages
+    )
 
 
 def _wire_startup_stages(monkeypatch, runner, calls, snapshots) -> None:
@@ -522,6 +600,183 @@ async def test_account_event_is_persisted_before_strategy_and_execution(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_missing_account_event_callback_still_persists_without_execution() -> None:
+    calls: list[str] = []
+
+    class Host:
+        async def on_account_event(self, event):
+            calls.append("strategy_host.on_account_event")
+            return None
+
+    signal_service = SimpleNamespace(execute=AsyncMock())
+    runner = _runner(
+        calls=calls,
+        services={
+            "strategy_host": Host(),
+            "signal_execution_service": signal_service,
+        },
+    )
+    event = AccountEvent(
+        exchange=ExchangeName.OKX,
+        event_type=AccountEventType.ORDER,
+        event_time_ms=9013,
+    )
+
+    await runner.process_account_event(event)
+
+    assert runner.stats.account_events_seen == 1
+    assert runner.context.state_store.saved_account_events == [event]
+    assert calls == [
+        "state_store.save_account_event",
+        "strategy_host.on_account_event",
+    ]
+    signal_service.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_called_account_event_with_no_signals_executes_empty_batch_last() -> None:
+    calls: list[str] = []
+
+    class Host:
+        async def on_account_event(self, event):
+            calls.append("strategy_host.on_account_event")
+            return ()
+
+    class SignalService:
+        def __init__(self) -> None:
+            self.requests = []
+
+        async def execute(self, request, plan) -> None:
+            calls.append("signal_execution_service.execute")
+            self.requests.append(request)
+
+    signal_service = SignalService()
+    runner = _runner(
+        calls=calls,
+        services={
+            "strategy_host": Host(),
+            "signal_execution_service": signal_service,
+        },
+    )
+    event = AccountEvent(
+        exchange=ExchangeName.OKX,
+        event_type=AccountEventType.ORDER,
+        event_time_ms=9014,
+    )
+
+    await runner.process_account_event(event)
+
+    assert calls == [
+        "state_store.save_account_event",
+        "strategy_host.on_account_event",
+        "signal_execution_service.execute",
+    ]
+    assert signal_service.requests[0].signals == ()
+    assert signal_service.requests[0].source == "account:okx"
+    assert signal_service.requests[0].event_time_ms == event.event_time_ms
+
+
+@pytest.mark.asyncio
+async def test_account_event_exception_propagates_after_persistence() -> None:
+    calls: list[str] = []
+    expected = RuntimeError("account callback failed")
+
+    class Host:
+        async def on_account_event(self, event):
+            calls.append("strategy_host.on_account_event")
+            raise expected
+
+    signal_service = SimpleNamespace(execute=AsyncMock())
+    runner = _runner(
+        calls=calls,
+        services={
+            "strategy_host": Host(),
+            "signal_execution_service": signal_service,
+        },
+    )
+    event = AccountEvent(
+        exchange=ExchangeName.OKX,
+        event_type=AccountEventType.ORDER,
+        event_time_ms=9015,
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        await runner.process_account_event(event)
+
+    assert raised.value is expected
+    assert runner.context.state_store.saved_account_events == [event]
+    assert calls == [
+        "state_store.save_account_event",
+        "strategy_host.on_account_event",
+    ]
+    signal_service.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_missing_account_snapshot_callback_updates_cache_without_logs(
+    caplog,
+) -> None:
+    host = SimpleNamespace(on_account_snapshot=AsyncMock(return_value=False))
+    runner = _runner(services={"strategy_host": host})
+    snapshot = SimpleNamespace(
+        balance=SimpleNamespace(
+            exchange=ExchangeName.OKX,
+            available=Decimal("900"),
+            total=Decimal("1000"),
+        )
+    )
+    caplog.set_level("DEBUG", logger=runner_module.logger.name)
+
+    await runner._on_account_snapshot_synced(snapshot, "account_periodic")
+
+    assert runner._last_snapshots == (snapshot,)
+    assert runner._last_snapshot is snapshot
+    assert runner._last_account_snapshot_log_state == {}
+    assert runner._last_account_snapshot_log_ms == {}
+    assert not any(
+        "Strategy account snapshot refreshed" in message
+        or "Account snapshot unchanged" in message
+        for message in caplog.messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_account_snapshot_exception_keeps_cache_and_skips_logs(
+    caplog,
+) -> None:
+    expected = RuntimeError("snapshot callback failed")
+    host = SimpleNamespace(
+        on_account_snapshot=AsyncMock(side_effect=expected)
+    )
+    runner = _runner(services={"strategy_host": host})
+    snapshot = SimpleNamespace(
+        balance=SimpleNamespace(
+            exchange=ExchangeName.OKX,
+            available=Decimal("900"),
+            total=Decimal("1000"),
+        )
+    )
+    caplog.set_level("DEBUG", logger=runner_module.logger.name)
+
+    with pytest.raises(RuntimeError) as raised:
+        await runner._on_account_snapshot_synced(
+            snapshot,
+            "account_periodic",
+        )
+
+    assert raised.value is expected
+    assert runner._last_snapshots == (snapshot,)
+    assert runner._last_snapshot is snapshot
+    assert runner._last_account_snapshot_log_state == {}
+    assert runner._last_account_snapshot_log_ms == {}
+    assert not any(
+        "Strategy account snapshot refreshed" in message
+        or "Account snapshot unchanged" in message
+        for message in caplog.messages
+    )
+
+
+@pytest.mark.asyncio
 async def test_signal_execution_feedback_order_is_characterized(monkeypatch) -> None:
     calls: list[str] = []
     strategy = FakeStrategy(calls)
@@ -626,7 +881,7 @@ async def test_signal_execution_feedback_order_is_characterized(monkeypatch) -> 
 
 
 @pytest.mark.asyncio
-async def test_injected_strategy_host_owns_order_result_feedback() -> None:
+async def test_injected_strategy_host_owns_order_result_feedback(caplog) -> None:
     calls: list[str] = []
     strategy = FakeStrategy(calls)
 
@@ -661,6 +916,7 @@ async def test_injected_strategy_host_owns_order_result_feedback() -> None:
         calls=calls,
         services={"strategy_host": InjectedStrategyHost()},
     )
+    caplog.set_level("INFO", logger=runner_module.logger.name)
 
     returned = await runner._process_order_result_feedback(
         signal=signal,
@@ -674,6 +930,84 @@ async def test_injected_strategy_host_owns_order_result_feedback() -> None:
     assert received[0]["results"] is results
     assert received[0]["source"] == "root_source"
     assert received[0]["event_time_ms"] == 4321
+    assert any(
+        "Strategy order results processed" in message
+        and "follow_up_signals=1" in message
+        for message in caplog.messages
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("returned", "expects_debug_log"),
+    [(None, False), ((), True)],
+)
+async def test_order_result_feedback_distinguishes_missing_and_called_empty(
+    caplog,
+    returned,
+    expects_debug_log,
+) -> None:
+    host = SimpleNamespace(on_order_results=AsyncMock(return_value=returned))
+    runner = _runner(services={"strategy_host": host})
+    signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.CLOSE_LONG,
+        quantity=Decimal("0.1"),
+    )
+    results = (
+        ExchangeOrderResult(exchange=ExchangeName.OKX, ok=True),
+    )
+    caplog.set_level("DEBUG", logger=runner_module.logger.name)
+
+    follow_up = await runner._process_order_result_feedback(
+        signal=signal,
+        results=results,
+        source="root_source",
+        event_time_ms=4322,
+    )
+
+    assert follow_up == ()
+    processed_logs = [
+        message
+        for message in caplog.messages
+        if "Strategy order results processed" in message
+    ]
+    if expects_debug_log:
+        assert len(processed_logs) == 1
+        assert "follow_up_signals=0" in processed_logs[0]
+    else:
+        assert processed_logs == []
+
+
+@pytest.mark.asyncio
+async def test_order_result_feedback_exception_propagates_without_logs(
+    caplog,
+) -> None:
+    expected = RuntimeError("order feedback failed")
+    host = SimpleNamespace(
+        on_order_results=AsyncMock(side_effect=expected)
+    )
+    runner = _runner(services={"strategy_host": host})
+    signal = TradeSignal(
+        symbol="ETH-USDT-PERP",
+        action=SignalAction.CLOSE_LONG,
+        quantity=Decimal("0.1"),
+    )
+    caplog.set_level("DEBUG", logger=runner_module.logger.name)
+
+    with pytest.raises(RuntimeError) as raised:
+        await runner._process_order_result_feedback(
+            signal=signal,
+            results=(),
+            source="root_source",
+            event_time_ms=4323,
+        )
+
+    assert raised.value is expected
+    assert not any(
+        "Strategy order results processed" in message
+        for message in caplog.messages
+    )
 
 
 @pytest.mark.asyncio

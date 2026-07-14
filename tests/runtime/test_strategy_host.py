@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -110,13 +111,23 @@ async def test_on_start_passes_same_snapshot_and_preserves_signals() -> None:
 
 
 @pytest.mark.asyncio
-async def test_on_start_missing_or_none_returns_empty_sequence() -> None:
+async def test_on_start_distinguishes_missing_none_and_empty_sequence() -> None:
+    empty_signals = []
+
     class ReturnsNone:
         async def on_start(self, snapshot):
             return None
 
-    assert await StrategyHost(object()).on_start(object()) == ()
+    class ReturnsEmptyList:
+        async def on_start(self, snapshot):
+            return empty_signals
+
+    assert await StrategyHost(object()).on_start(object()) is None
     assert await StrategyHost(ReturnsNone()).on_start(object()) == ()
+    assert (
+        await StrategyHost(ReturnsEmptyList()).on_start(object())
+        is empty_signals
+    )
 
 
 @pytest.mark.asyncio
@@ -175,7 +186,7 @@ async def test_market_callback_preserves_signal_elements_and_order() -> None:
 
 
 @pytest.mark.asyncio
-async def test_account_event_passes_same_event_and_missing_callback_is_empty() -> None:
+async def test_account_event_distinguishes_missing_and_called_none() -> None:
     event = AccountEvent(
         exchange=ExchangeName.OKX,
         event_type=AccountEventType.ORDER,
@@ -190,11 +201,11 @@ async def test_account_event_passes_same_event_and_missing_callback_is_empty() -
 
     assert await StrategyHost(Strategy()).on_account_event(event) == ()
     assert received == [event]
-    assert await StrategyHost(object()).on_account_event(event) == ()
+    assert await StrategyHost(object()).on_account_event(event) is None
 
 
 @pytest.mark.asyncio
-async def test_account_snapshot_passes_same_snapshot_and_missing_is_quiet() -> None:
+async def test_account_snapshot_reports_callback_presence_and_preserves_identity() -> None:
     snapshot = object()
     received = []
 
@@ -202,19 +213,67 @@ async def test_account_snapshot_passes_same_snapshot_and_missing_is_quiet() -> N
         async def on_account_snapshot(self, value):
             received.append(value)
 
-    assert await StrategyHost(Strategy()).on_account_snapshot(snapshot) is None
+    assert await StrategyHost(Strategy()).on_account_snapshot(snapshot) is True
     assert received == [snapshot]
-    assert await StrategyHost(object()).on_account_snapshot(snapshot) is None
+    assert await StrategyHost(object()).on_account_snapshot(snapshot) is False
 
 
 @pytest.mark.asyncio
-async def test_strategy_callback_exception_is_not_swallowed() -> None:
+async def test_optional_strategy_callback_exceptions_are_not_swallowed() -> None:
+    failures = {
+        name: RuntimeError(f"{name} failed")
+        for name in (
+            "on_start",
+            "on_account_event",
+            "on_account_snapshot",
+            "on_order_results",
+        )
+    }
+
     class Strategy:
         async def on_start(self, snapshot):
-            raise RuntimeError("strategy failed")
+            raise failures["on_start"]
 
-    with pytest.raises(RuntimeError, match="strategy failed"):
+        async def on_account_event(self, event):
+            raise failures["on_account_event"]
+
+        async def on_account_snapshot(self, snapshot):
+            raise failures["on_account_snapshot"]
+
+        async def on_order_results(self, **kwargs):
+            raise failures["on_order_results"]
+
+    host = StrategyHost(Strategy())
+    invocations = {
+        "on_start": lambda: host.on_start(object()),
+        "on_account_event": lambda: host.on_account_event(object()),
+        "on_account_snapshot": lambda: host.on_account_snapshot(object()),
+        "on_order_results": lambda: host.on_order_results(
+            signal=_signals()[0],
+            results=(),
+            source="test",
+            event_time_ms=None,
+        ),
+    }
+
+    for callback, invoke in invocations.items():
+        with pytest.raises(RuntimeError) as raised:
+            await invoke()
+        assert raised.value is failures[callback]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_error_is_not_swallowed() -> None:
+    expected = asyncio.CancelledError()
+
+    class Strategy:
+        async def on_start(self, snapshot):
+            raise expected
+
+    with pytest.raises(asyncio.CancelledError) as raised:
         await StrategyHost(Strategy()).on_start(object())
+
+    assert raised.value is expected
 
 
 @pytest.mark.asyncio
@@ -267,7 +326,7 @@ async def test_order_results_preserves_arguments_and_follow_up_sequence(
 
 
 @pytest.mark.asyncio
-async def test_order_results_missing_or_none_returns_empty_sequence() -> None:
+async def test_order_results_distinguishes_missing_and_called_none() -> None:
     class ReturnsNone:
         async def on_order_results(self, **kwargs):
             return None
@@ -279,7 +338,7 @@ async def test_order_results_missing_or_none_returns_empty_sequence() -> None:
         "event_time_ms": None,
     }
 
-    assert await StrategyHost(object()).on_order_results(**kwargs) == ()
+    assert await StrategyHost(object()).on_order_results(**kwargs) is None
     assert await StrategyHost(ReturnsNone()).on_order_results(**kwargs) == ()
 
 

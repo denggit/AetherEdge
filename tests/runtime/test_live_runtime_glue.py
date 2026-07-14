@@ -19,7 +19,7 @@ from src.market_data.events import MarketFeatureEvent, MarketFeatureEventType
 from src.market_data.models import MarketDataSet, RangeBar, RangeBarAggregate, TimeRange, WarmupRequest, WarmupResult
 from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
 from src.market_data.range_repair.store import SqliteRangeRepairJournalStore
-from src.market_data.storage import SqliteRangeBarStore
+from src.market_data.storage import SqliteKlineStore, SqliteRangeBarStore
 from src.market_data.storage import SqliteTradeStore
 from src.market_data.warmup.current_rangebar import CurrentRangeBarWarmupResult
 from src.platform import Balance, ExchangeName, InstrumentRule, LeverageInfo, MarginMode, Order, OrderSide, OrderStatus, Position, PositionMode, PositionSide
@@ -433,6 +433,10 @@ def _runner(strategy, *, data=None, services=None, dry_run=False, data_streams=(
     resolved_services.setdefault(
         "range_bar_store",
         SqliteRangeBarStore(runtime_root / "market-data.sqlite3"),
+    )
+    resolved_services.setdefault(
+        "kline_store",
+        SqliteKlineStore(runtime_root / "market-data.sqlite3"),
     )
     resolved_services.setdefault(
         "range_checkpoint_store",
