@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = PROJECT_ROOT / "src"
@@ -104,6 +106,31 @@ def _calls(node: ast.AST, attribute: str) -> list[ast.Call]:
         and isinstance(child.func, ast.Attribute)
         and child.func.attr == attribute
     ]
+
+
+def _assert_acyclic(graph: dict[str, set[str]]) -> None:
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(node: str, path: tuple[str, ...]) -> None:
+        if node in visiting:
+            cycle_start = path.index(node)
+            cycle = path[cycle_start:] + (node,)
+            raise AssertionError(
+                "runtime generic dependency cycle: "
+                + " -> ".join(cycle)
+            )
+        if node in visited:
+            return
+
+        visiting.add(node)
+        for dependency in sorted(graph[node]):
+            visit(dependency, path + (node,))
+        visiting.remove(node)
+        visited.add(node)
+
+    for node in sorted(graph):
+        visit(node, ())
 
 
 def test_final_runner_delegate_methods_remain_thin_and_single_call() -> None:
@@ -270,9 +297,10 @@ def test_final_service_injection_keys_and_fields_are_frozen() -> None:
 
 
 def test_generic_runtime_dependency_direction_is_acyclic_and_adapter_free() -> None:
-    generic_modules = {
-        f"src.runtime.{path.stem}" for path in GENERIC_MODULES
+    module_names = {
+        path: f"src.runtime.{path.stem}" for path in GENERIC_MODULES
     }
+    generic_module_names = set(module_names.values())
     coordinator_modules = {
         "src.runtime.shutdown_coordinator",
         "src.runtime.startup_phase_coordinator",
@@ -297,11 +325,40 @@ def test_generic_runtime_dependency_direction_is_acyclic_and_adapter_free() -> N
             )
             for module in imports
         )
-        own = f"src.runtime.{path.stem}"
-        if own in coordinator_modules:
-            assert (imports & coordinator_modules) <= {own}
+        own = module_names[path]
+        assert imports.isdisjoint(coordinator_modules)
         assert own not in imports
-        assert imports <= (imports | generic_modules)
+
+    graph = {
+        module_names[path]: _imports(path) & generic_module_names
+        for path in GENERIC_MODULES
+    }
+    _assert_acyclic(graph)
+
+
+def test_generic_dependency_cycle_detector_rejects_cycles() -> None:
+    _assert_acyclic(
+        {
+            "a": {"b"},
+            "b": {"c"},
+            "c": set(),
+        }
+    )
+
+    cyclic_graphs = (
+        ({"a": {"b"}, "b": {"a"}}, "a -> b -> a"),
+        (
+            {"a": {"b"}, "b": {"c"}, "c": {"a"}},
+            "a -> b -> c -> a",
+        ),
+        ({"a": {"a"}}, "a -> a"),
+    )
+    for graph, cycle in cyclic_graphs:
+        with pytest.raises(
+            AssertionError,
+            match=f"runtime generic dependency cycle: {cycle}",
+        ):
+            _assert_acyclic(graph)
 
 
 def test_strategy_callback_receivers_remain_explicit_and_not_strategy_direct() -> None:
