@@ -25,6 +25,9 @@ from src.order_management.reconciliation.models import (
 )
 from src.runtime.recovery.models import RecoveryReport
 from src.runtime.recovery_coordinator import RuntimeRecoveryCoordinator
+from src.runtime.reconciliation_coordinator import (
+    RuntimeReconciliationCoordinator,
+)
 from src.runtime.runner import (
     LiveRuntimeError,
     LiveRuntimeRunner,
@@ -147,6 +150,7 @@ def _snapshot(*, with_lf_stop: bool) -> PlatformSnapshot:
 def _runner(strategy: _Strategy) -> LiveRuntimeRunner:
     runner = LiveRuntimeRunner.__new__(LiveRuntimeRunner)
     runner._recovery_coordinator = RuntimeRecoveryCoordinator()
+    runner._reconciliation_coordinator = RuntimeReconciliationCoordinator()
     runner.app_config = AppConfig(
         symbol=SYMBOL,
         exchanges=(ExchangeName.OKX,),

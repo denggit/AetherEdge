@@ -87,6 +87,10 @@ from src.runtime.recovery_coordinator import (
     RuntimeRecoveryCoordinator,
     RuntimeRecoveryPlan,
 )
+from src.runtime.reconciliation_coordinator import (
+    RuntimeReconciliationCoordinator,
+    RuntimeReconciliationPlan,
+)
 from src.runtime.shutdown_coordinator import RuntimeShutdownCoordinator
 from src.runtime.startup_phase_coordinator import (
     RuntimeStartupPhaseCoordinator,
@@ -295,6 +299,17 @@ class LiveRuntimeRunner:
         )
         self.services["recovery_coordinator"] = self._recovery_coordinator
         self._reconciliation_service = self.services.get("reconciliation_service", "__default__")
+        injected_reconciliation_coordinator = self.services.get(
+            "reconciliation_coordinator"
+        )
+        self._reconciliation_coordinator = (
+            injected_reconciliation_coordinator
+            if injected_reconciliation_coordinator is not None
+            else RuntimeReconciliationCoordinator()
+        )
+        self.services["reconciliation_coordinator"] = (
+            self._reconciliation_coordinator
+        )
         self._range_bar_store = self.services.get("range_bar_store")
         self._range_bar_builder = self.services.get("range_bar_builder")
         self._range_bar_aggregator = self.services.get("range_bar_aggregator")
@@ -4418,24 +4433,35 @@ class LiveRuntimeRunner:
         return self._reconciliation_service
 
     async def _run_reconciliation(self, snapshots: tuple[PlatformSnapshot, ...]) -> None:
-        """Run startup state reconciliation: compare exchange truth against
-        local PositionPlan / LegPlan / order journal state and repair stale
-        artifacts before producers or sync tasks start.
+        await self._reconciliation_coordinator.execute(
+            snapshots,
+            RuntimeReconciliationPlan(
+                resolve_service=self._get_reconciliation_service,
+                validate_snapshots=(
+                    self._validate_startup_reconciliation_snapshots
+                ),
+                begin_reconciliation=self._log_startup_reconciliation_begin,
+                apply_legacy_adoptions=(
+                    self._apply_startup_legacy_stop_adoptions
+                ),
+                invoke_service=(
+                    self._invoke_startup_reconciliation_service
+                ),
+                handle_report=self._handle_startup_reconciliation_report,
+            ),
+        )
 
-        CRITICAL: All exchange snapshots MUST be present. Reconciling with
-        only one exchange can miss follower positions on the other exchange
-        and wrongly close active PositionPlans (master/follower safety
-        violation).
-        """
-        service = self._get_reconciliation_service()
-        if service is None:
-            return
-
+    def _validate_startup_reconciliation_snapshots(
+        self,
+        snapshots: tuple[PlatformSnapshot, ...],
+    ) -> None:
         expected = len(self.app_config.exchanges)
         if len(snapshots) != expected:
             snapshot_exchanges = sorted(
-                s.leverage.exchange.value if hasattr(s, "leverage") else str(s)
-                for s in snapshots
+                snapshot.leverage.exchange.value
+                if hasattr(snapshot, "leverage")
+                else str(snapshot)
+                for snapshot in snapshots
             )
             raise LiveRuntimeError(
                 f"startup reconciliation missing exchange snapshots: "
@@ -4444,12 +4470,26 @@ class LiveRuntimeRunner:
                 f"got {len(snapshots)} ({', '.join(snapshot_exchanges) if snapshot_exchanges else 'none'})"
             )
 
+    def _log_startup_reconciliation_begin(
+        self,
+        snapshots: tuple[PlatformSnapshot, ...],
+    ) -> None:
         exchange_names = ", ".join(
-            s.leverage.exchange.value if hasattr(s, "leverage") else "?"
-            for s in snapshots
+            snapshot.leverage.exchange.value
+            if hasattr(snapshot, "leverage")
+            else "?"
+            for snapshot in snapshots
         )
-        logger.info("Startup reconciliation starting | exchanges=%s count=%s", exchange_names, len(snapshots))
+        logger.info(
+            "Startup reconciliation starting | exchanges=%s count=%s",
+            exchange_names,
+            len(snapshots),
+        )
 
+    def _apply_startup_legacy_stop_adoptions(
+        self,
+        service: object,
+    ) -> None:
         # ── Inject legacy stop adoptions from strategy recovery ───────
         legacy_adoptions: list[dict[str, Any]] = getattr(
             self.context.strategy, "_legacy_adoptions", []
@@ -4489,7 +4529,10 @@ class LiveRuntimeRunner:
                 # Apply legacy adoption directly to the store before
                 # reconciliation runs (so reconciliation sees the
                 # corrected state).
-                service._apply_actions([action], self.app_config.symbol)
+                service._apply_actions(  # type: ignore[attr-defined]
+                    [action],
+                    self.app_config.symbol,
+                )
                 logger.warning(
                     "Startup recovery: legacy stop adopted | "
                     "position_id=%s exchange=%s stop_order_id=%s "
@@ -4502,7 +4545,16 @@ class LiveRuntimeRunner:
             # Clear the list so it is not re-applied on subsequent calls.
             self.context.strategy._legacy_adoptions = []
 
-        report = await service.reconcile_and_apply(snapshots)
+    async def _invoke_startup_reconciliation_service(
+        self,
+        service: object,
+        snapshots: tuple[PlatformSnapshot, ...],
+    ):
+        return await service.reconcile_and_apply(  # type: ignore[attr-defined]
+            snapshots
+        )
+
+    def _handle_startup_reconciliation_report(self, report) -> None:
         if report.stale_plans_closed > 0:
             logger.warning(
                 "Startup reconciliation closed %s stale position plan(s) | "
