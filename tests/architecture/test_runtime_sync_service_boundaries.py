@@ -376,15 +376,20 @@ def test_runner_retains_sync_context_callbacks_and_service_call_paths() -> None:
         "_get_order_sync_service",
     } <= start_attributes
 
-    execute_signals = methods["_execute_signals"]
+    signal_sync_methods = (
+        methods["_run_post_submit_order_sync"],
+        methods["_run_post_order_account_sync"],
+    )
     execute_attributes = {
         node.attr
-        for node in ast.walk(execute_signals)
+        for method in signal_sync_methods
+        for node in ast.walk(method)
         if isinstance(node, ast.Attribute)
     }
     execute_strings = {
         node.value
-        for node in ast.walk(execute_signals)
+        for method in signal_sync_methods
+        for node in ast.walk(method)
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
     }
     assert {

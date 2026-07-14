@@ -258,17 +258,19 @@ def test_runner_keeps_sync_task_selection_and_business_methods() -> None:
 
 
 def test_post_submit_and_post_order_sync_remain_in_signal_execution() -> None:
-    execute_signals = _methods(_class(RUNNER, "LiveRuntimeRunner"))[
-        "_execute_signals"
-    ]
+    methods = _methods(_class(RUNNER, "LiveRuntimeRunner"))
+    post_submit = methods["_run_post_submit_order_sync"]
+    post_order = methods["_run_post_order_account_sync"]
     attributes = {
         node.attr
-        for node in ast.walk(execute_signals)
+        for method in (post_submit, post_order)
+        for node in ast.walk(method)
         if isinstance(node, ast.Attribute)
     }
     strings = {
         node.value
-        for node in ast.walk(execute_signals)
+        for method in (post_submit, post_order)
+        for node in ast.walk(method)
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
     }
 

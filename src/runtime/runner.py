@@ -92,6 +92,11 @@ from src.runtime.reconciliation_coordinator import (
     RuntimeReconciliationPlan,
 )
 from src.runtime.shutdown_coordinator import RuntimeShutdownCoordinator
+from src.runtime.signal_execution_service import (
+    RuntimeSignalExecutionPlan,
+    RuntimeSignalExecutionRequest,
+    RuntimeSignalExecutionService,
+)
 from src.runtime.startup_phase_coordinator import (
     RuntimeStartupPhaseCoordinator,
     RuntimeStartupPhasePlan,
@@ -286,6 +291,17 @@ class LiveRuntimeRunner:
             self._sync_service_registry,
             "order_service",
             None,
+        )
+        injected_signal_execution_service = self.services.get(
+            "signal_execution_service"
+        )
+        self._signal_execution_service = (
+            injected_signal_execution_service
+            if injected_signal_execution_service is not None
+            else RuntimeSignalExecutionService()
+        )
+        self.services["signal_execution_service"] = (
+            self._signal_execution_service
         )
         self._request_sync_throttle = self.services.get("request_sync_throttle") or RequestThrottle(min_interval_seconds=0.25)
         self._recovery_service = self.services.get("recovery_service", "__default__")
@@ -3717,86 +3733,208 @@ class LiveRuntimeRunner:
         metadata: Mapping[str, Any] | None = None,
         feedback_depth: int = 0,
     ) -> None:
-        for signal in signals:
-            self.stats.signals_seen += 1
-            if self.app_config.dry_run:
-                self.stats.dry_run_actions += 1
-                logger.info(
-                    "Dry-run signal skipped | action=%s source=%s event_time_ms=%s",
-                    signal.action.value,
-                    source,
-                    event_time_ms,
-                )
-                continue
-            # ── Entry guard: block new OPEN signals while account config
-            #     is not verified due to existing exposure. ──
-            _EXPOSURE_INCREASING_ACTIONS = {
-                SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT,
-            }
-            if signal.action in _EXPOSURE_INCREASING_ACTIONS:
-                if self._has_account_config_entry_block():
-                    logger.warning(
-                        "Blocking new entry — account config not verified due to existing exposure | action=%s source=%s",
-                        signal.action.value,
-                        source,
-                    )
-                    self.context.alerts.emit(
-                        AppAlert(
-                            subject="AetherEdge entry blocked: account config unverified",
-                            severity="warning",
-                            content=(
-                                f"action={signal.action.value}\n"
-                                f"source={source}\n"
-                                f"reason=account_config_existing_exposure\n"
-                            ),
-                        )
-                    )
-                    continue
-            # ── Entry guard: block new OPEN signals while any follower close
-            #     is still unresolved after master close. ──
-            if signal.action in {SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT}:
-                purpose = str(signal.metadata.get("execution_purpose", "") if signal.metadata else "").strip().lower()
-                if purpose not in {"follower_recovery_topup"} and self._has_unresolved_follower_close():
-                    logger.warning(
-                        "Blocking new entry — unresolved follower close after master close detected | action=%s source=%s",
-                        signal.action.value,
-                        source,
-                    )
-                    self.context.alerts.emit(
-                        AppAlert(
-                            subject="AetherEdge entry blocked due to unresolved follower close",
-                            severity="warning",
-                            content=(
-                                f"action={signal.action.value}\n"
-                                f"source={source}\n"
-                                f"reason=unresolved_follower_close_after_master_close\n"
-                            ),
-                        )
-                    )
-                    continue
+        await self._signal_execution_service.execute(
+            RuntimeSignalExecutionRequest(
+                signals=signals,
+                source=source,
+                event_time_ms=event_time_ms,
+                metadata=metadata,
+                feedback_depth=feedback_depth,
+            ),
+            RuntimeSignalExecutionPlan(
+                prepare_signal=self._prepare_signal_execution,
+                create_intent=self._create_signal_execution_intent,
+                execute_intent=self._execute_signal_execution_intent,
+                post_submit_sync=self._run_post_submit_order_sync,
+                handle_results=self._handle_signal_execution_results,
+                post_order_sync=self._run_post_order_account_sync,
+                process_feedback=self._process_signal_execution_feedback,
+                build_feedback_request=self._build_signal_feedback_request,
+            ),
+        )
+
+    def _prepare_signal_execution(
+        self,
+        signal: TradeSignal,
+        request: RuntimeSignalExecutionRequest,
+    ) -> bool:
+        self.stats.signals_seen += 1
+        if self.app_config.dry_run:
+            self.stats.dry_run_actions += 1
             logger.info(
-                "Executing signal | action=%s source=%s event_time_ms=%s",
+                "Dry-run signal skipped | action=%s source=%s event_time_ms=%s",
                 signal.action.value,
-                source,
-                event_time_ms,
+                request.source,
+                request.event_time_ms,
             )
-            intent = self._intent_factory.create(signal, source=source, event_time_ms=event_time_ms, metadata=metadata)
-            results = await self._get_order_coordinator().execute(intent)
-            if self.requirements.order_state.post_submit_sync_enabled:
-                logger.info("Post-submit order sync started | action=%s source=%s", signal.action.value, source)
-                await self._get_order_sync_service().sync_once(sync_type="post_submit", priority=True)
-            self._record_order_results(results)
-            self._save_order_results(signal, results)
-            self._check_follower_close_failure(signal, results)
-            if self.requirements.account_state.post_order_sync_enabled and signal.action in {SignalAction.OPEN_LONG, SignalAction.OPEN_SHORT, SignalAction.CLOSE_LONG, SignalAction.CLOSE_SHORT}:
-                await self._get_account_sync_service().sync_once(sync_type="post_order_account", priority=True)
-            follow_up = await self._process_order_result_feedback(signal=signal, results=results, source=source, event_time_ms=event_time_ms)
-            if follow_up:
-                if feedback_depth >= 5:
-                    logger.error("Order result feedback depth exceeded | action=%s source=%s", signal.action.value, source)
-                    self.context.alerts.emit(AppAlert(subject="AetherEdge order feedback recursion blocked", content=f"action={signal.action.value} source={source}", severity="error"))
-                    continue
-                await self._execute_signals(follow_up, source="order_result_feedback", event_time_ms=event_time_ms, metadata={"parent_source": source}, feedback_depth=feedback_depth + 1)
+            return False
+        # ── Entry guard: block new OPEN signals while account config
+        #     is not verified due to existing exposure. ──
+        exposure_increasing_actions = {
+            SignalAction.OPEN_LONG,
+            SignalAction.OPEN_SHORT,
+        }
+        if signal.action in exposure_increasing_actions:
+            if self._has_account_config_entry_block():
+                logger.warning(
+                    "Blocking new entry — account config not verified due to existing exposure | action=%s source=%s",
+                    signal.action.value,
+                    request.source,
+                )
+                self.context.alerts.emit(
+                    AppAlert(
+                        subject="AetherEdge entry blocked: account config unverified",
+                        severity="warning",
+                        content=(
+                            f"action={signal.action.value}\n"
+                            f"source={request.source}\n"
+                            f"reason=account_config_existing_exposure\n"
+                        ),
+                    )
+                )
+                return False
+        # ── Entry guard: block new OPEN signals while any follower close
+        #     is still unresolved after master close. ──
+        if signal.action in {
+            SignalAction.OPEN_LONG,
+            SignalAction.OPEN_SHORT,
+        }:
+            purpose = str(
+                signal.metadata.get("execution_purpose", "")
+                if signal.metadata
+                else ""
+            ).strip().lower()
+            if (
+                purpose not in {"follower_recovery_topup"}
+                and self._has_unresolved_follower_close()
+            ):
+                logger.warning(
+                    "Blocking new entry — unresolved follower close after master close detected | action=%s source=%s",
+                    signal.action.value,
+                    request.source,
+                )
+                self.context.alerts.emit(
+                    AppAlert(
+                        subject="AetherEdge entry blocked due to unresolved follower close",
+                        severity="warning",
+                        content=(
+                            f"action={signal.action.value}\n"
+                            f"source={request.source}\n"
+                            f"reason=unresolved_follower_close_after_master_close\n"
+                        ),
+                    )
+                )
+                return False
+        logger.info(
+            "Executing signal | action=%s source=%s event_time_ms=%s",
+            signal.action.value,
+            request.source,
+            request.event_time_ms,
+        )
+        return True
+
+    def _create_signal_execution_intent(
+        self,
+        signal: TradeSignal,
+        request: RuntimeSignalExecutionRequest,
+    ):
+        return self._intent_factory.create(
+            signal,
+            source=request.source,
+            event_time_ms=request.event_time_ms,
+            metadata=request.metadata,
+        )
+
+    async def _execute_signal_execution_intent(self, intent):
+        return await self._get_order_coordinator().execute(intent)
+
+    async def _run_post_submit_order_sync(
+        self,
+        signal: TradeSignal,
+        request: RuntimeSignalExecutionRequest,
+    ) -> None:
+        if self.requirements.order_state.post_submit_sync_enabled:
+            logger.info(
+                "Post-submit order sync started | action=%s source=%s",
+                signal.action.value,
+                request.source,
+            )
+            await self._get_order_sync_service().sync_once(
+                sync_type="post_submit",
+                priority=True,
+            )
+
+    def _handle_signal_execution_results(
+        self,
+        signal: TradeSignal,
+        results: Sequence[ExchangeOrderResult],
+    ) -> None:
+        self._record_order_results(results)
+        self._save_order_results(signal, results)
+        self._check_follower_close_failure(signal, results)
+
+    async def _run_post_order_account_sync(
+        self,
+        signal: TradeSignal,
+        request: RuntimeSignalExecutionRequest,
+    ) -> None:
+        if (
+            self.requirements.account_state.post_order_sync_enabled
+            and signal.action
+            in {
+                SignalAction.OPEN_LONG,
+                SignalAction.OPEN_SHORT,
+                SignalAction.CLOSE_LONG,
+                SignalAction.CLOSE_SHORT,
+            }
+        ):
+            await self._get_account_sync_service().sync_once(
+                sync_type="post_order_account",
+                priority=True,
+            )
+
+    async def _process_signal_execution_feedback(
+        self,
+        signal: TradeSignal,
+        results: Sequence[ExchangeOrderResult],
+        request: RuntimeSignalExecutionRequest,
+    ):
+        return await self._process_order_result_feedback(
+            signal=signal,
+            results=results,
+            source=request.source,
+            event_time_ms=request.event_time_ms,
+        )
+
+    def _build_signal_feedback_request(
+        self,
+        signal: TradeSignal,
+        follow_up: Sequence[TradeSignal],
+        request: RuntimeSignalExecutionRequest,
+    ) -> RuntimeSignalExecutionRequest | None:
+        if request.feedback_depth >= 5:
+            logger.error(
+                "Order result feedback depth exceeded | action=%s source=%s",
+                signal.action.value,
+                request.source,
+            )
+            self.context.alerts.emit(
+                AppAlert(
+                    subject="AetherEdge order feedback recursion blocked",
+                    content=(
+                        f"action={signal.action.value} source={request.source}"
+                    ),
+                    severity="error",
+                )
+            )
+            return None
+        return RuntimeSignalExecutionRequest(
+            signals=follow_up,
+            source="order_result_feedback",
+            event_time_ms=request.event_time_ms,
+            metadata={"parent_source": request.source},
+            feedback_depth=request.feedback_depth + 1,
+        )
 
     def _record_order_results(self, results: Sequence[ExchangeOrderResult]) -> None:
         self.stats.order_intents_created += 1

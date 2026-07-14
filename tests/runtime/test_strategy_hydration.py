@@ -8,6 +8,7 @@ from src.market_data.models import TimeRange
 from src.platform.data.models import MarketKline
 from src.platform.exchanges.models import ExchangeName
 from src.runtime.runner import LiveRuntimeRunner
+from src.runtime.signal_execution_service import RuntimeSignalExecutionService
 from strategies.eth_lf_portfolio_v8.strategy import Strategy
 
 
@@ -45,6 +46,7 @@ def _kline(open_time_ms: int) -> MarketKline:
 def test_closed_kline_warmup_replays_history_into_v9c_feature_buffer_before_first_live_bar():
     strategy = Strategy()
     runner = LiveRuntimeRunner.__new__(LiveRuntimeRunner)
+    runner._signal_execution_service = RuntimeSignalExecutionService()
     runner.context = SimpleNamespace(strategy=strategy)
     runner.app_config = SimpleNamespace(symbol="ETH-USDT-PERP")
     runner._closed_bar_interval = "4h"
