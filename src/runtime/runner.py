@@ -83,6 +83,10 @@ from src.runtime.range_micro_repair_supervisor import (
 from src.runtime.range_repair_bootstrap import RangeRepairBootstrapService
 from src.runtime.range_speed_history import RangeSpeedHistoryRefresher
 from src.runtime.requirements import StrategyRuntimeRequirements, resolve_strategy_runtime_requirements
+from src.runtime.recovery_coordinator import (
+    RuntimeRecoveryCoordinator,
+    RuntimeRecoveryPlan,
+)
 from src.runtime.shutdown_coordinator import RuntimeShutdownCoordinator
 from src.runtime.startup_phase_coordinator import (
     RuntimeStartupPhaseCoordinator,
@@ -281,6 +285,15 @@ class LiveRuntimeRunner:
         )
         self._request_sync_throttle = self.services.get("request_sync_throttle") or RequestThrottle(min_interval_seconds=0.25)
         self._recovery_service = self.services.get("recovery_service", "__default__")
+        injected_recovery_coordinator = self.services.get(
+            "recovery_coordinator"
+        )
+        self._recovery_coordinator = (
+            injected_recovery_coordinator
+            if injected_recovery_coordinator is not None
+            else RuntimeRecoveryCoordinator()
+        )
+        self.services["recovery_coordinator"] = self._recovery_coordinator
         self._reconciliation_service = self.services.get("reconciliation_service", "__default__")
         self._range_bar_store = self.services.get("range_bar_store")
         self._range_bar_builder = self.services.get("range_bar_builder")
@@ -1964,13 +1977,53 @@ class LiveRuntimeRunner:
             await self.process_market_feature(closed_kline_feature(row))
 
     async def _run_recovery(self) -> tuple[PlatformSnapshot, ...]:
-        service = self._get_recovery_service()
-        if service is None:
-            if self._last_snapshot is None:
-                raise LiveRuntimeError("startup snapshot is required before live trading")
-            return (self._last_snapshot,)
-        report = await service.recover(strategy=self.context.strategy)
+        return await self._recovery_coordinator.execute(
+            RuntimeRecoveryPlan(
+                resolve_service=self._get_recovery_service,
+                fallback_snapshots=self._recovery_fallback_snapshots,
+                invoke_service=self._invoke_recovery_service,
+                record_run=self._record_recovery_run,
+                validate_report=self._validate_runtime_recovery_report,
+                partition_signals=self._partition_recovery_signals,
+                capture_failure_counts=(
+                    self._capture_recovery_failure_counts
+                ),
+                execute_stop_signals=self._execute_recovery_stop_signals,
+                validate_stop_execution=(
+                    self._validate_recovery_stop_execution
+                ),
+                validate_post_execution_protection=(
+                    self._validate_post_execution_stop_protection
+                ),
+                execute_other_signals=self._execute_recovery_other_signals,
+                finalize_report=self._finalize_recovery_report,
+            )
+        )
+
+    def _recovery_fallback_snapshots(
+        self,
+    ) -> tuple[PlatformSnapshot, ...]:
+        if self._last_snapshot is None:
+            raise LiveRuntimeError(
+                "startup snapshot is required before live trading"
+            )
+        return (self._last_snapshot,)
+
+    async def _invoke_recovery_service(
+        self,
+        service: object,
+    ) -> RecoveryReport:
+        return await service.recover(  # type: ignore[attr-defined]
+            strategy=self.context.strategy
+        )
+
+    def _record_recovery_run(self) -> None:
         self.stats.recovery_runs += 1
+
+    def _validate_runtime_recovery_report(
+        self,
+        report: RecoveryReport,
+    ) -> None:
         if not report.ok:
             raise LiveRuntimeError(f"runtime recovery failed: {tuple(report.issues)}")
         # ── Check strategy recovery blocking state ────────────────────────
@@ -1984,41 +2037,74 @@ class LiveRuntimeRunner:
         # ── Pre-execution postcondition: must have coverage plan ───────────
         self._validate_recovery_protection_postcondition(report)
 
-        # ── Separate stop signals from other recovery signals ──────────────
-        _STOP_ACTIONS = {SignalAction.PLACE_STOP_LOSS_LONG, SignalAction.PLACE_STOP_LOSS_SHORT}
-        stop_signals = [s for s in report.strategy_signals if s.action in _STOP_ACTIONS]
-        other_signals = [s for s in report.strategy_signals if s.action not in _STOP_ACTIONS]
+    def _partition_recovery_signals(
+        self,
+        report: RecoveryReport,
+    ) -> tuple[list[TradeSignal], list[TradeSignal]]:
+        stop_actions = {
+            SignalAction.PLACE_STOP_LOSS_LONG,
+            SignalAction.PLACE_STOP_LOSS_SHORT,
+        }
+        stop_signals = [
+            signal
+            for signal in report.strategy_signals
+            if signal.action in stop_actions
+        ]
+        other_signals = [
+            signal
+            for signal in report.strategy_signals
+            if signal.action not in stop_actions
+        ]
+        return stop_signals, other_signals
 
-        if stop_signals:
-            # ── Execute stop signals with failure detection ────────────────
-            failed_before = self.stats.failed_intents
-            partial_before = self.stats.partial_failures
-            await self._execute_signals(
-                stop_signals,
-                source="recovery",
-                event_time_ms=None,
-                metadata={"feature_type": "recovery"},
+    def _capture_recovery_failure_counts(self) -> tuple[int, int]:
+        return (
+            self.stats.failed_intents,
+            self.stats.partial_failures,
+        )
+
+    async def _execute_recovery_stop_signals(
+        self,
+        signals: list[TradeSignal],
+    ) -> None:
+        await self._execute_signals(
+            signals,
+            source="recovery",
+            event_time_ms=None,
+            metadata={"feature_type": "recovery"},
+        )
+
+    def _validate_recovery_stop_execution(
+        self,
+        failure_counts: tuple[int, int],
+    ) -> None:
+        failed_before, partial_before = failure_counts
+        if self.stats.failed_intents > failed_before:
+            raise LiveRuntimeError(
+                "recovery stop placement failed: "
+                "all target exchanges rejected the stop order"
             )
-            if self.stats.failed_intents > failed_before:
-                raise LiveRuntimeError(
-                    "recovery stop placement failed: all target exchanges rejected the stop order"
-                )
-            if self.stats.partial_failures > partial_before:
-                raise LiveRuntimeError(
-                    "recovery stop placement partially failed: some target exchanges rejected the stop order"
-                )
-            # ── Post-execution validation: stop must now exist on exchange ──
-            await self._validate_post_execution_stop_protection()
-
-        # ── Execute remaining recovery signals (non-stop) ─────────────────
-        if other_signals:
-            await self._execute_signals(
-                other_signals,
-                source="recovery",
-                event_time_ms=None,
-                metadata={"feature_type": "recovery"},
+        if self.stats.partial_failures > partial_before:
+            raise LiveRuntimeError(
+                "recovery stop placement partially failed: "
+                "some target exchanges rejected the stop order"
             )
 
+    async def _execute_recovery_other_signals(
+        self,
+        signals: list[TradeSignal],
+    ) -> None:
+        await self._execute_signals(
+            signals,
+            source="recovery",
+            event_time_ms=None,
+            metadata={"feature_type": "recovery"},
+        )
+
+    def _finalize_recovery_report(
+        self,
+        report: RecoveryReport,
+    ) -> tuple[PlatformSnapshot, ...]:
         # ── All checks passed — safe to log completion ────────────────────
         logger.info(
             "Runtime recovery completed | snapshots=%s strategy_signals=%s issues=%s",
