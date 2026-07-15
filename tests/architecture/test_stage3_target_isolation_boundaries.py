@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 from pathlib import Path
 
 
@@ -63,13 +64,44 @@ def _tree(path: Path) -> ast.AST:
     return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
 
-def _imports(tree: ast.AST) -> set[str]:
+def _module_name(path: Path) -> str:
+    return ".".join(path.relative_to(PROJECT_ROOT).with_suffix("").parts)
+
+
+def _imports(tree: ast.AST, module_name: str) -> set[str]:
     imports: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             imports.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imports.add(node.module)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                relative_name = "." * node.level + (node.module or "")
+                package = module_name.rpartition(".")[0]
+                base_module = importlib.util.resolve_name(relative_name, package)
+            else:
+                base_module = node.module or ""
+            if base_module:
+                imports.add(base_module)
+                imports.update(
+                    f"{base_module}.{alias.name}"
+                    for alias in node.names
+                    if alias.name != "*"
+                )
+        elif isinstance(node, ast.Call) and node.args:
+            first_arg = node.args[0]
+            if not isinstance(first_arg, ast.Constant) or not isinstance(first_arg.value, str):
+                continue
+            is_import_module = (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "importlib"
+                and node.func.attr == "import_module"
+            )
+            is_dunder_import = (
+                isinstance(node.func, ast.Name) and node.func.id == "__import__"
+            )
+            if is_import_module or is_dunder_import:
+                imports.add(first_arg.value)
     return imports
 
 
@@ -93,9 +125,9 @@ def _starts_with_any(module: str, prefixes: tuple[str, ...]) -> bool:
     return any(module == prefix or module.startswith(prefix + ".") for prefix in prefixes)
 
 
-def _target_violations(tree: ast.AST, label: str) -> list[str]:
+def _target_violations(tree: ast.AST, label: str, module_name: str) -> list[str]:
     violations: list[str] = []
-    for module in sorted(_imports(tree)):
+    for module in sorted(_imports(tree, module_name)):
         if _starts_with_any(module, TARGET_FORBIDDEN_IMPORT_PREFIXES):
             violations.append(f"{label} imports {module}")
     for name in sorted(TARGET_FORBIDDEN_EXECUTION_NAMES.intersection(_referenced_names(tree))):
@@ -117,7 +149,7 @@ def test_legacy_portfolio_runtime_planner_and_order_management_are_target_free()
     violations: list[str] = []
     for path in sorted(set(LEGACY_FILES)):
         tree = _tree(path)
-        for module in sorted(_imports(tree)):
+        for module in sorted(_imports(tree, _module_name(path))):
             if _starts_with_any(module, TARGET_IMPORT_PREFIXES):
                 violations.append(f"{path.relative_to(PROJECT_ROOT)} imports {module}")
         for name in sorted(TARGET_NAMES.intersection(_referenced_names(tree))):
@@ -132,7 +164,11 @@ def test_target_core_remains_execution_agnostic_when_package_is_introduced() -> 
 
     for path in target_files:
         violations.extend(
-            _target_violations(_tree(path), str(path.relative_to(PROJECT_ROOT)))
+            _target_violations(
+                _tree(path),
+                str(path.relative_to(PROJECT_ROOT)),
+                _module_name(path),
+            )
         )
 
     # This assertion is meaningful before the package exists because the legacy
@@ -142,12 +178,27 @@ def test_target_core_remains_execution_agnostic_when_package_is_introduced() -> 
 
 def test_target_violation_rule_rejects_facades_execution_store_and_endpoint() -> None:
     forbidden_sources = (
-        "from src.platform import create_execution_client",
-        "from src.platform.exchanges import create_exchange_client",
-        "from src.order_management.position_plan.store import SqlitePositionPlanStore",
-        'endpoint = "/api/v5/trade/order"',
+        ("from src.platform import ExchangeName", "src.platform"),
+        ("from src import platform", "src.platform"),
+        ("from ...platform import ExchangeName", "src.platform"),
+        ("from ...reconcile import ReconcileReport", "src.reconcile"),
+        (
+            "from ...order_management.position_plan import store",
+            "src.order_management",
+        ),
+        ('import importlib\nimportlib.import_module("src.platform")', "src.platform"),
+        ('__import__("src.order_management")', "src.order_management"),
+        ('endpoint = "/api/v5/trade/order"', "/api/v5"),
     )
 
-    for index, source in enumerate(forbidden_sources):
+    for index, (source, expected_module) in enumerate(forbidden_sources):
         tree = ast.parse(source, filename=f"synthetic-{index}.py")
-        assert _target_violations(tree, f"synthetic-{index}.py"), source
+        violations = _target_violations(
+            tree,
+            f"synthetic-{index}.py",
+            "src.strategy.targets.synthetic",
+        )
+        assert any(expected_module in violation for violation in violations), (
+            source,
+            violations,
+        )

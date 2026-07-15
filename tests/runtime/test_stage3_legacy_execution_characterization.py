@@ -216,14 +216,19 @@ async def test_runtime_signal_execution_records_complete_flow_and_recursive_foll
     child = _signal(SignalAction.CANCEL_ALL_STOP_ORDERS)
     root_metadata = {"trace_id": "root-trace"}
     child_metadata = {"trace_id": "child-trace"}
-    events: list[tuple[str, TradeSignal, str, int | None, int, object]] = []
+    root_intent = ("intent", root.action)
+    child_intent = ("intent", child.action)
+    root_results = (("result", root_intent),)
+    child_results = (("result", child_intent),)
+    flow_events: list[tuple[object, ...]] = []
+    request_events: list[tuple[str, TradeSignal, str, int | None, int, object]] = []
 
     def record(
         callback: str,
         signal: TradeSignal,
         request: RuntimeSignalExecutionRequest,
     ) -> None:
-        events.append(
+        request_events.append(
             (
                 callback,
                 signal,
@@ -235,25 +240,30 @@ async def test_runtime_signal_execution_records_complete_flow_and_recursive_foll
         )
 
     def prepare(signal: TradeSignal, request: RuntimeSignalExecutionRequest) -> bool:
+        flow_events.append(("prepare", signal))
         record("prepare", signal, request)
         assert isinstance(signal, TradeSignal)
         return True
 
     def create(signal: TradeSignal, request: RuntimeSignalExecutionRequest) -> object:
-        intent = ("intent", signal.action)
+        intent = root_intent if signal is root else child_intent
+        flow_events.append(("create", signal, intent))
         record("create", signal, request)
         return intent
 
     async def execute(intent: object) -> tuple[object, ...]:
+        flow_events.append(("execute", intent))
         return (("result", intent),)
 
     async def post_submit(signal: TradeSignal, request: RuntimeSignalExecutionRequest) -> None:
+        flow_events.append(("post-submit", signal))
         record("post-submit", signal, request)
 
     def handle(signal: TradeSignal, results: tuple[object, ...]) -> None:
-        assert results
+        flow_events.append(("handle", signal, results))
 
     async def post_order(signal: TradeSignal, request: RuntimeSignalExecutionRequest) -> None:
+        flow_events.append(("post-order", signal))
         record("post-order", signal, request)
 
     async def feedback(
@@ -261,6 +271,7 @@ async def test_runtime_signal_execution_records_complete_flow_and_recursive_foll
         results: tuple[object, ...],
         request: RuntimeSignalExecutionRequest,
     ) -> tuple[TradeSignal, ...]:
+        flow_events.append(("feedback", signal))
         record("feedback", signal, request)
         return (child,) if signal is root else ()
 
@@ -269,6 +280,7 @@ async def test_runtime_signal_execution_records_complete_flow_and_recursive_foll
         follow_up: tuple[TradeSignal, ...],
         request: RuntimeSignalExecutionRequest,
     ) -> RuntimeSignalExecutionRequest:
+        flow_events.append(("feedback-request", signal))
         record("feedback-request", signal, request)
         return RuntimeSignalExecutionRequest(
             signals=follow_up,
@@ -299,7 +311,24 @@ async def test_runtime_signal_execution_records_complete_flow_and_recursive_foll
         plan,
     )
 
-    assert events == [
+    assert flow_events == [
+        ("prepare", root),
+        ("create", root, root_intent),
+        ("execute", root_intent),
+        ("post-submit", root),
+        ("handle", root, root_results),
+        ("post-order", root),
+        ("feedback", root),
+        ("feedback-request", root),
+        ("prepare", child),
+        ("create", child, child_intent),
+        ("execute", child_intent),
+        ("post-submit", child),
+        ("handle", child, child_results),
+        ("post-order", child),
+        ("feedback", child),
+    ]
+    assert request_events == [
         ("prepare", root, "characterization", 123, 0, root_metadata),
         ("create", root, "characterization", 123, 0, root_metadata),
         ("post-submit", root, "characterization", 123, 0, root_metadata),
