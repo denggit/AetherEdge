@@ -69,11 +69,22 @@ def test_trade_signal_public_field_order_and_frozen_contract() -> None:
         pytest.param("negative", {"quantity": Decimal("-0.01")}, id="quantity-negative"),
     ],
 )
+@pytest.mark.parametrize(
+    "action",
+    (
+        SignalAction.OPEN_LONG,
+        SignalAction.OPEN_SHORT,
+        SignalAction.CLOSE_LONG,
+        SignalAction.CLOSE_SHORT,
+        SignalAction.REDUCE_LONG,
+        SignalAction.REDUCE_SHORT,
+    ),
+)
 def test_position_changing_signals_require_positive_quantity(
-    case: str, kwargs: dict[str, object]
+    action: SignalAction, case: str, kwargs: dict[str, object]
 ) -> None:
     del case
-    base = {"symbol": "ETH-USDT-PERP", "action": SignalAction.OPEN_LONG, "created_time_ms": 10}
+    base = {"symbol": "ETH-USDT-PERP", "action": action, "created_time_ms": 10}
 
     with pytest.raises(ValueError, match="quantity must be positive"):
         TradeSignal(**base, **kwargs)  # type: ignore[arg-type]

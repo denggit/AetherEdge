@@ -11,6 +11,7 @@ from src.order_management.models import OrderIntent
 from src.order_management.position_plan.models import PositionPlan
 from src.planner import ExecutionPlanner, PlannedExecutionAction
 from src.platform import ExchangeName, OrderSide
+from src.runtime.runner import LiveRuntimeRunner
 from src.runtime.orders import LiveOrderIntentFactory
 from src.runtime.signal_execution_service import (
     RuntimeSignalExecutionPlan,
@@ -193,41 +194,74 @@ def test_live_order_intent_identity_changes_with_event_or_target_exchange_set() 
     assert baseline.intent_id != okx_only.intent_id
 
 
+def test_live_order_intent_identity_excludes_source_but_preserves_source_audit_metadata() -> None:
+    factory = _factory()
+    signal = _identity_signal(metadata={"bar_close_time_ms": 1_000})
+
+    closed_kline = factory.create(
+        signal, source="closed_kline", event_time_ms=1_000
+    )
+    startup_catchup = factory.create(
+        signal, source="startup_catchup", event_time_ms=1_000
+    )
+
+    assert closed_kline.intent_id == startup_catchup.intent_id
+    assert closed_kline.metadata["source"] == "closed_kline"
+    assert startup_catchup.metadata["source"] == "startup_catchup"
+
+
 @pytest.mark.asyncio
 async def test_runtime_signal_execution_records_complete_flow_and_recursive_follow_up() -> None:
     root = _signal(SignalAction.OPEN_LONG)
     child = _signal(SignalAction.CANCEL_ALL_STOP_ORDERS)
-    events: list[tuple[str, object]] = []
+    root_metadata = {"trace_id": "root-trace"}
+    child_metadata = {"trace_id": "child-trace"}
+    events: list[tuple[str, TradeSignal, str, int | None, int, object]] = []
+
+    def record(
+        callback: str,
+        signal: TradeSignal,
+        request: RuntimeSignalExecutionRequest,
+    ) -> None:
+        events.append(
+            (
+                callback,
+                signal,
+                request.source,
+                request.event_time_ms,
+                request.feedback_depth,
+                request.metadata,
+            )
+        )
 
     def prepare(signal: TradeSignal, request: RuntimeSignalExecutionRequest) -> bool:
-        events.append(("prepare", signal))
+        record("prepare", signal, request)
         assert isinstance(signal, TradeSignal)
         return True
 
     def create(signal: TradeSignal, request: RuntimeSignalExecutionRequest) -> object:
         intent = ("intent", signal.action)
-        events.append(("create", intent))
+        record("create", signal, request)
         return intent
 
     async def execute(intent: object) -> tuple[object, ...]:
-        events.append(("execute", intent))
         return (("result", intent),)
 
     async def post_submit(signal: TradeSignal, request: RuntimeSignalExecutionRequest) -> None:
-        events.append(("post-submit", signal))
+        record("post-submit", signal, request)
 
     def handle(signal: TradeSignal, results: tuple[object, ...]) -> None:
-        events.append(("handle", signal))
+        assert results
 
     async def post_order(signal: TradeSignal, request: RuntimeSignalExecutionRequest) -> None:
-        events.append(("post-order", signal))
+        record("post-order", signal, request)
 
     async def feedback(
         signal: TradeSignal,
         results: tuple[object, ...],
         request: RuntimeSignalExecutionRequest,
     ) -> tuple[TradeSignal, ...]:
-        events.append(("feedback", signal))
+        record("feedback", signal, request)
         return (child,) if signal is root else ()
 
     def build(
@@ -235,11 +269,12 @@ async def test_runtime_signal_execution_records_complete_flow_and_recursive_foll
         follow_up: tuple[TradeSignal, ...],
         request: RuntimeSignalExecutionRequest,
     ) -> RuntimeSignalExecutionRequest:
-        events.append(("feedback-request", signal))
+        record("feedback-request", signal, request)
         return RuntimeSignalExecutionRequest(
             signals=follow_up,
             source="order_result_feedback",
             event_time_ms=request.event_time_ms,
+            metadata=child_metadata,
             feedback_depth=request.feedback_depth + 1,
         )
 
@@ -255,28 +290,52 @@ async def test_runtime_signal_execution_records_complete_flow_and_recursive_foll
     )
     await RuntimeSignalExecutionService().execute(
         RuntimeSignalExecutionRequest(
-            signals=(root,), source="characterization", event_time_ms=123
+            signals=(root,),
+            source="characterization",
+            event_time_ms=123,
+            metadata=root_metadata,
+            feedback_depth=0,
         ),
         plan,
     )
 
-    assert [(name, value is child) for name, value in events] == [
-        ("prepare", False),
-        ("create", False),
-        ("execute", False),
-        ("post-submit", False),
-        ("handle", False),
-        ("post-order", False),
-        ("feedback", False),
-        ("feedback-request", False),
-        ("prepare", True),
-        ("create", False),
-        ("execute", False),
-        ("post-submit", True),
-        ("handle", True),
-        ("post-order", True),
-        ("feedback", True),
+    assert events == [
+        ("prepare", root, "characterization", 123, 0, root_metadata),
+        ("create", root, "characterization", 123, 0, root_metadata),
+        ("post-submit", root, "characterization", 123, 0, root_metadata),
+        ("post-order", root, "characterization", 123, 0, root_metadata),
+        ("feedback", root, "characterization", 123, 0, root_metadata),
+        ("feedback-request", root, "characterization", 123, 0, root_metadata),
+        ("prepare", child, "order_result_feedback", 123, 1, child_metadata),
+        ("create", child, "order_result_feedback", 123, 1, child_metadata),
+        ("post-submit", child, "order_result_feedback", 123, 1, child_metadata),
+        ("post-order", child, "order_result_feedback", 123, 1, child_metadata),
+        ("feedback", child, "order_result_feedback", 123, 1, child_metadata),
     ]
+
+
+def test_runner_builds_feedback_request_with_current_propagation_contract() -> None:
+    runner = object.__new__(LiveRuntimeRunner)
+    signal = _signal(SignalAction.OPEN_LONG)
+    follow_up = (_signal(SignalAction.CANCEL_ALL_STOP_ORDERS),)
+    parent = RuntimeSignalExecutionRequest(
+        signals=(signal,),
+        source="closed_kline",
+        event_time_ms=456,
+        metadata={"trace_id": "parent"},
+        feedback_depth=2,
+    )
+
+    request = LiveRuntimeRunner._build_signal_feedback_request(
+        runner, signal, follow_up, parent
+    )
+
+    assert request is not None
+    assert request.signals == follow_up
+    assert request.source == "order_result_feedback"
+    assert request.event_time_ms == 456
+    assert request.metadata == {"parent_source": "closed_kline"}
+    assert request.feedback_depth == 3
 
 
 def test_runner_order_result_feedback_depth_is_frozen_at_five() -> None:
@@ -300,4 +359,3 @@ def test_runner_order_result_feedback_depth_is_frozen_at_five() -> None:
         and compare.comparators[0].value == 5
         for compare in comparisons
     )
-
