@@ -20,6 +20,28 @@ class TargetPositionSide(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class TargetIdentity:
+    strategy_id: str
+    sleeve_id: str
+    symbol: str
+
+    def __post_init__(self) -> None:
+        _validate_identity(self.strategy_id, "strategy_id")
+        _validate_identity(self.sleeve_id, "sleeve_id")
+        _validate_identity(self.symbol, "symbol")
+
+
+@dataclass(frozen=True, slots=True, order=True)
+class TargetVersion:
+    generation: int
+    revision: int
+
+    def __post_init__(self) -> None:
+        _validate_non_negative_int(self.generation, "generation")
+        _validate_non_negative_int(self.revision, "revision")
+
+
+@dataclass(frozen=True, slots=True)
 class StrategyTargetPosition:
     """A strategy's desired virtual sleeve position, not an execution action."""
 
@@ -65,6 +87,18 @@ class VirtualSleeveTarget:
         _validate_reason(self.reason)
         object.__setattr__(self, "metadata", freeze_metadata(self.metadata))
 
+    @property
+    def identity(self) -> TargetIdentity:
+        return TargetIdentity(
+            strategy_id=self.strategy_id,
+            sleeve_id=self.sleeve_id,
+            symbol=self.symbol,
+        )
+
+    @property
+    def version(self) -> TargetVersion:
+        return TargetVersion(generation=self.generation, revision=self.revision)
+
 
 @dataclass(frozen=True, slots=True)
 class StrategyDecision:
@@ -97,6 +131,7 @@ class StrategyDecision:
         targets = tuple(self.targets)
         if not targets:
             raise ValueError("targets must not be empty")
+        identities: set[TargetIdentity] = set()
         for target in targets:
             if not isinstance(target, VirtualSleeveTarget):
                 raise TypeError("targets must contain only VirtualSleeveTarget objects")
@@ -107,6 +142,9 @@ class StrategyDecision:
                 and target.valid_until_ms < self.decision_time_ms
             ):
                 raise ValueError("target valid_until_ms must be >= decision_time_ms")
+            if target.identity in identities:
+                raise ValueError(f"duplicate target identity: {target.identity}")
+            identities.add(target.identity)
         _validate_reason(self.reason)
         object.__setattr__(self, "targets", targets)
         object.__setattr__(self, "metadata", freeze_metadata(self.metadata))
@@ -140,6 +178,8 @@ def _validate_reason(value: object) -> None:
 __all__ = [
     "StrategyDecision",
     "StrategyTargetPosition",
+    "TargetIdentity",
     "TargetPositionSide",
+    "TargetVersion",
     "VirtualSleeveTarget",
 ]
