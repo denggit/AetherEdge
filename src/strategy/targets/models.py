@@ -19,7 +19,7 @@ class TargetPositionSide(str, Enum):
     SHORT = "short"
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class StrategyTargetPosition:
     """A strategy's desired virtual sleeve position, not an execution action."""
 
@@ -40,7 +40,7 @@ class StrategyTargetPosition:
             raise ValueError("LONG or SHORT target quantity_base must be positive")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class VirtualSleeveTarget:
     strategy_id: str
     sleeve_id: str
@@ -66,7 +66,7 @@ class VirtualSleeveTarget:
         object.__setattr__(self, "metadata", freeze_metadata(self.metadata))
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class StrategyDecision:
     strategy_id: str
     decision_id: str
@@ -113,7 +113,7 @@ class StrategyDecision:
 
 
 def _validate_identity(value: object, field_name: str) -> None:
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise TypeError(f"{field_name} must be a string")
     if not value or not value.strip():
         raise ValueError(f"{field_name} must be non-empty")
@@ -129,7 +129,7 @@ def _validate_non_negative_int(value: object, field_name: str) -> None:
 
 
 def _validate_reason(value: object) -> None:
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise TypeError("reason must be a string")
     if len(value) > MAX_METADATA_STRING_LENGTH:
         raise ValueError(
