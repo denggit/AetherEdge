@@ -72,6 +72,9 @@ class _StateStore:
 
 
 class _FeatureStrategy:
+    observer_id = "feature-test"
+    enabled = True
+
     def __init__(self) -> None:
         self.events: list[MarketFeatureEvent] = []
         self.last_decision_audit = None
@@ -88,6 +91,9 @@ class _FeatureStrategy:
 
     async def on_trade(self, trade):
         return []
+
+    def strategy_identity(self) -> str:
+        return "feature-test"
 
 
 class _SignalStrategy(_FeatureStrategy):
@@ -106,6 +112,9 @@ class _SignalStrategy(_FeatureStrategy):
 
 
 class _MfObserver:
+    observer_id = "mf-test"
+    enabled = True
+
     def __init__(self) -> None:
         self.tradebar_open_times: list[int] = []
         self.range_footprint_count = 0
@@ -145,6 +154,9 @@ class _MfStrategy:
 
     async def on_trade(self, trade):
         return []
+
+    def strategy_identity(self) -> str:
+        return "mf-test"
 
 
 class _MemoryRangeBarStore:

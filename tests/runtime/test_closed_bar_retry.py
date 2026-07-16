@@ -62,6 +62,9 @@ class _StateStore:
 
 
 class _Strategy:
+    observer_id = "closed-bar-test"
+    enabled = True
+
     def __init__(self) -> None:
         self.events = []
 

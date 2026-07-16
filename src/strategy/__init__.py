@@ -11,7 +11,6 @@ from src.strategy.positions import (
     StrategyPositionStatus,
 )
 from src.strategy.ports import (
-    MarketFeatureStrategyPort,
     RangeSpeedHistoryProvider,
     RecoverableStrategyPort,
     StrategyPort,
@@ -20,12 +19,13 @@ from src.strategy.ports import (
     StrategyRecoveryContext,
     StrategyRecoveryStatus,
     StrategyRecoveryStatusProvider,
-    StrategyRuntimeStateProvider,
+    StrategyIdentityProvider,
+    StrategyPendingWorkProvider,
+    StrategyStartupPreviewProvider,
     StrategyStopAdoptionProvider,
 )
 
 __all__ = [
-    "MarketFeatureStrategyPort",
     "RangeSpeedHistoryProvider",
     "MarketFeatureObserver",
     "MarketFeatureObserverProvider",
@@ -42,7 +42,9 @@ __all__ = [
     "StrategyRecoveryContext",
     "StrategyRecoveryStatus",
     "StrategyRecoveryStatusProvider",
-    "StrategyRuntimeStateProvider",
+    "StrategyIdentityProvider",
+    "StrategyPendingWorkProvider",
+    "StrategyStartupPreviewProvider",
     "StrategyStopAdoptionProvider",
     "load_strategy",
 ]

@@ -32,6 +32,7 @@ PROJECT_ENV_CONFIG = bootstrap_live_process_config()
 from src.app import AppConfig, build_app_context
 from src.runtime import LiveRuntimeRunner, RuntimeMode, live_runtime_config_from_app, runtime_mode_from_env
 from src.runtime.runner import LiveRuntimeError, _is_fatal_startup_error
+from src.runtime.strategy_capabilities import StrategyCapabilityError
 from src.utils.log import get_logger
 from scripts.live_launch_gate import (
     live_reports_required,
@@ -75,7 +76,15 @@ async def main() -> None:
 
     _log_live_process_config_loaded(PROJECT_ENV_CONFIG)
     config = AppConfig.from_env(defaults_path=args.defaults)
-    runtime_mode = runtime_mode_from_env(defaults_path=args.defaults)
+    try:
+        runtime_mode = runtime_mode_from_env(defaults_path=args.defaults)
+    except ValueError as exc:
+        configured_mode = PROJECT_ENV_CONFIG.get("AETHER_RUNTIME_MODE", "")
+        raise LiveRuntimeError(
+            "unsupported runtime mode for the formal live entrypoint: "
+            f"{configured_mode or '<empty>'}; "
+            f"expected={RuntimeMode.LIVE_RUNTIME.value}"
+        ) from exc
     if runtime_mode is not RuntimeMode.LIVE_RUNTIME:
         raise LiveRuntimeError(
             "unsupported runtime mode for the formal live entrypoint: "
@@ -180,7 +189,7 @@ def _validate_direct_live_private_credentials(config: AppConfig) -> None:
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except LiveRuntimeError as exc:
+    except (LiveRuntimeError, StrategyCapabilityError) as exc:
         logger.exception("Live runner fatal startup/runtime error")
         if _is_fatal_startup_error(exc):
             raise SystemExit(FATAL_STARTUP_EXIT_CODE)

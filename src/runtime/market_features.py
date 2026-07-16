@@ -16,11 +16,7 @@ def resolve_market_feature_observers(
 ) -> tuple[MarketFeatureObserver, ...]:
     """Resolve observers through the public provider capability."""
 
-    declared = any(
-        "market_feature_observers" in cls.__dict__
-        for cls in type(strategy).__mro__
-    )
-    if not declared or not isinstance(strategy, MarketFeatureObserverProvider):
+    if not isinstance(strategy, MarketFeatureObserverProvider):
         return ()
     provided = strategy.market_feature_observers()
     if (
@@ -30,11 +26,25 @@ def resolve_market_feature_observers(
         raise TypeError(
             "market_feature_observers() must return a sequence of observers"
         )
-    return tuple(
-        observer
-        for observer in provided
-        if getattr(observer, "enabled", True) is not False
-    )
+    observers: list[MarketFeatureObserver] = []
+    observer_ids: set[str] = set()
+    for observer in provided:
+        if not isinstance(observer, MarketFeatureObserver):
+            raise TypeError(
+                "market feature observer must define observer_id, enabled, "
+                "and callable on_market_feature"
+            )
+        observer_id = observer.observer_id
+        if not isinstance(observer_id, str) or not observer_id.strip():
+            raise ValueError("market feature observer_id must be non-empty")
+        if observer_id in observer_ids:
+            raise ValueError(
+                f"duplicate market feature observer_id: {observer_id}"
+            )
+        observer_ids.add(observer_id)
+        if observer.enabled is not False:
+            observers.append(observer)
+    return tuple(observers)
 
 
 async def dispatch_market_feature_event(
@@ -54,13 +64,7 @@ async def _dispatch_to_strategy_observers(
 
     signals: list[TradeSignal] = []
     for observer in resolve_market_feature_observers(strategy):
-        handler = getattr(observer, "on_market_feature", None)
-        if not callable(handler):
-            raise TypeError(
-                "market feature observer must define callable on_market_feature"
-            )
-
-        result = handler(event)
+        result = observer.on_market_feature(event)
         if inspect.isawaitable(result):
             result = await result
         if result is None:

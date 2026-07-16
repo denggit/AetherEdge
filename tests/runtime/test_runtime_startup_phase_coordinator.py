@@ -44,6 +44,11 @@ PLAN_FIELDS = (
 )
 
 
+class _Strategy:
+    def strategy_identity(self) -> str:
+        return "test-strategy"
+
+
 def _runner(*, startup_phase_coordinator=None) -> LiveRuntimeRunner:
     config = AppConfig(
         symbol="ETH-USDT-PERP",
@@ -71,7 +76,7 @@ def _runner(*, startup_phase_coordinator=None) -> LiveRuntimeRunner:
         services["startup_phase_coordinator"] = startup_phase_coordinator
     return LiveRuntimeRunner(
         app_config=config,
-        app_context=SimpleNamespace(strategy=object()),
+        app_context=SimpleNamespace(strategy=_Strategy()),
         runtime_config=LiveRuntimeConfig(
             app=config,
             mode=RuntimeMode.LIVE_RUNTIME,

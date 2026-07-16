@@ -51,6 +51,11 @@ class StrategyPositionSnapshot:
         if self.status == StrategyPositionStatus.ACTIVE:
             if not isinstance(self.position_id, str) or not self.position_id.strip():
                 raise ValueError("active position must have a non-empty position_id")
+            if self.side in {
+                StrategyPositionSide.FLAT,
+                StrategyPositionSide.UNKNOWN,
+            }:
+                raise ValueError("active position side must not be FLAT or UNKNOWN")
             try:
                 quantity_is_valid = self.base_quantity.is_finite() and self.base_quantity >= Decimal("0")
             except (AttributeError, InvalidOperation, TypeError):

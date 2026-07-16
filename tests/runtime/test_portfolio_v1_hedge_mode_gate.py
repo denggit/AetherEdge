@@ -53,6 +53,9 @@ class _Strategy:
     async def on_start(self, snapshot):
         return ()
 
+    def strategy_identity(self) -> str:
+        return self.config.strategy_id
+
 
 class _Account:
     def __init__(

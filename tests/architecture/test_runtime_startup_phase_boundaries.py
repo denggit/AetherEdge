@@ -262,11 +262,12 @@ def test_runner_selects_and_writes_back_one_startup_coordinator() -> None:
 
 def test_runner_startup_only_logs_builds_plan_and_delegates() -> None:
     startup = _methods(_class(RUNNER, "LiveRuntimeRunner"))["_startup"]
-    assert len(startup.body) == 3
-    assert ast.unparse(startup.body[0]) == (
+    assert len(startup.body) == 4
+    assert ast.unparse(startup.body[0]) == "self._strategy_capabilities()"
+    assert ast.unparse(startup.body[1]) == (
         "logger.info('Live runtime startup phase started')"
     )
-    assert ast.unparse(startup.body[2]) == (
+    assert ast.unparse(startup.body[3]) == (
         "logger.info('Live runtime startup phase completed')"
     )
     execute_calls = [
@@ -283,6 +284,7 @@ def test_runner_startup_only_logs_builds_plan_and_delegates() -> None:
     assert not any(isinstance(node, ast.Lambda) for node in ast.walk(startup))
     allowed_call_functions = {
         "logger.info",
+        "self._strategy_capabilities",
         "self._startup_phase_coordinator.execute",
         "RuntimeStartupPhasePlan",
     }

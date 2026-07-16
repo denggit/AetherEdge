@@ -182,6 +182,9 @@ class FakeStateStore:
 
 
 class FeatureStrategy:
+    observer_id = "feature-test"
+    enabled = True
+
     def __init__(self, *, signal_on_aggregate: bool = False) -> None:
         self.signal_on_aggregate = signal_on_aggregate
         self.events = []
@@ -228,6 +231,9 @@ class FeatureStrategy:
 
     def decision_audit(self):
         return self.last_decision_audit
+
+    def strategy_identity(self) -> str:
+        return "feature-test"
 
 
 class FakeRecoveryService:
@@ -1990,6 +1996,9 @@ class CatchupTestStrategy:
     When *signal_action* is an OPEN_* action, :meth:`on_market_feature` sets
     ``self.pending_entry`` to a truthy sentinel, mimicking real V9C behaviour.
     """
+
+    observer_id = "catchup-test"
+    enabled = True
 
     def __init__(self, *, signal_action: str | None = None, in_pos: bool = False,
                  pending_entry: object = None, config: dict | None = None,

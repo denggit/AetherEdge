@@ -66,6 +66,19 @@ class OrderStateRequirement:
 
 
 @dataclass(frozen=True)
+class StrategyCapabilityRequirements:
+    """Explicit public capabilities required from a strategy plugin."""
+
+    strategy_id: str | None = None
+    position_snapshots: bool = False
+    recovery_status: bool = False
+    market_features: bool = False
+    range_speed_history: bool = False
+    startup_preview: bool = False
+    pending_work: bool = False
+
+
+@dataclass(frozen=True)
 class StrategyRuntimeRequirements:
     """Strategy-declared runtime data requirements.
 
@@ -81,6 +94,9 @@ class StrategyRuntimeRequirements:
     private_account_stream: PrivateAccountStreamRequirement = field(default_factory=PrivateAccountStreamRequirement)
     account_state: AccountStateRequirement = field(default_factory=AccountStateRequirement)
     order_state: OrderStateRequirement = field(default_factory=OrderStateRequirement)
+    capabilities: StrategyCapabilityRequirements = field(
+        default_factory=StrategyCapabilityRequirements
+    )
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "StrategyRuntimeRequirements":
@@ -93,6 +109,7 @@ class StrategyRuntimeRequirements:
             private_account_stream=_private_account(raw.get("private_account_stream")),
             account_state=_account_state(raw.get("account_state")),
             order_state=_order_state(raw.get("order_state")),
+            capabilities=_capabilities(raw.get("capabilities")),
         )
 
     @classmethod
@@ -204,4 +221,20 @@ def _order_state(value: Any) -> OrderStateRequirement:
         sync_open_stop_orders=_bool(raw.get("sync_open_stop_orders"), True),
         sync_position=_bool(raw.get("sync_position"), True),
         consecutive_failure_alert_threshold=int(raw.get("consecutive_failure_alert_threshold", 3) or 3),
+    )
+
+
+def _capabilities(value: Any) -> StrategyCapabilityRequirements:
+    raw = _mapping(value)
+    strategy_id = raw.get("strategy_id")
+    if strategy_id is not None:
+        strategy_id = str(strategy_id).strip() or None
+    return StrategyCapabilityRequirements(
+        strategy_id=strategy_id,
+        position_snapshots=_bool(raw.get("position_snapshots"), False),
+        recovery_status=_bool(raw.get("recovery_status"), False),
+        market_features=_bool(raw.get("market_features"), False),
+        range_speed_history=_bool(raw.get("range_speed_history"), False),
+        startup_preview=_bool(raw.get("startup_preview"), False),
+        pending_work=_bool(raw.get("pending_work"), False),
     )

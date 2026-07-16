@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
-from src.market_data.events import MarketFeatureEvent
 from src.platform.account.events import AccountEvent
 from src.platform.data.models import MarketKline, MarketOrderBook, MarketTicker, MarketTrade
 from src.platform.snapshot import PlatformSnapshot
@@ -103,14 +102,24 @@ class StrategyPositionPlanRecoveryUpdateProvider(Protocol):
 
 
 @runtime_checkable
-class StrategyRuntimeStateProvider(Protocol):
-    """Optional runtime-facing view of plugin identity and transient state."""
+class StrategyIdentityProvider(Protocol):
+    """Public identity exposed by a strategy plugin."""
 
     def strategy_identity(self) -> str:
         ...
 
+
+@runtime_checkable
+class StrategyPendingWorkProvider(Protocol):
+    """Public view of transient work that must block lifecycle transitions."""
+
     def has_pending_strategy_work(self) -> bool:
         ...
+
+
+@runtime_checkable
+class StrategyStartupPreviewProvider(Protocol):
+    """Capture and restore state changed by startup catch-up previews."""
 
     def capture_startup_preview_state(self) -> object:
         ...
@@ -129,11 +138,4 @@ class AccountSnapshotStrategyPort(Protocol):
     """Optional strategy extension for request-synced account snapshots."""
 
     async def on_account_snapshot(self, snapshot: PlatformSnapshot) -> None:
-        ...
-
-
-class MarketFeatureStrategyPort(Protocol):
-    """Optional strategy extension for reusable market feature events."""
-
-    async def on_market_feature(self, event: MarketFeatureEvent) -> Sequence[TradeSignal]:
         ...

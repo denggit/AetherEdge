@@ -78,7 +78,9 @@ def _runner(
             symbol=config.symbol,
         ),
         state_store=SimpleNamespace(),
-        strategy=SimpleNamespace(),
+        strategy=SimpleNamespace(
+            strategy_identity=lambda: "characterization-test"
+        ),
         planner=SimpleNamespace(),
         alerts=_Alerts(calls),
     )

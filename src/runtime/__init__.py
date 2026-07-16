@@ -9,11 +9,17 @@ from src.runtime.requirements import (
     OrderStateRequirement,
     PrivateAccountStreamRequirement,
     RangeBarRequirement,
+    StrategyCapabilityRequirements,
     StrategyRuntimeRequirements,
     TradeStreamRequirement,
     resolve_strategy_runtime_requirements,
 )
 from src.runtime.runner import LiveRuntimeRunner, LiveRuntimeStats
+from src.runtime.strategy_capabilities import (
+    StrategyCapabilityError,
+    ValidatedStrategyCapabilities,
+    validate_strategy_capabilities,
+)
 
 __all__ = [
     "LiveRuntimeConfig",
@@ -31,9 +37,13 @@ __all__ = [
     "OrderStateRequirement",
     "PrivateAccountStreamRequirement",
     "RangeBarRequirement",
+    "StrategyCapabilityRequirements",
     "StrategyRuntimeRequirements",
+    "StrategyCapabilityError",
+    "ValidatedStrategyCapabilities",
     "TradeStreamRequirement",
     "resolve_strategy_runtime_requirements",
     "live_runtime_config_from_app",
     "runtime_mode_from_env",
+    "validate_strategy_capabilities",
 ]

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from src.runtime.strategy_positions import resolve_strategy_position_snapshots
 from src.strategy.positions import (
     StrategyPositionSide,
@@ -48,3 +50,40 @@ def test_strategy_without_position_provider_returns_empty_tuple() -> None:
         position = object()
 
     assert resolve_strategy_position_snapshots(StrategyWithPrivatePositionState()) == ()
+
+
+@pytest.mark.parametrize(
+    "side",
+    (StrategyPositionSide.FLAT, StrategyPositionSide.UNKNOWN),
+)
+def test_active_position_rejects_non_directional_side(
+    side: StrategyPositionSide,
+) -> None:
+    with pytest.raises(ValueError, match="must not be FLAT or UNKNOWN"):
+        StrategyPositionSnapshot(
+            strategy_id="test-strategy",
+            position_id="active-1",
+            symbol="ETH-USDT-PERP",
+            side=side,
+            status=StrategyPositionStatus.ACTIVE,
+            base_quantity=Decimal("1"),
+        )
+
+
+@pytest.mark.parametrize(
+    "side",
+    (StrategyPositionSide.LONG, StrategyPositionSide.SHORT),
+)
+def test_active_position_accepts_directional_side(
+    side: StrategyPositionSide,
+) -> None:
+    snapshot = StrategyPositionSnapshot(
+        strategy_id="test-strategy",
+        position_id="active-1",
+        symbol="ETH-USDT-PERP",
+        side=side,
+        status=StrategyPositionStatus.ACTIVE,
+        base_quantity=Decimal("1"),
+    )
+
+    assert snapshot.side is side

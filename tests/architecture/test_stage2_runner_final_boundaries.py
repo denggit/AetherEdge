@@ -153,7 +153,8 @@ def test_final_runner_delegate_methods_remain_thin_and_single_call() -> None:
     methods = _methods(_class(RUNNER, "LiveRuntimeRunner"))
 
     startup = methods["_startup"]
-    assert len(startup.body) == 3
+    assert len(startup.body) == 4
+    assert ast.unparse(startup.body[0]) == "self._strategy_capabilities()"
     assert len(
         [
             call

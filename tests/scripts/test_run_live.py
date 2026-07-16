@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from src.runtime.runner import LiveRuntimeError, _is_fatal_startup_error
+from src.runtime.strategy_capabilities import StrategyCapabilityError
 
 
 class TestFatalStartupErrorClassification:
@@ -53,6 +54,16 @@ class TestFatalStartupErrorClassification:
             "placeholder_private_credentials exchange=okx "
             "placeholder_fields=api_key"
         )
+        assert _is_fatal_startup_error(exc) is True
+
+    def test_unsupported_runtime_mode_is_fatal(self):
+        exc = LiveRuntimeError(
+            "unsupported runtime mode for the formal live entrypoint: legacy_app"
+        )
+        assert _is_fatal_startup_error(exc) is True
+
+    def test_strategy_capability_error_type_is_fatal(self):
+        exc = StrategyCapabilityError("provider contract failed")
         assert _is_fatal_startup_error(exc) is True
 
     def test_producer_unhealthy_is_not_fatal(self):

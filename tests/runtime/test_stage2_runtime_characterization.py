@@ -52,6 +52,8 @@ class FakeStateStore:
 
 class FakeStrategy:
     raw_trade_callbacks_enabled = True
+    observer_id = "characterization-test"
+    enabled = True
 
     def __init__(self, calls: list[str] | None = None) -> None:
         self.calls = calls if calls is not None else []
@@ -93,6 +95,9 @@ class FakeStrategy:
         self.calls.append("strategy.on_order_results")
         self.feedback_results.append((signal, results, source, event_time_ms))
         return () if self.feedback_signal is None else (self.feedback_signal,)
+
+    def strategy_identity(self) -> str:
+        return "characterization-test"
 
 
 def _runner(

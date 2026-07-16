@@ -83,6 +83,11 @@ from src.runtime.range_micro_repair_supervisor import (
 from src.runtime.range_repair_bootstrap import RangeRepairBootstrapService
 from src.runtime.range_speed_history import RangeSpeedHistoryRefresher
 from src.runtime.requirements import StrategyRuntimeRequirements, resolve_strategy_runtime_requirements
+from src.runtime.strategy_capabilities import (
+    StrategyCapabilityError,
+    ValidatedStrategyCapabilities,
+    validate_strategy_capabilities,
+)
 from src.runtime.recovery_coordinator import (
     RuntimeRecoveryCoordinator,
     RuntimeRecoveryPlan,
@@ -134,9 +139,10 @@ from src.strategy.positions import (
 from src.strategy.ports import (
     RangeSpeedHistoryProvider,
     StrategyDecisionAuditProvider,
+    StrategyPendingWorkProvider,
     StrategyRecoveryStatus,
     StrategyRecoveryStatusProvider,
-    StrategyRuntimeStateProvider,
+    StrategyStartupPreviewProvider,
     StrategyStopAdoptionProvider,
 )
 from src.utils.log import get_logger
@@ -199,12 +205,15 @@ FATAL_STARTUP_ERROR_MARKERS = (
     "live preflight/smoke report gate failed",
     "direct-live trading requires aether_required_live_strategy",
     "live strategy does not match required launch target",
+    "unsupported runtime mode",
     "private_credentials",
 )
 
 
 def _is_fatal_startup_error(exc: BaseException) -> bool:
     """Return True when the error should cause a fatal exit (code 78)."""
+    if isinstance(exc, StrategyCapabilityError):
+        return True
     text = str(exc).lower()
     return any(marker in text for marker in FATAL_STARTUP_ERROR_MARKERS)
 
@@ -215,7 +224,7 @@ class StartupPreviewState:
     preview so it can be rolled back when the previewed signal is ultimately
     NOT executed (e.g. price guard failure or journal dedupe)."""
 
-    provider: StrategyRuntimeStateProvider | None
+    provider: StrategyStartupPreviewProvider | None
     state: object | None
 
 
@@ -258,6 +267,9 @@ class LiveRuntimeRunner:
         self._account_config_apply_writes: bool = False
         self._account_config_results: tuple[AccountConfigBootstrapResult, ...] = ()
         self.requirements: StrategyRuntimeRequirements = self.services.get("runtime_requirements") or resolve_strategy_runtime_requirements(app_context.strategy, fallback_data_streams=app_config.data_streams)
+        self._validated_strategy_capabilities: (
+            ValidatedStrategyCapabilities | None
+        ) = None
         self.stats = LiveRuntimeStats()
         self._market_queue: asyncio.Queue[MarketEvent] = asyncio.Queue(maxsize=app_config.market_queue_maxsize)
         self._stop_event = asyncio.Event()
@@ -1081,6 +1093,7 @@ class LiveRuntimeRunner:
         return await self._emit_range_aggregates(self._load_range_aggregates_for_bucket(bucket_start_ms))
 
     async def _startup(self) -> None:
+        self._strategy_capabilities()
         logger.info("Live runtime startup phase started")
 
         await self._startup_phase_coordinator.execute(
@@ -1304,12 +1317,7 @@ class LiveRuntimeRunner:
         if not requirements:
             return
 
-        provider = self._strategy_runtime_state_provider()
-        strategy_id = (
-            provider.strategy_identity()
-            if provider is not None
-            else self.app_config.strategy
-        )
+        strategy_id = self._strategy_capabilities().identity
         audit: dict[str, Any] = {
             "strategy": strategy_id,
             "symbol": self.app_config.symbol,
@@ -1656,8 +1664,8 @@ class LiveRuntimeRunner:
     async def _warmup_range_speed_history(self) -> int:
         if not self.requirements.range_bars.enabled:
             return 0
-        strategy = self.context.strategy
-        if not isinstance(strategy, RangeSpeedHistoryProvider):
+        strategy = self._strategy_range_speed_history_provider()
+        if strategy is None:
             return 0
         status = strategy.range_speed_history_status()
         now_ms = int(time.time() * 1000)
@@ -2016,26 +2024,94 @@ class LiveRuntimeRunner:
         self._validate_recovery_protection_postcondition(report)
 
     def _strategy_recovery_status(self) -> StrategyRecoveryStatus:
-        strategy = self.context.strategy
-        declared = any(
-            "recovery_status" in cls.__dict__
-            for cls in type(strategy).__mro__
-        )
-        if not declared or not isinstance(strategy, StrategyRecoveryStatusProvider):
+        provider = self._strategy_recovery_status_provider()
+        if provider is None:
             return StrategyRecoveryStatus()
-        return strategy.recovery_status()
+        return provider.recovery_status()
 
-    def _strategy_runtime_state_provider(
+    def _strategy_recovery_status_provider(
         self,
-    ) -> StrategyRuntimeStateProvider | None:
-        strategy = self.context.strategy
-        declared = any(
-            "capture_startup_preview_state" in cls.__dict__
-            for cls in type(strategy).__mro__
+    ) -> StrategyRecoveryStatusProvider | None:
+        capabilities = getattr(
+            self,
+            "_validated_strategy_capabilities",
+            None,
         )
-        if not declared or not isinstance(strategy, StrategyRuntimeStateProvider):
-            return None
-        return strategy
+        if capabilities is not None:
+            return capabilities.recovery_status
+        strategy = self.context.strategy
+        return (
+            strategy
+            if isinstance(strategy, StrategyRecoveryStatusProvider)
+            else None
+        )
+
+    def _strategy_pending_work_provider(
+        self,
+    ) -> StrategyPendingWorkProvider | None:
+        capabilities = getattr(
+            self,
+            "_validated_strategy_capabilities",
+            None,
+        )
+        if capabilities is not None:
+            return capabilities.pending_work
+        strategy = self.context.strategy
+        return (
+            strategy
+            if isinstance(strategy, StrategyPendingWorkProvider)
+            else None
+        )
+
+    def _strategy_startup_preview_provider(
+        self,
+    ) -> StrategyStartupPreviewProvider | None:
+        capabilities = getattr(
+            self,
+            "_validated_strategy_capabilities",
+            None,
+        )
+        if capabilities is not None:
+            return capabilities.startup_preview
+        strategy = self.context.strategy
+        return (
+            strategy
+            if isinstance(strategy, StrategyStartupPreviewProvider)
+            else None
+        )
+
+    def _strategy_range_speed_history_provider(
+        self,
+    ) -> RangeSpeedHistoryProvider | None:
+        capabilities = getattr(
+            self,
+            "_validated_strategy_capabilities",
+            None,
+        )
+        if capabilities is not None:
+            return capabilities.range_speed_history
+        strategy = self.context.strategy
+        return (
+            strategy
+            if isinstance(strategy, RangeSpeedHistoryProvider)
+            else None
+        )
+
+    def _strategy_capabilities(self) -> ValidatedStrategyCapabilities:
+        capabilities = getattr(
+            self,
+            "_validated_strategy_capabilities",
+            None,
+        )
+        if capabilities is None:
+            capabilities = validate_strategy_capabilities(
+                self.context.strategy,
+                self.requirements,
+                strategy_entry=self.app_config.strategy,
+                runtime_mode=self.runtime_config.mode,
+            )
+            self._validated_strategy_capabilities = capabilities
+        return capabilities
 
     def _partition_recovery_signals(
         self,
@@ -2507,7 +2583,7 @@ class LiveRuntimeRunner:
         # 2 & 3. Strategy-internal logical positions / pending entry
         if self._strategy_position_index().active:
             return True
-        provider = self._strategy_runtime_state_provider()
+        provider = self._strategy_pending_work_provider()
         if provider is not None and provider.has_pending_strategy_work():
             return True
 
@@ -2544,7 +2620,7 @@ class LiveRuntimeRunner:
         return signals
 
     def _capture_startup_preview_state(self) -> StartupPreviewState:
-        provider = self._strategy_runtime_state_provider()
+        provider = self._strategy_startup_preview_provider()
         return StartupPreviewState(
             provider=provider,
             state=(
@@ -4772,7 +4848,7 @@ class LiveRuntimeRunner:
     def _order_sync_active(self) -> bool:
         if self._strategy_position_index().active:
             return True
-        provider = self._strategy_runtime_state_provider()
+        provider = self._strategy_pending_work_provider()
         if provider is not None and provider.has_pending_strategy_work():
             return True
         store = self._position_plan_store

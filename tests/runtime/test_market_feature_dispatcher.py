@@ -71,6 +71,7 @@ async def test_pipeline_holds_only_strategy_and_resolves_observers_each_time() -
     provider_calls = 0
 
     class First:
+        observer_id = "first"
         enabled = True
 
         def on_market_feature(self, event):
@@ -79,12 +80,14 @@ async def test_pipeline_holds_only_strategy_and_resolves_observers_each_time() -
             return (_signal("first"),)
 
     class Disabled:
+        observer_id = "disabled"
         enabled = False
 
         def on_market_feature(self, event):
             raise AssertionError("disabled observer must not be dispatched")
 
     class AsyncSecond:
+        observer_id = "async_second"
         enabled = None
 
         async def on_market_feature(self, event):
@@ -93,12 +96,16 @@ async def test_pipeline_holds_only_strategy_and_resolves_observers_each_time() -
             return [_signal("async_second")]
 
     class NoneResult:
+        observer_id = "none"
+        enabled = True
+
         def on_market_feature(self, event):
             calls.append("none")
             seen_events.append(event)
             return None
 
     class Dynamic:
+        observer_id = "dynamic"
         enabled = True
 
         def on_market_feature(self, event):
@@ -163,7 +170,7 @@ async def test_pipeline_rejects_invalid_observer_results(result) -> None:
 
 @pytest.mark.asyncio
 async def test_pipeline_rejects_missing_handler_and_propagates_callback_error() -> None:
-    missing = SimpleNamespace(enabled=True)
+    missing = SimpleNamespace(observer_id="missing", enabled=True)
 
     class MissingStrategy:
         def market_feature_observers(self):
@@ -173,6 +180,9 @@ async def test_pipeline_rejects_missing_handler_and_propagates_callback_error() 
         await MarketFeaturePipeline(MissingStrategy()).dispatch(_event())
 
     class BrokenStrategy:
+        observer_id = "broken"
+        enabled = True
+
         def market_feature_observers(self):
             return (self,)
 
@@ -188,6 +198,9 @@ async def test_pipeline_does_not_invoke_runtime_side_effect_boundaries() -> None
     signal = _signal("pipeline-only")
 
     class Strategy:
+        observer_id = "pipeline-only"
+        enabled = True
+
         def market_feature_observers(self):
             return (self,)
 
@@ -216,7 +229,7 @@ async def test_pipeline_does_not_invoke_runtime_side_effect_boundaries() -> None
 
 
 @pytest.mark.asyncio
-async def test_provider_dispatch_preserves_order_and_does_not_deduplicate() -> None:
+async def test_provider_dispatch_rejects_duplicate_observer_ids() -> None:
     calls: list[str] = []
 
     class First:
@@ -245,14 +258,10 @@ async def test_provider_dispatch_preserves_order_and_does_not_deduplicate() -> N
         def on_market_feature(self, event):
             raise AssertionError("provider must take priority")
 
-    signals = await dispatch_market_feature_event(Strategy(), _event())
+    with pytest.raises(ValueError, match="duplicate market feature observer_id"):
+        await dispatch_market_feature_event(Strategy(), _event())
 
-    assert calls == ["first", "second", "first"]
-    assert tuple(signal.reason for signal in signals) == (
-        "first",
-        "second",
-        "first",
-    )
+    assert calls == []
 
 
 @pytest.mark.asyncio

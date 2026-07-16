@@ -200,7 +200,7 @@ class Strategy:
         side = {
             Side.LONG: StrategyPositionSide.LONG,
             Side.SHORT: StrategyPositionSide.SHORT,
-        }.get(self.position.side, StrategyPositionSide.FLAT)
+        }.get(self.position.side, StrategyPositionSide.UNKNOWN)
         active_exchanges = tuple(self.position.open_legs)
         return (
             StrategyPositionSnapshot(

@@ -235,3 +235,33 @@ def test_legacy_runtime_mode_is_rejected_before_app_context(
             asyncio.run(run_live.main())
 
     build_context.assert_not_called()
+
+
+def test_invalid_runtime_mode_is_rejected_before_app_context(
+    tmp_path,
+    monkeypatch,
+):
+    env = tmp_path / "invalid-mode.env"
+    env.write_text("", encoding="utf-8")
+    project_env = load_project_env_config(
+        env_file=env,
+        process_env={
+            "AETHER_RUNTIME_MODE": "not_a_runtime",
+            "AETHER_DRY_RUN": "true",
+            "AETHER_MARKET": "ETH-USDT-PERP",
+            "AETHER_EXCHANGES": "okx",
+            "AETHER_DATA_EXCHANGE": "okx",
+            "AETHER_STRATEGY": "strategies.empty_strategy:Strategy",
+        },
+    )
+    with _isolated_run_live_import(tmp_path) as (run_live, _import_config):
+        platform_config.set_project_env_config(project_env)
+        run_live.PROJECT_ENV_CONFIG = project_env
+        monkeypatch.setattr(sys, "argv", ["run_live.py"])
+        build_context = Mock()
+        monkeypatch.setattr(run_live, "build_app_context", build_context)
+
+        with pytest.raises(LiveRuntimeError, match="unsupported runtime mode"):
+            asyncio.run(run_live.main())
+
+    build_context.assert_not_called()

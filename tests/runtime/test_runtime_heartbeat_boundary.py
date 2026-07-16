@@ -60,7 +60,11 @@ def _runner(*, heartbeat_service=None) -> LiveRuntimeRunner:
         services["heartbeat_service"] = heartbeat_service
     return LiveRuntimeRunner(
         app_config=config,
-        app_context=SimpleNamespace(strategy=object()),
+        app_context=SimpleNamespace(
+            strategy=SimpleNamespace(
+                strategy_identity=lambda: "heartbeat-test"
+            )
+        ),
         runtime_config=LiveRuntimeConfig(
             app=config,
             mode=RuntimeMode.LIVE_RUNTIME,

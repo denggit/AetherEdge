@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from src.strategy.positions import (
@@ -61,13 +62,25 @@ def resolve_strategy_position_snapshots(
 ) -> tuple[StrategyPositionSnapshot, ...]:
     """Resolve snapshots only through the public strategy capability."""
 
-    declared = any(
-        "position_snapshots" in cls.__dict__
-        for cls in type(strategy).__mro__
-    )
-    if not declared or not isinstance(strategy, StrategyPositionProvider):
+    if not isinstance(strategy, StrategyPositionProvider):
         return ()
-    return tuple(strategy.position_snapshots())
+    provided = strategy.position_snapshots()
+    if (
+        not isinstance(provided, Sequence)
+        or isinstance(provided, (str, bytes, bytearray))
+    ):
+        raise TypeError(
+            "position_snapshots() must return a sequence of snapshots"
+        )
+    snapshots = tuple(provided)
+    if any(
+        not isinstance(snapshot, StrategyPositionSnapshot)
+        for snapshot in snapshots
+    ):
+        raise TypeError(
+            "position_snapshots() must return StrategyPositionSnapshot values"
+        )
+    return snapshots
 
 
 def resolve_strategy_position_snapshot_index(

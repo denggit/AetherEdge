@@ -17,6 +17,15 @@
     }
   },
   "runtime_requirements": {
+    "capabilities": {
+      "strategy_id": "eth_lf_portfolio_v9e_range_exit_overlay",
+      "position_snapshots": true,
+      "recovery_status": true,
+      "market_features": true,
+      "range_speed_history": false,
+      "startup_preview": true,
+      "pending_work": true
+    },
     "closed_kline": {
       "enabled": true,
       "interval": "4h",
