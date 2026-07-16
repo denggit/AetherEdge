@@ -18,6 +18,7 @@
   },
   "runtime_requirements": {
     "capabilities": {
+      "manifest_version": 1,
       "strategy_id": "eth_lf_portfolio_v9e_range_exit_overlay",
       "position_snapshots": true,
       "recovery_status": true,

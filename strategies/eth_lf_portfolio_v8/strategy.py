@@ -19,6 +19,7 @@ from src.order_management.models import ExchangeOrderResult
 from src.platform.snapshot import PlatformSnapshot
 from src.signals import SignalAction, TradeSignal
 from src.strategy import (
+    StrategyPositionContractError,
     StrategyPositionSide,
     StrategyPositionSnapshot,
     StrategyPositionStatus,
@@ -172,12 +173,34 @@ class Strategy:
         return (self,)
 
     def position_snapshots(self) -> tuple[StrategyPositionSnapshot, ...]:
-        if not self.position.in_pos or not self.position.position_id:
+        if not self.position.in_pos:
             return ()
+        position_id = self.position.position_id
         side = {
             Side.LONG: StrategyPositionSide.LONG,
             Side.SHORT: StrategyPositionSide.SHORT,
-        }.get(self.position.side, StrategyPositionSide.UNKNOWN)
+        }.get(self.position.side)
+        quantity = self.position.qty
+        violations: list[str] = []
+        if not isinstance(position_id, str) or not position_id.strip():
+            violations.append("position_id")
+        if side is None:
+            violations.append("side")
+        if (
+            not isinstance(quantity, Decimal)
+            or not quantity.is_finite()
+            or quantity <= 0
+        ):
+            violations.append("quantity")
+        if violations:
+            raise StrategyPositionContractError(
+                "invalid active strategy position | "
+                f"strategy_id={self.config.strategy_id} | "
+                f"position_id={position_id!r} | in_pos={self.position.in_pos} | "
+                f"side={self.position.side!r} | quantity={quantity!r} | "
+                "provider=strategies.eth_lf_portfolio_v8.strategy.Strategy.position_snapshots | "
+                f"invalid={','.join(violations)}"
+            )
         active_exchanges = tuple(self.position.open_legs)
         return (
             StrategyPositionSnapshot(

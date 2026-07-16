@@ -29,8 +29,19 @@ class _Observer:
 
 
 def _requirements(**capabilities: object) -> StrategyRuntimeRequirements:
+    manifest: dict[str, object] = {
+        "manifest_version": 1,
+        "strategy_id": "test-strategy",
+        "position_snapshots": False,
+        "recovery_status": False,
+        "market_features": False,
+        "range_speed_history": False,
+        "startup_preview": False,
+        "pending_work": False,
+    }
+    manifest.update(capabilities)
     return StrategyRuntimeRequirements.from_mapping(
-        {"capabilities": capabilities}
+        {"capabilities": manifest}
     )
 
 
@@ -84,7 +95,19 @@ def test_declared_required_provider_is_fail_fast(
 
 def test_closed_kline_requires_observer_provider_even_without_capability_flag() -> None:
     requirements = StrategyRuntimeRequirements.from_mapping(
-        {"closed_kline": {"enabled": True}}
+        {
+            "closed_kline": {"enabled": True},
+            "capabilities": {
+                "manifest_version": 1,
+                "strategy_id": "test-strategy",
+                "position_snapshots": False,
+                "recovery_status": False,
+                "market_features": False,
+                "range_speed_history": False,
+                "startup_preview": False,
+                "pending_work": False,
+            },
+        }
     )
 
     with pytest.raises(
@@ -138,6 +161,118 @@ def test_empty_strategy_explicitly_opts_out_of_optional_capabilities() -> None:
     assert capabilities.range_speed_history is None
     assert capabilities.startup_preview is None
     assert capabilities.pending_work is None
+
+
+def test_undeclared_manifest_is_distinct_from_explicit_false_manifest() -> None:
+    undeclared = resolve_strategy_runtime_requirements(object())
+    declared = _requirements()
+
+    assert undeclared.capability_manifest_declared is False
+    assert declared.capability_manifest_declared is True
+    with pytest.raises(
+        StrategyCapabilityError,
+        match="capabilities manifest is not declared",
+    ):
+        _validate(_IdentityOnlyStrategy(), undeclared)
+
+
+def test_runtime_requirements_provider_error_is_fatal_and_preserves_cause() -> None:
+    cause = ValueError("broken manifest provider")
+
+    class BrokenRequirements:
+        def runtime_requirements(self):
+            raise cause
+
+    with pytest.raises(StrategyCapabilityError) as exc_info:
+        resolve_strategy_runtime_requirements(BrokenRequirements())
+
+    assert exc_info.value.__cause__ is cause
+
+
+@pytest.mark.parametrize("value", (None, [], "manifest"))
+def test_capability_manifest_must_be_a_mapping(value: object) -> None:
+    with pytest.raises(StrategyCapabilityError, match="must be a mapping"):
+        StrategyRuntimeRequirements.from_mapping({"capabilities": value})
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    (
+        "manifest_version",
+        "strategy_id",
+        "position_snapshots",
+        "recovery_status",
+        "market_features",
+        "range_speed_history",
+        "startup_preview",
+        "pending_work",
+    ),
+)
+def test_capability_manifest_rejects_every_missing_field(
+    missing_field: str,
+) -> None:
+    manifest = dict(_requirements().capabilities.__dict__)
+    manifest.pop(missing_field)
+
+    with pytest.raises(StrategyCapabilityError, match="missing="):
+        StrategyRuntimeRequirements.from_mapping({"capabilities": manifest})
+
+
+def test_capability_manifest_rejects_unknown_and_misspelled_fields() -> None:
+    manifest = dict(_requirements().capabilities.__dict__)
+    manifest["unexpected"] = False
+    with pytest.raises(
+        StrategyCapabilityError,
+        match=r"unknown=\['unexpected'\]",
+    ):
+        StrategyRuntimeRequirements.from_mapping({"capabilities": manifest})
+
+    manifest = dict(_requirements().capabilities.__dict__)
+    manifest["postion_snapshots"] = manifest.pop("position_snapshots")
+    with pytest.raises(StrategyCapabilityError, match="postion_snapshots"):
+        StrategyRuntimeRequirements.from_mapping({"capabilities": manifest})
+
+
+@pytest.mark.parametrize("version", (2, 0, True, "1", None))
+def test_capability_manifest_supports_only_integer_version_one(
+    version: object,
+) -> None:
+    manifest = dict(_requirements().capabilities.__dict__)
+    manifest["manifest_version"] = version
+    with pytest.raises(StrategyCapabilityError, match="manifest_version"):
+        StrategyRuntimeRequirements.from_mapping({"capabilities": manifest})
+
+
+@pytest.mark.parametrize("strategy_id", ("", "   ", None, 1))
+def test_capability_manifest_requires_non_empty_string_identity(
+    strategy_id: object,
+) -> None:
+    manifest = dict(_requirements().capabilities.__dict__)
+    manifest["strategy_id"] = strategy_id
+    with pytest.raises(StrategyCapabilityError, match="strategy_id"):
+        StrategyRuntimeRequirements.from_mapping({"capabilities": manifest})
+
+
+@pytest.mark.parametrize("value", ("true", "false", 1, 0, None))
+@pytest.mark.parametrize(
+    "field",
+    (
+        "position_snapshots",
+        "recovery_status",
+        "market_features",
+        "range_speed_history",
+        "startup_preview",
+        "pending_work",
+    ),
+)
+def test_capability_manifest_rejects_non_bool_capabilities(
+    field: str,
+    value: object,
+) -> None:
+    manifest = dict(_requirements().capabilities.__dict__)
+    manifest[field] = value
+    with pytest.raises(StrategyCapabilityError, match=field):
+        StrategyRuntimeRequirements.from_mapping({"capabilities": manifest})
 
 
 @pytest.mark.parametrize(

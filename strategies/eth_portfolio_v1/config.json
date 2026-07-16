@@ -20,6 +20,7 @@
   },
   "runtime_requirements": {
     "capabilities": {
+      "manifest_version": 1,
       "strategy_id": "eth_portfolio_v1",
       "position_snapshots": true,
       "recovery_status": true,

@@ -9,6 +9,7 @@ from src.strategy import (
     StrategyPositionSide,
     StrategyPositionSnapshot,
     StrategyPositionStatus,
+    StrategyPositionContractError,
 )
 
 
@@ -31,7 +32,7 @@ def _snapshot(
 
 
 def test_active_position_requires_position_id() -> None:
-    with pytest.raises(ValueError, match="position_id"):
+    with pytest.raises(StrategyPositionContractError, match="position_id"):
         _snapshot(position_id="")
 
 
@@ -41,12 +42,12 @@ def test_active_position_requires_position_id() -> None:
 )
 def test_strategy_id_and_symbol_must_be_non_empty(field: str, value: str) -> None:
     kwargs = {field: value}
-    with pytest.raises(ValueError, match=field):
+    with pytest.raises(StrategyPositionContractError, match=field):
         _snapshot(**kwargs)
 
 
 def test_side_must_be_strategy_position_side() -> None:
-    with pytest.raises(ValueError, match="side"):
+    with pytest.raises(StrategyPositionContractError, match="side"):
         StrategyPositionSnapshot(
             strategy_id="test-strategy",
             position_id="position-1",
@@ -58,7 +59,7 @@ def test_side_must_be_strategy_position_side() -> None:
 
 
 def test_status_must_be_strategy_position_status() -> None:
-    with pytest.raises(ValueError, match="status"):
+    with pytest.raises(StrategyPositionContractError, match="status"):
         StrategyPositionSnapshot(
             strategy_id="test-strategy",
             position_id="position-1",
@@ -70,7 +71,7 @@ def test_status_must_be_strategy_position_status() -> None:
 
 
 def test_active_position_rejects_negative_quantity() -> None:
-    with pytest.raises(ValueError, match="base_quantity"):
+    with pytest.raises(StrategyPositionContractError, match="base_quantity"):
         _snapshot(base_quantity=Decimal("-0.1"))
 
 

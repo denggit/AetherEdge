@@ -3,12 +3,17 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from src.strategy.contracts import (
+    StrategyCapabilityError,
+    StrategyContractError,
+)
 from src.runtime.market_features import resolve_market_feature_observers
 from src.runtime.models import RuntimeMode
 from src.runtime.requirements import StrategyRuntimeRequirements
 from src.runtime.strategy_positions import resolve_strategy_position_snapshots
 from src.strategy.market_features import MarketFeatureObserverProvider
 from src.strategy.positions import StrategyPositionProvider
+from src.strategy.positions import StrategyPositionSnapshot
 from src.strategy.ports import (
     RangeSpeedHistoryProvider,
     StrategyIdentityProvider,
@@ -19,8 +24,9 @@ from src.strategy.ports import (
 )
 
 
-class StrategyCapabilityError(RuntimeError):
-    """A strategy's public runtime capability contract is unsafe."""
+DYNAMIC_STRATEGY_CAPABILITIES_VALIDATED = (
+    "strategy_dynamic_capabilities_validated"
+)
 
 
 @dataclass(frozen=True)
@@ -34,6 +40,13 @@ class ValidatedStrategyCapabilities:
     pending_work: StrategyPendingWorkProvider | None
 
 
+@dataclass(frozen=True)
+class ValidatedDynamicStrategyState:
+    position_snapshots: tuple[StrategyPositionSnapshot, ...]
+    recovery_status: StrategyRecoveryStatus
+    pending_work: bool
+
+
 def validate_strategy_capabilities(
     strategy: object,
     requirements: StrategyRuntimeRequirements,
@@ -42,6 +55,14 @@ def validate_strategy_capabilities(
     runtime_mode: RuntimeMode,
 ) -> ValidatedStrategyCapabilities:
     """Validate required public capabilities before runtime startup work."""
+
+    if not requirements.capability_manifest_declared:
+        _raise_invalid(
+            strategy=strategy_entry,
+            provider="StrategyCapabilityManifest",
+            detail="capabilities manifest is not declared",
+            runtime_mode=runtime_mode,
+        )
 
     if not isinstance(strategy, StrategyIdentityProvider):
         _raise_missing(
@@ -52,6 +73,8 @@ def validate_strategy_capabilities(
         )
     try:
         identity = strategy.strategy_identity()
+    except StrategyContractError:
+        raise
     except Exception as exc:
         _raise_invalid(
             strategy=strategy_entry,
@@ -92,6 +115,8 @@ def validate_strategy_capabilities(
     if position_provider is not None:
         try:
             resolve_strategy_position_snapshots(strategy)
+        except StrategyContractError:
+            raise
         except Exception as exc:
             _raise_invalid(
                 strategy=identity,
@@ -113,6 +138,8 @@ def validate_strategy_capabilities(
     if recovery_provider is not None:
         try:
             recovery_status = recovery_provider.recovery_status()
+        except StrategyContractError:
+            raise
         except Exception as exc:
             _raise_invalid(
                 strategy=identity,
@@ -142,6 +169,8 @@ def validate_strategy_capabilities(
     if market_feature_provider is not None:
         try:
             observers = resolve_market_feature_observers(strategy)
+        except StrategyContractError:
+            raise
         except Exception as exc:
             _raise_invalid(
                 strategy=identity,
@@ -170,6 +199,8 @@ def validate_strategy_capabilities(
     if range_speed_provider is not None:
         try:
             range_speed_status = range_speed_provider.range_speed_history_status()
+        except StrategyContractError:
+            raise
         except Exception as exc:
             _raise_invalid(
                 strategy=identity,
@@ -219,6 +250,8 @@ def validate_strategy_capabilities(
     if pending_work_provider is not None:
         try:
             pending_work = pending_work_provider.has_pending_strategy_work()
+        except StrategyContractError:
+            raise
         except Exception as exc:
             _raise_invalid(
                 strategy=identity,
@@ -242,6 +275,75 @@ def validate_strategy_capabilities(
         range_speed_history=range_speed_provider,
         startup_preview=preview_provider,
         pending_work=pending_work_provider,
+    )
+
+
+def validate_dynamic_strategy_capabilities(
+    strategy: object,
+    *,
+    strategy_entry: str | None = None,
+    runtime_mode: RuntimeMode = RuntimeMode.LIVE_RUNTIME,
+) -> ValidatedDynamicStrategyState:
+    """Validate provider outputs that can change during strategy recovery."""
+
+    strategy_label = strategy_entry or (
+        f"{type(strategy).__module__}.{type(strategy).__qualname__}"
+    )
+
+    snapshots: tuple[StrategyPositionSnapshot, ...] = ()
+    if isinstance(strategy, StrategyPositionProvider):
+        snapshots = resolve_strategy_position_snapshots(strategy)
+
+    recovery_status = StrategyRecoveryStatus()
+    if isinstance(strategy, StrategyRecoveryStatusProvider):
+        try:
+            recovery_status = strategy.recovery_status()
+        except StrategyContractError:
+            raise
+        except Exception as exc:
+            raise StrategyContractError(
+                "strategy dynamic contract validation failed | "
+                f"strategy={strategy_label} | "
+                "invalid=StrategyRecoveryStatusProvider | "
+                f"detail={type(exc).__name__}: {exc} | "
+                f"runtime_mode={runtime_mode.value}"
+            ) from exc
+        if not isinstance(recovery_status, StrategyRecoveryStatus):
+            raise StrategyContractError(
+                "strategy dynamic contract validation failed | "
+                f"strategy={strategy_label} | "
+                "invalid=StrategyRecoveryStatusProvider | "
+                "detail=recovery_status() must return StrategyRecoveryStatus | "
+                f"runtime_mode={runtime_mode.value}"
+            )
+
+    pending_work = False
+    if isinstance(strategy, StrategyPendingWorkProvider):
+        try:
+            pending_work = strategy.has_pending_strategy_work()
+        except StrategyContractError:
+            raise
+        except Exception as exc:
+            raise StrategyContractError(
+                "strategy dynamic contract validation failed | "
+                f"strategy={strategy_label} | "
+                "invalid=StrategyPendingWorkProvider | "
+                f"detail={type(exc).__name__}: {exc} | "
+                f"runtime_mode={runtime_mode.value}"
+            ) from exc
+        if type(pending_work) is not bool:
+            raise StrategyContractError(
+                "strategy dynamic contract validation failed | "
+                f"strategy={strategy_label} | "
+                "invalid=StrategyPendingWorkProvider | "
+                "detail=has_pending_strategy_work() must return bool | "
+                f"runtime_mode={runtime_mode.value}"
+            )
+
+    return ValidatedDynamicStrategyState(
+        position_snapshots=snapshots,
+        recovery_status=recovery_status,
+        pending_work=pending_work,
     )
 
 
@@ -287,7 +389,11 @@ def _raise_invalid(
 
 
 __all__ = [
+    "DYNAMIC_STRATEGY_CAPABILITIES_VALIDATED",
     "StrategyCapabilityError",
+    "StrategyContractError",
+    "ValidatedDynamicStrategyState",
     "ValidatedStrategyCapabilities",
+    "validate_dynamic_strategy_capabilities",
     "validate_strategy_capabilities",
 ]

@@ -69,7 +69,20 @@ def _runner(
     )
     injected.setdefault(
         "runtime_requirements",
-        StrategyRuntimeRequirements.from_mapping({}),
+        StrategyRuntimeRequirements.from_mapping(
+            {
+                "capabilities": {
+                    "manifest_version": 1,
+                    "strategy_id": "characterization-test",
+                    "position_snapshots": False,
+                    "recovery_status": False,
+                    "market_features": False,
+                    "range_speed_history": False,
+                    "startup_preview": False,
+                    "pending_work": False,
+                }
+            }
+        ),
     )
     context = AppContext(
         data=SimpleNamespace(exchange=ExchangeName.OKX, symbol=config.symbol),

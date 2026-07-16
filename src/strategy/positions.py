@@ -6,6 +6,8 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
+from src.strategy.contracts import StrategyPositionContractError
+
 
 class StrategyPositionStatus(str, Enum):
     FLAT = "flat"
@@ -41,31 +43,43 @@ class StrategyPositionSnapshot:
 
     def __post_init__(self) -> None:
         if not isinstance(self.strategy_id, str) or not self.strategy_id.strip():
-            raise ValueError("strategy_id must be non-empty")
+            raise StrategyPositionContractError("strategy_id must be non-empty")
         if not isinstance(self.symbol, str) or not self.symbol.strip():
-            raise ValueError("symbol must be non-empty")
+            raise StrategyPositionContractError("symbol must be non-empty")
         if not isinstance(self.side, StrategyPositionSide):
-            raise ValueError("side must be StrategyPositionSide")
+            raise StrategyPositionContractError("side must be StrategyPositionSide")
         if not isinstance(self.status, StrategyPositionStatus):
-            raise ValueError("status must be StrategyPositionStatus")
+            raise StrategyPositionContractError("status must be StrategyPositionStatus")
         if self.status == StrategyPositionStatus.ACTIVE:
             if not isinstance(self.position_id, str) or not self.position_id.strip():
-                raise ValueError("active position must have a non-empty position_id")
-            if self.side in {
-                StrategyPositionSide.FLAT,
-                StrategyPositionSide.UNKNOWN,
+                raise StrategyPositionContractError(
+                    "active position must have a non-empty position_id"
+                )
+            if self.side not in {
+                StrategyPositionSide.LONG,
+                StrategyPositionSide.SHORT,
             }:
-                raise ValueError("active position side must not be FLAT or UNKNOWN")
+                raise StrategyPositionContractError(
+                    "active position side must be LONG or SHORT"
+                )
             try:
-                quantity_is_valid = self.base_quantity.is_finite() and self.base_quantity >= Decimal("0")
+                quantity_is_valid = (
+                    isinstance(self.base_quantity, Decimal)
+                    and self.base_quantity.is_finite()
+                    and self.base_quantity > Decimal("0")
+                )
             except (AttributeError, InvalidOperation, TypeError):
                 quantity_is_valid = False
             if not quantity_is_valid:
-                raise ValueError("active position base_quantity must be a non-negative Decimal")
+                raise StrategyPositionContractError(
+                    "active position base_quantity must be a positive finite Decimal"
+                )
         try:
             json.dumps(dict(self.metadata))
         except (TypeError, ValueError) as exc:
-            raise ValueError("metadata must contain only JSON-serializable values") from exc
+            raise StrategyPositionContractError(
+                "metadata must contain only JSON-serializable values"
+            ) from exc
 
 
 @runtime_checkable
@@ -77,6 +91,7 @@ class StrategyPositionProvider(Protocol):
 
 
 __all__ = [
+    "StrategyPositionContractError",
     "StrategyPositionProvider",
     "StrategyPositionSide",
     "StrategyPositionSnapshot",

@@ -49,8 +49,18 @@ from strategies.eth_portfolio_v1.strategy import Strategy as PortfolioV1Strategy
 H4 = 4 * 60 * 60_000
 
 
-def _feature_requirements():
+def _feature_requirements(*, strategy_id: str = "feature-test"):
     return StrategyRuntimeRequirements.from_mapping({
+        "capabilities": {
+            "manifest_version": 1,
+            "strategy_id": strategy_id,
+            "position_snapshots": False,
+            "recovery_status": False,
+            "market_features": True,
+            "range_speed_history": False,
+            "startup_preview": False,
+            "pending_work": False,
+        },
         "closed_kline": {"enabled": True, "interval": "4h", "close_buffer_ms": 60000},
         "trades": {"enabled": True, "stream_enabled": True},
         "range_bars": {
@@ -464,7 +474,12 @@ def _runner(strategy, *, data=None, services=None, dry_run=False, data_streams=(
         SqliteRangeRepairJournalStore(runtime_root / "repair-journal.sqlite3"),
     )
     if data_streams or "range_bar_builder" in resolved_services or "range_bar_store" in resolved_services:
-        resolved_services.setdefault("runtime_requirements", _feature_requirements())
+        identity = getattr(strategy, "strategy_identity", None)
+        strategy_id = identity() if callable(identity) else "feature-test"
+        resolved_services.setdefault(
+            "runtime_requirements",
+            _feature_requirements(strategy_id=strategy_id),
+        )
     return LiveRuntimeRunner(app_config=cfg, app_context=context, runtime_config=runtime_config, services=resolved_services)
 
 
@@ -827,6 +842,16 @@ async def _run_smoke(tmp_path, *, binance_fail: bool):
         services={
             "runtime_requirements": StrategyRuntimeRequirements.from_mapping(
                 {
+                    "capabilities": {
+                        "manifest_version": 1,
+                        "strategy_id": "feature-test",
+                        "position_snapshots": False,
+                        "recovery_status": False,
+                        "market_features": True,
+                        "range_speed_history": False,
+                        "startup_preview": False,
+                        "pending_work": False,
+                    },
                     "closed_kline": {"enabled": False},
                     "trades": {
                         "enabled": True,

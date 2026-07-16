@@ -5,7 +5,12 @@ from pathlib import Path
 import pytest
 
 from src.app.alerts import AppAlert
-from src.app.watchdog import ProcessWatchdog, WatchdogConfig, build_live_runner_command
+from src.app.watchdog import (
+    ProcessWatchdog,
+    WatchdogConfig,
+    build_live_runner_command,
+    build_live_watchdog_from_env,
+)
 
 
 class CollectingSink:
@@ -212,3 +217,17 @@ def test_build_live_runner_command_points_to_scripts_run_live(tmp_path):
     assert command[0] == sys.executable
     assert str(tmp_path / "scripts" / "run_live.py") == command[1]
     assert command[-2:] == ("--max-events", "1")
+
+
+def test_production_watchdog_defaults_to_formal_child_and_fatal_78(tmp_path):
+    watchdog = build_live_watchdog_from_env(
+        project_root=tmp_path,
+        environ={},
+    )
+
+    assert watchdog.config.command[0] == sys.executable
+    assert watchdog.config.command[1] == "-u"
+    assert watchdog.config.command[2] == str(
+        tmp_path / "scripts" / "run_live.py"
+    )
+    assert watchdog.config.fatal_exit_codes == frozenset({78})

@@ -70,7 +70,20 @@ def _runner(*, startup_phase_coordinator=None) -> LiveRuntimeRunner:
             env_file=Path(".env"),
             example_file=None,
         ),
-        "runtime_requirements": StrategyRuntimeRequirements.from_mapping({}),
+        "runtime_requirements": StrategyRuntimeRequirements.from_mapping(
+            {
+                "capabilities": {
+                    "manifest_version": 1,
+                    "strategy_id": "test-strategy",
+                    "position_snapshots": False,
+                    "recovery_status": False,
+                    "market_features": False,
+                    "range_speed_history": False,
+                    "startup_preview": False,
+                    "pending_work": False,
+                }
+            }
+        ),
     }
     if startup_phase_coordinator is not None:
         services["startup_phase_coordinator"] = startup_phase_coordinator

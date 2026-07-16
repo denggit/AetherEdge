@@ -15,7 +15,14 @@ from src.platform.state.ports import StateStore
 from src.reconcile.checker import Reconciler
 from src.reconcile.models import ReconcileCategory, ReconcileIssue, ReconcileReport
 from src.runtime.recovery.models import RecoveryReport
-from src.runtime.strategy_positions import resolve_strategy_position_snapshot_index
+from src.runtime.strategy_capabilities import (
+    DYNAMIC_STRATEGY_CAPABILITIES_VALIDATED,
+    validate_dynamic_strategy_capabilities,
+)
+from src.runtime.strategy_positions import (
+    StrategyPositionSnapshotIndex,
+    resolve_strategy_position_snapshot_index,
+)
 from src.signals import TradeSignal
 from src.strategy.ports import (
     StrategyPositionPlanRecoveryUpdateProvider,
@@ -97,7 +104,10 @@ class RuntimeRecoveryService:
             active_strategy_positions=strategy_position_index.active,
         )
         self._apply_strategy_position_plan_updates(strategy)
-        recovered_strategy_position_index = resolve_strategy_position_snapshot_index(strategy)
+        dynamic_state = validate_dynamic_strategy_capabilities(strategy)
+        recovered_strategy_position_index = StrategyPositionSnapshotIndex(
+            dynamic_state.position_snapshots
+        )
         ok = not issues
         return RecoveryReport(
             ok=ok,
@@ -112,6 +122,7 @@ class RuntimeRecoveryService:
                 "exchange_contexts": len(self.exchange_contexts),
                 "intent_ids": len(self.intent_ids),
                 "active_position_plans": active_position_plans,
+                DYNAMIC_STRATEGY_CAPABILITIES_VALIDATED: True,
                 "non_fatal_reconcile_issues": tuple(
                     issue.message
                     for report in reconcile_reports

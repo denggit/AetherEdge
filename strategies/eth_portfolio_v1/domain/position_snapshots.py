@@ -8,6 +8,7 @@ from src.strategy.positions import (
     StrategyPositionSnapshot,
     StrategyPositionStatus,
 )
+from src.strategy.contracts import StrategyPositionContractError
 from strategies.eth_portfolio_v1.domain.models import Side
 from strategies.eth_portfolio_v1.domain.position_state import V8PositionState
 from strategies.eth_portfolio_v1.domain.sleeves import LF_SLEEVE_ID
@@ -26,21 +27,34 @@ class LfSleeveSnapshotAdapter:
     ) -> StrategyPositionSnapshot | None:
         if not position.in_pos:
             return None
-        if not isinstance(position.position_id, str) or not position.position_id.strip():
-            return None
-
+        position_id = position.position_id
         side = _snapshot_side(position.side)
-        if side is None:
-            return None
-
         quantity = position.qty
-        if not isinstance(quantity, Decimal) or not quantity.is_finite() or quantity < 0:
-            return None
+        violations: list[str] = []
+        if not isinstance(position_id, str) or not position_id.strip():
+            violations.append("position_id")
+        if side is None:
+            violations.append("side")
+        if (
+            not isinstance(quantity, Decimal)
+            or not quantity.is_finite()
+            or quantity <= 0
+        ):
+            violations.append("quantity")
+        if violations:
+            raise StrategyPositionContractError(
+                "invalid active strategy position | "
+                f"strategy_id={self.strategy_id} | position_id={position_id!r} | "
+                f"in_pos={position.in_pos} | side={position.side!r} | "
+                f"quantity={quantity!r} | "
+                "provider=strategies.eth_portfolio_v1.domain.position_snapshots.LfSleeveSnapshotAdapter | "
+                f"invalid={','.join(violations)}"
+            )
 
         return StrategyPositionSnapshot(
             strategy_id=self.strategy_id,
             sleeve_id=LF_SLEEVE_ID,
-            position_id=position.position_id,
+            position_id=position_id,
             symbol=self.symbol,
             side=side,
             status=StrategyPositionStatus.ACTIVE,

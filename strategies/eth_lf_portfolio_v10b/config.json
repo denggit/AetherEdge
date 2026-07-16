@@ -20,6 +20,7 @@
   },
   "runtime_requirements": {
     "capabilities": {
+      "manifest_version": 1,
       "strategy_id": "eth_lf_portfolio_v10b_all_swing_structural_stop",
       "position_snapshots": true,
       "recovery_status": true,

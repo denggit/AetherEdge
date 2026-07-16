@@ -1,4 +1,9 @@
 from src.strategy.loader import StrategyLoadError, load_strategy
+from src.strategy.contracts import (
+    StrategyCapabilityError,
+    StrategyContractError,
+    StrategyPositionContractError,
+)
 from src.strategy.market_features import (
     MarketFeatureObserver,
     MarketFeatureObserverProvider,
@@ -32,6 +37,8 @@ __all__ = [
     "MarketFeatureObserverResult",
     "RecoverableStrategyPort",
     "StrategyLoadError",
+    "StrategyCapabilityError",
+    "StrategyContractError",
     "StrategyPort",
     "StrategyDecisionAuditProvider",
     "StrategyPositionProvider",
@@ -39,6 +46,7 @@ __all__ = [
     "StrategyPositionSide",
     "StrategyPositionSnapshot",
     "StrategyPositionStatus",
+    "StrategyPositionContractError",
     "StrategyRecoveryContext",
     "StrategyRecoveryStatus",
     "StrategyRecoveryStatusProvider",

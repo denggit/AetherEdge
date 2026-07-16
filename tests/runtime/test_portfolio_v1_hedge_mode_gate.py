@@ -56,6 +56,20 @@ class _Strategy:
     def strategy_identity(self) -> str:
         return self.config.strategy_id
 
+    def runtime_requirements(self):
+        return {
+            "capabilities": {
+                "manifest_version": 1,
+                "strategy_id": self.config.strategy_id,
+                "position_snapshots": False,
+                "recovery_status": False,
+                "market_features": False,
+                "range_speed_history": False,
+                "startup_preview": False,
+                "pending_work": False,
+            }
+        }
+
 
 class _Account:
     def __init__(

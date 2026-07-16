@@ -9,6 +9,10 @@ from src.strategy.positions import (
     StrategyPositionSnapshot,
     StrategyPositionStatus,
 )
+from src.strategy.contracts import (
+    StrategyContractError,
+    StrategyPositionContractError,
+)
 
 
 @dataclass(frozen=True)
@@ -64,21 +68,32 @@ def resolve_strategy_position_snapshots(
 
     if not isinstance(strategy, StrategyPositionProvider):
         return ()
-    provided = strategy.position_snapshots()
+    try:
+        provided = strategy.position_snapshots()
+    except StrategyContractError:
+        raise
+    except Exception as exc:
+        raise StrategyPositionContractError(
+            "strategy position provider failed | "
+            f"provider={type(strategy).__module__}.{type(strategy).__qualname__} | "
+            f"error={type(exc).__name__}: {exc}"
+        ) from exc
     if (
         not isinstance(provided, Sequence)
         or isinstance(provided, (str, bytes, bytearray))
     ):
-        raise TypeError(
-            "position_snapshots() must return a sequence of snapshots"
+        raise StrategyPositionContractError(
+            "position_snapshots() must return a sequence of snapshots | "
+            f"provider={type(strategy).__module__}.{type(strategy).__qualname__}"
         )
     snapshots = tuple(provided)
     if any(
         not isinstance(snapshot, StrategyPositionSnapshot)
         for snapshot in snapshots
     ):
-        raise TypeError(
-            "position_snapshots() must return StrategyPositionSnapshot values"
+        raise StrategyPositionContractError(
+            "position_snapshots() must return StrategyPositionSnapshot values | "
+            f"provider={type(strategy).__module__}.{type(strategy).__qualname__}"
         )
     return snapshots
 

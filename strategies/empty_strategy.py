@@ -17,6 +17,7 @@ class Strategy:
     def runtime_requirements(self) -> Mapping[str, Any]:
         return {
             "capabilities": {
+                "manifest_version": 1,
                 "strategy_id": "empty_strategy",
                 "position_snapshots": False,
                 "recovery_status": False,

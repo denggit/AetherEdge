@@ -16,12 +16,17 @@ from src.runtime.requirements import (
 )
 from src.runtime.runner import LiveRuntimeRunner, LiveRuntimeStats
 from src.runtime.strategy_capabilities import (
+    DYNAMIC_STRATEGY_CAPABILITIES_VALIDATED,
     StrategyCapabilityError,
+    StrategyContractError,
+    ValidatedDynamicStrategyState,
     ValidatedStrategyCapabilities,
+    validate_dynamic_strategy_capabilities,
     validate_strategy_capabilities,
 )
 
 __all__ = [
+    "DYNAMIC_STRATEGY_CAPABILITIES_VALIDATED",
     "LiveRuntimeConfig",
     "LiveRuntimeContext",
     "LiveRuntimeRunner",
@@ -40,10 +45,13 @@ __all__ = [
     "StrategyCapabilityRequirements",
     "StrategyRuntimeRequirements",
     "StrategyCapabilityError",
+    "StrategyContractError",
+    "ValidatedDynamicStrategyState",
     "ValidatedStrategyCapabilities",
     "TradeStreamRequirement",
     "resolve_strategy_runtime_requirements",
     "live_runtime_config_from_app",
     "runtime_mode_from_env",
     "validate_strategy_capabilities",
+    "validate_dynamic_strategy_capabilities",
 ]

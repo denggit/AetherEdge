@@ -99,6 +99,24 @@ class FakeStrategy:
     def strategy_identity(self) -> str:
         return "characterization-test"
 
+    def runtime_requirements(self):
+        return {
+            "capabilities": {
+                "manifest_version": 1,
+                "strategy_id": "characterization-test",
+                "position_snapshots": False,
+                "recovery_status": False,
+                "market_features": True,
+                "range_speed_history": False,
+                "startup_preview": False,
+                "pending_work": False,
+            },
+            "trades": {
+                "enabled": True,
+                "stream_enabled": True,
+            },
+        }
+
 
 def _runner(
     strategy: FakeStrategy | None = None,

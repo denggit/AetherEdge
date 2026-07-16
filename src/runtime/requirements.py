@@ -6,6 +6,21 @@ from pathlib import Path
 from typing import Any, Mapping
 import json
 
+from src.strategy.contracts import StrategyCapabilityError
+
+
+_CAPABILITY_BOOLEAN_FIELDS = (
+    "position_snapshots",
+    "recovery_status",
+    "market_features",
+    "range_speed_history",
+    "startup_preview",
+    "pending_work",
+)
+_CAPABILITY_MANIFEST_FIELDS = frozenset(
+    ("manifest_version", "strategy_id", *_CAPABILITY_BOOLEAN_FIELDS)
+)
+
 
 @dataclass(frozen=True)
 class ClosedKlineRequirement:
@@ -69,6 +84,7 @@ class OrderStateRequirement:
 class StrategyCapabilityRequirements:
     """Explicit public capabilities required from a strategy plugin."""
 
+    manifest_version: int | None = None
     strategy_id: str | None = None
     position_snapshots: bool = False
     recovery_status: bool = False
@@ -97,10 +113,12 @@ class StrategyRuntimeRequirements:
     capabilities: StrategyCapabilityRequirements = field(
         default_factory=StrategyCapabilityRequirements
     )
+    capability_manifest_declared: bool = False
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "StrategyRuntimeRequirements":
         raw = dict(data or {})
+        manifest_declared = "capabilities" in raw
         return cls(
             closed_kline=_closed_kline(raw.get("closed_kline")),
             trades=_trades(raw.get("trades")),
@@ -109,7 +127,12 @@ class StrategyRuntimeRequirements:
             private_account_stream=_private_account(raw.get("private_account_stream")),
             account_state=_account_state(raw.get("account_state")),
             order_state=_order_state(raw.get("order_state")),
-            capabilities=_capabilities(raw.get("capabilities")),
+            capabilities=(
+                _capabilities(raw["capabilities"])
+                if manifest_declared
+                else StrategyCapabilityRequirements()
+            ),
+            capability_manifest_declared=manifest_declared,
         )
 
     @classmethod
@@ -137,7 +160,16 @@ def resolve_strategy_runtime_requirements(strategy: object, *, fallback_data_str
 
     value = getattr(strategy, "runtime_requirements", None)
     if callable(value):
-        value = value()
+        try:
+            value = value()
+        except StrategyCapabilityError:
+            raise
+        except Exception as exc:
+            raise StrategyCapabilityError(
+                "strategy runtime requirements provider failed | "
+                f"provider={type(strategy).__module__}.{type(strategy).__qualname__} | "
+                f"error={type(exc).__name__}: {exc}"
+            ) from exc
     if isinstance(value, StrategyRuntimeRequirements):
         return value
     if isinstance(value, Mapping):
@@ -225,16 +257,59 @@ def _order_state(value: Any) -> OrderStateRequirement:
 
 
 def _capabilities(value: Any) -> StrategyCapabilityRequirements:
-    raw = _mapping(value)
-    strategy_id = raw.get("strategy_id")
-    if strategy_id is not None:
-        strategy_id = str(strategy_id).strip() or None
+    if not isinstance(value, Mapping):
+        raise StrategyCapabilityError(
+            "strategy capability manifest must be a mapping"
+        )
+    try:
+        raw = dict(value)
+    except Exception as exc:
+        raise StrategyCapabilityError(
+            "strategy capability manifest could not be read | "
+            f"error={type(exc).__name__}: {exc}"
+        ) from exc
+    actual_fields = set(raw)
+    missing = sorted(_CAPABILITY_MANIFEST_FIELDS - actual_fields)
+    unknown = sorted(
+        actual_fields - _CAPABILITY_MANIFEST_FIELDS,
+        key=repr,
+    )
+    if missing or unknown:
+        raise StrategyCapabilityError(
+            "strategy capability manifest fields must match schema exactly | "
+            f"missing={missing} | unknown={unknown}"
+        )
+
+    manifest_version = raw["manifest_version"]
+    if type(manifest_version) is not int or manifest_version != 1:
+        raise StrategyCapabilityError(
+            "strategy capability manifest_version must be integer 1"
+        )
+
+    strategy_id = raw["strategy_id"]
+    if not isinstance(strategy_id, str) or not strategy_id.strip():
+        raise StrategyCapabilityError(
+            "strategy capability strategy_id must be a non-empty string"
+        )
+
+    invalid_boolean_fields = [
+        name
+        for name in _CAPABILITY_BOOLEAN_FIELDS
+        if type(raw[name]) is not bool
+    ]
+    if invalid_boolean_fields:
+        raise StrategyCapabilityError(
+            "strategy capability values must be bool | "
+            f"invalid={invalid_boolean_fields}"
+        )
+
     return StrategyCapabilityRequirements(
-        strategy_id=strategy_id,
-        position_snapshots=_bool(raw.get("position_snapshots"), False),
-        recovery_status=_bool(raw.get("recovery_status"), False),
-        market_features=_bool(raw.get("market_features"), False),
-        range_speed_history=_bool(raw.get("range_speed_history"), False),
-        startup_preview=_bool(raw.get("startup_preview"), False),
-        pending_work=_bool(raw.get("pending_work"), False),
+        manifest_version=manifest_version,
+        strategy_id=strategy_id.strip(),
+        position_snapshots=raw["position_snapshots"],
+        recovery_status=raw["recovery_status"],
+        market_features=raw["market_features"],
+        range_speed_history=raw["range_speed_history"],
+        startup_preview=raw["startup_preview"],
+        pending_work=raw["pending_work"],
     )

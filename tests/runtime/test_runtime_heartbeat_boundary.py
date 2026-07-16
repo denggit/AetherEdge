@@ -54,7 +54,20 @@ def _runner(*, heartbeat_service=None) -> LiveRuntimeRunner:
             env_file=Path(".env"),
             example_file=None,
         ),
-        "runtime_requirements": StrategyRuntimeRequirements.from_mapping({}),
+        "runtime_requirements": StrategyRuntimeRequirements.from_mapping(
+            {
+                "capabilities": {
+                    "manifest_version": 1,
+                    "strategy_id": "heartbeat-test",
+                    "position_snapshots": False,
+                    "recovery_status": False,
+                    "market_features": False,
+                    "range_speed_history": False,
+                    "startup_preview": False,
+                    "pending_work": False,
+                }
+            }
+        ),
     }
     if heartbeat_service is not None:
         services["heartbeat_service"] = heartbeat_service

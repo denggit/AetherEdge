@@ -32,3 +32,17 @@ def test_script_exports_canonical_watchdog_helpers():
 
     assert entrypoint.build_command is core.build_command
     assert entrypoint.run_live_watchdog is core.run_live_watchdog
+
+
+def test_main_delegates_to_canonical_watchdog(monkeypatch):
+    import scripts.watchdog_live as entrypoint
+
+    calls = []
+    monkeypatch.setattr(
+        entrypoint,
+        "run_live_watchdog",
+        lambda *, project_root: calls.append(project_root) or 78,
+    )
+
+    assert entrypoint.main() == 78
+    assert calls == [entrypoint.PROJECT_ROOT]

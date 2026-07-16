@@ -84,8 +84,10 @@ from src.runtime.range_repair_bootstrap import RangeRepairBootstrapService
 from src.runtime.range_speed_history import RangeSpeedHistoryRefresher
 from src.runtime.requirements import StrategyRuntimeRequirements, resolve_strategy_runtime_requirements
 from src.runtime.strategy_capabilities import (
+    DYNAMIC_STRATEGY_CAPABILITIES_VALIDATED,
     StrategyCapabilityError,
     ValidatedStrategyCapabilities,
+    validate_dynamic_strategy_capabilities,
     validate_strategy_capabilities,
 )
 from src.runtime.recovery_coordinator import (
@@ -2011,6 +2013,28 @@ class LiveRuntimeRunner:
         self,
         report: RecoveryReport,
     ) -> None:
+        report_metadata = getattr(report, "metadata", {})
+        dynamic_state_validated = (
+            isinstance(report_metadata, Mapping)
+            and report_metadata.get(
+                DYNAMIC_STRATEGY_CAPABILITIES_VALIDATED
+            )
+            is True
+        )
+        if not dynamic_state_validated:
+            validate_dynamic_strategy_capabilities(
+                self.context.strategy,
+                strategy_entry=getattr(
+                    getattr(self, "app_config", None),
+                    "strategy",
+                    None,
+                ),
+                runtime_mode=getattr(
+                    getattr(self, "runtime_config", None),
+                    "mode",
+                    RuntimeMode.LIVE_RUNTIME,
+                ),
+            )
         if not report.ok:
             raise LiveRuntimeError(f"runtime recovery failed: {tuple(report.issues)}")
         # ── Check strategy recovery blocking state ────────────────────────
