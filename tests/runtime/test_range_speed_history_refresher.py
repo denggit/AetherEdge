@@ -11,28 +11,27 @@ from src.market_data.backfill.coverage import current_closed_bucket_end_ms
 from src.runtime.range_speed_history import RangeSpeedHistoryRefresher
 
 
-class EntryFilters:
-    range_speed_rolling_window_bars = 100
-    range_speed_min_periods = 3
-
-
-class Config:
-    entry_filters = EntryFilters()
-
-
 class Strategy:
-    config = Config()
-
     def __init__(self) -> None:
         self.values: list[int] = []
         self.calls = 0
-        self.range_speed_tracker = type("Tracker", (), {"complete_history_count": 0})()
+
+    def warmup_range_speed_history(self, values) -> int:
+        self.values.extend(values)
+        return len(values)
 
     def replace_range_speed_history(self, values) -> int:
         self.calls += 1
         self.values = list(values)
-        self.range_speed_tracker.complete_history_count = len(self.values)
         return len(self.values)
+
+    def range_speed_history_status(self):
+        return {
+            "complete_history": len(self.values),
+            "min_periods": 3,
+            "rolling_window_bars": 100,
+            "available": len(self.values) >= 3,
+        }
 
 
 def _aggregate(start: int, end: int, count: int) -> RangeBarAggregate:

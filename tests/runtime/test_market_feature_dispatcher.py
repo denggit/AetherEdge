@@ -173,6 +173,9 @@ async def test_pipeline_rejects_missing_handler_and_propagates_callback_error() 
         await MarketFeaturePipeline(MissingStrategy()).dispatch(_event())
 
     class BrokenStrategy:
+        def market_feature_observers(self):
+            return (self,)
+
         def on_market_feature(self, event):
             raise RuntimeError("observer failed")
 
@@ -185,6 +188,9 @@ async def test_pipeline_does_not_invoke_runtime_side_effect_boundaries() -> None
     signal = _signal("pipeline-only")
 
     class Strategy:
+        def market_feature_observers(self):
+            return (self,)
+
         def on_market_feature(self, event):
             return (signal,)
 
@@ -250,14 +256,14 @@ async def test_provider_dispatch_preserves_order_and_does_not_deduplicate() -> N
 
 
 @pytest.mark.asyncio
-async def test_legacy_strategy_handler_remains_supported() -> None:
-    class LegacyStrategy:
+async def test_strategy_without_observer_provider_is_not_dispatched() -> None:
+    class StrategyWithoutProvider:
         async def on_market_feature(self, event):
-            return (_signal("legacy"),)
+            raise AssertionError("handler must remain plugin-private")
 
-    signals = await dispatch_market_feature_event(LegacyStrategy(), _event())
+    signals = await dispatch_market_feature_event(StrategyWithoutProvider(), _event())
 
-    assert tuple(signal.reason for signal in signals) == ("legacy",)
+    assert signals == ()
 
 
 @pytest.mark.asyncio

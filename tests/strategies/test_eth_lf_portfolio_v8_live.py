@@ -11,6 +11,7 @@ from src.planner import ExecutionPlanner
 from src.runtime import LiveRuntimeConfig, LiveRuntimeRunner, RuntimeMode
 from src.runtime.tasks import ClosedBarScheduler
 from src.signals import SignalAction, TradeSignal
+from src.strategy import StrategyPositionSide, StrategyPositionStatus
 from strategies.eth_lf_portfolio_v8.domain.models import BarReadyContext, ClosedKlineContext, MicroDecision, RangeAggregateContext, RoutedSignal, Side
 from strategies.eth_lf_portfolio_v8.strategy import PendingEntryPlan, Strategy
 from strategies.eth_lf_portfolio_v8.strategy import _default_engine_execution_params
@@ -41,6 +42,39 @@ class _FakeStateStore:
 
     def save_snapshot(self, snapshot):
         pass
+
+
+def test_strategy_exposes_position_snapshots_through_public_provider() -> None:
+    strategy = Strategy()
+    assert strategy.position_snapshots() == ()
+
+    strategy.position.open_master(
+        side=Side.SHORT,
+        entry_time_ms=123,
+        avg_entry=Decimal("2500"),
+        qty=Decimal("0.4"),
+        stop_price=Decimal("2600"),
+        entry_engine="BEAR_V3_ONLY",
+        position_id="v8-position",
+    )
+    strategy.position.mark_leg_open(
+        exchange="okx",
+        avg_fill_price=Decimal("2500"),
+        base_qty=Decimal("0.4"),
+    )
+
+    snapshot = strategy.position_snapshots()[0]
+    assert snapshot.strategy_id == strategy.config.strategy_id
+    assert snapshot.position_id == "v8-position"
+    assert snapshot.symbol == strategy.config.symbol
+    assert snapshot.side is StrategyPositionSide.SHORT
+    assert snapshot.status is StrategyPositionStatus.ACTIVE
+    assert snapshot.base_quantity == Decimal("0.4")
+    assert snapshot.average_entry_price == Decimal("2500")
+    assert snapshot.stop_price == Decimal("2600")
+    assert snapshot.engine == "BEAR_V3_ONLY"
+    assert snapshot.entry_time_ms == 123
+    assert snapshot.metadata == {"active_exchanges": ("okx",)}
 
 
 def test_v9c_live_momentum_execution_params_match_coinbacktest_turbo():
@@ -255,9 +289,8 @@ def test_exit_sync_targets_only_open_legs_when_follower_entry_failed():
     assert next(signal for signal in signals if signal.action is SignalAction.PLACE_STOP_LOSS_SHORT).quantity == Decimal("0.282")
 
 
-def test_v9c_strategy_config_min_range_bars_is_read_by_runner():
-    """Real V9C Strategy.config.micro_context.min_range_bars (object path)
-    must be read correctly by runner._get_min_range_bars() and return 5."""
+def test_strategy_range_minimum_is_read_from_runtime_requirements():
+    """The plugin manifest exposes the same five-bar aggregate minimum."""
 
     strategy = Strategy()  # uses default config.json → min_range_bars=5
 
@@ -296,9 +329,8 @@ def test_v9c_strategy_config_min_range_bars_is_read_by_runner():
         runtime_config=runtime_config,
     )
 
-    # Real V9C config is a V8Config dataclass with micro_context.min_range_bars=5.
     assert runner._get_min_range_bars() == 5, (
-        f"Expected _get_min_range_bars() == 5 for real V9C Strategy, "
+        f"Expected _get_min_range_bars() == 5 for the live Strategy, "
         f"got {runner._get_min_range_bars()}"
     )
 

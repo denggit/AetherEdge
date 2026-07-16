@@ -10,7 +10,6 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-import src.app.factory as app_factory
 from src.platform import config as platform_config
 from src.platform.config import load_project_env_config
 from src.platform.data.websocket.connector import WebsocketsConnector
@@ -19,7 +18,7 @@ from src.platform.exchanges.http import RequestsHttpClient
 import tools.exchange_connectivity_smoke as connectivity_smoke
 import tools.preflight_check_v10b as preflight_v10b
 import tools.run_live as tool_run_live
-import tools.run_runtime_skeleton as runtime_skeleton
+import scripts.run_live as formal_run_live
 import tools.smoke_private_readonly as private_smoke
 import tools.v8_live_preflight_check as preflight_v8
 
@@ -87,106 +86,8 @@ def _app_env(
     return values
 
 
-@pytest.mark.parametrize(
-    ("exchange", "error_code", "field_name"),
-    (
-        ("okx", "placeholder_private_credentials", "api_key"),
-        ("binance", "missing_private_credentials", "api_key"),
-    ),
-)
-def test_tool_run_live_rejects_direct_live_before_startup_boundaries(
-    tmp_path,
-    monkeypatch,
-    caplog,
-    exchange,
-    error_code,
-    field_name,
-):
-    project_env = _project_env(tmp_path, _app_env(exchange))
-    build_context = Mock()
-    create_execution_client = Mock()
-    requests_http = AsyncMock()
-    websocket_connect = AsyncMock()
-    monkeypatch.setattr(
-        tool_run_live,
-        "load_project_env_config",
-        lambda **_kwargs: project_env,
-    )
-    monkeypatch.setattr(tool_run_live, "build_app_context", build_context)
-    monkeypatch.setattr(
-        app_factory,
-        "create_execution_client",
-        create_execution_client,
-    )
-    monkeypatch.setattr(RequestsHttpClient, "request", requests_http)
-    monkeypatch.setattr(WebsocketsConnector, "connect", websocket_connect)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["run_live.py", "--defaults", str(tmp_path / "missing.json")],
-    )
-
-    with pytest.raises(ExchangeConfigError) as exc_info:
-        asyncio.run(tool_run_live.main())
-
-    text = str(exc_info.value)
-    assert error_code in text
-    assert f"exchange={exchange}" in text
-    assert field_name in text
-    assert "canary_secret" not in text
-    assert "canary_passphrase" not in text
-    assert "canary_secret" not in repr(exc_info.value)
-    assert "canary_secret" not in caplog.text
-    build_context.assert_not_called()
-    create_execution_client.assert_not_called()
-    requests_http.assert_not_awaited()
-    websocket_connect.assert_not_awaited()
-
-
-def test_tool_run_live_dry_run_uses_process_override_and_ignores_example(
-    tmp_path,
-    monkeypatch,
-):
-    (tmp_path / ".env").write_text(
-        "AETHER_LIVE_TRADING=true\n"
-        "AETHER_DRY_RUN=false\n"
-        "AETHER_EXCHANGES=okx\n"
-        "AETHER_DATA_EXCHANGE=okx\n"
-        "OKX_API_KEY=your_okx_api_key\n",
-        encoding="utf-8",
-    )
-    (tmp_path / ".env.example").write_text(
-        "AETHER_DRY_RUN=false\n"
-        "AETHER_EXAMPLE_ONLY=must_not_load\n"
-        "OKX_SECRET_KEY=canary_example_secret\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("AETHER_DRY_RUN", "true")
-    monkeypatch.setenv("AETHER_STRATEGY", "strategies.empty_strategy:Strategy")
-    monkeypatch.setenv("AETHER_MARKET", "ETH-USDT-PERP")
-    monkeypatch.setattr(tool_run_live, "REPO_ROOT", tmp_path)
-    built_configs = []
-
-    def stop_at_build(config):
-        built_configs.append(config)
-        raise StartupBoundaryReached("build_app_context_reached")
-
-    monkeypatch.setattr(tool_run_live, "build_app_context", stop_at_build)
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["run_live.py", "--defaults", str(tmp_path / "missing.json")],
-    )
-
-    with pytest.raises(StartupBoundaryReached, match="build_app_context_reached"):
-        asyncio.run(tool_run_live.main())
-
-    snapshot = platform_config.get_project_env_config()
-    assert built_configs[0].dry_run is True
-    assert snapshot.get("AETHER_DRY_RUN") == "true"
-    assert snapshot.get("AETHER_EXAMPLE_ONLY", "") == ""
-    assert snapshot.example_file is None
-    assert snapshot.source_files == (str(tmp_path / ".env"),)
+def test_tool_run_live_delegates_to_formal_entrypoint():
+    assert tool_run_live.main is formal_run_live.main
 
 
 def test_private_readonly_rejects_before_clients_and_network(
@@ -361,26 +262,6 @@ def test_connectivity_smoke_valid_dry_preview_preserves_order_flags(
 
     assert asyncio.run(connectivity_smoke.main()) == 0
     coordinator.assert_not_called()
-
-
-def test_runtime_skeleton_validates_before_context_build(tmp_path, monkeypatch):
-    project_env = _project_env(tmp_path, _app_env("okx"))
-    build_context = Mock()
-    runtime = Mock()
-    monkeypatch.setattr(
-        runtime_skeleton,
-        "load_project_env_config",
-        lambda **_kwargs: project_env,
-    )
-    monkeypatch.setattr(runtime_skeleton, "build_runtime_context", build_context)
-    monkeypatch.setattr(runtime_skeleton, "PlatformRuntime", runtime)
-    monkeypatch.setattr(sys, "argv", ["run_runtime_skeleton.py", "okx"])
-
-    with pytest.raises(ExchangeConfigError, match="placeholder_private_credentials"):
-        asyncio.run(runtime_skeleton.main())
-
-    build_context.assert_not_called()
-    runtime.assert_not_called()
 
 
 @pytest.mark.parametrize("skip_api", (False, True))

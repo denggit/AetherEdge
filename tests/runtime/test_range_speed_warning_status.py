@@ -7,11 +7,19 @@ from src.runtime.range_speed_history import RangeSpeedHistoryRefresher, RangeSpe
 
 
 class DummyStrategy:
-    config = type(
-        "Config",
-        (),
-        {"entry_filters": type("EntryFilters", (), {"range_speed_rolling_window_bars": 100, "range_speed_min_periods": 3})()},
-    )()
+    def warmup_range_speed_history(self, values) -> int:
+        return len(values)
+
+    def replace_range_speed_history(self, values) -> int:
+        return len(values)
+
+    def range_speed_history_status(self):
+        return {
+            "complete_history": 0,
+            "min_periods": 3,
+            "rolling_window_bars": 100,
+            "available": False,
+        }
 
 
 def test_warning_log_is_rate_limited(tmp_path, caplog) -> None:

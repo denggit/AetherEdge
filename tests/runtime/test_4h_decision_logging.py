@@ -7,14 +7,17 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import src.runtime.runner as runner_module
+import src.runtime.strategy_diagnostics as diagnostics_module
 from src.runtime.runner import LiveRuntimeRunner
 
 
 def _runner(audit):
+    class AuditStrategy:
+        def decision_audit(self):
+            return audit
+
     runner = object.__new__(LiveRuntimeRunner)
-    runner.context = SimpleNamespace(
-        strategy=SimpleNamespace(last_decision_audit=audit)
-    )
+    runner.context = SimpleNamespace(strategy=AuditStrategy())
     runner.app_config = SimpleNamespace(symbol="ETH-USDT-PERP")
     runner._closed_bar_interval = "4h"
     runner._closed_bar_buffer_ms = 60_000
@@ -116,7 +119,9 @@ def test_runtime_has_generic_hook_without_portfolio_v1_import() -> None:
         module.startswith("strategies.eth_portfolio_v1")
         for module in imported_modules
     )
-    assert source.count("4H engine diagnostics") == 1
-    assert "4H engine diagnostics" in inspect.getsource(
+    diagnostics_source = inspect.getsource(diagnostics_module)
+    assert source.count("4H engine diagnostics") == 0
+    assert diagnostics_source.count("4H engine diagnostics") == 1
+    assert "log_closed_bar_decision" in inspect.getsource(
         LiveRuntimeRunner._log_4h_decision_summary
     )

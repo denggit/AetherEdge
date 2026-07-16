@@ -31,6 +31,7 @@ from src.strategy.positions import (
     StrategyPositionSnapshot,
     StrategyPositionStatus,
 )
+from src.strategy import StrategyRecoveryStatus
 
 
 SYMBOL = "ETH-USDT-PERP"
@@ -47,6 +48,11 @@ class MultiPositionStrategy:
 
     def position_snapshots(self) -> tuple[StrategyPositionSnapshot, ...]:
         return self._snapshots
+
+    def recovery_status(self) -> StrategyRecoveryStatus:
+        return StrategyRecoveryStatus(
+            blocking_manual_required=self.recovery_blocking_manual_required,
+        )
 
 
 class FakeAccount:

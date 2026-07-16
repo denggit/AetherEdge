@@ -267,6 +267,12 @@ from src.platform.markets import get_market_profile
 from src.platform.snapshot import PlatformSnapshot
 from src.runtime.runner import LiveRuntimeError, LiveRuntimeRunner, _first_active_position, _position_side_from_quantity, _position_side_label
 from src.runtime.recovery.models import RecoveryReport
+from src.strategy import (
+    StrategyPositionSide,
+    StrategyPositionSnapshot,
+    StrategyPositionStatus,
+    StrategyRecoveryStatus,
+)
 
 
 def _minimal_runner(
@@ -363,7 +369,39 @@ def _minimal_runner(
 
 class _FakeStrategy:
     """Minimal strategy stub for postcondition tests."""
-    recovery_blocking_manual_required = False
+
+    def __init__(self) -> None:
+        self.recovery_blocking_manual_required = False
+        self.recovery_alerts: list[str] = []
+        self.config = MagicMock(strategy_id="test_strategy")
+        self.position = MagicMock(
+            in_pos=False,
+            position_id=None,
+            stop_price=None,
+            open_legs={},
+        )
+
+    def recovery_status(self) -> StrategyRecoveryStatus:
+        return StrategyRecoveryStatus(
+            blocking_manual_required=self.recovery_blocking_manual_required,
+            alerts=tuple(self.recovery_alerts),
+        )
+
+    def position_snapshots(self) -> tuple[StrategyPositionSnapshot, ...]:
+        if not self.position.in_pos or not self.position.position_id:
+            return ()
+        return (
+            StrategyPositionSnapshot(
+                strategy_id="test_strategy",
+                position_id=self.position.position_id,
+                symbol="ETH-USDT-PERP",
+                side=StrategyPositionSide.SHORT,
+                status=StrategyPositionStatus.ACTIVE,
+                base_quantity=Decimal("2.82"),
+                stop_price=self.position.stop_price,
+                metadata={"active_exchanges": tuple(self.position.open_legs)},
+            ),
+        )
 
 
 def _recovery_report(*, snapshots=(), strategy_signals=()) -> RecoveryReport:
@@ -390,7 +428,7 @@ class TestRecoveryProtectionPostcondition:
 
     def test_active_position_without_stop_or_signal_raises(self):
         """8.4: active position + no stop + no signal → LiveRuntimeError."""
-        strategy = MagicMock()
+        strategy = _FakeStrategy()
         strategy.recovery_blocking_manual_required = False
         strategy.config = MagicMock()
         strategy.config.strategy_id = "test_strategy"
@@ -414,7 +452,7 @@ class TestRecoveryProtectionPostcondition:
 
     def test_active_position_with_valid_bot_stop_passes_without_signal(self):
         """8.5: active position + valid bot stop → no signal needed, postcondition passes."""
-        strategy = MagicMock()
+        strategy = _FakeStrategy()
         strategy.recovery_blocking_manual_required = False
         strategy.config = MagicMock()
         strategy.config.strategy_id = "test_strategy"
@@ -450,7 +488,7 @@ class TestRecoveryProtectionPostcondition:
 
     def test_manual_stop_does_not_satisfy_postcondition_without_signal(self):
         """8.6: manual stop only → not bot-owned → postcondition fails."""
-        strategy = MagicMock()
+        strategy = _FakeStrategy()
         strategy.recovery_blocking_manual_required = False
         strategy.config = MagicMock()
         strategy.config.strategy_id = "test_strategy"
@@ -487,7 +525,7 @@ class TestRecoveryProtectionPostcondition:
 
     def test_manual_stop_with_place_stop_signal_satisfies_postcondition(self):
         """Manual stop + recovery PLACE_STOP_LOSS signal → postcondition passes."""
-        strategy = MagicMock()
+        strategy = _FakeStrategy()
         strategy.recovery_blocking_manual_required = False
         strategy.config = MagicMock()
         strategy.config.strategy_id = "test_strategy"
@@ -530,7 +568,7 @@ class TestRecoveryProtectionPostcondition:
 
     def test_blocking_flag_skips_postcondition(self):
         """When recovery_blocking_manual_required is True, postcondition is skipped."""
-        strategy = MagicMock()
+        strategy = _FakeStrategy()
         strategy.recovery_blocking_manual_required = True  # blocking
 
         snapshot = _custom_snapshot(
@@ -546,7 +584,7 @@ class TestRecoveryProtectionPostcondition:
 
     def test_flat_snapshot_passes_postcondition(self):
         """No active position → postcondition passes."""
-        strategy = MagicMock()
+        strategy = _FakeStrategy()
         strategy.recovery_blocking_manual_required = False
 
         snapshot = _custom_snapshot(
@@ -562,7 +600,7 @@ class TestRecoveryProtectionPostcondition:
 
     def test_postcondition_error_message_contains_diagnostics(self):
         """Error message includes exchange, symbol, position_side, qty, stop info."""
-        strategy = MagicMock()
+        strategy = _FakeStrategy()
         strategy.recovery_blocking_manual_required = False
         strategy.config = MagicMock()
         strategy.config.strategy_id = "test_strategy"
@@ -598,7 +636,7 @@ class TestPostExecutionStopProtection:
     @pytest.fixture
     def runner_with_mock_exchanges(self):
         """Runner whose exchange clients can be controlled per test."""
-        strategy = MagicMock()
+        strategy = _FakeStrategy()
         strategy.config = MagicMock()
         strategy.config.strategy_id = "test_strategy"
         strategy.position = MagicMock()

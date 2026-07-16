@@ -20,6 +20,7 @@ from src.runtime.recovery_coordinator import (
 from src.runtime.runner import LiveRuntimeError, LiveRuntimeRunner
 from src.runtime.requirements import StrategyRuntimeRequirements
 from src.signals.models import SignalAction
+from src.strategy import StrategyRecoveryStatus
 
 
 PLAN_FIELDS = (
@@ -385,6 +386,13 @@ async def test_invoke_service_passes_same_strategy_once() -> None:
 
 
 def test_record_and_report_validation_keep_order_and_messages() -> None:
+    class BlockingStrategy:
+        def recovery_status(self) -> StrategyRecoveryStatus:
+            return StrategyRecoveryStatus(
+                blocking_manual_required=True,
+                alerts=("manual",),
+            )
+
     runner = object.__new__(LiveRuntimeRunner)
     runner.stats = SimpleNamespace(recovery_runs=4)
     runner.context = SimpleNamespace(strategy=SimpleNamespace())
@@ -401,10 +409,7 @@ def test_record_and_report_validation_keep_order_and_messages() -> None:
         runner._validate_runtime_recovery_report(invalid)
     runner._validate_recovery_protection_postcondition.assert_not_called()
 
-    runner.context.strategy = SimpleNamespace(
-        recovery_blocking_manual_required=True,
-        recovery_alerts=["manual"],
-    )
+    runner.context.strategy = BlockingStrategy()
     valid = SimpleNamespace(ok=True, issues=[])
     with pytest.raises(
         LiveRuntimeError,

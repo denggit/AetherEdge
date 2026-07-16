@@ -82,6 +82,9 @@ class FakeStrategy:
         self.calls.append("strategy.on_market_feature")
         return self.feature_signals
 
+    def market_feature_observers(self):
+        return (self,)
+
     async def on_account_event(self, event):
         self.calls.append("strategy.on_account_event")
         return self.account_signals

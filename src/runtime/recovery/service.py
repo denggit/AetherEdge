@@ -17,7 +17,10 @@ from src.reconcile.models import ReconcileCategory, ReconcileIssue, ReconcileRep
 from src.runtime.recovery.models import RecoveryReport
 from src.runtime.strategy_positions import resolve_strategy_position_snapshot_index
 from src.signals import TradeSignal
-from src.strategy.ports import StrategyRecoveryContext
+from src.strategy.ports import (
+    StrategyPositionPlanRecoveryUpdateProvider,
+    StrategyRecoveryContext,
+)
 from src.strategy.positions import StrategyPositionSnapshot
 
 logger = logging.getLogger(__name__)
@@ -42,7 +45,7 @@ class RuntimeRecoveryService:
 
     It collects read-only platform snapshots, persists snapshots, runs reconcile
     checks, optionally loads order intents from a journal, and then calls a
-    strategy's optional ``recover`` hook. It does not make V8-specific decisions
+    strategy's optional ``recover`` hook. It does not make plugin-specific decisions
     and it does not place/cancel orders.
     """
 
@@ -180,13 +183,15 @@ class RuntimeRecoveryService:
 
         if self.position_plan_store is None or strategy is None:
             return
-        updates = getattr(strategy, "position_plan_recovery_updates", None)
         apply_resolution = getattr(
             self.position_plan_store, "apply_recovery_leg_resolution", None
         )
-        if not callable(updates) or not callable(apply_resolution):
+        if not isinstance(
+            strategy,
+            StrategyPositionPlanRecoveryUpdateProvider,
+        ) or not callable(apply_resolution):
             return
-        for raw in updates() or ():
+        for raw in strategy.position_plan_recovery_updates() or ():
             if not isinstance(raw, dict):
                 continue
             position_id = str(raw.get("position_id") or "").strip()

@@ -53,7 +53,12 @@ def _feature_requirements():
     return StrategyRuntimeRequirements.from_mapping({
         "closed_kline": {"enabled": True, "interval": "4h", "close_buffer_ms": 60000},
         "trades": {"enabled": True, "stream_enabled": True},
-        "range_bars": {"enabled": True, "range_pct": "0.002", "aggregate_interval": "4h"},
+        "range_bars": {
+            "enabled": True,
+            "range_pct": "0.002",
+            "aggregate_interval": "4h",
+            "min_bars": 5,
+        },
     })
 
 
@@ -217,6 +222,12 @@ class FeatureStrategy:
         if self.signal_on_aggregate and event.event_type is MarketFeatureEventType.RANGE_AGGREGATE:
             return [TradeSignal(symbol="ETH-USDT-PERP", action=SignalAction.OPEN_LONG, quantity=Decimal("0.5"), created_time_ms=event.event_time_ms)]
         return []
+
+    def market_feature_observers(self):
+        return (self,)
+
+    def decision_audit(self):
+        return self.last_decision_audit
 
 
 class FakeRecoveryService:
@@ -2011,6 +2022,28 @@ class CatchupTestStrategy:
     async def on_start(self, snapshot):
         return []
 
+    def market_feature_observers(self):
+        return (self,)
+
+    def strategy_identity(self) -> str:
+        return "test-catchup"
+
+    def has_pending_strategy_work(self) -> bool:
+        return self.pending_entry is not None
+
+    def capture_startup_preview_state(self) -> object:
+        return (
+            self.pending_entry,
+            set(self.buffer.evaluated_bars),
+            len(self.bar_ready_events),
+        )
+
+    def restore_startup_preview_state(self, state: object) -> None:
+        pending_entry, evaluated_bars, events_len = state
+        self.pending_entry = pending_entry
+        self.buffer.evaluated_bars = set(evaluated_bars)
+        del self.bar_ready_events[events_len:]
+
 
 class CatchupTestData:
     """Data feed that returns controlled ticker price and klines."""
@@ -3365,8 +3398,9 @@ async def test_degraded_range_bucket_still_allows_closed_kline_decision():
 
 
 @pytest.mark.asyncio
-async def test_v9c_trade_event_is_range_only_and_skips_on_trade_callback(monkeypatch):
+async def test_explicit_range_only_trade_skips_on_trade_callback(monkeypatch):
     strategy = CountingTradeStrategy(strategy_id="eth_lf_portfolio_v9c_reclaim_priority")
+    strategy.raw_trade_callbacks_enabled = False
     runner = _runner(strategy, dry_run=True)
     processed_trades = []
 

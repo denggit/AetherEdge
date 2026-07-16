@@ -15,7 +15,7 @@ class RecoveryReport:
     """Generic runtime recovery report.
 
     Strategy-specific recovery remains inside strategy plugins. This report is
-    intentionally generic so runtime does not learn V8 internals.
+    intentionally generic so runtime does not learn plugin internals.
     """
 
     ok: bool

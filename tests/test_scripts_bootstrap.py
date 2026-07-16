@@ -25,7 +25,7 @@ def test_all_shell_startup_scripts_define_project_root():
     assert missing == []
 
 
-def test_watchdog_uses_simple_shell_pid_control():
+def test_watchdog_uses_shell_pid_control_and_canonical_python_core():
     shell_text = (ROOT / "scripts" / "start_live_watchdog.sh").read_text(encoding="utf-8")
     py_text = (ROOT / "scripts" / "watchdog_live.py").read_text(encoding="utf-8")
 
@@ -33,6 +33,5 @@ def test_watchdog_uses_simple_shell_pid_control():
     assert "nohup" in shell_text
     assert "WATCHDOG_PID" in shell_text
     assert "DEFAULT_CHILD_PID_FILE" in py_text
-    assert "subprocess.Popen" in py_text
-    assert "ProcessWatchdog" not in py_text
-    assert "PidFileProcessController" not in py_text
+    assert "run_live_watchdog" in py_text
+    assert "subprocess.Popen" not in py_text

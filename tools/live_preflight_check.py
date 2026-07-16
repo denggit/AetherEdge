@@ -354,7 +354,8 @@ async def main() -> int:
     report.add("runtime_mode_check", "ok", detail={"mode": runtime_mode.value})
 
     # ── 3. Strategy identity check ──
-    strategy_id = getattr(getattr(strategy, "config", None), "strategy_id", None)
+    identity_provider = getattr(strategy, "strategy_identity", None)
+    strategy_id = identity_provider() if callable(identity_provider) else None
     if not strategy_id:
         report.add("strategy_identity", "fail", error="Strategy has no strategy_id")
         report.verdict = "fail_config"

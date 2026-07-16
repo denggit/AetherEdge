@@ -293,7 +293,9 @@ def test_runner_retains_service_construction_and_business_rules() -> None:
     assert "LiveRuntimeError" in validate
 
     legacy = ast.unparse(methods["_apply_startup_legacy_stop_adoptions"])
-    assert "_legacy_adoptions" in legacy
+    assert "StrategyStopAdoptionProvider" in legacy
+    assert "pending_stop_adoptions" in legacy
+    assert "clear_pending_stop_adoptions" in legacy
     assert "ReconciliationAction" in legacy
     assert "int(time.time() * 1000)" in legacy
     assert "service._apply_actions" in legacy

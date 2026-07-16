@@ -36,11 +36,9 @@ def test_runtime_position_resolver_has_no_concrete_strategy_or_raw_adapter_depen
     )
 
 
-def test_runtime_reads_legacy_strategy_position_only_inside_resolver() -> None:
+def test_runtime_never_reads_strategy_position_state() -> None:
     violations: list[str] = []
     for path in RUNTIME_ROOT.rglob("*.py"):
-        if path == RUNTIME_RESOLVER:
-            continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
@@ -52,6 +50,22 @@ def test_runtime_reads_legacy_strategy_position_only_inside_resolver() -> None:
                 violations.append(f"{path.relative_to(PROJECT_ROOT)}:{node.lineno}")
 
     assert violations == []
+
+
+def test_runtime_position_resolver_uses_public_provider_only() -> None:
+    source = RUNTIME_RESOLVER.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    private_reads = [
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "strategy"
+        and node.attr in {"config", "position"}
+    ]
+
+    assert private_reads == []
+    assert "legacy_" not in source
 
 
 def test_runtime_has_no_loaded_first_active_strategy_helpers() -> None:

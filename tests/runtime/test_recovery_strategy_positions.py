@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
-from types import SimpleNamespace
 
 from src.runtime.recovery.service import RuntimeRecoveryService
 from src.strategy.positions import (
@@ -36,20 +35,8 @@ class RecoveringProviderStrategy:
         return ()
 
 
-class RecoveringLegacyStrategy:
-    def __init__(self, *, in_pos: bool) -> None:
-        self.config = SimpleNamespace(
-            strategy_id="legacy-strategy",
-            symbol="ETH-USDT-PERP",
-        )
-        self.position = SimpleNamespace(
-            in_pos=in_pos,
-            position_id="legacy-position",
-            side="long",
-            qty=Decimal("2"),
-            avg_entry=Decimal("2500"),
-            stop_price=Decimal("2400"),
-        )
+class RecoveringStrategyWithoutPositionProvider:
+    def __init__(self) -> None:
         self.recovery_contexts = []
 
     async def recover(self, context) -> tuple:
@@ -86,20 +73,8 @@ def test_recovery_does_not_reduce_multiple_positions_to_first_active() -> None:
     )
 
 
-def test_recovery_uses_legacy_position_fallback() -> None:
-    strategy = RecoveringLegacyStrategy(in_pos=True)
-
-    report = asyncio.run(RuntimeRecoveryService().recover(strategy=strategy))
-
-    assert len(report.active_strategy_positions) == 1
-    assert report.active_strategy_positions[0].position_id == "legacy-position"
-    assert strategy.recovery_contexts[0].metadata["active_strategy_positions"] == (
-        report.active_strategy_positions
-    )
-
-
-def test_recovery_without_active_strategy_position_returns_empty_tuples() -> None:
-    strategy = RecoveringLegacyStrategy(in_pos=False)
+def test_recovery_without_position_provider_returns_empty_tuples() -> None:
+    strategy = RecoveringStrategyWithoutPositionProvider()
 
     report = asyncio.run(RuntimeRecoveryService().recover(strategy=strategy))
 

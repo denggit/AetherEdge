@@ -407,7 +407,7 @@ def test_range_speed_result_wrapper_keeps_exact_warning(monkeypatch) -> None:
     runner._handle_startup_range_speed_history_result(7)
 
     logger.warning.assert_called_once_with(
-        "V10A range-speed history insufficient; live runtime continues | complete_history=%s min_periods=%s missing=%s",
+        "Range-speed history insufficient; live runtime continues | complete_history=%s min_periods=%s missing=%s",
         7,
         10,
         3,

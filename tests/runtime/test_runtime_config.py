@@ -21,8 +21,8 @@ def _app_config() -> AppConfig:
     )
 
 
-def test_runtime_mode_defaults_to_legacy_app(tmp_path):
-    assert runtime_mode_from_env(defaults_path=tmp_path / "missing.json", environ={}) is RuntimeMode.LEGACY_APP
+def test_runtime_mode_defaults_to_live_runtime(tmp_path):
+    assert runtime_mode_from_env(defaults_path=tmp_path / "missing.json", environ={}) is RuntimeMode.LIVE_RUNTIME
 
 
 def test_runtime_mode_can_be_enabled_from_environment(tmp_path):

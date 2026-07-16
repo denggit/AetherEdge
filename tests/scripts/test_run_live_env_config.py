@@ -5,16 +5,12 @@ import importlib
 import os
 import sys
 from contextlib import contextmanager
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import Mock
 
 import pytest
 
-import src.app.factory as app_factory
-from src.platform.data.websocket.connector import WebsocketsConnector
-from src.platform.exchanges.http import RequestsHttpClient, StdlibHttpClient
 from src.platform import config as platform_config
 from src.platform.config import get_project_env_config, load_project_env_config
-from src.runtime import RuntimeMode
 from src.runtime.runner import LiveRuntimeError
 
 
@@ -160,33 +156,6 @@ def _live_runtime_project_env(tmp_path, *, dry_run: bool):
     )
 
 
-def _legacy_project_env(
-    tmp_path,
-    *,
-    dry_run: bool,
-    runtime_mode: str | None = "legacy_app",
-):
-    env = tmp_path / "legacy-app.env"
-    env.write_text("", encoding="utf-8")
-    process_env = {
-        "AETHER_LIVE_TRADING": "true",
-        "AETHER_DRY_RUN": str(dry_run).lower(),
-        "AETHER_MARKET": "ETH-USDT-PERP",
-        "AETHER_EXCHANGES": "okx",
-        "AETHER_DATA_EXCHANGE": "okx",
-        "AETHER_STRATEGY": "strategies.eth_portfolio_v1:Strategy",
-        "OKX_API_KEY": "your_okx_api_key",
-        "OKX_SECRET_KEY": "canary_legacy_okx_secret",
-        "OKX_PASSPHRASE": "canary_legacy_okx_passphrase",
-    }
-    if runtime_mode is not None:
-        process_env["AETHER_RUNTIME_MODE"] = runtime_mode
-    return load_project_env_config(
-        env_file=env,
-        process_env=process_env,
-    )
-
-
 def test_direct_live_rejects_placeholder_credentials_before_app_context(
     tmp_path,
     monkeypatch,
@@ -238,133 +207,31 @@ def test_dry_run_does_not_require_private_credentials_at_live_validation_layer(
             asyncio.run(run_live.main())
 
 
-def test_legacy_direct_live_rejects_placeholder_credentials_before_startup(
+def test_legacy_runtime_mode_is_rejected_before_app_context(
     tmp_path,
     monkeypatch,
 ):
+    env = tmp_path / "legacy-app.env"
+    env.write_text("", encoding="utf-8")
+    project_env = load_project_env_config(
+        env_file=env,
+        process_env={
+            "AETHER_RUNTIME_MODE": "legacy_app",
+            "AETHER_DRY_RUN": "true",
+            "AETHER_MARKET": "ETH-USDT-PERP",
+            "AETHER_EXCHANGES": "okx",
+            "AETHER_DATA_EXCHANGE": "okx",
+            "AETHER_STRATEGY": "strategies.empty_strategy:Strategy",
+        },
+    )
     with _isolated_run_live_import(tmp_path) as (run_live, _import_config):
-        project_env = _legacy_project_env(tmp_path, dry_run=False)
         platform_config.set_project_env_config(project_env)
         run_live.PROJECT_ENV_CONFIG = project_env
         monkeypatch.setattr(sys, "argv", ["run_live.py"])
-
-        build_context = Mock(
-            side_effect=AssertionError("app context built with invalid credentials")
-        )
-        load_strategy = Mock(
-            side_effect=AssertionError("strategy loaded with invalid credentials")
-        )
-        create_execution_client = Mock(
-            side_effect=AssertionError("client created with invalid credentials")
-        )
-        app_runner = Mock(
-            side_effect=AssertionError("AppRunner created with invalid credentials")
-        )
-        live_runtime_runner = Mock(
-            side_effect=AssertionError(
-                "LiveRuntimeRunner created with invalid credentials"
-            )
-        )
-        requests_http = AsyncMock(
-            side_effect=AssertionError("HTTP called with invalid credentials")
-        )
-        stdlib_http = AsyncMock(
-            side_effect=AssertionError("HTTP called with invalid credentials")
-        )
-        websocket_connect = AsyncMock(
-            side_effect=AssertionError("WebSocket called with invalid credentials")
-        )
-        monkeypatch.setattr(run_live, "build_app_context", build_context)
-        monkeypatch.setattr(run_live, "AppRunner", app_runner)
-        monkeypatch.setattr(run_live, "LiveRuntimeRunner", live_runtime_runner)
-        monkeypatch.setattr(app_factory, "load_strategy", load_strategy)
-        monkeypatch.setattr(
-            app_factory,
-            "create_execution_client",
-            create_execution_client,
-        )
-        monkeypatch.setattr(RequestsHttpClient, "request", requests_http)
-        monkeypatch.setattr(StdlibHttpClient, "request", stdlib_http)
-        monkeypatch.setattr(WebsocketsConnector, "connect", websocket_connect)
-
-        with pytest.raises(LiveRuntimeError) as exc_info:
-            asyncio.run(run_live.main())
-
-    text = str(exc_info.value)
-    assert "placeholder_private_credentials" in text
-    assert "exchange=okx" in text
-    assert "placeholder_fields=api_key" in text
-    assert "canary_legacy_okx_secret" not in text
-    assert "canary_legacy_okx_passphrase" not in text
-    build_context.assert_not_called()
-    load_strategy.assert_not_called()
-    create_execution_client.assert_not_called()
-    app_runner.assert_not_called()
-    live_runtime_runner.assert_not_called()
-    requests_http.assert_not_awaited()
-    stdlib_http.assert_not_awaited()
-    websocket_connect.assert_not_awaited()
-
-
-def test_legacy_dry_run_reaches_app_context_with_placeholder_credentials(
-    tmp_path,
-    monkeypatch,
-):
-    class BuildReached(RuntimeError):
-        pass
-
-    with _isolated_run_live_import(tmp_path) as (run_live, _import_config):
-        project_env = _legacy_project_env(tmp_path, dry_run=True)
-        platform_config.set_project_env_config(project_env)
-        run_live.PROJECT_ENV_CONFIG = project_env
-        monkeypatch.setattr(sys, "argv", ["run_live.py"])
-        build_calls = []
-
-        def stop_at_app_context(config):
-            build_calls.append(config)
-            raise BuildReached("legacy_build_app_context_reached")
-
-        monkeypatch.setattr(run_live, "build_app_context", stop_at_app_context)
-
-        with pytest.raises(BuildReached, match="legacy_build_app_context_reached"):
-            asyncio.run(run_live.main())
-
-    assert len(build_calls) == 1
-    assert build_calls[0].dry_run is True
-    assert build_calls[0].strategy == "strategies.eth_portfolio_v1:Strategy"
-
-
-def test_default_legacy_mode_rejects_direct_live_before_app_context(
-    tmp_path,
-    monkeypatch,
-):
-    with _isolated_run_live_import(tmp_path) as (run_live, _import_config):
-        project_env = _legacy_project_env(
-            tmp_path,
-            dry_run=False,
-            runtime_mode=None,
-        )
-        defaults_path = tmp_path / "missing-defaults.json"
-        platform_config.set_project_env_config(project_env)
-        run_live.PROJECT_ENV_CONFIG = project_env
-        monkeypatch.setattr(
-            sys,
-            "argv",
-            ["run_live.py", "--defaults", str(defaults_path)],
-        )
-        build_context = Mock(
-            side_effect=AssertionError("default legacy app context built")
-        )
+        build_context = Mock()
         monkeypatch.setattr(run_live, "build_app_context", build_context)
 
-        assert (
-            run_live.runtime_mode_from_env(defaults_path=defaults_path)
-            is RuntimeMode.LEGACY_APP
-        )
-        with pytest.raises(
-            LiveRuntimeError,
-            match="placeholder_private_credentials exchange=okx",
-        ):
+        with pytest.raises(LiveRuntimeError, match="unsupported runtime mode"):
             asyncio.run(run_live.main())
 
     build_context.assert_not_called()

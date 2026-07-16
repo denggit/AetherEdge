@@ -35,7 +35,8 @@
     "range_bars": {
       "enabled": true,
       "range_pct": "0.002",
-      "aggregate_interval": "4h"
+      "aggregate_interval": "4h",
+      "min_bars": 5
     },
     "order_book": {
       "enabled": false

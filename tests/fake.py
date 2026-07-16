@@ -33,6 +33,9 @@ class Strategy:
     def __init__(self) -> None:
         self.config = _FakeStrategyConfig()
 
+    def strategy_identity(self) -> str:
+        return self.config.strategy_id
+
     @property
     def runtime_requirements(self) -> StrategyRuntimeRequirements:
         return StrategyRuntimeRequirements(

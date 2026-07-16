@@ -39,7 +39,7 @@ from src.order_management.models import ExchangeOrderResult
 from src.platform.snapshot import PlatformSnapshot
 from src.runtime.position_mode_gate import PositionModeRequirement
 from src.signals import SignalAction, SignalOrderType, TradeSignal
-from src.strategy import StrategyRecoveryContext
+from src.strategy import StrategyRecoveryContext, StrategyRecoveryStatus
 from src.strategy.positions import StrategyPositionSnapshot
 from strategies.eth_portfolio_v1.diagnostics.lf_engine_diag import (
     build_lf_engine_diag,
@@ -203,6 +203,8 @@ class Strategy:
     """AetherEdge live plugin for V10B all-swing structural stops."""
 
     raw_trade_callbacks_enabled = False
+    observer_id = "primary"
+    enabled = True
 
     def __init__(
         self,
@@ -309,6 +311,7 @@ class Strategy:
         self.bar_ready_events: list[BarReadyContext] = []
         self.last_decision_audit: dict[str, Any] | None = None
         self.recovery_alerts: list[str] = []
+        self._legacy_adoptions: list[dict[str, Any]] = []
         self._position_plan_recovery_updates: list[dict[str, Any]] = []
         self.last_recovery_audit: dict[str, Any] | None = None
         self.stop_safety_alerts: list[str] = []
@@ -479,6 +482,40 @@ class Strategy:
         """Expose active V1 logical positions through the generic provider."""
 
         return self.sleeves.position_snapshots()
+
+    def pending_stop_adoptions(self) -> tuple[Mapping[str, Any], ...]:
+        return tuple(self._legacy_adoptions)
+
+    def clear_pending_stop_adoptions(self) -> None:
+        self._legacy_adoptions.clear()
+
+    def recovery_status(self) -> StrategyRecoveryStatus:
+        return StrategyRecoveryStatus(
+            blocking_manual_required=self.recovery_blocking_manual_required,
+            alerts=tuple(self.recovery_alerts),
+        )
+
+    def strategy_identity(self) -> str:
+        return self.config.strategy_id
+
+    def decision_audit(self) -> Mapping[str, Any] | None:
+        return self.last_decision_audit
+
+    def has_pending_strategy_work(self) -> bool:
+        return self.pending_entry is not None
+
+    def capture_startup_preview_state(self) -> object:
+        return (
+            self.pending_entry,
+            set(self.buffer.evaluated_bars),
+            len(self.bar_ready_events),
+        )
+
+    def restore_startup_preview_state(self, state: object) -> None:
+        pending_entry, evaluated_bars, events_len = state  # type: ignore[misc]
+        self.pending_entry = pending_entry
+        self.buffer.evaluated_bars = set(evaluated_bars)
+        del self.bar_ready_events[events_len:]
 
     async def on_start(self, snapshot: PlatformSnapshot) -> Sequence[TradeSignal]:
         self.started = True
@@ -3328,8 +3365,6 @@ class Strategy:
                     legacy_adopted = True
                     # Store resolution for later write-back via
                     # reconciliation service.
-                    if not hasattr(self, "_legacy_adoptions"):
-                        self._legacy_adoptions: list[dict[str, Any]] = []
                     self._legacy_adoptions.append({
                         "position_id": self.position.position_id,
                         "exchange": exchange,

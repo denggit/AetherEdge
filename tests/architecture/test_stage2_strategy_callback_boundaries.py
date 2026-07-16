@@ -34,8 +34,8 @@ FORBIDDEN_EXCHANGE_IMPORTS = (
 # controlled Strategy callback names. Keep each exception exact so a new
 # reference still requires an architecture review.
 NON_STRATEGY_CALLBACK_REFERENCES = {
-    ("recover", "src/runtime/runner.py", 2047),
-    ("on_trade", "src/runtime/runner.py", 3559),
+    ("recover", "src/runtime/runner.py", 1995),
+    ("on_trade", "src/runtime/runner.py", 3476),
     # Generic Trade Feature Builder callback, not a Strategy callback.
     ("on_trade", "src/runtime/feature_pipeline.py", 103),
 }
@@ -160,6 +160,58 @@ def test_runtime_has_no_concrete_strategy_imports() -> None:
         for module in _imports(path):
             if _module_is_or_below(module, "strategies"):
                 violations.append((_relative(path), module))
+
+    assert violations == []
+
+
+def test_runtime_has_no_concrete_strategy_names() -> None:
+    forbidden = ("eth_lf_portfolio", "eth_portfolio", "v8", "v9c", "v9e", "v10")
+    violations = []
+    for path in _runtime_files():
+        source = path.read_text(encoding="utf-8").lower()
+        for name in forbidden:
+            if name in source:
+                violations.append((_relative(path), name))
+
+    assert violations == []
+
+
+def test_runtime_does_not_reach_into_strategy_state() -> None:
+    forbidden = {
+        "_legacy_adoptions",
+        "bar_ready_events",
+        "buffer",
+        "config",
+        "pending_entry",
+        "position",
+        "range_speed_tracker",
+        "recovery_alerts",
+        "recovery_blocking_manual_required",
+    }
+    violations: list[str] = []
+    for path in _runtime_files():
+        tree = _tree(path)
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "strategy"
+                and node.attr in forbidden
+            ):
+                violations.append(
+                    f"{_relative(path)}:{node.lineno}:{node.attr}"
+                )
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in {"getattr", "hasattr", "setattr"}
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value in forbidden
+            ):
+                violations.append(
+                    f"{_relative(path)}:{node.lineno}:{node.args[1].value}"
+                )
 
     assert violations == []
 

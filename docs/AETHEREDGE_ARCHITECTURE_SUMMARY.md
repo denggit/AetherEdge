@@ -121,7 +121,6 @@ src/app/
     config.py      # AppConfig，从 env/defaults 加载配置
     context.py     # AppContext，组合 data/execution/state/strategy/planner/alerts
     factory.py     # build_app_context
-    runner.py      # AppRunner，market event -> strategy -> signal -> planner -> execution
 ```
 
 允许放：
@@ -129,7 +128,6 @@ src/app/
 - 应用入口组装。
 - AppConfig。
 - AppContext。
-- AppRunner。
 - Alert dispatcher。
 
 禁止放：
@@ -357,38 +355,6 @@ src/platform/state/
 - RecoveryEngine。
 - 策略仓位状态机。
 - 自动修复逻辑。
-
-### 5.6 `src/platform/runtime/`
-
-当前职责：
-
-```text
-平台 runtime skeleton：启动 snapshot、保存 private account event。
-```
-
-现有模块：
-
-```text
-src/platform/runtime/
-    config.py
-    context.py
-    factory.py
-    handlers.py
-    service.py
-```
-
-注意：
-
-该目录当前已经存在，但未来不建议继续扩张成完整实盘 runtime。真正的实盘运行编排应该放新的 `src/runtime/`。
-
-未来原则：
-
-```text
-保留现有 platform/runtime 的轻量平台生命周期能力。
-不要把 warmup、strategy dispatch、order recovery、async workers 继续塞到这里。
-```
-
----
 
 ## 6. `src/planner/`：信号转执行计划
 
@@ -883,7 +849,7 @@ strategies
 5. 把 V8 规则放进 src/platform 或 src/app
 6. 把策略插件直接 import OKX/Binance client
 7. 把业务逻辑放进 src/utils
-8. 把 runtime 编排继续塞进 src/platform/runtime
+8. 在 src/platform 中重新创建 runtime 编排
 9. 写一个几千行 strategy.py 什么都做
 10. 把 CoinBacktest 回测框架和 AetherEdge 实盘框架混用
 ```

@@ -721,7 +721,7 @@ def _install_generic_preflight(monkeypatch, preflight, args) -> None:
         preflight,
         "load_strategy",
         lambda _path, **_kwargs: SimpleNamespace(
-            config=SimpleNamespace(strategy_id="test")
+            strategy_identity=lambda: "test"
         ),
     )
     monkeypatch.setattr(

@@ -5,34 +5,36 @@ from collections.abc import Sequence
 
 from src.market_data.events import MarketFeatureEvent
 from src.signals import TradeSignal
-from src.strategy.market_features import MarketFeatureObserver
+from src.strategy.market_features import (
+    MarketFeatureObserver,
+    MarketFeatureObserverProvider,
+)
 
 
 def resolve_market_feature_observers(
     strategy: object,
 ) -> tuple[MarketFeatureObserver, ...]:
-    """Resolve provider observers first, then the legacy strategy handler."""
+    """Resolve observers through the public provider capability."""
 
-    provider = getattr(strategy, "market_feature_observers", None)
-    if callable(provider):
-        provided = provider()
-        if (
-            not isinstance(provided, Sequence)
-            or isinstance(provided, (str, bytes, bytearray))
-        ):
-            raise TypeError(
-                "market_feature_observers() must return a sequence of observers"
-            )
-        return tuple(
-            observer
-            for observer in provided
-            if getattr(observer, "enabled", True) is not False
+    declared = any(
+        "market_feature_observers" in cls.__dict__
+        for cls in type(strategy).__mro__
+    )
+    if not declared or not isinstance(strategy, MarketFeatureObserverProvider):
+        return ()
+    provided = strategy.market_feature_observers()
+    if (
+        not isinstance(provided, Sequence)
+        or isinstance(provided, (str, bytes, bytearray))
+    ):
+        raise TypeError(
+            "market_feature_observers() must return a sequence of observers"
         )
-
-    legacy_handler = getattr(strategy, "on_market_feature", None)
-    if callable(legacy_handler) and getattr(strategy, "enabled", True) is not False:
-        return (strategy,)  # type: ignore[return-value]
-    return ()
+    return tuple(
+        observer
+        for observer in provided
+        if getattr(observer, "enabled", True) is not False
+    )
 
 
 async def dispatch_market_feature_event(

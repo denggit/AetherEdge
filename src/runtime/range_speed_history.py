@@ -13,6 +13,7 @@ from src.market_data.backfill.status_store import (
     worker_status_is_running,
 )
 from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
+from src.strategy.ports import RangeSpeedHistoryProvider
 from src.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -138,9 +139,8 @@ class RangeSpeedHistoryRefresher:
         refreshed = False
         if marker != self._last_marker or coverage_marker != self._last_coverage_marker:
             values = self._history_values_for_strategy(rows)
-            replace = getattr(self.strategy, "replace_range_speed_history", None)
-            if callable(replace):
-                replace(values)
+            if isinstance(self.strategy, RangeSpeedHistoryProvider):
+                self.strategy.replace_range_speed_history(values)
                 refreshed = True
             else:
                 logger.warning("Strategy has no replace_range_speed_history(); range speed refresh skipped")
@@ -187,7 +187,7 @@ class RangeSpeedHistoryRefresher:
         if status.available:
             if self._was_available is False:
                 logger.info(
-                    "V10A range-speed history recovered; short-speed block available without restart | complete_history=%s min_periods=%s refreshed=%s",
+                    "range-speed history recovered; short-speed block available without restart | complete_history=%s min_periods=%s refreshed=%s",
                     status.complete_history,
                     status.min_periods,
                     status.refreshed,
@@ -217,7 +217,7 @@ class RangeSpeedHistoryRefresher:
             and status.first_missing_bucket_end_ms <= int(archive_safe)
         )
         logger.warning(
-            "V10A range-speed history still insufficient; live runtime continues | "
+            "range-speed history still insufficient; live runtime continues | "
             "symbol=%s exchange=%s range_pct=%s interval=%s complete_history=%s "
             "min_periods=%s missing_periods=%s rolling_window_bars=%s available=%s "
             "latest_complete_bucket_end_ms=%s current_closed_bucket_end_ms=%s "
@@ -260,17 +260,16 @@ class RangeSpeedHistoryRefresher:
             int(self.refresh_seconds),
         )
 
-    def _entry_filters(self):
-        return getattr(getattr(self.strategy, "config", None), "entry_filters", None)
+    def _strategy_status(self) -> dict[str, int | bool]:
+        if not isinstance(self.strategy, RangeSpeedHistoryProvider):
+            return {}
+        return dict(self.strategy.range_speed_history_status())
 
     def _rolling_window_bars(self) -> int:
-        return int(getattr(self._entry_filters(), "range_speed_rolling_window_bars", 1080))
+        return int(self._strategy_status().get("rolling_window_bars", 1080))
 
     def _min_periods(self) -> int:
-        return int(getattr(self._entry_filters(), "range_speed_min_periods", 100))
+        return int(self._strategy_status().get("min_periods", 100))
 
     def _complete_history_count(self, *, default: int) -> int:
-        tracker = getattr(self.strategy, "range_speed_tracker", None)
-        if tracker is None:
-            return default
-        return int(getattr(tracker, "complete_history_count", default))
+        return int(self._strategy_status().get("complete_history", default))

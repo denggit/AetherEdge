@@ -20,6 +20,7 @@ from strategies.eth_lf_portfolio_v10b.execution.structural_stop import (
     evaluate_swing_structural_stop,
 )
 from strategies.eth_lf_portfolio_v10b.strategy import Strategy as V10BStrategy
+from src.strategy import StrategyPositionSide, StrategyPositionStatus
 
 
 FOUR_HOURS_MS = 4 * 60 * 60 * 1000
@@ -307,6 +308,26 @@ def _open_long(strategy, *, old_stop: Decimal) -> None:
         avg_fill_price=Decimal("100"),
         base_qty=Decimal("1"),
     )
+
+
+def test_v10b_exposes_position_snapshots_through_public_provider() -> None:
+    strategy = V10BStrategy()
+    assert strategy.position_snapshots() == ()
+
+    _open_long(strategy, old_stop=Decimal("80"))
+    snapshot = strategy.position_snapshots()[0]
+
+    assert snapshot.strategy_id == strategy.config.strategy_id
+    assert snapshot.position_id == "v10b-test-position"
+    assert snapshot.symbol == strategy.config.symbol
+    assert snapshot.side is StrategyPositionSide.LONG
+    assert snapshot.status is StrategyPositionStatus.ACTIVE
+    assert snapshot.base_quantity == Decimal("1")
+    assert snapshot.average_entry_price == Decimal("100")
+    assert snapshot.stop_price == Decimal("80")
+    assert snapshot.engine == "MOMENTUM_V3"
+    assert snapshot.entry_time_ms == 0
+    assert snapshot.metadata == {"active_exchanges": ("okx",)}
 
 
 def _fill_buffer(

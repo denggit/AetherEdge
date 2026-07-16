@@ -4,7 +4,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_app_lives_outside_platform_and_does_not_import_exchange_adapters():
-    assert (ROOT / "src" / "app" / "runner.py").exists()
+    assert (ROOT / "src" / "app" / "factory.py").exists()
     assert not (ROOT / "src" / "platform" / "app").exists()
     forbidden = ["/api/v5", "/fapi/", "OkxExchangeClient", "BinanceExchangeClient"]
     leaks = []

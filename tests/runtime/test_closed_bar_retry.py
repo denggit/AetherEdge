@@ -69,6 +69,9 @@ class _Strategy:
         self.events.append(event)
         return []
 
+    def market_feature_observers(self):
+        return (self,)
+
 
 class _FailingKlineStore:
     def save(self, rows):

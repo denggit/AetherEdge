@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from src.market_data.events import MarketFeatureEvent
 from src.platform.account.events import AccountEvent
@@ -24,6 +24,12 @@ class StrategyRecoveryContext:
     reconcile_reports: tuple[ReconcileReport, ...]
     order_intent_ids: tuple[str, ...] = ()
     metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class StrategyRecoveryStatus:
+    blocking_manual_required: bool = False
+    alerts: tuple[str, ...] = ()
 
 
 class StrategyPort(Protocol):
@@ -56,6 +62,66 @@ class RecoverableStrategyPort(Protocol):
     """Optional strategy extension used by runtime recovery."""
 
     async def recover(self, context: StrategyRecoveryContext) -> Sequence[TradeSignal]:
+        ...
+
+
+@runtime_checkable
+class StrategyStopAdoptionProvider(Protocol):
+    """Optional recovery output for stop references adopted by a plugin."""
+
+    def pending_stop_adoptions(self) -> Sequence[Mapping[str, Any]]:
+        ...
+
+    def clear_pending_stop_adoptions(self) -> None:
+        ...
+
+
+@runtime_checkable
+class RangeSpeedHistoryProvider(Protocol):
+    """Optional strategy capability for past-only range-speed history."""
+
+    def warmup_range_speed_history(self, rf_bar_counts: Sequence[int]) -> int:
+        ...
+
+    def replace_range_speed_history(self, rf_bar_counts: Sequence[int]) -> int:
+        ...
+
+    def range_speed_history_status(self) -> Mapping[str, int | bool]:
+        ...
+
+
+@runtime_checkable
+class StrategyRecoveryStatusProvider(Protocol):
+    def recovery_status(self) -> StrategyRecoveryStatus:
+        ...
+
+
+@runtime_checkable
+class StrategyPositionPlanRecoveryUpdateProvider(Protocol):
+    def position_plan_recovery_updates(self) -> Sequence[Mapping[str, Any]]:
+        ...
+
+
+@runtime_checkable
+class StrategyRuntimeStateProvider(Protocol):
+    """Optional runtime-facing view of plugin identity and transient state."""
+
+    def strategy_identity(self) -> str:
+        ...
+
+    def has_pending_strategy_work(self) -> bool:
+        ...
+
+    def capture_startup_preview_state(self) -> object:
+        ...
+
+    def restore_startup_preview_state(self, state: object) -> None:
+        ...
+
+
+@runtime_checkable
+class StrategyDecisionAuditProvider(Protocol):
+    def decision_audit(self) -> Mapping[str, Any] | None:
         ...
 
 

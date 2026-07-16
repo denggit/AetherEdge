@@ -18,7 +18,13 @@ from src.platform.markets import get_market_profile
 from src.order_management.models import ExchangeOrderResult
 from src.platform.snapshot import PlatformSnapshot
 from src.signals import SignalAction, TradeSignal
-from src.strategy import StrategyRecoveryContext
+from src.strategy import (
+    StrategyPositionSide,
+    StrategyPositionSnapshot,
+    StrategyPositionStatus,
+    StrategyRecoveryContext,
+    StrategyRecoveryStatus,
+)
 from strategies.eth_lf_portfolio_v8.domain.models import BarReadyContext, Side, V8DecisionType, V8TradeDecision
 from strategies.eth_lf_portfolio_v10b.domain.position_state import V8PositionState
 from strategies.eth_lf_portfolio_v8.engines.bear_v3 import BearV3OnlyEngine
@@ -144,6 +150,8 @@ class Strategy:
     """AetherEdge live plugin for V10B all-swing structural stops."""
 
     raw_trade_callbacks_enabled = False
+    observer_id = "primary"
+    enabled = True
 
     def __init__(self, config_path: str | Path | None = None) -> None:
         self.config = V10BConfig.from_file(config_path or DEFAULT_CONFIG_PATH)
@@ -185,6 +193,61 @@ class Strategy:
         self._stop_update_blocked_bar_close_time_ms: int | None = None
         self.recovered = False
         self.started = False
+
+    def position_snapshots(self) -> tuple[StrategyPositionSnapshot, ...]:
+        if not self.position.in_pos or not self.position.position_id:
+            return ()
+        side = {
+            Side.LONG: StrategyPositionSide.LONG,
+            Side.SHORT: StrategyPositionSide.SHORT,
+        }.get(self.position.side, StrategyPositionSide.FLAT)
+        active_exchanges = tuple(self.position.open_legs)
+        return (
+            StrategyPositionSnapshot(
+                strategy_id=self.config.strategy_id,
+                position_id=self.position.position_id,
+                symbol=self.config.symbol,
+                side=side,
+                status=StrategyPositionStatus.ACTIVE,
+                base_quantity=self.position.qty,
+                average_entry_price=self.position.avg_entry,
+                stop_price=self.position.stop_price,
+                engine=self.position.entry_engine,
+                entry_time_ms=self.position.entry_time_ms,
+                metadata={"active_exchanges": active_exchanges} if active_exchanges else {},
+            ),
+        )
+
+    def market_feature_observers(self) -> tuple[object, ...]:
+        return (self,)
+
+    def recovery_status(self) -> StrategyRecoveryStatus:
+        return StrategyRecoveryStatus(
+            blocking_manual_required=self.recovery_blocking_manual_required,
+            alerts=tuple(self.recovery_alerts),
+        )
+
+    def strategy_identity(self) -> str:
+        return self.config.strategy_id
+
+    def decision_audit(self) -> Mapping[str, Any] | None:
+        return self.last_decision_audit
+
+    def has_pending_strategy_work(self) -> bool:
+        return self.pending_entry is not None
+
+    def capture_startup_preview_state(self) -> object:
+        return (
+            self.pending_entry,
+            set(self.buffer.evaluated_bars),
+            len(self.bar_ready_events),
+        )
+
+    def restore_startup_preview_state(self, state: object) -> None:
+        pending_entry, evaluated_bars, events_len = state  # type: ignore[misc]
+        self.pending_entry = pending_entry
+        self.buffer.evaluated_bars = set(evaluated_bars)
+        del self.bar_ready_events[events_len:]
 
     def configure_range_coverage(
         self,

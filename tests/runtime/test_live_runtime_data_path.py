@@ -80,6 +80,12 @@ class _FeatureStrategy:
         self.events.append(event)
         return []
 
+    def market_feature_observers(self):
+        return (self,)
+
+    def decision_audit(self):
+        return self.last_decision_audit
+
     async def on_trade(self, trade):
         return []
 

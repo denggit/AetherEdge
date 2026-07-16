@@ -36,6 +36,17 @@ PLAN_FIELDS = (
 )
 
 
+class _StopAdoptionProvider:
+    def __init__(self, adoptions=()) -> None:
+        self.adoptions = list(adoptions)
+
+    def pending_stop_adoptions(self):
+        return tuple(self.adoptions)
+
+    def clear_pending_stop_adoptions(self) -> None:
+        self.adoptions.clear()
+
+
 def _runner(*, reconciliation_coordinator=None) -> LiveRuntimeRunner:
     config = AppConfig(
         symbol="ETH-USDT-PERP",
@@ -357,7 +368,7 @@ def test_empty_legacy_adoptions_do_not_read_clock_or_call_service(
     monkeypatch,
 ) -> None:
     runner = object.__new__(LiveRuntimeRunner)
-    runner.context = SimpleNamespace(strategy=SimpleNamespace(_legacy_adoptions=[]))
+    runner.context = SimpleNamespace(strategy=_StopAdoptionProvider())
     runner.app_config = SimpleNamespace(symbol="ETH-USDT-PERP")
     service = SimpleNamespace(_apply_actions=Mock())
     clock = Mock()
@@ -367,7 +378,7 @@ def test_empty_legacy_adoptions_do_not_read_clock_or_call_service(
 
     clock.assert_not_called()
     service._apply_actions.assert_not_called()
-    assert runner.context.strategy._legacy_adoptions == []
+    assert runner.context.strategy.adoptions == []
 
 
 def test_legacy_adoptions_keep_order_fields_clock_and_clear_after_success(
@@ -375,9 +386,7 @@ def test_legacy_adoptions_keep_order_fields_clock_and_clear_after_success(
 ) -> None:
     runner = object.__new__(LiveRuntimeRunner)
     adoptions = [_adoption("first", "okx"), _adoption("second", "binance")]
-    runner.context = SimpleNamespace(
-        strategy=SimpleNamespace(_legacy_adoptions=adoptions)
-    )
+    runner.context = SimpleNamespace(strategy=_StopAdoptionProvider(adoptions))
     runner.app_config = SimpleNamespace(symbol="ETH-USDT-PERP")
     service = SimpleNamespace(_apply_actions=Mock())
     clock = Mock(return_value=1.25)
@@ -411,7 +420,7 @@ def test_legacy_adoptions_keep_order_fields_clock_and_clear_after_success(
         args.args[1] == "ETH-USDT-PERP"
         for args in service._apply_actions.call_args_list
     )
-    assert runner.context.strategy._legacy_adoptions == []
+    assert runner.context.strategy.adoptions == []
     assert logger.warning.call_args_list == [
         call(
             "Startup recovery: legacy stop adopted | position_id=%s exchange=%s stop_order_id=%s effective_stop_price=%s",
@@ -433,9 +442,8 @@ def test_legacy_adoptions_keep_order_fields_clock_and_clear_after_success(
 def test_legacy_adoption_failure_preserves_original_list(monkeypatch) -> None:
     runner = object.__new__(LiveRuntimeRunner)
     adoptions = [_adoption("first", "okx"), _adoption("second", "binance")]
-    runner.context = SimpleNamespace(
-        strategy=SimpleNamespace(_legacy_adoptions=adoptions)
-    )
+    provider = _StopAdoptionProvider(adoptions)
+    runner.context = SimpleNamespace(strategy=provider)
     runner.app_config = SimpleNamespace(symbol="ETH-USDT-PERP")
     error = RuntimeError("store write failed")
     service = SimpleNamespace(
@@ -447,7 +455,7 @@ def test_legacy_adoption_failure_preserves_original_list(monkeypatch) -> None:
         runner._apply_startup_legacy_stop_adoptions(service)
 
     assert raised.value is error
-    assert runner.context.strategy._legacy_adoptions is adoptions
+    assert provider.adoptions == adoptions
     assert service._apply_actions.call_count == 2
 
 

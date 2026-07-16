@@ -34,7 +34,7 @@ class LiveRuntimeConfig:
     """Runtime-domain config layered on top of the existing AppConfig."""
 
     app: AppConfig
-    mode: RuntimeMode = RuntimeMode.LEGACY_APP
+    mode: RuntimeMode = RuntimeMode.LIVE_RUNTIME
     warmup_enabled: bool = True
     background_queue_maxsize: int = 1000
     scheduler_poll_seconds: float = 1.0
@@ -112,7 +112,7 @@ def runtime_mode_from_env(
 ) -> RuntimeMode:
     defaults = _load_defaults(defaults_path)
     env = _load_runtime_env(env_file=env_file, environ=environ)
-    value = env.get("AETHER_RUNTIME_MODE", str(defaults.get("runtime_mode", RuntimeMode.LEGACY_APP.value)))
+    value = env.get("AETHER_RUNTIME_MODE", str(defaults.get("runtime_mode", RuntimeMode.LIVE_RUNTIME.value)))
     return RuntimeMode(str(value).strip().lower())
 
 
@@ -128,7 +128,7 @@ def live_runtime_config_from_app(
     master_follower_env = _master_follower_env(env, env_file=env_file, environ=environ)
     return LiveRuntimeConfig(
         app=app_config,
-        mode=RuntimeMode(str(env.get("AETHER_RUNTIME_MODE", defaults.get("runtime_mode", RuntimeMode.LEGACY_APP.value))).strip().lower()),
+        mode=RuntimeMode(str(env.get("AETHER_RUNTIME_MODE", defaults.get("runtime_mode", RuntimeMode.LIVE_RUNTIME.value))).strip().lower()),
         warmup_enabled=_bool(env.get("AETHER_WARMUP_ENABLED", defaults.get("warmup_enabled", True))),
         background_queue_maxsize=int(env.get("AETHER_BACKGROUND_QUEUE_MAXSIZE", defaults.get("background_queue_maxsize", 1000))),
         scheduler_poll_seconds=float(env.get("AETHER_SCHEDULER_POLL_SECONDS", defaults.get("scheduler_poll_seconds", 1.0))),

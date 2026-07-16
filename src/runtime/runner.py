@@ -116,6 +116,7 @@ from src.runtime.strategy_positions import (
     resolve_strategy_position_snapshot_index,
 )
 from src.runtime.strategy_host import StrategyHost
+from src.runtime.strategy_diagnostics import log_closed_bar_decision
 from src.runtime.sync_lifecycle import RuntimeSyncLifecycle, SyncTaskFactory
 from src.runtime.sync_services import RuntimeSyncServiceRegistry
 from src.runtime.orders import LiveOrderIntentFactory
@@ -129,6 +130,14 @@ from src.strategy.positions import (
     StrategyPositionSide,
     StrategyPositionSnapshot,
     StrategyPositionStatus,
+)
+from src.strategy.ports import (
+    RangeSpeedHistoryProvider,
+    StrategyDecisionAuditProvider,
+    StrategyRecoveryStatus,
+    StrategyRecoveryStatusProvider,
+    StrategyRuntimeStateProvider,
+    StrategyStopAdoptionProvider,
 )
 from src.utils.log import get_logger
 
@@ -206,17 +215,15 @@ class StartupPreviewState:
     preview so it can be rolled back when the previewed signal is ultimately
     NOT executed (e.g. price guard failure or journal dedupe)."""
 
-    pending_entry: object | None
-    evaluated_bars: set[int] | None
-    bar_ready_events_len: int | None
+    provider: StrategyRuntimeStateProvider | None
+    state: object | None
 
 
 class LiveRuntimeRunner:
     """Live runtime orchestration for strategy plugins.
 
-    The legacy ``AppRunner`` path is intentionally left untouched. This runner
-    composes existing platform, market_data, order_management and recovery
-    services into the ``AETHER_RUNTIME_MODE=live_runtime`` path.
+    This runner composes platform, market_data, order_management and recovery
+    services into the sole formal live-runtime path.
     """
 
     def __init__(
@@ -618,71 +625,25 @@ class LiveRuntimeRunner:
         await self._process_account_event(event)
 
     def _log_4h_decision_summary(self, *, open_time_ms: int, closed_kline: MarketKline) -> None:
-        audit = getattr(self.context.strategy, "last_decision_audit", None)
-
-        if not isinstance(audit, dict) or audit.get("bar_open_time_ms") != open_time_ms:
-            logger.info(
-                "4H decision completed | "
-                f"symbol={self.app_config.symbol} interval={self._closed_bar_interval} "
-                f"open_time_ms={closed_kline.open_time_ms} close_time_ms={closed_kline.close_time_ms} "
-                "decision=no_audit reason=no_strategy_audit actions= selected_engine=None selected_side=None "
-                "risk_mult=None quality_mult=None micro_action=None micro_scale=None micro_aligned=None micro_contra=None "
-                "range_available=False range_status=no_audit range_bar_count=None range_min_required=None "
-                "range_imbalance=None range_taker_buy_ratio=None range_close_pos=None range_micro_return_pct=None "
-                "range_exit_triggered=False range_exit_reason=None range_exit_peak_r=None "
-                "range_exit_current_r=None range_exit_giveback_frac=None "
-                f"position=None position_side=None position_engine=None position_stop=None close={closed_kline.close} "
-                f"close_buffer_ms={self._closed_bar_buffer_ms}"
-            )
-            return
-
-        actions = audit.get("actions") or []
-        logger.info(
-            "4H decision completed | symbol=%s interval=%s open_time_ms=%s close_time_ms=%s decision=%s actions=%s selected_engine=%s selected_side=%s risk_mult=%s quality_mult=%s micro_action=%s micro_scale=%s micro_aligned=%s micro_contra=%s range_available=%s range_status=%s range_bar_count=%s range_min_required=%s range_imbalance=%s range_taker_buy_ratio=%s range_close_pos=%s range_micro_return_pct=%s range_exit_triggered=%s range_exit_reason=%s range_exit_peak_r=%s range_exit_current_r=%s range_exit_giveback_frac=%s position=%s position_side=%s position_engine=%s position_stop=%s close=%s close_buffer_ms=%s",
-            self.app_config.symbol,
-            self._closed_bar_interval,
-            audit.get("bar_open_time_ms"),
-            audit.get("bar_close_time_ms"),
-            audit.get("reason"),
-            ",".join(actions),
-            audit.get("selected_engine"),
-            audit.get("selected_side"),
-            audit.get("risk_mult"),
-            audit.get("quality_mult"),
-            audit.get("micro_action"),
-            audit.get("micro_entry_risk_scale"),
-            audit.get("micro_aligned"),
-            audit.get("micro_contra"),
-            audit.get("range_available"),
-            audit.get("range_status"),
-            audit.get("range_bar_count"),
-            audit.get("range_min_required"),
-            audit.get("range_imbalance"),
-            audit.get("range_taker_buy_ratio"),
-            audit.get("range_close_pos"),
-            audit.get("range_micro_return_pct"),
-            audit.get("range_exit_triggered"),
-            audit.get("range_exit_reason"),
-            audit.get("range_exit_peak_r"),
-            audit.get("range_exit_current_r"),
-            audit.get("range_exit_giveback_frac"),
-            audit.get("position_in_pos"),
-            audit.get("position_side"),
-            audit.get("position_engine"),
-            audit.get("position_stop"),
-            closed_kline.close,
-            self._closed_bar_buffer_ms,
+        strategy = self.context.strategy
+        declared = any(
+            "decision_audit" in cls.__dict__
+            for cls in type(strategy).__mro__
         )
-        engine_diag_text = audit.get("engine_diag_text")
-        if isinstance(engine_diag_text, str) and engine_diag_text.strip():
-            logger.info(
-                "4H engine diagnostics | symbol=%s interval=%s open_time_ms=%s close_time_ms=%s\n%s",
-                self.app_config.symbol,
-                self._closed_bar_interval,
-                audit.get("bar_open_time_ms"),
-                audit.get("bar_close_time_ms"),
-                engine_diag_text,
-            )
+        audit = (
+            strategy.decision_audit()
+            if declared and isinstance(strategy, StrategyDecisionAuditProvider)
+            else None
+        )
+
+        log_closed_bar_decision(
+            audit=audit,
+            symbol=self.app_config.symbol,
+            interval=self._closed_bar_interval,
+            close_buffer_ms=self._closed_bar_buffer_ms,
+            open_time_ms=open_time_ms,
+            closed_kline=closed_kline,
+        )
 
     async def poll_closed_bar_once(self, *, now_ms: int | None = None) -> list[MarketFeatureEvent]:
         now = int(time.time() * 1000) if now_ms is None else now_ms
@@ -1194,7 +1155,7 @@ class LiveRuntimeRunner:
             and loaded_range_speed_history < self._range_speed_min_periods
         ):
             logger.warning(
-                "V10A range-speed history insufficient; live runtime continues | complete_history=%s min_periods=%s missing=%s",
+                "Range-speed history insufficient; live runtime continues | complete_history=%s min_periods=%s missing=%s",
                 loaded_range_speed_history,
                 self._range_speed_min_periods,
                 self._range_speed_min_periods - loaded_range_speed_history,
@@ -1343,12 +1304,11 @@ class LiveRuntimeRunner:
         if not requirements:
             return
 
-        strategy_id = str(
-            getattr(
-                getattr(self.context.strategy, "config", None),
-                "strategy_id",
-                self.app_config.strategy,
-            )
+        provider = self._strategy_runtime_state_provider()
+        strategy_id = (
+            provider.strategy_identity()
+            if provider is not None
+            else self.app_config.strategy
         )
         audit: dict[str, Any] = {
             "strategy": strategy_id,
@@ -1696,11 +1656,10 @@ class LiveRuntimeRunner:
     async def _warmup_range_speed_history(self) -> int:
         if not self.requirements.range_bars.enabled:
             return 0
-        warmup = getattr(
-            self.context.strategy, "warmup_range_speed_history", None
-        )
-        if not callable(warmup):
+        strategy = self.context.strategy
+        if not isinstance(strategy, RangeSpeedHistoryProvider):
             return 0
+        status = strategy.range_speed_history_status()
         now_ms = int(time.time() * 1000)
         current_bucket = (
             now_ms // self._closed_bar_interval_ms
@@ -1717,13 +1676,7 @@ class LiveRuntimeRunner:
             if within_catchup_window
             else current_bucket + self._closed_bar_interval_ms - 1
         )
-        limit = int(
-            getattr(
-                getattr(self.context.strategy, "config", None),
-                "entry_filters",
-                None,
-            ).range_speed_rolling_window_bars
-        )
+        limit = int(status["rolling_window_bars"])
         rows = await asyncio.to_thread(
             self._get_range_checkpoint_store().load_complete_history,
             exchange=self.app_config.data_exchange.value,
@@ -1732,21 +1685,16 @@ class LiveRuntimeRunner:
             before_bucket_end_ms=before_bucket_end_ms,
             limit=limit,
         )
-        loaded = warmup([row.rf_bar_count for row in rows])
-        min_periods = int(
-            self.context.strategy.config.entry_filters.range_speed_min_periods
+        loaded = strategy.warmup_range_speed_history(
+            [row.rf_bar_count for row in rows]
         )
-        self._range_speed_complete_history = int(
-            getattr(
-                getattr(self.context.strategy, "range_speed_tracker", None),
-                "complete_history_count",
-                loaded,
-            )
-        )
+        status = strategy.range_speed_history_status()
+        min_periods = int(status["min_periods"])
+        self._range_speed_complete_history = int(status["complete_history"])
         self._range_speed_min_periods = min_periods
         log = logger.info if loaded >= min_periods else logger.warning
         log(
-            "V10A range-speed history warmup | complete_history=%s min_periods=%s available=%s",
+            "Range-speed history warmup | complete_history=%s min_periods=%s available=%s",
             loaded,
             min_periods,
             loaded >= min_periods,
@@ -1759,10 +1707,8 @@ class LiveRuntimeRunner:
             or self._startup_catchup_range_observed
         ):
             return
-        warmup = getattr(
-            self.context.strategy, "warmup_range_speed_history", None
-        )
-        if not callable(warmup):
+        strategy = self.context.strategy
+        if not isinstance(strategy, RangeSpeedHistoryProvider):
             return
         now_ms = int(time.time() * 1000)
         current_bucket = (
@@ -1778,7 +1724,9 @@ class LiveRuntimeRunner:
             limit=1,
         )
         if rows and rows[-1].bucket_end_ms == previous_end:
-            count = warmup([rows[-1].rf_bar_count])
+            count = strategy.warmup_range_speed_history(
+                [rows[-1].rf_bar_count]
+            )
             self._range_speed_complete_history += int(count)
 
     async def _run_warmup(self) -> None:
@@ -2058,15 +2006,36 @@ class LiveRuntimeRunner:
         if not report.ok:
             raise LiveRuntimeError(f"runtime recovery failed: {tuple(report.issues)}")
         # ── Check strategy recovery blocking state ────────────────────────
-        strategy = self.context.strategy
-        if getattr(strategy, "recovery_blocking_manual_required", False):
-            alerts = getattr(strategy, "recovery_alerts", [])
+        recovery_status = self._strategy_recovery_status()
+        if recovery_status.blocking_manual_required:
             raise LiveRuntimeError(
                 f"runtime recovery blocking manual required: "
-                f"alerts={alerts}"
+                f"alerts={list(recovery_status.alerts)}"
             )
         # ── Pre-execution postcondition: must have coverage plan ───────────
         self._validate_recovery_protection_postcondition(report)
+
+    def _strategy_recovery_status(self) -> StrategyRecoveryStatus:
+        strategy = self.context.strategy
+        declared = any(
+            "recovery_status" in cls.__dict__
+            for cls in type(strategy).__mro__
+        )
+        if not declared or not isinstance(strategy, StrategyRecoveryStatusProvider):
+            return StrategyRecoveryStatus()
+        return strategy.recovery_status()
+
+    def _strategy_runtime_state_provider(
+        self,
+    ) -> StrategyRuntimeStateProvider | None:
+        strategy = self.context.strategy
+        declared = any(
+            "capture_startup_preview_state" in cls.__dict__
+            for cls in type(strategy).__mro__
+        )
+        if not declared or not isinstance(strategy, StrategyRuntimeStateProvider):
+            return None
+        return strategy
 
     def _partition_recovery_signals(
         self,
@@ -2165,7 +2134,7 @@ class LiveRuntimeRunner:
         """
         strategy = self.context.strategy
         # Already fatal via blocking check — skip postcondition.
-        if getattr(strategy, "recovery_blocking_manual_required", False):
+        if self._strategy_recovery_status().blocking_manual_required:
             return
 
         position_index = self._strategy_position_index()
@@ -2524,7 +2493,7 @@ class LiveRuntimeRunner:
         Checks (any single true → skip catch-up):
         1. Exchange snapshot positions with non-zero quantity
         2. Strategy exposes one or more active logical position snapshots
-        3. Strategy ``pending_entry`` is not None
+        3. Strategy reports pending transient work
         4. PositionPlanStore ``list_active_positions()`` non-empty
         5. StateStore has open orders (including stop orders)
         """
@@ -2536,10 +2505,10 @@ class LiveRuntimeRunner:
                     return True
 
         # 2 & 3. Strategy-internal logical positions / pending entry
-        strategy = self.context.strategy
         if self._strategy_position_index().active:
             return True
-        if getattr(strategy, "pending_entry", None) is not None:
+        provider = self._strategy_runtime_state_provider()
+        if provider is not None and provider.has_pending_strategy_work():
             return True
 
         # 4. PositionPlanStore active plans
@@ -2575,43 +2544,19 @@ class LiveRuntimeRunner:
         return signals
 
     def _capture_startup_preview_state(self) -> StartupPreviewState:
-        strategy = self.context.strategy
-
-        pending_entry = getattr(strategy, "pending_entry", None)
-
-        evaluated_bars = None
-        buffer_obj = getattr(strategy, "buffer", None)
-        if buffer_obj is not None and hasattr(buffer_obj, "evaluated_bars"):
-            evaluated_bars = set(getattr(buffer_obj, "evaluated_bars"))
-
-        bar_ready_events_len = None
-        events = getattr(strategy, "bar_ready_events", None)
-        if isinstance(events, list):
-            bar_ready_events_len = len(events)
-
+        provider = self._strategy_runtime_state_provider()
         return StartupPreviewState(
-            pending_entry=pending_entry,
-            evaluated_bars=evaluated_bars,
-            bar_ready_events_len=bar_ready_events_len,
+            provider=provider,
+            state=(
+                provider.capture_startup_preview_state()
+                if provider is not None
+                else None
+            ),
         )
 
     def _restore_startup_preview_state(self, state: StartupPreviewState) -> None:
-        strategy = self.context.strategy
-
-        if hasattr(strategy, "pending_entry"):
-            setattr(strategy, "pending_entry", state.pending_entry)
-
-        buffer_obj = getattr(strategy, "buffer", None)
-        if (
-            buffer_obj is not None
-            and state.evaluated_bars is not None
-            and hasattr(buffer_obj, "evaluated_bars")
-        ):
-            buffer_obj.evaluated_bars = set(state.evaluated_bars)
-
-        events = getattr(strategy, "bar_ready_events", None)
-        if isinstance(events, list) and state.bar_ready_events_len is not None:
-            del events[state.bar_ready_events_len:]
+        if state.provider is not None:
+            state.provider.restore_startup_preview_state(state.state)
 
     async def _build_range_aggregate_events_for_bucket(
         self, bucket_start_ms: int
@@ -2665,37 +2610,9 @@ class LiveRuntimeRunner:
         return events
 
     def _get_min_range_bars(self) -> int:
-        """Read ``min_range_bars`` from the strategy config, default 1.
+        """Read the strategy-declared range aggregate minimum."""
 
-        V9C declares this via ``config.micro_context.min_range_bars``
-        (an object/dataclass) or ``config["micro_context"]["min_range_bars"]``
-        (a dict).
-        """
-        strategy = self.context.strategy
-        cfg = getattr(strategy, "config", None)
-
-        # 1. Object/dataclass path: strategy.config.micro_context.min_range_bars
-        micro_obj = getattr(cfg, "micro_context", None)
-        value = getattr(micro_obj, "min_range_bars", None)
-        if value is not None:
-            try:
-                return max(1, int(value))
-            except (TypeError, ValueError):
-                pass
-
-        # 2. Dict path: strategy.config["micro_context"]["min_range_bars"]
-        if isinstance(cfg, dict):
-            micro = cfg.get("micro_context", {})
-            if isinstance(micro, dict):
-                value = micro.get("min_range_bars")
-                if value is not None:
-                    try:
-                        return max(1, int(value))
-                    except (TypeError, ValueError):
-                        pass
-
-        # 3. Default
-        return 1
+        return self.requirements.range_bars.min_bars
 
     async def _evaluate_startup_catchup_once(self, snapshot: PlatformSnapshot) -> None:
         """Evaluate whether the most recent closed 4H bar qualifies for a
@@ -3718,17 +3635,11 @@ class LiveRuntimeRunner:
         return await self._strategy_host.on_market_event(event)
 
     def _trade_events_are_range_only(self) -> bool:
-        strategy = self.context.strategy
-        raw_flag = getattr(strategy, "raw_trade_callbacks_enabled", None)
-        if raw_flag is False:
-            return True
-
-        cfg = getattr(strategy, "config", None)
-        strategy_id = getattr(cfg, "strategy_id", "")
-        if str(strategy_id).lower().startswith(("eth_lf_portfolio_v9c", "eth_lf_portfolio_v9e")):
-            return True
-
-        return False
+        return getattr(
+            self.context.strategy,
+            "raw_trade_callbacks_enabled",
+            None,
+        ) is False
 
     async def _execute_signals(
         self,
@@ -4637,9 +4548,12 @@ class LiveRuntimeRunner:
         service: object,
     ) -> None:
         # ── Inject legacy stop adoptions from strategy recovery ───────
-        legacy_adoptions: list[dict[str, Any]] = getattr(
-            self.context.strategy, "_legacy_adoptions", []
-        ) or []
+        strategy = self.context.strategy
+        legacy_adoptions = (
+            tuple(strategy.pending_stop_adoptions())
+            if isinstance(strategy, StrategyStopAdoptionProvider)
+            else ()
+        )
         if legacy_adoptions:
             from src.order_management.reconciliation.models import (
                 ReconciliationAction,
@@ -4689,7 +4603,7 @@ class LiveRuntimeRunner:
                     adoption["effective_stop_price"],
                 )
             # Clear the list so it is not re-applied on subsequent calls.
-            self.context.strategy._legacy_adoptions = []
+            strategy.clear_pending_stop_adoptions()
 
     async def _invoke_startup_reconciliation_service(
         self,
@@ -4856,10 +4770,10 @@ class LiveRuntimeRunner:
         return service
 
     def _order_sync_active(self) -> bool:
-        strategy = self.context.strategy
         if self._strategy_position_index().active:
             return True
-        if getattr(strategy, "pending_entry", None) is not None:
+        provider = self._strategy_runtime_state_provider()
+        if provider is not None and provider.has_pending_strategy_work():
             return True
         store = self._position_plan_store
         if store is not None and callable(getattr(store, "list_active_positions", None)) and store.list_active_positions():
@@ -4872,12 +4786,7 @@ class LiveRuntimeRunner:
         return False
 
     def _strategy_position_index(self) -> StrategyPositionSnapshotIndex:
-        return resolve_strategy_position_snapshot_index(
-            self.context.strategy,
-            legacy_strategy_id=self.app_config.strategy,
-            legacy_symbol=self.app_config.symbol,
-            legacy_base_quantity=Decimal("0"),
-        )
+        return resolve_strategy_position_snapshot_index(self.context.strategy)
 
     def _get_runtime_persistence_service(self) -> RuntimePersistenceService:
         service = getattr(self, "_runtime_persistence_service", None)

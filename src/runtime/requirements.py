@@ -37,6 +37,7 @@ class RangeBarRequirement:
     enabled: bool = False
     range_pct: Decimal = Decimal("0.002")
     aggregate_interval: str = "4h"
+    min_bars: int = 1
 
 
 @dataclass(frozen=True)
@@ -173,6 +174,7 @@ def _range_bars(value: Any) -> RangeBarRequirement:
         enabled=_bool(raw.get("enabled"), False),
         range_pct=Decimal(str(raw.get("range_pct", "0.002"))),
         aggregate_interval=str(raw.get("aggregate_interval", "4h")),
+        min_bars=max(1, int(raw.get("min_bars", 1) or 1)),
     )
 
 

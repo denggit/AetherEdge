@@ -16,7 +16,7 @@ logger = get_logger(__name__)
 class StartupCatchupConfig:
     """Per-strategy configuration for the startup catch-up window.
 
-    Defaults are safe for V9C live mode: a 300 s fresh-window, tight price
+    Defaults use a 300 s fresh-window, tight price
     guards, and all safety requirements enabled.
     """
 
