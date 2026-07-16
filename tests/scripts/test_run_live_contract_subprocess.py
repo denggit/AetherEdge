@@ -100,6 +100,8 @@ def _run_live(
 ) -> subprocess.CompletedProcess[str]:
     module_path = tmp_path / "contract_subprocess_strategy.py"
     module_path.write_text(strategy_source, encoding="utf-8")
+    defaults_path = tmp_path / "aether_defaults.json"
+    defaults_path.write_text("{}", encoding="utf-8")
     heartbeat_isolation = textwrap.dedent(
         """
         import src.runtime.runner as _runner_module
@@ -130,6 +132,38 @@ def _run_live(
             "AETHER_REQUIRED_LIVE_STRATEGY": "",
             "AETHER_REQUIRE_LIVE_GATE_REPORTS": "false",
             "AETHER_STATE_DB": str(tmp_path / "state.sqlite3"),
+            "AETHER_ORDER_JOURNAL_DB": str(tmp_path / "order-journal.sqlite3"),
+            "AETHER_POSITION_PLAN_DB": str(tmp_path / "position-plan.sqlite3"),
+            "AETHER_RANGE_CHECKPOINT_DB": str(tmp_path / "range-checkpoint.sqlite3"),
+            "AETHER_RANGE_REPAIR_JOURNAL_DB": str(
+                tmp_path / "range-repair-journal.sqlite3"
+            ),
+            "AETHER_MARKET_DATA_DB": str(tmp_path / "market-data.sqlite3"),
+            "AETHER_PYTEST_RUNTIME_HEARTBEAT_DB": str(
+                tmp_path / "runtime-heartbeat.sqlite3"
+            ),
+            "AETHER_RANGE_MICRO_REPAIR_STATUS_PATH": str(
+                tmp_path / "range-micro-repair-status.json"
+            ),
+            "AETHER_RANGE_MICRO_REPAIR_LOCK_PATH": str(
+                tmp_path / "range-micro-repair.lock"
+            ),
+            "AETHER_RANGE_BACKFILL_STATUS_PATH": str(
+                tmp_path / "range-backfill-status.json"
+            ),
+            "AETHER_RANGE_BACKFILL_LOCK_PATH": str(
+                tmp_path / "range-backfill.lock"
+            ),
+            "AETHER_RANGE_BACKFILL_RAW_ROOT": str(tmp_path / "raw-trades"),
+            "AETHER_RAW_TRADE_BACKFILL_GLOBAL_LOCK_PATH": str(
+                tmp_path / "raw-trade-backfill.lock"
+            ),
+            "AETHER_RAW_TRADE_BACKFILL_GLOBAL_STATUS_PATH": str(
+                tmp_path / "raw-trade-backfill-status.json"
+            ),
+            "AETHER_LIVE_PREFLIGHT_REPORT": str(tmp_path / "preflight.json"),
+            "AETHER_LIVE_SMOKE_REPORT": str(tmp_path / "smoke.json"),
+            "LOG_DIR": str(tmp_path / "logs"),
             "PYTHONPATH": os.pathsep.join(
                 filter(
                     None,
@@ -143,7 +177,7 @@ def _run_live(
         }
     )
     return subprocess.run(
-        [sys.executable, str(RUN_LIVE)],
+        [sys.executable, str(RUN_LIVE), "--defaults", str(defaults_path)],
         cwd=PROJECT_ROOT,
         env=env,
         text=True,
@@ -257,7 +291,12 @@ def test_real_run_live_subprocess_exits_78_for_post_recovery_position_contract(
         class _RecoveryService:
             async def recover(self, *, strategy):
                 strategy.recovered = True
-                return RecoveryReport(ok=True)
+                return RecoveryReport(
+                    ok=True,
+                    metadata={
+                        "strategy_dynamic_capabilities_validated": True,
+                    },
+                )
 
         async def _skip_account_config(self):
             return None

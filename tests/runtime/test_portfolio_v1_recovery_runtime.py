@@ -25,6 +25,8 @@ from src.order_management.reconciliation.models import (
 )
 from src.runtime.recovery.models import RecoveryReport
 from src.runtime.recovery_coordinator import RuntimeRecoveryCoordinator
+from src.runtime.models import RuntimeMode
+from src.runtime.strategy_capabilities import ValidatedStrategyCapabilities
 from src.runtime.reconciliation_coordinator import (
     RuntimeReconciliationCoordinator,
 )
@@ -172,6 +174,16 @@ def _runner(strategy: _Strategy) -> LiveRuntimeRunner:
         enable_email_alerts=False,
     )
     runner.context = SimpleNamespace(strategy=strategy)
+    runner.runtime_config = SimpleNamespace(mode=RuntimeMode.LIVE_RUNTIME)
+    runner._validated_strategy_capabilities = ValidatedStrategyCapabilities(
+        identity="eth_portfolio_v1",
+        position_snapshots=strategy,
+        recovery_status=strategy,
+        market_features=None,
+        range_speed_history=None,
+        startup_preview=None,
+        pending_work=None,
+    )
     return runner
 
 

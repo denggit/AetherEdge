@@ -9,6 +9,7 @@ from src.runtime.models import RuntimeMode
 from src.runtime.requirements import StrategyRuntimeRequirements
 from src.runtime.strategy_capabilities import (
     StrategyCapabilityError,
+    validate_dynamic_strategy_capabilities,
     validate_strategy_capabilities,
 )
 from src.strategy import load_strategy
@@ -309,6 +310,13 @@ def test_formal_strategy_capability_declarations_validate(
         strategy_entry=entry,
         runtime_mode=RuntimeMode.LIVE_RUNTIME,
     )
+    dynamic_state = validate_dynamic_strategy_capabilities(
+        strategy,
+        expected_strategy_id=capabilities.identity,
+        expected_symbol="ETH-USDT-PERP",
+        strategy_entry=entry,
+        runtime_mode=RuntimeMode.LIVE_RUNTIME,
+    )
 
     assert capabilities.identity == expected_identity
     assert capabilities.position_snapshots is strategy
@@ -317,3 +325,4 @@ def test_formal_strategy_capability_declarations_validate(
     assert (capabilities.range_speed_history is strategy) is expects_range_speed
     assert capabilities.startup_preview is strategy
     assert capabilities.pending_work is strategy
+    assert isinstance(dynamic_state.position_snapshots, tuple)

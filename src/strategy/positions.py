@@ -82,6 +82,18 @@ class StrategyPositionSnapshot:
             ) from exc
 
 
+def format_strategy_position_snapshot_contexts(
+    snapshots: Sequence[StrategyPositionSnapshot],
+) -> str:
+    """Format public ownership fields for position contract diagnostics."""
+
+    return (
+        f"strategy_ids={[snapshot.strategy_id for snapshot in snapshots]} | "
+        f"symbols={[snapshot.symbol for snapshot in snapshots]} | "
+        f"sleeve_ids={[snapshot.sleeve_id for snapshot in snapshots]}"
+    )
+
+
 @runtime_checkable
 class StrategyPositionProvider(Protocol):
     """Optional strategy extension exposing logical position snapshots."""
@@ -91,6 +103,7 @@ class StrategyPositionProvider(Protocol):
 
 
 __all__ = [
+    "format_strategy_position_snapshot_contexts",
     "StrategyPositionContractError",
     "StrategyPositionProvider",
     "StrategyPositionSide",

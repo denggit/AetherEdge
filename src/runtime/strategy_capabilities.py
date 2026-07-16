@@ -10,7 +10,10 @@ from src.strategy.contracts import (
 from src.runtime.market_features import resolve_market_feature_observers
 from src.runtime.models import RuntimeMode
 from src.runtime.requirements import StrategyRuntimeRequirements
-from src.runtime.strategy_positions import resolve_strategy_position_snapshots
+from src.runtime.strategy_positions import (
+    resolve_strategy_position_snapshots,
+    validate_strategy_position_snapshot_set,
+)
 from src.strategy.market_features import MarketFeatureObserverProvider
 from src.strategy.positions import StrategyPositionProvider
 from src.strategy.positions import StrategyPositionSnapshot
@@ -21,11 +24,6 @@ from src.strategy.ports import (
     StrategyRecoveryStatus,
     StrategyRecoveryStatusProvider,
     StrategyStartupPreviewProvider,
-)
-
-
-DYNAMIC_STRATEGY_CAPABILITIES_VALIDATED = (
-    "strategy_dynamic_capabilities_validated"
 )
 
 
@@ -281,6 +279,8 @@ def validate_strategy_capabilities(
 def validate_dynamic_strategy_capabilities(
     strategy: object,
     *,
+    expected_strategy_id: str | None = None,
+    expected_symbol: str | None = None,
     strategy_entry: str | None = None,
     runtime_mode: RuntimeMode = RuntimeMode.LIVE_RUNTIME,
 ) -> ValidatedDynamicStrategyState:
@@ -293,6 +293,12 @@ def validate_dynamic_strategy_capabilities(
     snapshots: tuple[StrategyPositionSnapshot, ...] = ()
     if isinstance(strategy, StrategyPositionProvider):
         snapshots = resolve_strategy_position_snapshots(strategy)
+        if expected_strategy_id is not None and expected_symbol is not None:
+            snapshots = validate_strategy_position_snapshot_set(
+                snapshots,
+                expected_strategy_id=expected_strategy_id,
+                expected_symbol=expected_symbol,
+            )
 
     recovery_status = StrategyRecoveryStatus()
     if isinstance(strategy, StrategyRecoveryStatusProvider):
@@ -389,7 +395,6 @@ def _raise_invalid(
 
 
 __all__ = [
-    "DYNAMIC_STRATEGY_CAPABILITIES_VALIDATED",
     "StrategyCapabilityError",
     "StrategyContractError",
     "ValidatedDynamicStrategyState",

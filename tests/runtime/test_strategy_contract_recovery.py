@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from src.runtime.models import RuntimeMode, RuntimePhase
 from src.runtime.recovery import RuntimeRecoveryService
+from src.runtime.recovery.models import RecoveryReport
 from src.runtime.recovery_coordinator import (
     RuntimeRecoveryCoordinator,
     RuntimeRecoveryPlan,
@@ -79,6 +80,24 @@ class _RecoveringContractStrategy:
         )
 
 
+def _runner_for(strategy: object) -> LiveRuntimeRunner:
+    runner = object.__new__(LiveRuntimeRunner)
+    runner.context = SimpleNamespace(strategy=strategy)
+    runner.app_config = SimpleNamespace(
+        strategy="tests.contract:Strategy",
+        symbol="ETH-USDT-PERP",
+    )
+    runner.runtime_config = SimpleNamespace(mode=RuntimeMode.LIVE_RUNTIME)
+    runner._validated_strategy_capabilities = SimpleNamespace(
+        identity="recovery-contract"
+    )
+    runner._health = SimpleNamespace(phase=RuntimePhase.CATCHING_UP)
+    runner._producer_tasks = []
+    runner._sync_tasks = []
+    runner._validate_recovery_protection_postcondition = Mock()
+    return runner
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("invalid", "error_type"),
@@ -148,18 +167,11 @@ async def test_recovery_contract_failure_stops_before_signal_partition_or_execut
 def test_runner_revalidates_injected_recovery_report_before_any_signal_work() -> None:
     strategy = _RecoveringContractStrategy("position_id")
     strategy.recovered = True
-    runner = object.__new__(LiveRuntimeRunner)
-    runner.context = SimpleNamespace(strategy=strategy)
-    runner.app_config = SimpleNamespace(strategy="tests.contract:Strategy")
-    runner.runtime_config = SimpleNamespace(mode=RuntimeMode.LIVE_RUNTIME)
-    runner._health = SimpleNamespace(phase=RuntimePhase.CATCHING_UP)
-    runner._producer_tasks = []
-    runner._sync_tasks = []
-    runner._validate_recovery_protection_postcondition = Mock()
+    runner = _runner_for(strategy)
     report = SimpleNamespace(
         ok=True,
         issues=(),
-        metadata={},
+        metadata={"strategy_dynamic_capabilities_validated": True},
         strategy_signals=(object(),),
     )
 
@@ -173,7 +185,7 @@ def test_runner_revalidates_injected_recovery_report_before_any_signal_work() ->
 
 
 @pytest.mark.asyncio
-async def test_default_recovery_report_prevents_duplicate_position_provider_call() -> None:
+async def test_default_recovery_report_is_revalidated_by_runner() -> None:
     class ValidStrategy(_RecoveringContractStrategy):
         def __init__(self) -> None:
             super().__init__("valid")
@@ -181,14 +193,64 @@ async def test_default_recovery_report_prevents_duplicate_position_provider_call
     strategy = ValidStrategy()
     report = await RuntimeRecoveryService().recover(strategy=strategy)
     assert strategy.position_calls == 2
+    assert "strategy_dynamic_capabilities_validated" not in report.metadata
 
-    runner = object.__new__(LiveRuntimeRunner)
-    runner.context = SimpleNamespace(strategy=strategy)
-    runner._validated_strategy_capabilities = None
-    runner._validate_recovery_protection_postcondition = Mock()
+    runner = _runner_for(strategy)
     runner._validate_runtime_recovery_report(report)
 
-    assert strategy.position_calls == 2
+    assert strategy.position_calls == 3
     runner._validate_recovery_protection_postcondition.assert_called_once_with(
         report
     )
+
+
+def test_runner_dynamic_validation_requires_established_startup_identity() -> None:
+    runner = _runner_for(_RecoveringContractStrategy("valid"))
+    runner._validated_strategy_capabilities = None
+
+    with pytest.raises(
+        StrategyContractError,
+        match="requires established startup capabilities",
+    ):
+        runner._validate_runtime_recovery_report(
+            RecoveryReport(ok=True)
+        )
+
+    runner._validate_recovery_protection_postcondition.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_forged_recovery_metadata_cannot_reach_partition_or_execution() -> None:
+    strategy = _RecoveringContractStrategy("position_id")
+    strategy.recovered = True
+    runner = _runner_for(strategy)
+    report = RecoveryReport(
+        ok=True,
+        strategy_signals=(object(),),
+        metadata={"strategy_dynamic_capabilities_validated": True},
+    )
+    service = SimpleNamespace(
+        recover=AsyncMock(return_value=report),
+    )
+    runner._recovery_coordinator = RuntimeRecoveryCoordinator()
+    runner._get_recovery_service = Mock(return_value=service)
+    runner._recovery_fallback_snapshots = Mock(return_value=())
+    runner.stats = SimpleNamespace(recovery_runs=0)
+    runner._partition_recovery_signals = Mock()
+    runner._capture_recovery_failure_counts = Mock()
+    runner._execute_recovery_stop_signals = AsyncMock()
+    runner._validate_recovery_stop_execution = Mock()
+    runner._validate_post_execution_stop_protection = AsyncMock()
+    runner._execute_recovery_other_signals = AsyncMock()
+    runner._finalize_recovery_report = Mock()
+
+    with pytest.raises(StrategyPositionContractError):
+        await runner._run_recovery()
+
+    runner._partition_recovery_signals.assert_not_called()
+    runner._execute_recovery_stop_signals.assert_not_awaited()
+    runner._execute_recovery_other_signals.assert_not_awaited()
+    runner._finalize_recovery_report.assert_not_called()
+    assert runner._health.phase is RuntimePhase.CATCHING_UP
+    assert runner._producer_tasks == []
+    assert runner._sync_tasks == []

@@ -1903,6 +1903,7 @@ async def test_reconciliation_receives_all_snapshots():
         services={"recovery_service": FakeRecoveryService()},
         dry_run=True,
     )
+    runner._strategy_capabilities()
 
     # _run_recovery should return a tuple with both OKX and Binance snapshots
     snapshots = await runner._run_recovery()
@@ -1934,6 +1935,7 @@ async def test_runner_recovery_stores_last_snapshots():
         services={"recovery_service": FakeRecoveryService()},
         dry_run=True,
     )
+    runner._strategy_capabilities()
 
     snapshots = await runner._run_recovery()
     assert runner._last_snapshots == snapshots

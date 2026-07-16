@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from src.strategy.positions import (
+    format_strategy_position_snapshot_contexts,
     StrategyPositionProvider,
     StrategyPositionSide,
     StrategyPositionSnapshot,
@@ -98,6 +99,55 @@ def resolve_strategy_position_snapshots(
     return snapshots
 
 
+def validate_strategy_position_snapshot_set(
+    snapshots: Sequence[StrategyPositionSnapshot],
+    *,
+    expected_strategy_id: str,
+    expected_symbol: str,
+) -> tuple[StrategyPositionSnapshot, ...]:
+    """Validate runtime identity, symbol, and active position uniqueness."""
+
+    resolved = tuple(snapshots)
+    if any(
+        not isinstance(snapshot, StrategyPositionSnapshot)
+        for snapshot in resolved
+    ):
+        raise StrategyPositionContractError(
+            "strategy position snapshot set must contain "
+            "StrategyPositionSnapshot values"
+        )
+
+    active_by_position_id: dict[str, StrategyPositionSnapshot] = {}
+    for snapshot in resolved:
+        if snapshot.status is not StrategyPositionStatus.ACTIVE:
+            continue
+        previous = active_by_position_id.get(snapshot.position_id)
+        if previous is not None:
+            raise StrategyPositionContractError(
+                "duplicate active position_id | "
+                f"position_id={snapshot.position_id} | "
+                f"{format_strategy_position_snapshot_contexts((previous, snapshot))}"
+            )
+        active_by_position_id[snapshot.position_id] = snapshot
+
+    for snapshot in resolved:
+        if snapshot.strategy_id != expected_strategy_id:
+            raise StrategyPositionContractError(
+                "strategy position snapshot identity mismatch | "
+                f"expected_strategy_id={expected_strategy_id} | "
+                f"actual_strategy_id={snapshot.strategy_id} | "
+                f"position_id={snapshot.position_id}"
+            )
+        if snapshot.symbol != expected_symbol:
+            raise StrategyPositionContractError(
+                "strategy position snapshot symbol mismatch | "
+                f"expected_symbol={expected_symbol} | "
+                f"actual_symbol={snapshot.symbol} | "
+                f"position_id={snapshot.position_id}"
+            )
+    return resolved
+
+
 def resolve_strategy_position_snapshot_index(
     strategy: object,
 ) -> StrategyPositionSnapshotIndex:
@@ -110,4 +160,5 @@ __all__ = [
     "StrategyPositionSnapshotIndex",
     "resolve_strategy_position_snapshot_index",
     "resolve_strategy_position_snapshots",
+    "validate_strategy_position_snapshot_set",
 ]

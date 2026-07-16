@@ -90,6 +90,27 @@ def test_capability_manifest_parser_never_uses_permissive_bool_parser() -> None:
     )
 
 
+def test_runtime_requirements_use_one_strict_validator_at_direct_boundaries() -> None:
+    requirements_source = REQUIREMENTS.read_text(encoding="utf-8")
+    runner_source = RUNNER.read_text(encoding="utf-8")
+
+    assert "def validate_strategy_runtime_requirements(" in requirements_source
+    assert "validate_strategy_runtime_requirements(self)" in requirements_source
+    assert "return validate_strategy_runtime_requirements(value)" in requirements_source
+    assert 'self.services["runtime_requirements"]' in runner_source
+    assert "validate_strategy_runtime_requirements(" in runner_source
+
+
+def test_recovery_validation_marker_is_not_a_runtime_trust_mechanism() -> None:
+    source = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in RUNTIME_ROOT.rglob("*.py")
+    )
+
+    assert "strategy_dynamic_capabilities_validated" not in source
+    assert "DYNAMIC_STRATEGY_CAPABILITIES_VALIDATED" not in source
+
+
 def test_all_formal_strategy_manifests_have_exact_version_one_schema() -> None:
     manifest_fields = {
         "manifest_version",

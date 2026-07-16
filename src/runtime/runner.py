@@ -82,10 +82,14 @@ from src.runtime.range_micro_repair_supervisor import (
 )
 from src.runtime.range_repair_bootstrap import RangeRepairBootstrapService
 from src.runtime.range_speed_history import RangeSpeedHistoryRefresher
-from src.runtime.requirements import StrategyRuntimeRequirements, resolve_strategy_runtime_requirements
+from src.runtime.requirements import (
+    StrategyRuntimeRequirements,
+    resolve_strategy_runtime_requirements,
+    validate_strategy_runtime_requirements,
+)
 from src.runtime.strategy_capabilities import (
-    DYNAMIC_STRATEGY_CAPABILITIES_VALIDATED,
     StrategyCapabilityError,
+    StrategyContractError,
     ValidatedStrategyCapabilities,
     validate_dynamic_strategy_capabilities,
     validate_strategy_capabilities,
@@ -268,7 +272,15 @@ class LiveRuntimeRunner:
         self._account_config_new_entries_blocked: bool = False
         self._account_config_apply_writes: bool = False
         self._account_config_results: tuple[AccountConfigBootstrapResult, ...] = ()
-        self.requirements: StrategyRuntimeRequirements = self.services.get("runtime_requirements") or resolve_strategy_runtime_requirements(app_context.strategy, fallback_data_streams=app_config.data_streams)
+        if "runtime_requirements" in self.services:
+            self.requirements = validate_strategy_runtime_requirements(
+                self.services["runtime_requirements"]
+            )
+        else:
+            self.requirements = resolve_strategy_runtime_requirements(
+                app_context.strategy,
+                fallback_data_streams=app_config.data_streams,
+            )
         self._validated_strategy_capabilities: (
             ValidatedStrategyCapabilities | None
         ) = None
@@ -2013,32 +2025,27 @@ class LiveRuntimeRunner:
         self,
         report: RecoveryReport,
     ) -> None:
-        report_metadata = getattr(report, "metadata", {})
-        dynamic_state_validated = (
-            isinstance(report_metadata, Mapping)
-            and report_metadata.get(
-                DYNAMIC_STRATEGY_CAPABILITIES_VALIDATED
-            )
-            is True
+        capabilities = getattr(
+            self,
+            "_validated_strategy_capabilities",
+            None,
         )
-        if not dynamic_state_validated:
-            validate_dynamic_strategy_capabilities(
-                self.context.strategy,
-                strategy_entry=getattr(
-                    getattr(self, "app_config", None),
-                    "strategy",
-                    None,
-                ),
-                runtime_mode=getattr(
-                    getattr(self, "runtime_config", None),
-                    "mode",
-                    RuntimeMode.LIVE_RUNTIME,
-                ),
+        if capabilities is None:
+            raise StrategyContractError(
+                "strategy dynamic contract validation requires established "
+                "startup capabilities"
             )
+        dynamic_state = validate_dynamic_strategy_capabilities(
+            self.context.strategy,
+            expected_strategy_id=capabilities.identity,
+            expected_symbol=self.app_config.symbol,
+            strategy_entry=self.app_config.strategy,
+            runtime_mode=self.runtime_config.mode,
+        )
         if not report.ok:
             raise LiveRuntimeError(f"runtime recovery failed: {tuple(report.issues)}")
         # ── Check strategy recovery blocking state ────────────────────────
-        recovery_status = self._strategy_recovery_status()
+        recovery_status = dynamic_state.recovery_status
         if recovery_status.blocking_manual_required:
             raise LiveRuntimeError(
                 f"runtime recovery blocking manual required: "

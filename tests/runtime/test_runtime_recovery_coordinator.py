@@ -396,6 +396,14 @@ def test_record_and_report_validation_keep_order_and_messages() -> None:
     runner = object.__new__(LiveRuntimeRunner)
     runner.stats = SimpleNamespace(recovery_runs=4)
     runner.context = SimpleNamespace(strategy=SimpleNamespace())
+    runner.app_config = SimpleNamespace(
+        strategy="tests.fake:Strategy",
+        symbol="ETH-USDT-PERP",
+    )
+    runner.runtime_config = SimpleNamespace(mode=RuntimeMode.LIVE_RUNTIME)
+    runner._validated_strategy_capabilities = SimpleNamespace(
+        identity="test-strategy"
+    )
     runner._validate_recovery_protection_postcondition = Mock()
 
     runner._record_recovery_run()

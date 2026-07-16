@@ -115,6 +115,9 @@ class StrategyRuntimeRequirements:
     )
     capability_manifest_declared: bool = False
 
+    def __post_init__(self) -> None:
+        validate_strategy_runtime_requirements(self)
+
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any] | None) -> "StrategyRuntimeRequirements":
         raw = dict(data or {})
@@ -149,6 +152,75 @@ class StrategyRuntimeRequirements:
         )
 
 
+def validate_strategy_runtime_requirements(
+    requirements: StrategyRuntimeRequirements,
+) -> StrategyRuntimeRequirements:
+    """Validate the capability manifest without coercing dataclass fields."""
+
+    if not isinstance(requirements, StrategyRuntimeRequirements):
+        raise StrategyCapabilityError(
+            "strategy runtime requirements must be StrategyRuntimeRequirements"
+        )
+    if type(requirements.capability_manifest_declared) is not bool:
+        raise StrategyCapabilityError(
+            "strategy capability_manifest_declared must be bool"
+        )
+
+    capabilities = requirements.capabilities
+    if type(capabilities) is not StrategyCapabilityRequirements:
+        raise StrategyCapabilityError(
+            "strategy capabilities must be StrategyCapabilityRequirements"
+        )
+
+    if requirements.capability_manifest_declared:
+        if (
+            type(capabilities.manifest_version) is not int
+            or capabilities.manifest_version != 1
+        ):
+            raise StrategyCapabilityError(
+                "strategy capability manifest_version must be integer 1"
+            )
+        if (
+            not isinstance(capabilities.strategy_id, str)
+            or not capabilities.strategy_id.strip()
+        ):
+            raise StrategyCapabilityError(
+                "strategy capability strategy_id must be a non-empty string"
+            )
+        invalid_boolean_fields = [
+            name
+            for name in _CAPABILITY_BOOLEAN_FIELDS
+            if type(getattr(capabilities, name)) is not bool
+        ]
+        if invalid_boolean_fields:
+            raise StrategyCapabilityError(
+                "strategy capability values must be bool | "
+                f"invalid={invalid_boolean_fields}"
+            )
+        return requirements
+
+    if capabilities.manifest_version is not None:
+        raise StrategyCapabilityError(
+            "undeclared strategy capability manifest_version must be None"
+        )
+    if capabilities.strategy_id is not None:
+        raise StrategyCapabilityError(
+            "undeclared strategy capability strategy_id must be None"
+        )
+    invalid_undeclared_fields = [
+        name
+        for name in _CAPABILITY_BOOLEAN_FIELDS
+        if type(getattr(capabilities, name)) is not bool
+        or getattr(capabilities, name) is not False
+    ]
+    if invalid_undeclared_fields:
+        raise StrategyCapabilityError(
+            "undeclared strategy capability values must be bool False | "
+            f"invalid={invalid_undeclared_fields}"
+        )
+    return requirements
+
+
 def resolve_strategy_runtime_requirements(strategy: object, *, fallback_data_streams: tuple[str, ...] = ()) -> StrategyRuntimeRequirements:
     """Resolve runtime requirements from a strategy object.
 
@@ -171,7 +243,7 @@ def resolve_strategy_runtime_requirements(strategy: object, *, fallback_data_str
                 f"error={type(exc).__name__}: {exc}"
             ) from exc
     if isinstance(value, StrategyRuntimeRequirements):
-        return value
+        return validate_strategy_runtime_requirements(value)
     if isinstance(value, Mapping):
         return StrategyRuntimeRequirements.from_mapping(value)
     return StrategyRuntimeRequirements.from_data_streams(tuple(fallback_data_streams))

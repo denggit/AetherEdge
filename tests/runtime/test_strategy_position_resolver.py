@@ -4,7 +4,13 @@ from decimal import Decimal
 
 import pytest
 
-from src.runtime.strategy_positions import resolve_strategy_position_snapshots
+from src.runtime.strategy_capabilities import (
+    validate_dynamic_strategy_capabilities,
+)
+from src.runtime.strategy_positions import (
+    resolve_strategy_position_snapshots,
+    validate_strategy_position_snapshot_set,
+)
 from src.strategy.positions import (
     StrategyPositionSide,
     StrategyPositionSnapshot,
@@ -16,14 +22,23 @@ from src.strategy import (
 )
 
 
-def _snapshot(position_id: str) -> StrategyPositionSnapshot:
+def _snapshot(
+    position_id: str,
+    *,
+    strategy_id: str = "test-strategy",
+    symbol: str = "ETH-USDT-PERP",
+    side: StrategyPositionSide = StrategyPositionSide.LONG,
+    status: StrategyPositionStatus = StrategyPositionStatus.ACTIVE,
+    sleeve_id: str | None = None,
+) -> StrategyPositionSnapshot:
     return StrategyPositionSnapshot(
-        strategy_id="test-strategy",
+        strategy_id=strategy_id,
         position_id=position_id,
-        symbol="ETH-USDT-PERP",
-        side=StrategyPositionSide.LONG,
-        status=StrategyPositionStatus.ACTIVE,
+        symbol=symbol,
+        side=side,
+        status=status,
         base_quantity=Decimal("1"),
+        sleeve_id=sleeve_id,
     )
 
 
@@ -162,3 +177,111 @@ def test_provider_internal_error_is_wrapped_and_contract_error_is_preserved() ->
     with pytest.raises(StrategyPositionContractError) as preserved:
         resolve_strategy_position_snapshots(ContractProvider())
     assert preserved.value is contract
+
+
+def test_snapshot_set_accepts_matching_identity_symbol_and_unique_active_ids() -> None:
+    snapshots = (_snapshot("position-1"), _snapshot("position-2"))
+
+    assert validate_strategy_position_snapshot_set(
+        snapshots,
+        expected_strategy_id="test-strategy",
+        expected_symbol="ETH-USDT-PERP",
+    ) is snapshots
+
+
+def test_snapshot_set_rejects_wrong_strategy_identity_with_context() -> None:
+    snapshot = _snapshot("position-1", strategy_id="wrong-strategy")
+
+    with pytest.raises(StrategyPositionContractError) as exc_info:
+        validate_strategy_position_snapshot_set(
+            (snapshot,),
+            expected_strategy_id="test-strategy",
+            expected_symbol="ETH-USDT-PERP",
+        )
+
+    message = str(exc_info.value)
+    assert "expected_strategy_id=test-strategy" in message
+    assert "actual_strategy_id=wrong-strategy" in message
+    assert "position_id=position-1" in message
+
+
+def test_snapshot_set_rejects_wrong_symbol_with_context() -> None:
+    snapshot = _snapshot("position-1", symbol="BTC-USDT-PERP")
+
+    with pytest.raises(StrategyPositionContractError) as exc_info:
+        validate_strategy_position_snapshot_set(
+            (snapshot,),
+            expected_strategy_id="test-strategy",
+            expected_symbol="ETH-USDT-PERP",
+        )
+
+    message = str(exc_info.value)
+    assert "expected_symbol=ETH-USDT-PERP" in message
+    assert "actual_symbol=BTC-USDT-PERP" in message
+    assert "position_id=position-1" in message
+
+
+@pytest.mark.parametrize(
+    "second",
+    (
+        _snapshot("duplicate", sleeve_id="sleeve-2"),
+        _snapshot("duplicate", side=StrategyPositionSide.SHORT),
+        _snapshot("duplicate", symbol="BTC-USDT-PERP"),
+    ),
+    ids=("different_sleeve", "different_side", "different_symbol"),
+)
+def test_snapshot_set_rejects_duplicate_active_position_ids(
+    second: StrategyPositionSnapshot,
+) -> None:
+    first = _snapshot("duplicate", sleeve_id="sleeve-1")
+
+    with pytest.raises(
+        StrategyPositionContractError,
+        match="duplicate active position_id",
+    ) as exc_info:
+        validate_strategy_position_snapshot_set(
+            (first, second),
+            expected_strategy_id="test-strategy",
+            expected_symbol="ETH-USDT-PERP",
+        )
+
+    message = str(exc_info.value)
+    assert "position_id=duplicate" in message
+    assert "strategy_ids=" in message
+    assert "symbols=" in message
+    assert "sleeve_ids=" in message
+
+
+def test_snapshot_set_allows_duplicate_non_active_position_ids() -> None:
+    snapshots = (
+        _snapshot(
+            "historical",
+            status=StrategyPositionStatus.CLOSING,
+        ),
+        _snapshot(
+            "historical",
+            side=StrategyPositionSide.FLAT,
+            status=StrategyPositionStatus.FLAT,
+        ),
+    )
+
+    assert validate_strategy_position_snapshot_set(
+        snapshots,
+        expected_strategy_id="test-strategy",
+        expected_symbol="ETH-USDT-PERP",
+    ) is snapshots
+
+
+def test_dynamic_validation_applies_snapshot_set_context() -> None:
+    snapshot = _snapshot("position-1", strategy_id="wrong-strategy")
+
+    class ProviderStrategy:
+        def position_snapshots(self):
+            return (snapshot,)
+
+    with pytest.raises(StrategyPositionContractError, match="identity mismatch"):
+        validate_dynamic_strategy_capabilities(
+            ProviderStrategy(),
+            expected_strategy_id="test-strategy",
+            expected_symbol="ETH-USDT-PERP",
+        )

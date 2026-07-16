@@ -16,7 +16,6 @@ from src.reconcile.checker import Reconciler
 from src.reconcile.models import ReconcileCategory, ReconcileIssue, ReconcileReport
 from src.runtime.recovery.models import RecoveryReport
 from src.runtime.strategy_capabilities import (
-    DYNAMIC_STRATEGY_CAPABILITIES_VALIDATED,
     validate_dynamic_strategy_capabilities,
 )
 from src.runtime.strategy_positions import (
@@ -122,7 +121,6 @@ class RuntimeRecoveryService:
                 "exchange_contexts": len(self.exchange_contexts),
                 "intent_ids": len(self.intent_ids),
                 "active_position_plans": active_position_plans,
-                DYNAMIC_STRATEGY_CAPABILITIES_VALIDATED: True,
                 "non_fatal_reconcile_issues": tuple(
                     issue.message
                     for report in reconcile_reports
