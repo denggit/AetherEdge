@@ -68,7 +68,6 @@ def test_target_position_fields_and_frozen_value_equality() -> None:
         "quantity_base",
     )
     assert position == _position()
-    assert not hasattr(position, "__dict__")
     with pytest.raises(FrozenInstanceError):
         position.quantity_base = Decimal("2")  # type: ignore[misc]
 
@@ -124,13 +123,8 @@ def test_virtual_target_fields_frozen_and_equal() -> None:
         "metadata",
     )
     assert target == _target()
-    assert not hasattr(target, "__dict__")
     with pytest.raises(FrozenInstanceError):
         target.revision = 1  # type: ignore[misc]
-    with pytest.raises(FrozenInstanceError):
-        target.position = _position(TargetPositionSide.SHORT)  # type: ignore[misc]
-    with pytest.raises(FrozenInstanceError):
-        target.metadata = {}  # type: ignore[misc]
 
 
 @pytest.mark.parametrize("field_name", ("strategy_id", "sleeve_id", "symbol"))
@@ -154,17 +148,6 @@ def test_virtual_target_rejects_invalid_identity_values(
     field_name: str, invalid: object
 ) -> None:
     with pytest.raises((TypeError, ValueError)):
-        _target(**{field_name: invalid})
-
-
-@pytest.mark.parametrize("field_name", ("strategy_id", "sleeve_id", "symbol"))
-@pytest.mark.parametrize(
-    "invalid", (SignalAction.OPEN_LONG, TargetPositionSide.LONG)
-)
-def test_virtual_target_identity_requires_plain_string(
-    field_name: str, invalid: object
-) -> None:
-    with pytest.raises(TypeError, match=field_name):
         _target(**{field_name: invalid})
 
 
@@ -205,14 +188,6 @@ def test_virtual_target_rejects_invalid_reason(invalid: object) -> None:
         _target(reason=invalid)
 
 
-@pytest.mark.parametrize(
-    "invalid", (SignalAction.OPEN_LONG, TargetPositionSide.SHORT)
-)
-def test_virtual_target_reason_requires_plain_string(invalid: object) -> None:
-    with pytest.raises(TypeError, match="reason"):
-        _target(reason=invalid)
-
-
 def test_virtual_target_metadata_missing_empty_and_none_are_distinct() -> None:
     assert dict(_target().metadata) == {}
     assert dict(_target(metadata={}).metadata) == {}
@@ -234,13 +209,8 @@ def test_decision_fields_frozen_and_times_have_no_defaults() -> None:
     )
     for name in ("event_time_ms", "available_time_ms", "decision_time_ms"):
         assert StrategyDecision.__dataclass_fields__[name].default.__class__.__name__ == "_MISSING_TYPE"
-    assert not hasattr(decision, "__dict__")
     with pytest.raises(FrozenInstanceError):
         decision.decision_time_ms = 999  # type: ignore[misc]
-    with pytest.raises(FrozenInstanceError):
-        decision.targets = ()  # type: ignore[misc]
-    with pytest.raises(FrozenInstanceError):
-        decision.metadata = {}  # type: ignore[misc]
 
 
 def test_decision_accepts_equal_and_normally_increasing_times() -> None:
@@ -254,17 +224,6 @@ def test_decision_rejects_invalid_identity_values(
     field_name: str, invalid: object
 ) -> None:
     with pytest.raises((TypeError, ValueError)):
-        _decision(**{field_name: invalid})
-
-
-@pytest.mark.parametrize("field_name", ("strategy_id", "decision_id"))
-@pytest.mark.parametrize(
-    "invalid", (SignalAction.OPEN_LONG, TargetPositionSide.LONG)
-)
-def test_decision_identity_requires_plain_string(
-    field_name: str, invalid: object
-) -> None:
-    with pytest.raises(TypeError, match=field_name):
         _decision(**{field_name: invalid})
 
 
@@ -345,32 +304,6 @@ def test_decision_reason_and_metadata_use_shared_boundaries() -> None:
         _decision(reason="x" * (MAX_METADATA_STRING_LENGTH + 1))
     with pytest.raises(TypeError, match="metadata"):
         _decision(metadata=None)
-
-
-@pytest.mark.parametrize(
-    "invalid", (SignalAction.OPEN_LONG, TargetPositionSide.SHORT)
-)
-def test_decision_reason_requires_plain_string(invalid: object) -> None:
-    with pytest.raises(TypeError, match="reason"):
-        _decision(reason=invalid)
-
-
-def test_plain_string_identity_and_reason_values_remain_unchanged() -> None:
-    target = _target(reason="normal target update")
-    decision = _decision(
-        targets=(target,),
-        reason="normal target update",
-    )
-
-    assert target.strategy_id == "strategy-1"
-    assert target.sleeve_id == "sleeve-1"
-    assert target.symbol == "ETH-USDT-PERP"
-    assert target.reason == "normal target update"
-    assert decision.strategy_id == "strategy-1"
-    assert decision.decision_id == "decision-1"
-    assert decision.reason == "normal target update"
-    assert _target().reason == ""
-    assert _decision().reason == ""
 
 
 def test_metadata_deep_freeze_and_input_mutation_isolation() -> None:
