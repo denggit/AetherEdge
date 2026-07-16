@@ -517,12 +517,6 @@ def _bounded_window(
     return max(first_ms, last_ms - span_ms + 1), last_ms
 
 
-def _resolve_current_day_archive_ready(*, symbol: str) -> bool:
-    """The current OKX UTC+8 archive day is never considered complete."""
-    _ = symbol
-    return False
-
-
 def _check_worker_running(status_path: str | None) -> bool:
     if not status_path:
         return False

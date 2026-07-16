@@ -10,14 +10,23 @@ def test_platform_keeps_only_infrastructure_modules_at_top_level():
         "exchanges",
         "execution",
         "markets",
-        "runtime",
         "state",
         "__init__.py",
         "config.py",
         "snapshot.py",
     }
-    actual = {path.name for path in (ROOT / "src" / "platform").iterdir() if not path.name.startswith("__pycache__")}
+    actual = {
+        path.name
+        for path in (ROOT / "src" / "platform").iterdir()
+        if not path.name.startswith("__pycache__")
+        and (path.is_file() or any(path.rglob("*.py")))
+    }
     assert actual <= allowed
+
+
+def test_removed_runtime_source_paths_stay_removed():
+    for relative in ("src/platform/runtime", "src/runtime/lifecycle"):
+        assert not list((ROOT / relative).rglob("*.py"))
 
 
 def test_state_store_is_storage_not_state_machine_or_recovery_engine():
