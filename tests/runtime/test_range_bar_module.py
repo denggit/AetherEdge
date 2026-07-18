@@ -108,7 +108,7 @@ def _trade() -> MarketTrade:
     )
 
 
-def _module(*, builder, persistence, emitted):
+def _module(*, builder, persistence, emitted, publish=None):
     return RangeBarModule(
         config=RangeBarModuleConfig(
             symbol="ETH-USDT-PERP",
@@ -120,7 +120,7 @@ def _module(*, builder, persistence, emitted):
             checkpoint_interval_ms=10_000,
         ),
         dispatcher=BoundedOrderedEventDispatcher(maxsize=4),
-        publish=lambda event: _append(emitted, event),
+        publish=publish or (lambda event: _append(emitted, event)),
         persistence=persistence,
         builder=builder,
         bar_store=FakeBarStore(),
@@ -169,3 +169,38 @@ def test_range_module_has_no_resources_before_instantiation() -> None:
 
     assert dispatcher.subscriber_ids == ()
     assert dispatcher.task_count == 0
+
+
+@pytest.mark.asyncio
+async def test_range_aggregate_publish_failure_is_retryable_and_commits_once() -> None:
+    emitted = []
+    attempts = 0
+
+    async def publish(event):
+        nonlocal attempts
+        if event.type_value == "range_bar_closed":
+            return
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("first publish failed")
+        emitted.append(event)
+
+    module = _module(
+        builder=FakeBuilder((_bar(),)),
+        persistence=FakePersistence(),
+        emitted=emitted,
+        publish=publish,
+    )
+    await module.prepare()
+    await module.process_trade(_trade())
+
+    with pytest.raises(RuntimeError, match="first publish failed"):
+        await module.emit_aggregate_for_bucket(0)
+
+    retried = await module.emit_aggregate_for_bucket(0)
+    duplicate = await module.emit_aggregate_for_bucket(0)
+
+    assert attempts == 2
+    assert len(retried) == 1
+    assert duplicate == []
+    assert emitted == retried

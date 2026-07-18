@@ -57,7 +57,11 @@ class ClosedBarComponent(RuntimeComponent):
         if due is None:
             return []
         open_time_ms, closed_kline = due
-        await self._drain_before_closed_bar(open_time_ms, closed_kline)
+        if not await self._drain_before_closed_bar(
+            open_time_ms,
+            closed_kline,
+        ):
+            return []
         features = await self._emit_closed_kline_feature(
             open_time_ms,
             closed_kline,
@@ -146,12 +150,12 @@ class ClosedBarComponent(RuntimeComponent):
         self,
         open_time_ms: int,
         closed_kline: MarketKline,
-    ) -> None:
+    ) -> bool:
         result = await self._drain_market_events_before_closed_bar(
             closed_bar_close_time_ms=closed_kline.close_time_ms,
         )
         if not (result.hit_event_limit or result.hit_time_limit):
-            return
+            return True
         self._mark_range_context_degraded_bucket(
             bucket_start_ms=open_time_ms,
             reason="market_queue_drain_incomplete_before_closed_bar",
@@ -168,6 +172,20 @@ class ClosedBarComponent(RuntimeComponent):
             result.hit_event_limit,
             result.hit_time_limit,
         )
+        self.context.alerts.emit(
+            AppAlert(
+                subject="AetherEdge closed-bar trade barrier incomplete",
+                severity="error",
+                content=(
+                    f"symbol={self.app_config.symbol}\n"
+                    f"close_time_ms={closed_kline.close_time_ms}\n"
+                    f"pipeline_completed={result.pipeline_completed}\n"
+                    f"pipeline_pending={result.pipeline_pending}\n"
+                    f"queue_size_after={result.queue_size_after}\n"
+                ),
+            )
+        )
+        return False
 
     async def _emit_closed_kline_feature(
         self,

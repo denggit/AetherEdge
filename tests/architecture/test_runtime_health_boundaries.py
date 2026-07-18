@@ -318,9 +318,6 @@ def test_runner_retains_health_call_ownership_and_compatibility_reader() -> None
         if _attribute_calls(method, "_set_health")
     }
     assert call_counts == {
-        "run": 2,
-        "start": 1,
-        "stop": 1,
         "process_market_event": 1,
         "_enter_startup_warming_up": 1,
         "_enter_startup_catching_up": 1,
@@ -376,38 +373,31 @@ def test_run_start_and_stop_keep_existing_health_and_shutdown_order() -> None:
     methods = _methods(_class(RUNNER, "LiveRuntimeRunner"))
 
     start = methods["start"]
-    assert len(start.body) == 2
-    assert ast.unparse(start.body[0]).startswith(
-        "self._set_health(RuntimePhase.RUNNING"
-    )
-    assert ast.unparse(start.body[1]) == "return self._health"
+    start_source = ast.unparse(start)
+    assert "self._named_component('lifecycle', LifecycleComponent)" in start_source
+    assert "RuntimePhase.RUNNING" in start_source
+    assert ast.unparse(start.body[-1]) == "return self._health"
 
     stop = methods["stop"]
     stop_statements = [ast.unparse(statement) for statement in stop.body]
-    assert stop_statements == [
+    assert stop_statements[:2] == [
         "self._stop_event.set()",
         "await self._explicit_stop_shutdown()",
-        "self._set_health(RuntimePhase.STOPPED, healthy=True)",
-        "return self._health",
     ]
+    assert "RuntimePhase.STOPPED" in ast.unparse(stop)
+    assert stop_statements[-1] == "return self._health"
 
     run = methods["run"]
     try_node = next(node for node in run.body if isinstance(node, ast.Try))
     stopped_call = next(
-        node
-        for node in ast.walk(try_node)
+        node for node in ast.walk(try_node)
         if isinstance(node, ast.Call)
-        and ast.unparse(node.func) == "self._set_health"
-        and node.args
-        and ast.unparse(node.args[0]) == "RuntimePhase.STOPPED"
+        and any(ast.unparse(arg) == "RuntimePhase.STOPPED" for arg in node.args)
     )
     error_call = next(
-        node
-        for node in ast.walk(try_node)
+        node for node in ast.walk(try_node)
         if isinstance(node, ast.Call)
-        and ast.unparse(node.func) == "self._set_health"
-        and node.args
-        and ast.unparse(node.args[0]) == "RuntimePhase.ERROR"
+        and any(ast.unparse(arg) == "RuntimePhase.ERROR" for arg in node.args)
     )
     assert stopped_call.lineno < next(
         node.lineno

@@ -142,7 +142,7 @@ async def test_drop_oldest_backpressure_never_blocks_publisher() -> None:
     second = _trade("second")
 
     assert dispatcher.publish(first).dropped == 0
-    assert dispatcher.publish(second).dropped == 0
+    assert dispatcher.publish(second).dropped == 1
     assert dispatcher.health()[0].dropped == 1
 
     await dispatcher.start()

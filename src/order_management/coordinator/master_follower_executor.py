@@ -23,6 +23,9 @@ from src.platform.execution import ExecutionClient
 from src.platform.exchanges.models import CancelStopOrderRequest, ExchangeName, Order, OrderRequest, OrderStatus, PositionMode, PositionSide, StopMarketOrderRequest
 from src.signals.models import SignalAction
 from src.utils.log import get_logger
+from src.order_management.coordinator.multi_exchange_executor import (
+    MultiExchangeExecutor,
+)
 
 
 _MASTER_GATED_PURPOSES = {"normal_entry", "normal_close"}
@@ -35,10 +38,16 @@ _BYPASS_MASTER_PURPOSES = {
 logger = get_logger(__name__)
 
 
-from src.order_management.coordinator.support import *  # noqa: F403
-
-
 class MasterFollowerExecutor:
+    def __init__(
+        self,
+        *,
+        policy: MasterFollowerExecutionPolicy,
+        executor: MultiExchangeExecutor,
+    ) -> None:
+        self.master_follower_policy = policy
+        self._executor = executor
+
     async def _execute_master_follower(self, clients: Sequence[ExecutionClient], intent: OrderIntent, items: Sequence[PlannedExecution]) -> list[ExchangeOrderResult]:
         assert self.master_follower_policy is not None
         if self._bypasses_master_gating(intent):
@@ -47,7 +56,7 @@ class MasterFollowerExecutor:
                 close_retry = self.master_follower_policy.follower_close_retry
                 results_nested = await asyncio.gather(
                     *(
-                        self._execute_for_client(
+                        self._executor._execute_for_client(
                             client,
                             intent,
                             items,
@@ -58,7 +67,7 @@ class MasterFollowerExecutor:
                     )
                 )
             else:
-                results_nested = await asyncio.gather(*(self._execute_for_client(client, intent, items) for client in clients))
+                results_nested = await asyncio.gather(*(self._executor._execute_for_client(client, intent, items) for client in clients))
             return [item for group in results_nested for item in group]
         client_by_exchange = {client.exchange: client for client in clients}
         master = client_by_exchange.get(self.master_follower_policy.master_exchange)
@@ -67,7 +76,7 @@ class MasterFollowerExecutor:
             logger.error("Master execution client unavailable | intent_id=%s master=%s", intent.intent_id, self.master_follower_policy.master_exchange.value)
             return [ExchangeOrderResult(exchange=self.master_follower_policy.master_exchange, ok=False, error="master execution client not available")]
     
-        master_results = await self._execute_for_client(
+        master_results = await self._executor._execute_for_client(
             master,
             intent,
             items,
@@ -82,7 +91,7 @@ class MasterFollowerExecutor:
             return master_results
         follower_nested = await asyncio.gather(
             *(
-                self._execute_for_client(
+                self._executor._execute_for_client(
                     client,
                     intent,
                     items,
@@ -116,4 +125,3 @@ class MasterFollowerExecutor:
 
 
 __all__ = ["MasterFollowerExecutor"]
-

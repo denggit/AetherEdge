@@ -31,6 +31,50 @@ def test_runtime_orchestrator_meets_size_and_range_boundaries() -> None:
     assert "RangeBuilder" not in source
 
 
+def test_runner_formal_path_uses_named_composition_without_metaclass_patching() -> None:
+    source = RUNNER.read_text(encoding="utf-8")
+    tree = _tree(RUNNER)
+    runner = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "LiveRuntimeRunner"
+    )
+    assert runner.keywords == []
+    for forbidden in (
+        "_RunnerMeta",
+        "_METHOD_COMPONENTS",
+        "_COMPONENT_CLASS_PATCH_DEFAULTS",
+        "metaclass=",
+    ):
+        assert forbidden not in source
+    initialize = next(
+        node
+        for node in runner.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    assigned_names = {
+        node.args[1].value
+        for node in ast.walk(initialize)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and ast.unparse(node.func) == "object.__setattr__"
+        and len(node.args) >= 2
+        and isinstance(node.args[1], ast.Constant)
+    }
+    assert {
+        "lifecycle",
+        "market_events",
+        "closed_bar",
+        "signal_execution",
+        "account_runtime",
+        "recovery",
+    }.issubset(assigned_names)
+    component_base = (COMPONENTS / "base.py").read_text(encoding="utf-8")
+    assert 'object.__getattribute__(owner, "__dict__")' not in component_base
+    assert 'object.__setattr__(owner,' not in component_base
+    assert "RuntimeSharedState" in component_base
+
+
 def test_runtime_components_are_focused_and_below_file_limit() -> None:
     oversized = {
         path.relative_to(ROOT).as_posix(): len(
@@ -82,15 +126,7 @@ def test_order_coordinator_is_an_orchestrator_over_separate_responsibilities() -
         if isinstance(node, ast.ClassDef)
         and node.name == "MultiExchangeOrderCoordinator"
     )
-    bases = {ast.unparse(base) for base in coordinator.bases}
-    assert bases == {
-        "OrderIntentPlanner",
-        "MasterFollowerExecutor",
-        "MultiExchangeExecutor",
-        "OrderSafetyValidator",
-        "ExecutionResultRecorder",
-        "PositionPlanUpdater",
-    }
+    assert coordinator.bases == []
     assert coordinator.end_lineno - coordinator.lineno + 1 <= 250
     assert {
         "OrderIntentPlanner": "intent_planner.py",
@@ -114,6 +150,52 @@ def test_order_coordinator_is_an_orchestrator_over_separate_responsibilities() -
             "PositionPlanUpdater",
         }
     }
+    constructor = next(
+        node
+        for node in coordinator.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "__init__"
+    )
+    assignments = {
+        ast.unparse(node.targets[0])
+        for node in ast.walk(constructor)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Attribute)
+    }
+    assert {
+        "self.intent_planner",
+        "self.safety_validator",
+        "self.executor",
+        "self.result_recorder",
+        "self.position_plan_updater",
+    }.issubset(assignments)
+
+
+def test_order_services_have_explicit_constructors_and_no_wildcard_imports() -> None:
+    service_files = {
+        "intent_planner.py": "OrderIntentPlanner",
+        "master_follower_executor.py": "MasterFollowerExecutor",
+        "multi_exchange_executor.py": "MultiExchangeExecutor",
+        "position_plan_updater.py": "PositionPlanUpdater",
+        "result_recorder.py": "ExecutionResultRecorder",
+        "safety_validator.py": "OrderSafetyValidator",
+    }
+    for filename, class_name in service_files.items():
+        path = ORDER_COORDINATOR / filename
+        source = path.read_text(encoding="utf-8")
+        assert "import *" not in source
+        class_node = next(
+            node
+            for node in _tree(path).body
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+        )
+        assert class_node.bases == []
+        assert any(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "__init__"
+            for node in class_node.body
+        )
 
 
 def test_no_refactor_production_file_exceeds_eight_hundred_lines() -> None:

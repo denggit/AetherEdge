@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Protocol
@@ -7,10 +8,17 @@ from typing import Protocol
 from src.runtime.module import CapabilityId
 from src.runtime.module import ModuleHealth, ModuleHost
 from src.runtime.registry import DependencyResolver, ModuleRegistry, RuntimePlan
+from src.runtime.market_data.dispatcher import DispatcherBarrierResult
 
 
 class RuntimeLog(Protocol):
     def info(self, message: str, *args: object) -> None: ...
+
+    def error(self, message: str, *args: object) -> None: ...
+
+
+class MarketDataRuntimeError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -34,6 +42,10 @@ class MarketDataRuntime:
         self._logger = logger
         self._plan: RuntimePlan | None = None
         self._host: ModuleHost | None = None
+        self._error: BaseException | None = None
+        self._supervisor_stop = asyncio.Event()
+        self._supervisor_task: asyncio.Task[None] | None = None
+        self._failure_event = asyncio.Event()
 
     def plan(
         self,
@@ -65,7 +77,8 @@ class MarketDataRuntime:
         self._log_plan(plan)
         try:
             await host.prepare()
-        except BaseException:
+        except BaseException as exc:
+            self._error = exc
             self._plan = None
             self._host = None
             raise
@@ -77,7 +90,19 @@ class MarketDataRuntime:
         host = self._host
         if host is None:
             raise RuntimeError("market data runtime is not prepared")
-        await host.start()
+        try:
+            await host.start()
+        except BaseException as exc:
+            self._error = exc
+            self._host = None
+            self._plan = None
+            raise
+        self._supervisor_stop.clear()
+        self._failure_event.clear()
+        self._supervisor_task = asyncio.create_task(
+            self._supervise(),
+            name="market-data-supervisor",
+        )
         plan = self._plan
         assert plan is not None
         self._log("Started modules | modules=%s", plan.module_ids)
@@ -86,8 +111,87 @@ class MarketDataRuntime:
         host = self._host
         self._host = None
         self._plan = None
-        if host is not None:
-            await host.stop()
+        self._supervisor_stop.set()
+        supervisor = self._supervisor_task
+        self._supervisor_task = None
+        try:
+            if host is not None:
+                await host.stop()
+        finally:
+            if supervisor is not None:
+                await asyncio.gather(supervisor, return_exceptions=True)
+
+    async def drain_through(
+        self,
+        cutoff_time_ms: int,
+        *,
+        timeout_seconds: float,
+    ) -> DispatcherBarrierResult:
+        host = self._host
+        if host is None:
+            return DispatcherBarrierResult(
+                cutoff_time_ms=cutoff_time_ms,
+                pending=0,
+                completed=True,
+            )
+        for module in host.modules:
+            drain = getattr(module, "drain_through", None)
+            if callable(drain):
+                result = await drain(
+                    cutoff_time_ms,
+                    timeout_seconds=timeout_seconds,
+                )
+                if result is not None:
+                    return result
+        return DispatcherBarrierResult(
+            cutoff_time_ms=cutoff_time_ms,
+            pending=0,
+            completed=True,
+        )
+
+    def raise_if_failed(self) -> None:
+        if self._error is not None:
+            raise MarketDataRuntimeError(
+                "market data runtime failed | "
+                f"error={type(self._error).__name__}: {self._error}"
+            ) from self._error
+        host = self._host
+        if host is None:
+            return
+        unhealthy = tuple(item for item in host.health() if not item.healthy)
+        if not unhealthy:
+            return
+        detail = "; ".join(
+            f"{item.module_id}:{item.state.value}:{item.detail}"
+            for item in unhealthy
+        )
+        error = MarketDataRuntimeError(
+            f"market data module unhealthy | {detail}"
+        )
+        self._error = error
+        if self._logger is not None:
+            self._logger.error("Market data runtime failed | %s", detail)
+        raise error
+
+    async def wait_failed(self) -> None:
+        await self._failure_event.wait()
+        self.raise_if_failed()
+
+    async def _supervise(self) -> None:
+        while not self._supervisor_stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._supervisor_stop.wait(),
+                    timeout=0.05,
+                )
+                continue
+            except TimeoutError:
+                pass
+            try:
+                self.raise_if_failed()
+            except MarketDataRuntimeError:
+                self._failure_event.set()
+                return
 
     def state(self) -> MarketDataRuntimeState:
         host = self._host
@@ -120,4 +224,9 @@ class MarketDataRuntime:
             self._logger.info(message, *args)
 
 
-__all__ = ["MarketDataRuntime", "MarketDataRuntimeState", "RuntimeLog"]
+__all__ = [
+    "MarketDataRuntime",
+    "MarketDataRuntimeError",
+    "MarketDataRuntimeState",
+    "RuntimeLog",
+]

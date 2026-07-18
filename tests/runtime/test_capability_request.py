@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from src.runtime.capabilities import (
     ACCOUNT_POLL,
     ACCOUNT_PRIVATE_EVENTS,
@@ -102,6 +104,69 @@ def test_legacy_trade_feature_config_is_adapted_once_to_explicit_features() -> N
             FEATURE_RANGE_FOOTPRINT,
         }
     )
+
+
+@pytest.mark.parametrize(
+    ("values", "expected"),
+    [
+        ({}, frozenset()),
+        (
+            {"fixed_time_trade_bars_enabled": True},
+            frozenset({FEATURE_FIXED_TIME_TRADE_BARS}),
+        ),
+        (
+            {"trade_footprint_enabled": True},
+            frozenset({FEATURE_TRADE_FOOTPRINT}),
+        ),
+        (
+            {"range_footprint_enabled": True},
+            frozenset({FEATURE_RANGE_FOOTPRINT}),
+        ),
+        (
+            {
+                "fixed_time_trade_bars_enabled": True,
+                "range_footprint_enabled": True,
+            },
+            frozenset(
+                {
+                    FEATURE_FIXED_TIME_TRADE_BARS,
+                    FEATURE_RANGE_FOOTPRINT,
+                }
+            ),
+        ),
+        (
+            {"enabled": True},
+            frozenset(
+                {
+                    FEATURE_FIXED_TIME_TRADE_BARS,
+                    FEATURE_TRADE_FOOTPRINT,
+                    FEATURE_RANGE_FOOTPRINT,
+                }
+            ),
+        ),
+    ],
+)
+def test_trade_features_resolve_independently(values, expected) -> None:
+    config = TradeFeatureRuntimeConfig.from_strategy(
+        type(
+            "Strategy",
+            (),
+            {"trade_feature_runtime_config": lambda self: values},
+        )()
+    )
+
+    request = capability_request_from_requirements(
+        _requirements(
+            account_state={
+                "startup_snapshot_enabled": False,
+                "poll_enabled": False,
+            },
+            order_state={"poll_when_position_enabled": False},
+        ),
+        trade_features=config,
+    )
+
+    assert request.capabilities == expected
 
 
 def test_account_and_scheduler_requirements_are_explicit() -> None:

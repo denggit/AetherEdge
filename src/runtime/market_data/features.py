@@ -53,6 +53,8 @@ class RangeFootprintModuleConfig:
 
 
 class _TradeFeatureModule:
+    dispatch_priority = 0
+
     def __init__(
         self,
         *,
@@ -64,6 +66,7 @@ class _TradeFeatureModule:
         self.provides = frozenset({capability})
         self.requires = frozenset({MARKET_TRADES})
         self._state = ModuleState.CREATED
+        self._dispatcher = dispatcher
         self._error: BaseException | None = None
         self.events_seen = 0
         self.features_emitted = 0
@@ -71,6 +74,7 @@ class _TradeFeatureModule:
             subscriber_id=module_id,
             handler=self._process_trade,
             on_error=self._on_dispatch_error,
+            order=self.dispatch_priority,
         )
 
     async def prepare(self) -> None:
@@ -83,6 +87,7 @@ class _TradeFeatureModule:
         self._state = ModuleState.STOPPED
 
     def health(self) -> ModuleHealth:
+        dispatcher_dropped = self._dispatcher.dropped_count
         return ModuleHealth(
             module_id=self.module_id,
             state=self._state,
@@ -95,6 +100,8 @@ class _TradeFeatureModule:
             metadata=(
                 ("events_seen", str(self.events_seen)),
                 ("features_emitted", str(self.features_emitted)),
+                ("events_dropped", str(dispatcher_dropped)),
+                ("data_complete", str(dispatcher_dropped == 0).lower()),
             ),
         )
 
@@ -115,6 +122,8 @@ class _TradeFeatureModule:
 
 
 class FixedTimeTradeBarModule(_TradeFeatureModule):
+    dispatch_priority = 200
+
     def __init__(
         self,
         *,
@@ -153,6 +162,8 @@ class FixedTimeTradeBarModule(_TradeFeatureModule):
 
 
 class TradeFootprintModule(_TradeFeatureModule):
+    dispatch_priority = 300
+
     def __init__(
         self,
         *,
@@ -182,6 +193,8 @@ class TradeFootprintModule(_TradeFeatureModule):
 
 
 class RangeFootprintModule(_TradeFeatureModule):
+    dispatch_priority = 100
+
     def __init__(
         self,
         *,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Optional, Protocol
 
 from src.market_data.derived import (
     FixedTimeTradeBarBuilder,
@@ -25,11 +25,36 @@ class _TradeFeatureBuilder(Protocol):
 @dataclass(frozen=True)
 class TradeFeatureRuntimeConfig:
     enabled: bool = False
+    fixed_time_trade_bars_enabled: bool | None = None
+    trade_footprint_enabled: bool | None = None
+    range_footprint_enabled: bool | None = None
     contract_value: str = "0.01"
     large_trade_threshold: str = "10000"
     price_bucket_size: str = "1"
     range_pct: str = "0.002"
     range_price_step: str = "1"
+
+    def __post_init__(self) -> None:
+        legacy = bool(self.enabled)
+        fixed = (
+            legacy
+            if self.fixed_time_trade_bars_enabled is None
+            else bool(self.fixed_time_trade_bars_enabled)
+        )
+        trade = (
+            legacy
+            if self.trade_footprint_enabled is None
+            else bool(self.trade_footprint_enabled)
+        )
+        range_ = (
+            legacy
+            if self.range_footprint_enabled is None
+            else bool(self.range_footprint_enabled)
+        )
+        object.__setattr__(self, "fixed_time_trade_bars_enabled", fixed)
+        object.__setattr__(self, "trade_footprint_enabled", trade)
+        object.__setattr__(self, "range_footprint_enabled", range_)
+        object.__setattr__(self, "enabled", fixed or trade or range_)
 
     @classmethod
     def from_strategy(cls, strategy: object | None) -> "TradeFeatureRuntimeConfig":
@@ -45,6 +70,21 @@ class TradeFeatureRuntimeConfig:
             return cls()
         return cls(
             enabled=bool(value.get("enabled", False)),
+            fixed_time_trade_bars_enabled=(
+                bool(value["fixed_time_trade_bars_enabled"])
+                if "fixed_time_trade_bars_enabled" in value
+                else None
+            ),
+            trade_footprint_enabled=(
+                bool(value["trade_footprint_enabled"])
+                if "trade_footprint_enabled" in value
+                else None
+            ),
+            range_footprint_enabled=(
+                bool(value["range_footprint_enabled"])
+                if "range_footprint_enabled" in value
+                else None
+            ),
             contract_value=str(value.get("contract_value", "0.01")),
             large_trade_threshold=str(
                 value.get("large_trade_threshold", "10000")
@@ -75,19 +115,28 @@ class TradeDerivedFeaturePipeline:
         self.range_footprint_builder = range_footprint_builder
         if not self._config.enabled:
             return
-        if self.fixed_time_trade_bar_builder is None:
+        if (
+            self._config.fixed_time_trade_bars_enabled
+            and self.fixed_time_trade_bar_builder is None
+        ):
             self.fixed_time_trade_bar_builder = FixedTimeTradeBarBuilder(
                 contract_value=self._config.contract_value,
                 large_trade_threshold_notional=(
                     self._config.large_trade_threshold
                 ),
             )
-        if self.trade_footprint_builder is None:
+        if (
+            self._config.trade_footprint_enabled
+            and self.trade_footprint_builder is None
+        ):
             self.trade_footprint_builder = TradeFootprintBuilder(
                 contract_value=self._config.contract_value,
                 price_bucket_size=self._config.price_bucket_size,
             )
-        if self.range_footprint_builder is None:
+        if (
+            self._config.range_footprint_enabled
+            and self.range_footprint_builder is None
+        ):
             self.range_footprint_builder = RangeFootprintBuilder(
                 contract_value=self._config.contract_value,
                 range_pct=self._config.range_pct,
@@ -123,10 +172,10 @@ class TradeDerivedFeaturePipeline:
 
 
 def _feed_trade(
-    builder: _TradeFeatureBuilder,
+    builder: Optional[_TradeFeatureBuilder],
     trade: MarketTrade,
 ) -> Sequence[object]:
-    return builder.on_trade(trade)
+    return () if builder is None else builder.on_trade(trade)
 
 
 __all__ = ["TradeDerivedFeaturePipeline", "TradeFeatureRuntimeConfig"]

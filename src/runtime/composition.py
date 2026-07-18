@@ -75,6 +75,9 @@ def compose_live_runtime(
         runtime_services.range_trade_dispatcher
         or BoundedOrderedEventDispatcher(
             maxsize=max(1, app_config.market_queue_maxsize),
+            event_time_ms=lambda trade: (
+                trade.trade_time_ms or trade.event_time_ms
+            ),
         )
     )
     runtime_services.range_trade_dispatcher = trade_dispatcher
@@ -120,7 +123,8 @@ def compose_live_runtime(
             else lambda _dispatcher: runtime_services.range_bar_module
         ),
         trade_dispatcher=trade_dispatcher,
-        consume_trade=runner.enqueue_market_event,
+        consume_trade=runner.process_market_event,
+        consume_dropped_trade=runner.handle_dropped_trade,
         consume_order_book=runner.enqueue_market_event,
     )
     market_data = MarketDataRuntime(registry=registry, logger=logger)

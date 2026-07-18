@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Generic, Protocol, TypeVar
 
@@ -11,6 +11,7 @@ from typing import Generic, Protocol, TypeVar
 EventT = TypeVar("EventT")
 EventHandler = Callable[[EventT], Awaitable[None] | None]
 ErrorHandler = Callable[[str, BaseException], None]
+EventTimeReader = Callable[[EventT], int | None]
 
 
 class EventDispatcher(Protocol[EventT]):
@@ -27,9 +28,21 @@ class BackpressurePolicy(str, Enum):
 
 
 @dataclass(frozen=True)
-class DispatchResult:
+class DispatchResult(Generic[EventT]):
     delivered: int
     dropped: int
+    dropped_events: tuple[EventT, ...] = ()
+
+
+@dataclass(frozen=True)
+class DispatcherBarrierResult:
+    cutoff_time_ms: int
+    pending: int
+    completed: bool
+
+
+class DispatcherDrainTimeout(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -67,21 +80,21 @@ class _Subscription(Generic[EventT]):
         self.dropped = 0
         self.error: BaseException | None = None
 
-    def publish(self, event: EventT) -> bool:
+    def publish(self, event: EventT) -> tuple[bool, bool]:
         try:
             self.queue.put_nowait(event)
-            return True
+            return True, False
         except asyncio.QueueFull:
             self.dropped += 1
             if self.policy is BackpressurePolicy.DROP_NEWEST:
-                return False
+                return False, True
             try:
                 self.queue.get_nowait()
                 self.queue.task_done()
             except asyncio.QueueEmpty:  # pragma: no cover - same-loop guard
-                return False
+                return False, True
             self.queue.put_nowait(event)
-            return True
+            return True, True
 
     def start(self) -> None:
         if self.task is None or self.task.done():
@@ -179,9 +192,10 @@ class BoundedEventDispatcher(Generic[EventT]):
         delivered = 0
         dropped = 0
         for subscription in self._subscriptions.values():
-            if subscription.publish(event):
+            accepted, discarded = subscription.publish(event)
+            if accepted:
                 delivered += 1
-            else:
+            if discarded:
                 dropped += 1
         return DispatchResult(delivered=delivered, dropped=dropped)
 
@@ -229,8 +243,17 @@ class _OrderedSubscriber(Generic[EventT]):
     subscriber_id: str
     handler: EventHandler[EventT]
     on_error: ErrorHandler | None
+    order: int
     delivered: int = 0
     error: BaseException | None = None
+
+
+@dataclass
+class _QueuedEvent(Generic[EventT]):
+    sequence: int
+    event: EventT
+    event_time_ms: int | None
+    done: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class BoundedOrderedEventDispatcher(Generic[EventT]):
@@ -242,18 +265,26 @@ class BoundedOrderedEventDispatcher(Generic[EventT]):
         maxsize: int,
         policy: BackpressurePolicy = BackpressurePolicy.DROP_OLDEST,
         drain_timeout_seconds: float = 5.0,
+        event_time_ms: EventTimeReader[EventT] | None = None,
     ) -> None:
         if maxsize <= 0:
             raise ValueError("dispatcher queue maxsize must be positive")
         if drain_timeout_seconds < 0:
             raise ValueError("drain timeout must be non-negative")
-        self._queue: asyncio.Queue[EventT] = asyncio.Queue(maxsize=maxsize)
+        self._queue: asyncio.Queue[_QueuedEvent[EventT]] = asyncio.Queue(
+            maxsize=maxsize
+        )
         self._policy = policy
         self._drain_timeout_seconds = float(drain_timeout_seconds)
         self._subscribers: list[_OrderedSubscriber[EventT]] = []
         self._subscriber_ids: set[str] = set()
         self._task: asyncio.Task[None] | None = None
         self._dropped = 0
+        self._sequence = 0
+        self._pending: dict[int, _QueuedEvent[EventT]] = {}
+        self._event_time_ms = event_time_ms
+        self._accepting = True
+        self._error: BaseException | None = None
 
     def subscribe(
         self,
@@ -261,6 +292,7 @@ class BoundedOrderedEventDispatcher(Generic[EventT]):
         subscriber_id: str,
         handler: EventHandler[EventT],
         on_error: ErrorHandler | None = None,
+        order: int = 0,
     ) -> None:
         normalized = subscriber_id.strip().lower()
         if not normalized:
@@ -273,45 +305,131 @@ class BoundedOrderedEventDispatcher(Generic[EventT]):
                 subscriber_id=normalized,
                 handler=handler,
                 on_error=on_error,
+                order=int(order),
             )
         )
+        self._subscribers.sort(key=lambda subscriber: subscriber.order)
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
+            self._accepting = True
+            self._error = None
             self._task = asyncio.create_task(
                 self._run(),
                 name="ordered-event-dispatcher",
             )
 
     def publish(self, event: EventT) -> DispatchResult:
+        if not self._accepting:
+            self._dropped += 1
+            return DispatchResult(
+                delivered=0,
+                dropped=1,
+                dropped_events=(event,),
+            )
+        self._sequence += 1
+        queued = _QueuedEvent(
+            sequence=self._sequence,
+            event=event,
+            event_time_ms=(
+                None
+                if self._event_time_ms is None
+                else self._event_time_ms(event)
+            ),
+        )
+        dropped_events: tuple[EventT, ...] = ()
         try:
-            self._queue.put_nowait(event)
+            self._queue.put_nowait(queued)
         except asyncio.QueueFull:
             self._dropped += 1
             if self._policy is BackpressurePolicy.DROP_NEWEST:
-                return DispatchResult(delivered=0, dropped=1)
+                queued.done.set()
+                return DispatchResult(
+                    delivered=0,
+                    dropped=1,
+                    dropped_events=(event,),
+                )
             try:
-                self._queue.get_nowait()
+                dropped = self._queue.get_nowait()
                 self._queue.task_done()
+                self._pending.pop(dropped.sequence, None)
+                dropped.done.set()
+                dropped_events = (dropped.event,)
             except asyncio.QueueEmpty:  # pragma: no cover - same-loop guard
-                return DispatchResult(delivered=0, dropped=1)
-            self._queue.put_nowait(event)
-        return DispatchResult(delivered=len(self._subscribers), dropped=0)
+                queued.done.set()
+                return DispatchResult(
+                    delivered=0,
+                    dropped=1,
+                    dropped_events=(event,),
+                )
+            self._queue.put_nowait(queued)
+        self._pending[queued.sequence] = queued
+        return DispatchResult(
+            delivered=len(self._subscribers),
+            dropped=len(dropped_events),
+            dropped_events=dropped_events,
+        )
+
+    async def drain_through(
+        self,
+        cutoff_time_ms: int,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> DispatcherBarrierResult:
+        pending = tuple(
+            queued
+            for queued in self._pending.values()
+            if queued.event_time_ms is None
+            or queued.event_time_ms <= cutoff_time_ms
+        )
+        if not pending:
+            return DispatcherBarrierResult(
+                cutoff_time_ms=cutoff_time_ms,
+                pending=0,
+                completed=True,
+            )
+        waiter = asyncio.gather(*(queued.done.wait() for queued in pending))
+        timeout = (
+            self._drain_timeout_seconds
+            if timeout_seconds is None
+            else max(0.0, float(timeout_seconds))
+        )
+        try:
+            await asyncio.wait_for(waiter, timeout=timeout)
+        except TimeoutError:
+            return DispatcherBarrierResult(
+                cutoff_time_ms=cutoff_time_ms,
+                pending=sum(not queued.done.is_set() for queued in pending),
+                completed=False,
+            )
+        self.raise_if_failed()
+        return DispatcherBarrierResult(
+            cutoff_time_ms=cutoff_time_ms,
+            pending=0,
+            completed=True,
+        )
 
     async def stop(self) -> None:
+        self._accepting = False
         task = self._task
         self._task = None
         if task is None:
             return
+        drain_error: BaseException | None = None
         try:
             await asyncio.wait_for(
                 self._queue.join(),
                 timeout=self._drain_timeout_seconds,
             )
-        except TimeoutError:
-            pass
+        except TimeoutError as exc:
+            drain_error = DispatcherDrainTimeout(
+                "ordered dispatcher drain timed out | "
+                f"pending={self._queue.qsize()}"
+            )
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+        if drain_error is not None:
+            raise drain_error
 
     def health(self) -> tuple[SubscriptionHealth, ...]:
         return tuple(
@@ -321,12 +439,14 @@ class BoundedOrderedEventDispatcher(Generic[EventT]):
                 queue_maxsize=self._queue.maxsize,
                 delivered=subscriber.delivered,
                 dropped=self._dropped,
-                failed=subscriber.error is not None,
+                failed=(
+                    subscriber.error is not None or self._error is not None
+                ),
                 error=(
-                    None
-                    if subscriber.error is None
-                    else f"{type(subscriber.error).__name__}: "
-                    f"{subscriber.error}"
+                    f"{type(subscriber.error or self._error).__name__}: "
+                    f"{subscriber.error or self._error}"
+                    if subscriber.error is not None or self._error is not None
+                    else None
                 ),
             )
             for subscriber in self._subscribers
@@ -342,13 +462,37 @@ class BoundedOrderedEventDispatcher(Generic[EventT]):
     def task_count(self) -> int:
         return int(self._task is not None and not self._task.done())
 
+    @property
+    def dropped_count(self) -> int:
+        return self._dropped
+
+    @property
+    def error(self) -> BaseException | None:
+        if self._error is not None:
+            return self._error
+        task = self._task
+        if task is not None and task.done() and not task.cancelled():
+            try:
+                return task.exception()
+            except asyncio.CancelledError:
+                return None
+        return None
+
+    def raise_if_failed(self) -> None:
+        error = self.error
+        if error is not None:
+            raise RuntimeError(
+                "ordered event dispatcher failed | "
+                f"error={type(error).__name__}: {error}"
+            ) from error
+
     async def _run(self) -> None:
         while True:
-            event = await self._queue.get()
+            queued = await self._queue.get()
             try:
                 for subscriber in self._subscribers:
                     try:
-                        result = subscriber.handler(event)
+                        result = subscriber.handler(queued.event)
                         if inspect.isawaitable(result):
                             await result
                         subscriber.delivered += 1
@@ -359,8 +503,28 @@ class BoundedOrderedEventDispatcher(Generic[EventT]):
                         if subscriber.on_error is not None:
                             subscriber.on_error(subscriber.subscriber_id, exc)
                         raise
+            except asyncio.CancelledError:
+                raise
+            except BaseException as exc:
+                self._error = exc
+                self._accepting = False
+                self._discard_queued_after_failure()
+                raise
             finally:
+                self._pending.pop(queued.sequence, None)
+                queued.done.set()
                 self._queue.task_done()
+
+    def _discard_queued_after_failure(self) -> None:
+        while True:
+            try:
+                queued = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            self._dropped += 1
+            self._pending.pop(queued.sequence, None)
+            queued.done.set()
+            self._queue.task_done()
 
 
 __all__ = [
@@ -368,6 +532,8 @@ __all__ = [
     "BoundedEventDispatcher",
     "BoundedOrderedEventDispatcher",
     "DispatchResult",
+    "DispatcherBarrierResult",
+    "DispatcherDrainTimeout",
     "EventDispatcher",
     "SubscriptionHealth",
 ]

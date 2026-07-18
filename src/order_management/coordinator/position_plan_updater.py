@@ -35,10 +35,40 @@ _BYPASS_MASTER_PURPOSES = {
 logger = get_logger(__name__)
 
 
-from src.order_management.coordinator.support import *  # noqa: F403
+from src.order_management.coordinator.support import (
+    _durable_generation,
+    _json_safe_value,
+    _optional_decimal,
+    _position_plan_metadata,
+    _requires_manual_on_unconfirmed_master_close,
+    _result_filled_base,
+    _result_is_filled,
+    _signal_exchange_quantity,
+)
 
 
 class PositionPlanUpdater:
+    def __init__(
+        self,
+        *,
+        repository: OrderIntentRepository,
+        position_plan_store: object | None,
+        master_follower_policy: MasterFollowerExecutionPolicy | None,
+    ) -> None:
+        self.repository = repository
+        self.position_plan_store = position_plan_store
+        self.master_follower_policy = master_follower_policy
+
+    def record_position_plan(
+        self,
+        intent: OrderIntent,
+        results: Sequence[ExchangeOrderResult],
+    ) -> None:
+        self._record_position_plan(intent, results)
+
+    def advance_topup_generation(self, intent: OrderIntent) -> None:
+        self._advance_topup_generation(intent)
+
     def _record_position_plan(self, intent: OrderIntent, results: Sequence[ExchangeOrderResult]) -> None:
         if self.position_plan_store is None:
             return

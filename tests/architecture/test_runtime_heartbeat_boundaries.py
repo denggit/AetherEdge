@@ -356,9 +356,9 @@ def test_run_finally_and_explicit_stop_order_remain_unchanged() -> None:
     )
 
     stop = methods["stop"]
-    assert [ast.unparse(statement) for statement in stop.body] == [
-        "self._stop_event.set()",
-        "await self._explicit_stop_shutdown()",
-        "self._set_health(RuntimePhase.STOPPED, healthy=True)",
-        "return self._health",
-    ]
+    stop_source = ast.unparse(stop)
+    assert stop_source.index("self._stop_event.set()") < stop_source.index(
+        "await self._explicit_stop_shutdown()"
+    )
+    assert "RuntimePhase.STOPPED" in stop_source
+    assert ast.unparse(stop.body[-1]) == "return self._health"

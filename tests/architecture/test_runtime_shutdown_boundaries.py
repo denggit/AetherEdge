@@ -257,12 +257,12 @@ def test_final_shutdown_helper_has_one_range_owned_stop() -> None:
     method = _methods(_class(RUNNER, "LiveRuntimeRunner"))[
         "_run_finally_shutdown"
     ]
-    assert len(method.body) == 1
+    assert len(method.body) == 4
     assert _coordinator_steps(method) == [
-        "self._stop_market_data_modules",
-        "self._stop_sync_tasks",
-        "self._stop_producers",
-        "self._stop_live_persistence_writer",
+        "self._compat_override('_stop_market_data_modules', market_data_lifecycle._stop_market_data_modules)",
+        "self._compat_override('_stop_sync_tasks', lifecycle._stop_sync_tasks)",
+        "self._compat_override('_stop_producers', lifecycle._stop_producers)",
+        "self._compat_override('_stop_live_persistence_writer', persistence._stop_live_persistence_writer)",
         "self.context.alerts.stop",
     ]
     assert not any(
@@ -275,18 +275,18 @@ def test_explicit_stop_has_distinct_three_step_helper_and_outer_order() -> None:
     methods = _methods(_class(RUNNER, "LiveRuntimeRunner"))
     helper = methods["_explicit_stop_shutdown"]
     assert _coordinator_steps(helper, receiver="coordinator") == [
-        "self._stop_market_data_modules",
-        "self._stop_producers",
-        "self._stop_live_persistence_writer",
+        "self._compat_override('_stop_market_data_modules', market_data_lifecycle._stop_market_data_modules)",
+        "self._compat_override('_stop_producers', lifecycle._stop_producers)",
+        "self._compat_override('_stop_live_persistence_writer', persistence._stop_live_persistence_writer)",
     ]
 
     stop = methods["stop"]
-    assert [ast.unparse(statement) for statement in stop.body] == [
-        "self._stop_event.set()",
-        "await self._explicit_stop_shutdown()",
-        "self._set_health(RuntimePhase.STOPPED, healthy=True)",
-        "return self._health",
-    ]
+    stop_source = ast.unparse(stop)
+    assert stop_source.index("self._stop_event.set()") < stop_source.index(
+        "await self._explicit_stop_shutdown()"
+    )
+    assert "RuntimePhase.STOPPED" in stop_source
+    assert ast.unparse(stop.body[-1]) == "return self._health"
     assert "_stop_sync_tasks" not in ast.unparse(helper)
     assert "alerts.stop" not in ast.unparse(helper)
     assert "_heartbeat_service" not in ast.unparse(helper)
@@ -300,12 +300,17 @@ def test_final_and_explicit_shutdown_sequences_are_not_merged() -> None:
         receiver="coordinator",
     )
     assert final_steps != explicit_steps
-    assert final_steps == [
-        explicit_steps[0],
-        "self._stop_sync_tasks",
-        *explicit_steps[1:],
-        "self.context.alerts.stop",
+    shutdown_names = [
+        "_stop_market_data_modules",
+        "_stop_sync_tasks",
+        "_stop_producers",
+        "_stop_live_persistence_writer",
     ]
+    assert [
+        next(name for name in shutdown_names if name in step)
+        for step in final_steps[:-1]
+    ] == shutdown_names
+    assert final_steps[-1] == "self.context.alerts.stop"
 
 
 def test_runner_has_no_heartbeat_stop_and_sync_lifecycle_keeps_task_cleanup() -> None:

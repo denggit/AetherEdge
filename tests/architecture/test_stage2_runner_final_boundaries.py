@@ -251,16 +251,16 @@ def test_shutdown_health_and_sync_delegation_stays_frozen() -> None:
     assert isinstance(final_steps, ast.Tuple)
     assert isinstance(explicit_steps, ast.Tuple)
     assert [ast.unparse(item) for item in final_steps.elts] == [
-        "self._stop_market_data_modules",
-        "self._stop_sync_tasks",
-        "self._stop_producers",
-        "self._stop_live_persistence_writer",
+        "self._compat_override('_stop_market_data_modules', market_data_lifecycle._stop_market_data_modules)",
+        "self._compat_override('_stop_sync_tasks', lifecycle._stop_sync_tasks)",
+        "self._compat_override('_stop_producers', lifecycle._stop_producers)",
+        "self._compat_override('_stop_live_persistence_writer', persistence._stop_live_persistence_writer)",
         "self.context.alerts.stop",
     ]
     assert [ast.unparse(item) for item in explicit_steps.elts] == [
-        "self._stop_market_data_modules",
-        "self._stop_producers",
-        "self._stop_live_persistence_writer",
+        "self._compat_override('_stop_market_data_modules', market_data_lifecycle._stop_market_data_modules)",
+        "self._compat_override('_stop_producers', lifecycle._stop_producers)",
+        "self._compat_override('_stop_live_persistence_writer', persistence._stop_live_persistence_writer)",
     ]
 
     set_health = methods["_set_health"]

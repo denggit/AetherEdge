@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+import inspect
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Generic, Protocol, TypeVar
 
 from src.platform.data.models import MarketOrderBook, MarketTrade
 from src.platform.data.websocket.ports import OrderBookStream, TradeStream
 from src.runtime.capabilities import MARKET_ORDER_BOOK, MARKET_TRADES
 from src.runtime.market_data.dispatcher import EventDispatcher
+from src.runtime.market_data.dispatcher import DispatcherBarrierResult
 from src.runtime.module import (
     CapabilityId,
     ModuleHealth,
@@ -18,6 +20,7 @@ from src.runtime.module import (
 EventT = TypeVar("EventT")
 StreamFactory = Callable[[], AsyncIterator[EventT]]
 ModuleErrorHandler = Callable[[str, BaseException], None]
+DroppedEventHandler = Callable[[EventT], Awaitable[None] | None]
 
 
 class _StreamIdentity(Protocol):
@@ -25,6 +28,8 @@ class _StreamIdentity(Protocol):
 
 
 class _StreamModule(Generic[EventT]):
+    shutdown_priority = 100
+
     def __init__(
         self,
         *,
@@ -33,6 +38,7 @@ class _StreamModule(Generic[EventT]):
         stream: StreamFactory[EventT],
         dispatcher: EventDispatcher[EventT],
         on_error: ModuleErrorHandler | None = None,
+        on_dropped: DroppedEventHandler[EventT] | None = None,
     ) -> None:
         self.module_id = module_id
         self.provides = frozenset({capability})
@@ -40,11 +46,13 @@ class _StreamModule(Generic[EventT]):
         self._stream = stream
         self._dispatcher = dispatcher
         self._on_error = on_error
+        self._on_dropped = on_dropped
         self._task: asyncio.Task[None] | None = None
         self._state = ModuleState.CREATED
         self._error: BaseException | None = None
         self.events_seen = 0
         self.events_dropped = 0
+        self._stopping = False
 
     async def prepare(self) -> None:
         self._state = ModuleState.PREPARED
@@ -53,6 +61,7 @@ class _StreamModule(Generic[EventT]):
         if self._task is not None and not self._task.done():
             return
         await self._dispatcher.start()
+        self._stopping = False
         self._state = ModuleState.RUNNING
         self._task = asyncio.create_task(
             self._consume(),
@@ -60,23 +69,32 @@ class _StreamModule(Generic[EventT]):
         )
 
     async def stop(self) -> None:
+        self._stopping = True
         task = self._task
         self._task = None
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        await self._dispatcher.stop()
-        self._state = ModuleState.STOPPED
+        try:
+            await self._dispatcher.stop()
+        except BaseException as exc:
+            self._error = exc
+            self._state = ModuleState.ERROR
+            raise
+        else:
+            self._state = ModuleState.STOPPED
 
     def health(self) -> ModuleHealth:
+        dispatcher_error = getattr(self._dispatcher, "error", None)
+        error = self._error or dispatcher_error
         return ModuleHealth(
             module_id=self.module_id,
             state=self._state,
-            healthy=self._error is None,
+            healthy=error is None,
             detail=(
                 None
-                if self._error is None
-                else f"{type(self._error).__name__}: {self._error}"
+                if error is None
+                else f"{type(error).__name__}: {error}"
             ),
             background_tasks=int(
                 self._task is not None and not self._task.done()
@@ -87,12 +105,35 @@ class _StreamModule(Generic[EventT]):
             ),
         )
 
+    async def drain_through(
+        self,
+        cutoff_time_ms: int,
+        *,
+        timeout_seconds: float,
+    ) -> DispatcherBarrierResult | None:
+        drain = getattr(self._dispatcher, "drain_through", None)
+        if not callable(drain):
+            return None
+        return await drain(
+            cutoff_time_ms,
+            timeout_seconds=timeout_seconds,
+        )
+
     async def _consume(self) -> None:
         try:
             async for event in self._stream():
                 self.events_seen += 1
                 result = self._dispatcher.publish(event)
                 self.events_dropped += result.dropped
+                if self._on_dropped is not None:
+                    for dropped in result.dropped_events:
+                        callback_result = self._on_dropped(dropped)
+                        if inspect.isawaitable(callback_result):
+                            await callback_result
+            if not self._stopping:
+                raise RuntimeError(
+                    f"market source ended unexpectedly: {self.module_id}"
+                )
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
@@ -110,6 +151,7 @@ class TradeStreamModule(_StreamModule[MarketTrade]):
         stream: TradeStream,
         dispatcher: EventDispatcher[MarketTrade],
         on_error: ModuleErrorHandler | None = None,
+        on_dropped: DroppedEventHandler[MarketTrade] | None = None,
     ) -> None:
         super().__init__(
             module_id="trade-stream",
@@ -117,6 +159,7 @@ class TradeStreamModule(_StreamModule[MarketTrade]):
             stream=stream.stream_trades,
             dispatcher=dispatcher,
             on_error=on_error,
+            on_dropped=on_dropped,
         )
 
 
@@ -127,6 +170,7 @@ class OrderBookStreamModule(_StreamModule[MarketOrderBook]):
         stream: OrderBookStream,
         dispatcher: EventDispatcher[MarketOrderBook],
         on_error: ModuleErrorHandler | None = None,
+        on_dropped: DroppedEventHandler[MarketOrderBook] | None = None,
     ) -> None:
         super().__init__(
             module_id="order-book-stream",
@@ -134,6 +178,7 @@ class OrderBookStreamModule(_StreamModule[MarketOrderBook]):
             stream=stream.stream_order_book,
             dispatcher=dispatcher,
             on_error=on_error,
+            on_dropped=on_dropped,
         )
 
 

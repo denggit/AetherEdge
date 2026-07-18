@@ -275,8 +275,9 @@ def test_gate_is_ordered_before_recovery_on_start_and_producers() -> None:
     assert startup.index("_check_strategy_position_mode_requirements") < (
         startup.index("_call_on_start")
     )
-    assert run.index("await self._startup()") < run.index(
-        "self._start_producers()"
+    assert run.index('"_startup"') < run.index('"_start_producers"')
+    assert run.index('"_start_producers"') < run.index(
+        '"_consume_market_events"'
     )
 
 

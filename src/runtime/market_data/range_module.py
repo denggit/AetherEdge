@@ -120,6 +120,7 @@ class RangeBarModule:
     module_id = "range-bars"
     provides = frozenset({FEATURE_RANGE_BARS})
     requires = frozenset({MARKET_TRADES})
+    dispatch_priority = 400
 
     def __init__(
         self,
@@ -177,6 +178,7 @@ class RangeBarModule:
             subscriber_id=self.module_id,
             handler=self.process_trade,
             on_error=self._handle_dispatch_error,
+            order=self.dispatch_priority,
         )
 
     async def prepare(self) -> None:
@@ -318,6 +320,11 @@ class RangeBarModule:
                 ("bars_closed", str(self.bars_closed)),
                 ("aggregates_created", str(self.aggregates_created)),
                 ("cached_buckets", str(len(self._bars_by_bucket))),
+                ("events_dropped", str(self._dispatcher.dropped_count)),
+                (
+                    "data_complete",
+                    str(self._dispatcher.dropped_count == 0).lower(),
+                ),
             ),
         )
 
@@ -387,9 +394,9 @@ class RangeBarModule:
             )
             if key in self._emitted_aggregate_buckets:
                 continue
-            self._emitted_aggregate_buckets.add(key)
             event = self._aggregate_event(aggregate)
             await self._publish(event)
+            self._emitted_aggregate_buckets.add(key)
             events.append(event)
             self.aggregates_created += 1
             self._persist_aggregate(aggregate)

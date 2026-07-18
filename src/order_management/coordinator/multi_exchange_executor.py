@@ -35,10 +35,35 @@ _BYPASS_MASTER_PURPOSES = {
 logger = get_logger(__name__)
 
 
-from src.order_management.coordinator.support import *  # noqa: F403
+from src.order_management.coordinator.support import (
+    _client_market_profile,
+    _order_to_result,
+    _requires_real_fill,
+    _result_has_real_fill,
+    _synthetic_order,
+    _with_exchange_quantity,
+    _with_order_client_id,
+    _with_scoped_cancel_audit,
+    _with_stop_client_id,
+)
 
 
 class MultiExchangeExecutor:
+    def __init__(
+        self,
+        *,
+        client_order_id_factory: ClientOrderIdFactory,
+        quantity_converter: NativeQuantityConverter,
+        order_status_synchronizer: OrderStatusSynchronizer,
+        safety_validator: object,
+        result_recorder: object,
+    ) -> None:
+        self.client_order_id_factory = client_order_id_factory
+        self.quantity_converter = quantity_converter
+        self.order_status_synchronizer = order_status_synchronizer
+        self._safety_validator = safety_validator
+        self._result_recorder = result_recorder
+
     async def _execute_for_client(
         self,
         client: ExecutionClient,
@@ -82,7 +107,11 @@ class MultiExchangeExecutor:
                     break
                 except ExitSafetyError as exc:
                     last_error = exc
-                    self._record_exit_safety_event(intent=intent, exchange=client.exchange, error=exc)
+                    self._result_recorder.record_exit_safety_event(
+                        intent=intent,
+                        exchange=client.exchange,
+                        error=exc,
+                    )
                     logger.critical(
                         "Exit safety rejected order | intent_id=%s exchange=%s action=%s reason=%s metadata=%s",
                         intent.intent_id,
@@ -150,7 +179,7 @@ class MultiExchangeExecutor:
                 raise ValueError("order_request is required")
             if client_order_id is None:
                 raise ValueError("client_order_id is required")
-            request = await self._normalize_order_for_client(
+            request = await self._safety_validator._normalize_order_for_client(
                 client,
                 item.signal.action,
                 _with_exchange_quantity(item.order_request, intent=intent, exchange=client.exchange),
@@ -162,7 +191,7 @@ class MultiExchangeExecutor:
                 raise ValueError("stop_market_request is required")
             if client_order_id is None:
                 raise ValueError("client_order_id is required")
-            request = await self._normalize_stop_for_client(
+            request = await self._safety_validator._normalize_stop_for_client(
                 client,
                 item.signal.action,
                 _with_exchange_quantity(item.stop_market_request, intent=intent, exchange=client.exchange),
@@ -235,4 +264,3 @@ class MultiExchangeExecutor:
 
 
 __all__ = ["MultiExchangeExecutor"]
-

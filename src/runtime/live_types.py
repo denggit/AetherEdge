@@ -54,6 +54,8 @@ class MarketQueueDrainResult:
     duration_ms: int
     hit_event_limit: bool
     hit_time_limit: bool
+    pipeline_completed: bool = True
+    pipeline_pending: int = 0
 
 class LiveRuntimeError(RuntimeError):
     pass

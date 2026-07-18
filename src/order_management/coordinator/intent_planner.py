@@ -35,10 +35,25 @@ _BYPASS_MASTER_PURPOSES = {
 logger = get_logger(__name__)
 
 
-from src.order_management.coordinator.support import *  # noqa: F403
+from src.order_management.coordinator.support import (
+    _client_market_profile,
+    _optional_decimal,
+    _signal_exchange_quantity,
+)
 
 
 class OrderIntentPlanner:
+    def __init__(
+        self,
+        *,
+        clients: Sequence[ExecutionClient],
+        quantity_converter: NativeQuantityConverter,
+        result_recorder: object,
+    ) -> None:
+        self.clients = tuple(clients)
+        self.quantity_converter = quantity_converter
+        self._result_recorder = result_recorder
+
     async def _normalize_recovery_topup_intent(
         self, intent: OrderIntent
     ) -> tuple[OrderIntent, list[ExchangeOrderResult] | None]:
@@ -87,7 +102,7 @@ class OrderIntentPlanner:
             if resolution.executable
         }
         if not executable:
-            return intent, self._record_skipped_recovery_topup(
+            return intent, self._result_recorder.record_skipped_recovery_topup(
                 intent=intent,
                 resolutions=resolutions,
             )
@@ -121,4 +136,3 @@ class OrderIntentPlanner:
 
 
 __all__ = ["OrderIntentPlanner"]
-

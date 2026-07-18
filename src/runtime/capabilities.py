@@ -57,14 +57,12 @@ def capability_request_from_requirements(
         requested.add(ORDER_POLL)
 
     resolved_trade_features = trade_features or TradeFeatureRuntimeConfig()
-    if resolved_trade_features.enabled:
-        requested.update(
-            {
-                FEATURE_FIXED_TIME_TRADE_BARS,
-                FEATURE_TRADE_FOOTPRINT,
-                FEATURE_RANGE_FOOTPRINT,
-            }
-        )
+    if resolved_trade_features.fixed_time_trade_bars_enabled:
+        requested.add(FEATURE_FIXED_TIME_TRADE_BARS)
+    if resolved_trade_features.trade_footprint_enabled:
+        requested.add(FEATURE_TRADE_FOOTPRINT)
+    if resolved_trade_features.range_footprint_enabled:
+        requested.add(FEATURE_RANGE_FOOTPRINT)
 
     return CapabilityRequest(
         capabilities=frozenset(requested),

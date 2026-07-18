@@ -86,9 +86,18 @@ class ModuleHost:
     async def prepare(self) -> None:
         if self._prepared:
             return
+        module: RuntimeModule | None = None
         try:
             for module in self.modules:
-                await module.prepare()
+                try:
+                    await module.prepare()
+                except BaseException:
+                    # A failed prepare may already own a store, connection,
+                    # writer or task even though it was never appended to the
+                    # prepared list.  Include it in rollback exactly once.
+                    if module not in self._prepared:
+                        self._prepared.append(module)
+                    raise
                 self._prepared.append(module)
                 self._observe(module)
                 if isinstance(module, WarmupCapable):
@@ -96,6 +105,7 @@ class ModuleHost:
                 if isinstance(module, RepairCapable):
                     await module.repair()
         except BaseException as exc:
+            assert module is not None
             await self._raise_startup_error(module, exc)
 
     async def start(self) -> None:
@@ -111,7 +121,15 @@ class ModuleHost:
 
     async def stop(self) -> None:
         errors: list[str] = []
-        for module in reversed(self._prepared):
+        prepared_in_reverse = list(reversed(self._prepared))
+        shutdown_order = sorted(
+            prepared_in_reverse,
+            key=lambda item: int(
+                getattr(item, "shutdown_priority", 0)
+            ),
+            reverse=True,
+        )
+        for module in shutdown_order:
             try:
                 await module.stop()
                 self._observe(module)

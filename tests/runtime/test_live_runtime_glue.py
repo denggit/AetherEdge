@@ -3073,6 +3073,34 @@ async def test_market_queue_full_trade_marks_range_context_degraded():
 
 
 @pytest.mark.asyncio
+async def test_dispatcher_dropped_trade_degrades_range_and_invalidates_journal():
+    strategy = FeatureStrategy()
+    runner = _runner(strategy, dry_run=True)
+    invalidations = []
+    runner._range_repair_journal = type(
+        "Journal",
+        (),
+        {
+            "invalidate": lambda self, **values: invalidations.append(values),
+        },
+    )()
+    trade = _trade(trade_time_ms=2 * H4 + 3)
+
+    await runner._handle_market_data_trade_drop(trade)
+
+    assert runner.stats.market_events_dropped == 1
+    assert runner._range_context_degraded_buckets[2 * H4] == "market_queue_dropped_trade"
+    assert invalidations == [
+        {
+            "bucket_start_ms": 2 * H4,
+            "status": "journal_invalid_dropped_trade",
+            "reason": "market_queue_dropped_trade",
+            "dropped_trades": 1,
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_poll_closed_bar_drains_queued_trades_before_range_aggregate():
     range_store = MemoryRangeBarStore()
     strategy = FeatureStrategy()
@@ -3326,10 +3354,9 @@ async def test_drain_incomplete_marks_range_context_degraded(monkeypatch):
     events = await runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
 
     assert runner._range_context_degraded_buckets[open_time_ms] == "market_queue_drain_incomplete_before_closed_bar"
-    assert [event.type_value for event in events] == ["closed_kline", "range_aggregate"]
-    assert events[-1].data["context_available"] is False
-    assert events[-1].data["incomplete"] is True
-    assert events[-1].data["reason"] == "market_queue_drain_incomplete_before_closed_bar"
+    assert events == []
+    assert runner._market_queue.qsize() == 1
+    assert runner._closed_bar_scheduler.last_emitted_open_time_ms is None
 
 
 @pytest.mark.asyncio

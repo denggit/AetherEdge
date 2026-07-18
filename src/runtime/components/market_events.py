@@ -30,6 +30,17 @@ from src.runtime.components.base import RuntimeComponent
 
 
 class MarketEventsComponent(RuntimeComponent):
+    async def _handle_market_data_trade_drop(
+        self,
+        event: MarketEvent,
+    ) -> None:
+        self.stats.market_events_dropped += 1
+        self._mark_range_context_degraded_for_event(
+            event,
+            reason="market_queue_dropped_trade",
+        )
+        self._emit_market_queue_full_alert(event)
+
     async def _process_market_event(self, event: MarketEvent) -> None:
         self.stats.market_events_seen += 1
         is_trade = (
@@ -224,6 +235,30 @@ class MarketEventsComponent(RuntimeComponent):
         examined = 0
         deferred: list[MarketEvent] = []
         max_duration_seconds = max(float(max_duration_ms), 0.0) / 1000.0
+        pipeline_completed = True
+        pipeline_pending = 0
+        market_data_runtime = getattr(self, "_market_data_runtime", None)
+        if market_data_runtime is not None:
+            barrier = await market_data_runtime.drain_through(
+                closed_bar_close_time_ms,
+                timeout_seconds=max_duration_seconds,
+            )
+            pipeline_completed = barrier.completed
+            pipeline_pending = barrier.pending
+            if not pipeline_completed:
+                elapsed_seconds = time.monotonic() - started
+                return MarketQueueDrainResult(
+                    processed=0,
+                    deferred=0,
+                    examined=0,
+                    queue_size_before=queue_size_before,
+                    queue_size_after=self._market_queue.qsize(),
+                    duration_ms=int(elapsed_seconds * 1000),
+                    hit_event_limit=False,
+                    hit_time_limit=True,
+                    pipeline_completed=False,
+                    pipeline_pending=pipeline_pending,
+                )
 
         while examined < max_events:
             if max_duration_seconds and time.monotonic() - started >= max_duration_seconds:
@@ -269,6 +304,8 @@ class MarketEventsComponent(RuntimeComponent):
             duration_ms=duration_ms,
             hit_event_limit=hit_event_limit,
             hit_time_limit=hit_time_limit,
+            pipeline_completed=pipeline_completed,
+            pipeline_pending=pipeline_pending,
         )
 
     async def _consume_market_events(self, *, max_market_events: int | None) -> None:
@@ -277,6 +314,7 @@ class MarketEventsComponent(RuntimeComponent):
                 break
             if self.requirements.closed_kline.enabled:
                 await self.poll_closed_bar_once()
+            self._raise_on_unhealthy_market_data()
             self._raise_on_unhealthy_producer()
             if self._all_producers_done() and self._market_queue.empty():
                 break
@@ -300,6 +338,11 @@ class MarketEventsComponent(RuntimeComponent):
                     self._market_queue.task_done()
             if max_market_events is not None and self.stats.market_events_seen >= max_market_events:
                 break
+
+    def _raise_on_unhealthy_market_data(self) -> None:
+        runtime = getattr(self, "_market_data_runtime", None)
+        if runtime is not None:
+            runtime.raise_if_failed()
 
     async def _process_trade(self, trade: MarketTrade) -> None:
         if getattr(self, "_market_modules_managed", False):

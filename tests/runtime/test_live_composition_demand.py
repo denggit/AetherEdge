@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
 
 from src.app import AppConfig, AppContext
 from src.platform import ExchangeName
+from src.platform.data.models import MarketTrade, TradeSide
 from src.platform.markets import get_market_profile
 from src.runtime import LiveRuntimeConfig, RuntimeMode
 from src.runtime.composition import compose_live_runtime
+from src.runtime.market_data.runtime import MarketDataRuntimeError
 from src.runtime.requirements import (
     AccountStateRequirement,
     OrderBookRequirement,
@@ -45,6 +48,17 @@ class _Strategy:
         return {"enabled": self.trade_features}
 
 
+class _Alerts:
+    def start(self) -> None:
+        return None
+
+    def emit(self, _alert) -> None:
+        return None
+
+    async def stop(self) -> None:
+        return None
+
+
 def _app_config(tmp_path) -> AppConfig:
     return AppConfig(
         symbol="ETH-USDT-PERP",
@@ -70,7 +84,7 @@ def _context(strategy: _Strategy) -> AppContext:
         state_store=object(),
         strategy=strategy,
         planner=object(),
-        alerts=SimpleNamespace(emit=lambda _alert: None),
+        alerts=_Alerts(),
     )
 
 
@@ -242,3 +256,163 @@ async def test_empty_formal_composition_starts_no_market_resources(
 
     await application.market_data.stop()
     assert application.market_data.state().plan is None
+
+
+@pytest.mark.asyncio
+async def test_formal_composition_processes_finite_trade_smoke(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    received = asyncio.Event()
+    hold = asyncio.Event()
+    calls = []
+    trade = MarketTrade(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP",
+        price=Decimal("100"),
+        quantity=Decimal("1"),
+        side=TradeSide.BUY,
+        trade_id="smoke-1",
+        trade_time_ms=100,
+        event_time_ms=100,
+    )
+
+    class FiniteTradeStream:
+        async def stream_trades(self):
+            yield trade
+            await hold.wait()
+
+    class SmokeStrategy(_Strategy):
+        async def on_trade(self, event):
+            calls.append(event.trade_id)
+            received.set()
+            return ()
+
+    monkeypatch.setattr(
+        "src.runtime.composition.create_trade_stream",
+        lambda *_args, **_kwargs: FiniteTradeStream(),
+    )
+    monkeypatch.setattr(
+        "src.runtime.composition.create_order_book_stream",
+        lambda *_args, **_kwargs: _IdleOrderBookStream(),
+    )
+    strategy = SmokeStrategy()
+    application = _compose(
+        tmp_path,
+        _requirements(trades=True),
+        strategy,
+    )
+
+    await application.market_data.start(
+        application.runner._market_data_capabilities
+    )
+    await asyncio.wait_for(received.wait(), timeout=1)
+    await application.market_data.stop()
+
+    assert calls == ["smoke-1"]
+    assert application.runner.stats.market_events_seen == 1
+
+
+@pytest.mark.asyncio
+async def test_formal_runtime_exits_when_trade_source_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    class FailingTradeStream:
+        async def stream_trades(self):
+            raise RuntimeError("injected formal source failure")
+            if False:
+                yield None
+
+    monkeypatch.setattr(
+        "src.runtime.composition.create_trade_stream",
+        lambda *_args, **_kwargs: FailingTradeStream(),
+    )
+    monkeypatch.setattr(
+        "src.runtime.composition.create_order_book_stream",
+        lambda *_args, **_kwargs: _IdleOrderBookStream(),
+    )
+    application = _compose(
+        tmp_path,
+        _requirements(trades=True),
+        _Strategy(),
+    )
+
+    async def no_op() -> None:
+        return None
+
+    application.runner._startup = no_op
+    application.runner._start_producers = lambda: []
+    application.runner._start_sync_tasks = lambda: []
+    application.runner._stop_producers = no_op
+    application.runner._stop_sync_tasks = no_op
+    application.runner._stop_live_persistence_writer = no_op
+
+    with pytest.raises(
+        MarketDataRuntimeError,
+        match="injected formal source failure",
+    ):
+        await application.run()
+
+
+@pytest.mark.asyncio
+async def test_formal_runtime_exits_when_feature_handler_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    hold = asyncio.Event()
+    trade = MarketTrade(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        raw_symbol="ETH-USDT-SWAP",
+        price=Decimal("100"),
+        quantity=Decimal("1"),
+        side=TradeSide.BUY,
+        trade_id="feature-failure",
+        trade_time_ms=100,
+        event_time_ms=100,
+    )
+
+    class OneTradeStream:
+        async def stream_trades(self):
+            yield trade
+            await hold.wait()
+
+    class BrokenRangeFootprintBuilder:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def on_trade(self, _trade):
+            raise RuntimeError("injected feature failure")
+
+    monkeypatch.setattr(
+        "src.runtime.composition.create_trade_stream",
+        lambda *_args, **_kwargs: OneTradeStream(),
+    )
+    monkeypatch.setattr(
+        "src.runtime.composition.create_order_book_stream",
+        lambda *_args, **_kwargs: _IdleOrderBookStream(),
+    )
+    monkeypatch.setattr(
+        "src.runtime.market_data.features.RangeFootprintBuilder",
+        BrokenRangeFootprintBuilder,
+    )
+    application = _compose(
+        tmp_path,
+        _requirements(),
+        _Strategy(trade_features=True),
+    )
+
+    async def no_op() -> None:
+        return None
+
+    application.runner._startup = no_op
+    application.runner._start_producers = lambda: []
+    application.runner._start_sync_tasks = lambda: []
+    application.runner._stop_producers = no_op
+    application.runner._stop_sync_tasks = no_op
+    application.runner._stop_live_persistence_writer = no_op
+
+    with pytest.raises(MarketDataRuntimeError, match="injected feature failure"):
+        await application.run()

@@ -189,6 +189,53 @@ async def test_module_host_starts_in_plan_order_and_stops_in_reverse() -> None:
     ]
 
 
+@pytest.mark.asyncio
+async def test_market_source_shutdown_priority_drains_before_feature_stop() -> None:
+    calls: list[str] = []
+    source = FakeModule(
+        "trade-stream", frozenset({TRADES}), frozenset(), calls
+    )
+    source.shutdown_priority = 100
+    feature = FakeModule(
+        "range-bars", frozenset({RANGE}), frozenset({TRADES}), calls
+    )
+    host = ModuleHost((source, feature))
+
+    await host.start()
+    await host.stop()
+
+    assert calls[-2:] == ["stop:trade-stream", "stop:range-bars"]
+
+
+@pytest.mark.asyncio
+async def test_prepare_failure_rolls_back_partially_prepared_module() -> None:
+    calls: list[str] = []
+
+    class PartialFailure(FakeModule):
+        async def prepare(self) -> None:
+            self.calls.append(f"prepare:{self.module_id}")
+            raise RuntimeError("prepare failed after allocating")
+
+    first = FakeModule("first", frozenset({TRADES}), frozenset(), calls)
+    failing = PartialFailure(
+        "failing",
+        frozenset({RANGE}),
+        frozenset({TRADES}),
+        calls,
+    )
+    host = ModuleHost((first, failing))
+
+    with pytest.raises(RuntimeError, match="module startup failed"):
+        await host.prepare()
+
+    assert calls == [
+        "prepare:first",
+        "prepare:failing",
+        "stop:failing",
+        "stop:first",
+    ]
+
+
 def test_duplicate_capability_provider_is_rejected() -> None:
     probe = FactoryProbe()
     registry = _registry(probe)

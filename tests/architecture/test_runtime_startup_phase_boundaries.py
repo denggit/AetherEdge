@@ -390,11 +390,12 @@ def test_run_and_shutdown_order_remain_runner_owned() -> None:
     methods = _methods(_class(RUNNER, "LiveRuntimeRunner"))
     run = methods["run"]
     try_node = next(node for node in run.body if isinstance(node, ast.Try))
-    startup = _calls(try_node, "_startup")[0]
-    producers = _calls(try_node, "_start_producers")[0]
-    sync_tasks = _calls(try_node, "_start_sync_tasks")[0]
-    consume = _calls(try_node, "_consume_market_events")[0]
-    assert startup.lineno < producers.lineno < sync_tasks.lineno < consume.lineno
+    run_source = ast.unparse(try_node)
+    assert run_source.index("'_startup'") < run_source.index(
+        "'_start_producers'"
+    ) < run_source.index("'_start_sync_tasks'") < run_source.index(
+        "'_consume_market_events'"
+    )
     assert len(try_node.finalbody) == 1
     assert ast.unparse(try_node.finalbody[0]) == (
         "await self._run_finally_shutdown()"

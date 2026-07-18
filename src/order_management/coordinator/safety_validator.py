@@ -35,10 +35,19 @@ _BYPASS_MASTER_PURPOSES = {
 logger = get_logger(__name__)
 
 
-from src.order_management.coordinator.support import *  # noqa: F403
+from src.order_management.coordinator.support import (
+    _client_market_profile,
+    _client_positions,
+    _log_exchange_exit_normalization,
+    _with_position_side_for_mode,
+)
 
 
 class OrderSafetyValidator:
+    def __init__(self, *, exit_safety_guard: ExitSafetyGuard) -> None:
+        self.exit_safety_guard = exit_safety_guard
+        self._position_mode_cache: dict[ExchangeName, PositionMode] = {}
+
     async def _normalize_order_for_client(self, client: ExecutionClient, action: SignalAction, request: OrderRequest) -> OrderRequest:
         position_mode = await self._position_mode_for_client(client)
         if is_exit_action(action) and self._client_supports_exit_safety(client):
@@ -116,4 +125,3 @@ class OrderSafetyValidator:
 
 
 __all__ = ["OrderSafetyValidator"]
-

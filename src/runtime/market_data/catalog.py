@@ -41,6 +41,7 @@ RangeModuleFactory = Callable[
 ]
 TradeConsumer = Callable[[MarketTrade], Awaitable[None] | None]
 OrderBookConsumer = Callable[[MarketOrderBook], Awaitable[None] | None]
+DroppedTradeConsumer = Callable[[MarketTrade], Awaitable[None] | None]
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,7 @@ def build_market_data_registry(
     trade_dispatcher: BoundedOrderedEventDispatcher[MarketTrade] | None = None,
     order_book_dispatcher: BoundedEventDispatcher[MarketOrderBook] | None = None,
     consume_trade: TradeConsumer | None = None,
+    consume_dropped_trade: DroppedTradeConsumer | None = None,
     consume_order_book: OrderBookConsumer | None = None,
 ) -> ModuleRegistry:
     """Build lazy definitions; no stream, task or store is created here."""
@@ -80,6 +82,7 @@ def build_market_data_registry(
         trade_dispatcher.subscribe(
             subscriber_id="runtime-trade-consumer",
             handler=consume_trade,
+            order=500,
         )
     if consume_order_book is not None:
         order_book_dispatcher.subscribe(
@@ -96,6 +99,7 @@ def build_market_data_registry(
             factory=lambda: TradeStreamModule(
                 stream=create_trade_stream(),
                 dispatcher=trade_dispatcher,
+                on_dropped=consume_dropped_trade,
             ),
         )
     )

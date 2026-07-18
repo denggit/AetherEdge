@@ -35,11 +35,19 @@ _BYPASS_MASTER_PURPOSES = {
 logger = get_logger(__name__)
 
 
-from src.order_management.coordinator.support import *  # noqa: F403
-
-
 class ExecutionResultRecorder:
-    def _record_skipped_recovery_topup(
+    def __init__(
+        self,
+        *,
+        repository: OrderIntentRepository,
+        position_plan_store: object | None,
+        position_plan_updater: object,
+    ) -> None:
+        self.repository = repository
+        self.position_plan_store = position_plan_store
+        self._position_plan_updater = position_plan_updater
+
+    def record_skipped_recovery_topup(
         self,
         *,
         intent: OrderIntent,
@@ -102,7 +110,7 @@ class ExecutionResultRecorder:
                             "execution_outcome": outcome,
                         },
                     )
-            self._advance_topup_generation(intent)
+            self._position_plan_updater.advance_topup_generation(intent)
         logger.info(
             "Follower recovery top-up skipped before planning | "
             "intent_id=%s targets=%s outcome=%s resolutions=%s",
@@ -113,11 +121,18 @@ class ExecutionResultRecorder:
         )
         return results
 
-    def _with_execution_metadata(self, intent: OrderIntent, *, clients: Sequence[ExecutionClient], items: Sequence[PlannedExecution]) -> OrderIntent:
+    def with_execution_metadata(
+        self,
+        intent: OrderIntent,
+        *,
+        clients: Sequence[ExecutionClient],
+        items: Sequence[PlannedExecution],
+        preview_conversion,
+    ) -> OrderIntent:
         conversions: list[dict[str, object]] = []
         for client in clients:
             for sequence, item in enumerate(items):
-                conversion = self._preview_conversion(client, item, intent=intent)
+                conversion = preview_conversion(client, item, intent=intent)
                 if conversion:
                     conversion["sequence"] = sequence
                     conversion["action"] = item.action.value
@@ -133,7 +148,7 @@ class ExecutionResultRecorder:
         }
         return replace(intent, metadata=metadata)
 
-    def _record_exit_safety_event(self, *, intent: OrderIntent, exchange: ExchangeName, error: ExitSafetyError) -> None:
+    def record_exit_safety_event(self, *, intent: OrderIntent, exchange: ExchangeName, error: ExitSafetyError) -> None:
         add_event = getattr(self.repository, "add_event", None)
         if callable(add_event):
             add_event(
@@ -148,4 +163,3 @@ class ExecutionResultRecorder:
 
 
 __all__ = ["ExecutionResultRecorder"]
-

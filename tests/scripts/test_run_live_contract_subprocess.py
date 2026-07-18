@@ -286,7 +286,8 @@ def test_real_run_live_subprocess_exits_78_for_post_recovery_position_contract(
     sitecustomize_source = textwrap.dedent(
         """
         from src.runtime.recovery.models import RecoveryReport
-        from src.runtime.runner import LiveRuntimeRunner
+        from src.runtime.components.recovery import RecoveryComponent
+        from src.runtime.components.startup import StartupComponent
 
         class _RecoveryService:
             async def recover(self, *, strategy):
@@ -301,10 +302,10 @@ def test_real_run_live_subprocess_exits_78_for_post_recovery_position_contract(
         async def _skip_account_config(self):
             return None
 
-        LiveRuntimeRunner._bootstrap_account_config_if_enabled = (
+        StartupComponent._bootstrap_account_config_if_enabled = (
             _skip_account_config
         )
-        LiveRuntimeRunner._get_recovery_service = (
+        RecoveryComponent._get_recovery_service = (
             lambda self: _RecoveryService()
         )
         """
