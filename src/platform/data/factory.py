@@ -53,7 +53,7 @@ def create_market_data_feed(
     connector = websocket_connector or WebsocketsConnector()
     data_store = store or (SqliteMarketDataStore(sqlite_path) if sqlite_path is not None else None)
     trade_stream = (
-        _create_trade_stream(
+        create_trade_stream(
             exchange_name,
             symbol=symbol,
             config=cfg,
@@ -66,7 +66,7 @@ def create_market_data_feed(
         else None
     )
     order_book_stream = (
-        _create_order_book_stream(
+        create_order_book_stream(
             exchange_name,
             symbol=symbol,
             config=cfg,
@@ -88,7 +88,7 @@ def create_market_data_feed(
     )
 
 
-def _create_trade_stream(
+def create_trade_stream(
     exchange: ExchangeName,
     *,
     symbol: str,
@@ -119,7 +119,7 @@ def _create_trade_stream(
     raise ValueError(f"Unsupported exchange for trade stream: {exchange.value}")
 
 
-def _create_order_book_stream(
+def create_order_book_stream(
     exchange: ExchangeName,
     *,
     symbol: str,
@@ -148,3 +148,10 @@ def _create_order_book_stream(
             max_reconnects=max_reconnects,
         )
     raise ValueError(f"Unsupported exchange for order book stream: {exchange.value}")
+
+
+__all__ = [
+    "create_market_data_feed",
+    "create_order_book_stream",
+    "create_trade_stream",
+]

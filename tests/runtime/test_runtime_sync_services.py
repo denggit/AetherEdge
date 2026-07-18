@@ -223,13 +223,11 @@ def test_empty_registry_construction_keeps_sync_dependencies_lazy(
     get_contexts = Mock(return_value=(object(),))
     get_position_plan_store = Mock(return_value=object())
     monkeypatch.setattr(
-        runner_module,
-        "AccountStateSyncService",
+        "src.runtime.components.account.AccountStateSyncService",
         account_factory,
     )
     monkeypatch.setattr(
-        runner_module,
-        "OrderStateSyncService",
+        "src.runtime.components.account.OrderStateSyncService",
         order_factory,
     )
     monkeypatch.setattr(
@@ -261,8 +259,7 @@ def test_complete_registry_injection_does_not_create_default(
     registry = RuntimeSyncServiceRegistry()
     default_factory = Mock()
     monkeypatch.setattr(
-        runner_module,
-        "RuntimeSyncServiceRegistry",
+        "src.runtime.components.wiring.RuntimeSyncServiceRegistry",
         default_factory,
     )
 
@@ -276,7 +273,10 @@ def test_complete_registry_injection_does_not_create_default(
 def test_runner_creates_one_default_registry(monkeypatch) -> None:
     registry = object()
     factory = Mock(return_value=registry)
-    monkeypatch.setattr(runner_module, "RuntimeSyncServiceRegistry", factory)
+    monkeypatch.setattr(
+        "src.runtime.components.wiring.RuntimeSyncServiceRegistry",
+        factory,
+    )
 
     runner = _runner()
 
@@ -330,7 +330,10 @@ def test_account_builder_preserves_all_dependencies_and_identity(
     service = object()
     factory = Mock(return_value=service)
     get_contexts = Mock(return_value=contexts)
-    monkeypatch.setattr(runner_module, "AccountStateSyncService", factory)
+    monkeypatch.setattr(
+        "src.runtime.components.account.AccountStateSyncService",
+        factory,
+    )
     runner._get_sync_contexts = get_contexts
     runner.requirements = SimpleNamespace(account_state=config)
     runner.context = SimpleNamespace(alerts=alerts)
@@ -364,7 +367,10 @@ def test_order_builder_preserves_all_dependencies_and_lazy_position_store(
     factory = Mock(return_value=service)
     get_contexts = Mock(return_value=contexts)
     get_position_plan_store = Mock(return_value=position_plan_store)
-    monkeypatch.setattr(runner_module, "OrderStateSyncService", factory)
+    monkeypatch.setattr(
+        "src.runtime.components.account.OrderStateSyncService",
+        factory,
+    )
     runner._get_sync_contexts = get_contexts
     runner._get_position_plan_store = get_position_plan_store
     runner.requirements = SimpleNamespace(order_state=config)
@@ -443,13 +449,11 @@ def test_account_and_order_builders_resolve_contexts_independently(
     account_factory = Mock(return_value=account_service)
     order_factory = Mock(return_value=order_service)
     monkeypatch.setattr(
-        runner_module,
-        "AccountStateSyncService",
+        "src.runtime.components.account.AccountStateSyncService",
         account_factory,
     )
     monkeypatch.setattr(
-        runner_module,
-        "OrderStateSyncService",
+        "src.runtime.components.account.OrderStateSyncService",
         order_factory,
     )
 

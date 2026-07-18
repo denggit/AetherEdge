@@ -65,7 +65,7 @@ def test_provider_resolution_is_ordered_filters_disabled_and_has_priority() -> N
 
 
 @pytest.mark.asyncio
-async def test_pipeline_holds_only_strategy_and_resolves_observers_each_time() -> None:
+async def test_pipeline_freezes_observers_at_startup_and_holds_no_strategy() -> None:
     calls: list[str] = []
     seen_events: list[MarketFeatureEvent] = []
     provider_calls = 0
@@ -131,15 +131,25 @@ async def test_pipeline_holds_only_strategy_and_resolves_observers_each_time() -
     first_signals = await pipeline.dispatch(event)
     second_signals = await pipeline.dispatch(event)
 
-    assert vars(pipeline) == {"_strategy": strategy}
-    assert provider_calls == 2
-    assert calls == ["first", "async_second", "none", "dynamic"]
+    assert set(vars(pipeline)) == {"_observers"}
+    assert provider_calls == 1
+    assert calls == [
+        "first",
+        "async_second",
+        "none",
+        "first",
+        "async_second",
+        "none",
+    ]
     assert all(seen is event for seen in seen_events)
     assert tuple(signal.reason for signal in first_signals) == (
         "first",
         "async_second",
     )
-    assert tuple(signal.reason for signal in second_signals) == ("dynamic",)
+    assert tuple(signal.reason for signal in second_signals) == (
+        "first",
+        "async_second",
+    )
 
 
 @pytest.mark.asyncio
@@ -149,7 +159,7 @@ async def test_pipeline_rejects_non_sequence_provider_result() -> None:
             return object()
 
     with pytest.raises(TypeError, match="sequence of observers"):
-        await MarketFeaturePipeline(Strategy()).dispatch(_event())
+        MarketFeaturePipeline(Strategy())
 
 
 @pytest.mark.asyncio

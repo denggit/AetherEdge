@@ -1058,12 +1058,10 @@ async def test_run_lifecycle_and_cleanup_order_is_characterized(
 
     monkeypatch.setattr(runner, "_consume_market_events", consume)
     for name in (
-        "_stop_range_speed_background_services",
+        "_stop_market_data_modules",
         "_stop_sync_tasks",
         "_stop_producers",
         "_stop_live_persistence_writer",
-        "_stop_range_repair_journal_writer",
-        "_stop_range_checkpoint_writer",
     ):
         monkeypatch.setattr(runner, name, _async_stage(calls, name.removeprefix("_")))
 
@@ -1081,21 +1079,17 @@ async def test_run_lifecycle_and_cleanup_order_is_characterized(
         "consume_market_events",
     ]
     cleanup_names = {
-        "stop_range_speed_background_services",
+        "stop_market_data_modules",
         "stop_sync_tasks",
         "stop_producers",
         "stop_live_persistence_writer",
-        "stop_range_repair_journal_writer",
-        "stop_range_checkpoint_writer",
         "alerts.stop",
     }
     assert [name for name in calls if name in cleanup_names] == [
-        "stop_range_speed_background_services",
+        "stop_market_data_modules",
         "stop_sync_tasks",
         "stop_producers",
         "stop_live_persistence_writer",
-        "stop_range_repair_journal_writer",
-        "stop_range_checkpoint_writer",
         "alerts.stop",
     ]
 

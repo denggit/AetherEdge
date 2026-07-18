@@ -14,6 +14,7 @@ from src.runtime import runner as runner_module
 from src.runtime.models import RuntimeHealth, RuntimePhase
 from src.runtime.requirements import StrategyRuntimeRequirements
 from src.runtime.runner import LiveRuntimeRunner
+from src.runtime.services import DEFAULT_RUNTIME_SERVICE
 from src.runtime.signal_execution_service import (
     RuntimeSignalExecutionPlan,
     RuntimeSignalExecutionRequest,
@@ -212,8 +213,8 @@ def test_all_final_service_keys_preserve_injected_identity_and_are_lazy() -> Non
 def test_default_construction_preserves_expensive_service_laziness() -> None:
     runner = _runner()
 
-    assert runner._recovery_service == "__default__"
-    assert runner._reconciliation_service == "__default__"
+    assert runner._recovery_service is DEFAULT_RUNTIME_SERVICE
+    assert runner._reconciliation_service is DEFAULT_RUNTIME_SERVICE
     assert runner._order_coordinator is None
     assert runner._order_journal is None
     assert runner._position_plan_store is None
@@ -546,12 +547,10 @@ async def test_final_and_explicit_shutdown_keep_distinct_sequences(
     runner = _runner(calls=calls)
 
     for name in (
-        "_stop_range_speed_background_services",
+        "_stop_market_data_modules",
         "_stop_sync_tasks",
         "_stop_producers",
         "_stop_live_persistence_writer",
-        "_stop_range_repair_journal_writer",
-        "_stop_range_checkpoint_writer",
     ):
         monkeypatch.setattr(
             runner,
@@ -561,12 +560,10 @@ async def test_final_and_explicit_shutdown_keep_distinct_sequences(
 
     await runner._run_finally_shutdown()
     assert calls == [
-        "stop_range_speed_background_services",
+        "stop_market_data_modules",
         "stop_sync_tasks",
         "stop_producers",
         "stop_live_persistence_writer",
-        "stop_range_repair_journal_writer",
-        "stop_range_checkpoint_writer",
         "alerts.stop",
     ]
 
@@ -590,9 +587,8 @@ async def test_final_and_explicit_shutdown_keep_distinct_sequences(
     assert returned is stopped
     assert calls == [
         "stop_event",
-        "stop_range_speed_background_services",
+        "stop_market_data_modules",
         "stop_producers",
         "stop_live_persistence_writer",
-        "stop_range_repair_journal_writer",
         "health.stopped",
     ]

@@ -43,15 +43,17 @@ def test_runtime_state_capabilities_are_three_independent_protocols() -> None:
 
 
 def test_capability_validation_is_first_startup_operation() -> None:
+    lifecycle = RUNTIME_ROOT / "components" / "lifecycle.py"
     runner_class = next(
         node
-        for node in _tree(RUNNER).body
-        if isinstance(node, ast.ClassDef) and node.name == "LiveRuntimeRunner"
+        for node in _tree(lifecycle).body
+        if isinstance(node, ast.ClassDef) and node.name == "LifecycleComponent"
     )
     startup = next(
         node
         for node in runner_class.body
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_startup"
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "_run_startup_sequence"
     )
     first = startup.body[0]
 
@@ -92,13 +94,15 @@ def test_capability_manifest_parser_never_uses_permissive_bool_parser() -> None:
 
 def test_runtime_requirements_use_one_strict_validator_at_direct_boundaries() -> None:
     requirements_source = REQUIREMENTS.read_text(encoding="utf-8")
-    runner_source = RUNNER.read_text(encoding="utf-8")
+    wiring_source = (RUNTIME_ROOT / "components" / "wiring.py").read_text(
+        encoding="utf-8"
+    )
 
     assert "def validate_strategy_runtime_requirements(" in requirements_source
     assert "validate_strategy_runtime_requirements(self)" in requirements_source
     assert "return validate_strategy_runtime_requirements(value)" in requirements_source
-    assert 'self.services["runtime_requirements"]' in runner_source
-    assert "validate_strategy_runtime_requirements(" in runner_source
+    assert "self.runtime_services.runtime_requirements" in wiring_source
+    assert "validate_strategy_runtime_requirements(" in wiring_source
 
 
 def test_recovery_validation_marker_is_not_a_runtime_trust_mechanism() -> None:

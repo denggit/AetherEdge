@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from tests.runtime_surface_ast import runtime_surface_class
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_ROOT = PROJECT_ROOT / "src" / "runtime"
@@ -86,8 +88,7 @@ def test_runtime_has_no_loaded_first_active_strategy_helpers() -> None:
 
 
 def test_generic_stop_protection_paths_do_not_use_single_active_helpers() -> None:
-    runner_path = RUNTIME_ROOT / "runner.py"
-    tree = ast.parse(runner_path.read_text(encoding="utf-8"))
+    tree = runtime_surface_class(PROJECT_ROOT / "src")
     generic_paths = {
         "_validate_recovery_protection_postcondition",
         "_validate_post_execution_stop_protection",

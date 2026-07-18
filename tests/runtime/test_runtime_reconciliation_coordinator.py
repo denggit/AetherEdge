@@ -17,13 +17,14 @@ from src.order_management.reconciliation.models import (
 from src.platform import ExchangeName
 from src.platform.config import ProjectEnvConfig
 from src.runtime import LiveRuntimeConfig, RuntimeMode
-from src.runtime import runner as runner_module
+from src.runtime.components import account as account_component
 from src.runtime.reconciliation_coordinator import (
     RuntimeReconciliationCoordinator,
     RuntimeReconciliationPlan,
 )
 from src.runtime.requirements import StrategyRuntimeRequirements
 from src.runtime.runner import LiveRuntimeError, LiveRuntimeRunner
+from src.runtime.services import DEFAULT_RUNTIME_SERVICE
 
 
 PLAN_FIELDS = (
@@ -245,8 +246,7 @@ def test_injected_coordinator_has_priority_without_default_construction(
     coordinator = SimpleNamespace(execute=AsyncMock())
     default_factory = Mock()
     monkeypatch.setattr(
-        runner_module,
-        "RuntimeReconciliationCoordinator",
+        "src.runtime.components.wiring.RuntimeReconciliationCoordinator",
         default_factory,
     )
 
@@ -256,7 +256,7 @@ def test_injected_coordinator_has_priority_without_default_construction(
     coordinator.execute.assert_not_called()
     assert runner._reconciliation_coordinator is coordinator
     assert runner.services["reconciliation_coordinator"] is coordinator
-    assert runner._reconciliation_service == "__default__"
+    assert runner._reconciliation_service is DEFAULT_RUNTIME_SERVICE
     assert runner._position_plan_store is None
     assert runner._order_journal is None
 
@@ -267,8 +267,7 @@ def test_default_coordinator_is_created_once_written_back_and_not_executed(
     coordinator = SimpleNamespace(execute=AsyncMock())
     factory = Mock(return_value=coordinator)
     monkeypatch.setattr(
-        runner_module,
-        "RuntimeReconciliationCoordinator",
+        "src.runtime.components.wiring.RuntimeReconciliationCoordinator",
         factory,
     )
 
@@ -278,7 +277,7 @@ def test_default_coordinator_is_created_once_written_back_and_not_executed(
     coordinator.execute.assert_not_called()
     assert runner._reconciliation_coordinator is coordinator
     assert runner.services["reconciliation_coordinator"] is coordinator
-    assert runner._reconciliation_service == "__default__"
+    assert runner._reconciliation_service is DEFAULT_RUNTIME_SERVICE
     assert runner._position_plan_store is None
     assert runner._order_journal is None
 
@@ -353,7 +352,7 @@ def test_begin_log_keeps_snapshot_order_and_exact_arguments(monkeypatch) -> None
         ),
     )
     logger = Mock()
-    monkeypatch.setattr(runner_module, "logger", logger)
+    monkeypatch.setattr(account_component, "logger", logger)
 
     runner._log_startup_reconciliation_begin(snapshots)
 
@@ -372,7 +371,7 @@ def test_empty_legacy_adoptions_do_not_read_clock_or_call_service(
     runner.app_config = SimpleNamespace(symbol="ETH-USDT-PERP")
     service = SimpleNamespace(_apply_actions=Mock())
     clock = Mock()
-    monkeypatch.setattr(runner_module.time, "time", clock)
+    monkeypatch.setattr(account_component.time, "time", clock)
 
     runner._apply_startup_legacy_stop_adoptions(service)
 
@@ -391,8 +390,8 @@ def test_legacy_adoptions_keep_order_fields_clock_and_clear_after_success(
     service = SimpleNamespace(_apply_actions=Mock())
     clock = Mock(return_value=1.25)
     logger = Mock()
-    monkeypatch.setattr(runner_module.time, "time", clock)
-    monkeypatch.setattr(runner_module, "logger", logger)
+    monkeypatch.setattr(account_component.time, "time", clock)
+    monkeypatch.setattr(account_component, "logger", logger)
 
     runner._apply_startup_legacy_stop_adoptions(service)
 
@@ -449,7 +448,7 @@ def test_legacy_adoption_failure_preserves_original_list(monkeypatch) -> None:
     service = SimpleNamespace(
         _apply_actions=Mock(side_effect=[None, error])
     )
-    monkeypatch.setattr(runner_module.time, "time", Mock(return_value=2.0))
+    monkeypatch.setattr(account_component.time, "time", Mock(return_value=2.0))
 
     with pytest.raises(RuntimeError) as raised:
         runner._apply_startup_legacy_stop_adoptions(service)
@@ -483,7 +482,7 @@ def test_report_handler_preserves_warning_alert_and_failure_order(
     emit = Mock()
     runner.context = SimpleNamespace(alerts=SimpleNamespace(emit=emit))
     logger = Mock()
-    monkeypatch.setattr(runner_module, "logger", logger)
+    monkeypatch.setattr(account_component, "logger", logger)
     ref = FakeOrderRef(
         position_id="position-1",
         exchange="okx",
@@ -586,7 +585,7 @@ def test_report_cleanup_log_all_three_conditions(
     runner = object.__new__(LiveRuntimeRunner)
     runner.context = SimpleNamespace(alerts=SimpleNamespace(emit=Mock()))
     logger = Mock()
-    monkeypatch.setattr(runner_module, "logger", logger)
+    monkeypatch.setattr(account_component, "logger", logger)
     report = _report(
         verdict=verdict,
         stale_plans_closed=stale,
@@ -610,7 +609,7 @@ def test_report_plain_pass_accepts_string_verdict_and_logs_exactly(
     runner = object.__new__(LiveRuntimeRunner)
     runner.context = SimpleNamespace(alerts=SimpleNamespace(emit=Mock()))
     logger = Mock()
-    monkeypatch.setattr(runner_module, "logger", logger)
+    monkeypatch.setattr(account_component, "logger", logger)
 
     runner._handle_startup_reconciliation_report(_report(verdict="pass"))
 

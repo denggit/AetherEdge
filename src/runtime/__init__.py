@@ -1,5 +1,4 @@
 from src.runtime.config import LiveRuntimeConfig, live_runtime_config_from_app, runtime_mode_from_env
-from src.runtime.context import LiveRuntimeContext
 from src.runtime.models import RuntimeHealth, RuntimeMode, RuntimePhase
 from src.runtime.ports import BackgroundTaskQueue, RuntimeServicePort
 from src.runtime.requirements import (
@@ -16,6 +15,28 @@ from src.runtime.requirements import (
     validate_strategy_runtime_requirements,
 )
 from src.runtime.runner import LiveRuntimeRunner, LiveRuntimeStats
+from src.runtime.module import (
+    CapabilityId,
+    ModuleHealth,
+    ModuleHost,
+    ModuleLifecycleError,
+    ModuleState,
+    RepairCapable,
+    RuntimeModule,
+    WarmupCapable,
+)
+from src.runtime.registry import (
+    CapabilityRegistry,
+    CapabilityResolutionError,
+    DependencyResolver,
+    ModuleDefinition,
+    ModuleRegistry,
+    RuntimePlan,
+)
+from src.runtime.capabilities import (
+    CapabilityRequest,
+    capability_request_from_requirements,
+)
 from src.runtime.strategy_capabilities import (
     StrategyCapabilityError,
     StrategyContractError,
@@ -27,9 +48,24 @@ from src.runtime.strategy_capabilities import (
 
 __all__ = [
     "LiveRuntimeConfig",
-    "LiveRuntimeContext",
     "LiveRuntimeRunner",
     "LiveRuntimeStats",
+    "CapabilityId",
+    "CapabilityRegistry",
+    "CapabilityResolutionError",
+    "CapabilityRequest",
+    "DependencyResolver",
+    "ModuleDefinition",
+    "ModuleHealth",
+    "ModuleHost",
+    "ModuleLifecycleError",
+    "ModuleRegistry",
+    "ModuleState",
+    "RepairCapable",
+    "RuntimeModule",
+    "RuntimePlan",
+    "WarmupCapable",
+    "capability_request_from_requirements",
     "RuntimeHealth",
     "RuntimeMode",
     "RuntimePhase",

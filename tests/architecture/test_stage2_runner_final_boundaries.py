@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from tests.runtime_surface_ast import runtime_surface_class
+
 import pytest
 
 
@@ -10,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = PROJECT_ROOT / "src"
 RUNTIME_ROOT = SOURCE_ROOT / "runtime"
 RUNNER = RUNTIME_ROOT / "runner.py"
+RUNTIME_CONFIG = RUNTIME_ROOT / "config.py"
 
 GENERIC_MODULES = (
     RUNTIME_ROOT / "strategy_host.py",
@@ -44,6 +47,19 @@ SERVICE_FIELDS = {
     "startup_phase_coordinator": "_startup_phase_coordinator",
 }
 
+
+def test_generic_runtime_config_contains_no_market_module_configuration() -> None:
+    config_class = _class(RUNTIME_CONFIG, "LiveRuntimeConfig")
+    fields = {
+        node.target.id
+        for node in config_class.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+    }
+    assert not {name for name in fields if name.startswith("range_")}
+    assert "market_data_db_path" not in fields
+    assert "degraded_fast_margin" not in fields
+
 UNIQUE_CLASSES = {
     "StrategyHost": "src/runtime/strategy_host.py",
     "TradeDerivedFeaturePipeline": "src/runtime/feature_pipeline.py",
@@ -73,6 +89,8 @@ def _tree(path: Path) -> ast.Module:
 
 
 def _class(path: Path, name: str) -> ast.ClassDef:
+    if path == RUNNER and name == "LiveRuntimeRunner":
+        return runtime_surface_class(SOURCE_ROOT)
     return next(
         node
         for node in _tree(path).body
@@ -233,19 +251,16 @@ def test_shutdown_health_and_sync_delegation_stays_frozen() -> None:
     assert isinstance(final_steps, ast.Tuple)
     assert isinstance(explicit_steps, ast.Tuple)
     assert [ast.unparse(item) for item in final_steps.elts] == [
-        "self._stop_range_speed_background_services",
+        "self._stop_market_data_modules",
         "self._stop_sync_tasks",
         "self._stop_producers",
         "self._stop_live_persistence_writer",
-        "self._stop_range_repair_journal_writer",
-        "self._stop_range_checkpoint_writer",
         "self.context.alerts.stop",
     ]
     assert [ast.unparse(item) for item in explicit_steps.elts] == [
-        "self._stop_range_speed_background_services",
+        "self._stop_market_data_modules",
         "self._stop_producers",
         "self._stop_live_persistence_writer",
-        "self._stop_range_repair_journal_writer",
     ]
 
     set_health = methods["_set_health"]
@@ -276,10 +291,11 @@ def test_shutdown_health_and_sync_delegation_stays_frozen() -> None:
 
 def test_final_service_injection_keys_and_fields_are_frozen() -> None:
     initializer = _methods(_class(RUNNER, "LiveRuntimeRunner"))["__init__"]
-    string_constants = {
-        node.value
+    dependency_fields = {
+        node.attr
         for node in ast.walk(initializer)
-        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        if isinstance(node, ast.Attribute)
+        and ast.unparse(node.value) == "self.runtime_services"
     }
     assigned_fields = {
         ast.unparse(target)
@@ -288,7 +304,7 @@ def test_final_service_injection_keys_and_fields_are_frozen() -> None:
         for target in node.targets
         if isinstance(target, ast.Attribute)
     }
-    assert set(SERVICE_FIELDS) <= string_constants
+    assert set(SERVICE_FIELDS) <= dependency_fields
     assert {
         f"self.{field}" for field in SERVICE_FIELDS.values()
     } <= assigned_fields
@@ -411,7 +427,6 @@ def test_strategy_callback_receivers_remain_explicit_and_not_strategy_direct() -
             "on_account_snapshot",
             "self._strategy_host",
         ),
-        ("_process_trade", "on_trade", "builder"),
         (
             "_process_order_result_feedback",
             "on_order_results",

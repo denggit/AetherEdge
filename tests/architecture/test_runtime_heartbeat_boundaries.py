@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from tests.runtime_surface_ast import runtime_surface_class
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = PROJECT_ROOT / "src"
@@ -17,6 +19,8 @@ def _tree(path: Path) -> ast.Module:
 
 
 def _class(path: Path, name: str) -> ast.ClassDef:
+    if path == RUNNER and name == "LiveRuntimeRunner":
+        return runtime_surface_class(SOURCE_ROOT)
     return next(
         node
         for node in _tree(path).body
@@ -90,12 +94,12 @@ def test_runner_constructor_selects_and_writes_back_one_heartbeat_service() -> N
     selected = _assignment(initializer, "self._heartbeat_service")
     writeback = _assignment(
         initializer,
-        "self.services['heartbeat_service']",
+        "self.runtime_services.heartbeat_service",
     )
     health_compatibility = _assignment(initializer, "self._health")
 
     assert ast.unparse(injected.value) == (
-        "self.services.get('heartbeat_service')"
+        "self.runtime_services.heartbeat_service"
     )
     assert isinstance(selected.value, ast.IfExp)
     assert ast.unparse(selected.value.test) == (

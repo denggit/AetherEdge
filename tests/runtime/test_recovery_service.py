@@ -358,12 +358,13 @@ def _minimal_runner(
     runner.runtime_config.mode.value = "live_runtime"
     runner.runtime_config.closed_bar_interval = "4h"
     runner.runtime_config.closed_bar_buffer_ms = 5000
-    runner.runtime_config.range_pct = Decimal("0.002")
     runner.runtime_config.scheduler_poll_seconds = 1
     runner.runtime_config.master_follower_policy = None
     runner.runtime_config.startup_catchup = MagicMock()
     runner.runtime_config.startup_catchup.enabled = False
     runner.runtime_config.producer_stale_timeout_ms = 60000
+    runner.range_config = MagicMock()
+    runner.range_config.range_pct = Decimal("0.002")
     return runner
 
 

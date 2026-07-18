@@ -11,9 +11,19 @@ from src.planner import ExecutionPlanner
 from src.strategy import load_strategy
 
 
-def build_app_context(config: AppConfig) -> AppContext:
+def build_app_context(
+    config: AppConfig,
+    *,
+    enable_market_streams: bool = True,
+) -> AppContext:
     data_exchange_config = ExchangeConfig.from_env(config.data_exchange)
-    data = create_market_data_feed(config.data_exchange, symbol=config.symbol, config=data_exchange_config)
+    data = create_market_data_feed(
+        config.data_exchange,
+        symbol=config.symbol,
+        config=data_exchange_config,
+        enable_trade_stream=enable_market_streams,
+        enable_order_book_stream=enable_market_streams,
+    )
     execution_clients = [create_execution_client(exchange, symbol=config.symbol) for exchange in config.exchanges]
     execution = execution_clients[0] if len(execution_clients) == 1 else MultiExchangeExecutionClient(execution_clients)
     sink = EmailAlertSink() if config.enable_email_alerts else NoopAlertSink()

@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from tests.runtime_surface_ast import runtime_surface_class
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = PROJECT_ROOT / "src"
@@ -18,6 +20,8 @@ def _tree(path: Path) -> ast.Module:
 
 
 def _class(path: Path, name: str) -> ast.ClassDef:
+    if path == RUNNER and name == "LiveRuntimeRunner":
+        return runtime_surface_class(SOURCE_ROOT)
     return next(
         node
         for node in _tree(path).body
@@ -202,11 +206,11 @@ def test_runner_selects_and_writes_back_one_shutdown_coordinator() -> None:
     selected = _assignment(initializer, "self._shutdown_coordinator")
     writeback = _assignment(
         initializer,
-        "self.services['shutdown_coordinator']",
+        "self.runtime_services.shutdown_coordinator",
     )
 
     assert ast.unparse(injected.value) == (
-        "self.services.get('shutdown_coordinator')"
+        "self.runtime_services.shutdown_coordinator"
     )
     assert isinstance(selected.value, ast.IfExp)
     assert ast.unparse(selected.value.test) == (
@@ -249,18 +253,16 @@ def test_run_finally_only_delegates_to_final_shutdown_helper() -> None:
     )
 
 
-def test_final_shutdown_helper_has_exact_seven_bound_steps() -> None:
+def test_final_shutdown_helper_has_one_range_owned_stop() -> None:
     method = _methods(_class(RUNNER, "LiveRuntimeRunner"))[
         "_run_finally_shutdown"
     ]
     assert len(method.body) == 1
     assert _coordinator_steps(method) == [
-        "self._stop_range_speed_background_services",
+        "self._stop_market_data_modules",
         "self._stop_sync_tasks",
         "self._stop_producers",
         "self._stop_live_persistence_writer",
-        "self._stop_range_repair_journal_writer",
-        "self._stop_range_checkpoint_writer",
         "self.context.alerts.stop",
     ]
     assert not any(
@@ -269,14 +271,13 @@ def test_final_shutdown_helper_has_exact_seven_bound_steps() -> None:
     )
 
 
-def test_explicit_stop_has_distinct_four_step_helper_and_outer_order() -> None:
+def test_explicit_stop_has_distinct_three_step_helper_and_outer_order() -> None:
     methods = _methods(_class(RUNNER, "LiveRuntimeRunner"))
     helper = methods["_explicit_stop_shutdown"]
     assert _coordinator_steps(helper, receiver="coordinator") == [
-        "self._stop_range_speed_background_services",
+        "self._stop_market_data_modules",
         "self._stop_producers",
         "self._stop_live_persistence_writer",
-        "self._stop_range_repair_journal_writer",
     ]
 
     stop = methods["stop"]
@@ -287,7 +288,6 @@ def test_explicit_stop_has_distinct_four_step_helper_and_outer_order() -> None:
         "return self._health",
     ]
     assert "_stop_sync_tasks" not in ast.unparse(helper)
-    assert "_stop_range_checkpoint_writer" not in ast.unparse(helper)
     assert "alerts.stop" not in ast.unparse(helper)
     assert "_heartbeat_service" not in ast.unparse(helper)
 
@@ -304,7 +304,6 @@ def test_final_and_explicit_shutdown_sequences_are_not_merged() -> None:
         explicit_steps[0],
         "self._stop_sync_tasks",
         *explicit_steps[1:],
-        "self._stop_range_checkpoint_writer",
         "self.context.alerts.stop",
     ]
 

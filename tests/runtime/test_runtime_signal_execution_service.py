@@ -12,7 +12,7 @@ from src.app import AppConfig
 from src.platform import ExchangeName
 from src.platform.config import ProjectEnvConfig
 from src.runtime import LiveRuntimeConfig, RuntimeMode
-from src.runtime import runner as runner_module
+from src.runtime.components import signal_execution as signal_execution_component
 from src.runtime.requirements import StrategyRuntimeRequirements
 from src.runtime.runner import LiveRuntimeRunner, LiveRuntimeStats
 from src.runtime.signal_execution_service import (
@@ -345,8 +345,7 @@ def test_injected_service_has_priority_without_default_construction(
     service = SimpleNamespace(execute=AsyncMock())
     default_factory = Mock()
     monkeypatch.setattr(
-        runner_module,
-        "RuntimeSignalExecutionService",
+        "src.runtime.components.wiring.RuntimeSignalExecutionService",
         default_factory,
     )
 
@@ -369,8 +368,7 @@ def test_default_service_created_once_written_back_and_not_executed(
     service = SimpleNamespace(execute=AsyncMock())
     factory = Mock(return_value=service)
     monkeypatch.setattr(
-        runner_module,
-        "RuntimeSignalExecutionService",
+        "src.runtime.components.wiring.RuntimeSignalExecutionService",
         factory,
     )
 
@@ -437,7 +435,7 @@ def test_prepare_dry_run_precedes_guards_and_keeps_exact_stats_log(
     runner._has_account_config_entry_block = Mock(side_effect=AssertionError)
     runner._has_unresolved_follower_close = Mock(side_effect=AssertionError)
     logger = Mock()
-    monkeypatch.setattr(runner_module, "logger", logger)
+    monkeypatch.setattr(signal_execution_component, "logger", logger)
     signal = _signal(SignalAction.OPEN_LONG)
     request = _request([signal], source="dry", event_time_ms=9)
 
@@ -464,7 +462,7 @@ def test_prepare_account_config_block_keeps_warning_and_alert(monkeypatch) -> No
     emit = Mock()
     runner.context = SimpleNamespace(alerts=SimpleNamespace(emit=emit))
     logger = Mock()
-    monkeypatch.setattr(runner_module, "logger", logger)
+    monkeypatch.setattr(signal_execution_component, "logger", logger)
     signal = _signal(SignalAction.OPEN_SHORT)
     request = _request([signal], source="account")
 
@@ -492,7 +490,7 @@ def test_prepare_unresolved_follower_block_and_topup_exception(monkeypatch) -> N
     emit = Mock()
     runner.context = SimpleNamespace(alerts=SimpleNamespace(emit=emit))
     logger = Mock()
-    monkeypatch.setattr(runner_module, "logger", logger)
+    monkeypatch.setattr(signal_execution_component, "logger", logger)
     blocked = _signal(SignalAction.OPEN_LONG)
     request = _request([blocked], source="follower")
 
@@ -569,7 +567,7 @@ async def test_post_submit_sync_condition_log_and_arguments(
     sync = SimpleNamespace(sync_once=AsyncMock())
     runner._get_order_sync_service = Mock(return_value=sync)
     logger = Mock()
-    monkeypatch.setattr(runner_module, "logger", logger)
+    monkeypatch.setattr(signal_execution_component, "logger", logger)
     signal = _signal(SignalAction.CLOSE_LONG)
     request = _request([signal], source="submit")
 
@@ -699,7 +697,7 @@ def test_feedback_depth_five_blocks_with_exact_log_and_alert(monkeypatch) -> Non
     emit = Mock()
     runner.context = SimpleNamespace(alerts=SimpleNamespace(emit=emit))
     logger = Mock()
-    monkeypatch.setattr(runner_module, "logger", logger)
+    monkeypatch.setattr(signal_execution_component, "logger", logger)
     signal = _signal(SignalAction.CLOSE_SHORT)
     request = _request([signal], source="feedback", feedback_depth=5)
 

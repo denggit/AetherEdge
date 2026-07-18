@@ -457,9 +457,12 @@ def test_runner_live_kline_store_uses_configured_path_and_caches(
     path = tmp_path / "market.sqlite3"
     store = object()
     factory = Mock(return_value=store)
-    monkeypatch.setattr(runner_module, "SqliteKlineStore", factory)
+    monkeypatch.setattr(
+        "src.runtime.components.range_runtime.SqliteKlineStore",
+        factory,
+    )
     runner.services = {}
-    runner.runtime_config = SimpleNamespace(market_data_db_path=path)
+    runner.range_config = SimpleNamespace(market_data_db_path=path)
 
     assert runner._get_live_kline_store() is store
     assert runner._get_live_kline_store() is store

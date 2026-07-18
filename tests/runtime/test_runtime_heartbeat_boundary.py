@@ -13,7 +13,7 @@ from src.platform import ExchangeName
 from src.platform.config import ProjectEnvConfig
 from src.platform.data.models import MarketEventType, MarketTrade, TradeSide
 from src.runtime import LiveRuntimeConfig, RuntimeMode
-from src.runtime import runner as runner_module
+from src.runtime.components import catchup as catchup_component
 from src.runtime.models import RuntimePhase
 from src.runtime.requirements import StrategyRuntimeRequirements
 from src.runtime.runner import LiveRuntimeRunner
@@ -103,8 +103,7 @@ def test_injected_heartbeat_has_priority_and_no_constructor_side_effects(
     heartbeat = _HeartbeatProbe()
     default_factory = Mock()
     monkeypatch.setattr(
-        runner_module,
-        "RuntimeHeartbeatService",
+        "src.runtime.components.wiring.RuntimeHeartbeatService",
         default_factory,
     )
 
@@ -121,7 +120,10 @@ def test_default_heartbeat_is_created_once_written_back_and_not_used(
 ) -> None:
     heartbeat = _HeartbeatProbe()
     factory = Mock(return_value=heartbeat)
-    monkeypatch.setattr(runner_module, "RuntimeHeartbeatService", factory)
+    monkeypatch.setattr(
+        "src.runtime.components.wiring.RuntimeHeartbeatService",
+        factory,
+    )
 
     runner = _runner()
 
@@ -493,7 +495,7 @@ async def test_startup_catchup_reads_previous_heartbeat_once(monkeypatch) -> Non
     runner._last_snapshots = ()
     runner._has_any_active_position_for_catchup = lambda snapshots: True
     runner._closed_bar_scheduler = SimpleNamespace(mark_emitted=Mock())
-    monkeypatch.setattr(runner_module.time, "time", lambda: 1_728_000)
+    monkeypatch.setattr(catchup_component.time, "time", lambda: 1_728_000)
 
     await runner._evaluate_startup_catchup_once(object())
 

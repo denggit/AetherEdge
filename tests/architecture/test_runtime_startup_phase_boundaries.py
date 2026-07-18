@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from tests.runtime_surface_ast import runtime_surface_class
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = PROJECT_ROOT / "src"
@@ -14,6 +16,9 @@ HEARTBEAT = SOURCE_ROOT / "runtime" / "heartbeat.py"
 SYNC_LIFECYCLE = SOURCE_ROOT / "runtime" / "sync_lifecycle.py"
 PERSISTENCE = SOURCE_ROOT / "runtime" / "persistence.py"
 PERSISTENCE_SERVICE = SOURCE_ROOT / "runtime" / "persistence_service.py"
+RANGE_SPEED_RUNTIME = (
+    SOURCE_ROOT / "runtime" / "market_data" / "range_speed_runtime.py"
+)
 
 
 PLAN_FIELDS = [
@@ -43,6 +48,8 @@ def _tree(path: Path) -> ast.Module:
 
 
 def _class(path: Path, name: str) -> ast.ClassDef:
+    if path == RUNNER and name == "LiveRuntimeRunner":
+        return runtime_surface_class(SOURCE_ROOT)
     return next(
         node
         for node in _tree(path).body
@@ -234,10 +241,10 @@ def test_runner_selects_and_writes_back_one_startup_coordinator() -> None:
     selected = _assignment(initializer, "self._startup_phase_coordinator")
     writeback = _assignment(
         initializer,
-        "self.services['startup_phase_coordinator']",
+        "self.runtime_services.startup_phase_coordinator",
     )
     assert ast.unparse(injected.value) == (
-        "self.services.get('startup_phase_coordinator')"
+        "self.runtime_services.startup_phase_coordinator"
     )
     assert isinstance(selected.value, ast.IfExp)
     assert ast.unparse(selected.value.test) == (
@@ -325,16 +332,23 @@ def test_runner_wrappers_retain_health_business_values() -> None:
         } == keywords
 
 
-def test_runner_retains_range_speed_and_blocked_business_conditions() -> None:
+def test_range_speed_component_and_runner_retain_business_conditions() -> None:
     methods = _methods(_class(RUNNER, "LiveRuntimeRunner"))
     range_result = methods["_handle_startup_range_speed_history_result"]
-    conditions = [node for node in ast.walk(range_result) if isinstance(node, ast.If)]
+    assert len(_calls(range_result, "warn_if_insufficient")) == 1
+
+    speed_methods = _methods(
+        _class(RANGE_SPEED_RUNTIME, "RangeSpeedWarmup")
+    )
+    warning_method = speed_methods["warn_if_insufficient"]
+    conditions = [
+        node for node in ast.walk(warning_method) if isinstance(node, ast.If)
+    ]
     assert len(conditions) == 1
     assert ast.unparse(conditions[0].test) == (
-        "self._range_speed_min_periods > 0 and "
-        "loaded_range_speed_history < self._range_speed_min_periods"
+        "self.min_periods > 0 and loaded < self.min_periods"
     )
-    warnings = _calls(range_result, "warning")
+    warnings = _calls(warning_method, "warning")
     assert len(warnings) == 1
     assert ast.unparse(warnings[0].func.value) == "logger"
 

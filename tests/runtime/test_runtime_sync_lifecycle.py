@@ -208,7 +208,10 @@ def test_runner_uses_injected_lifecycle_and_writes_it_back_to_services() -> None
 def test_runner_creates_one_default_lifecycle(monkeypatch) -> None:
     lifecycle = object()
     factory = Mock(return_value=lifecycle)
-    monkeypatch.setattr(runner_module, "RuntimeSyncLifecycle", factory)
+    monkeypatch.setattr(
+        "src.runtime.components.wiring.RuntimeSyncLifecycle",
+        factory,
+    )
 
     runner = _runner()
 

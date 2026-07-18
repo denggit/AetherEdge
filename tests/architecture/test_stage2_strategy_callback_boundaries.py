@@ -30,17 +30,6 @@ FORBIDDEN_EXCHANGE_IMPORTS = (
     "src.platform.account.websocket.binance",
 )
 
-# These are generic runtime collaborators whose method names happen to match
-# controlled Strategy callback names. Keep each exception exact so a new
-# reference still requires an architecture review.
-NON_STRATEGY_CALLBACK_REFERENCES = {
-    ("recover", "src/runtime/runner.py", 2017),
-    ("on_trade", "src/runtime/runner.py", 3583),
-    # Generic Trade Feature Builder callback, not a Strategy callback.
-    ("on_trade", "src/runtime/feature_pipeline.py", 103),
-}
-
-
 def _runtime_files() -> tuple[Path, ...]:
     return tuple(sorted(RUNTIME_ROOT.rglob("*.py")))
 
@@ -63,6 +52,8 @@ def _callback_references(tree: ast.AST) -> tuple[tuple[str, int], ...]:
                 and node.value.attr == "_strategy_host"
             ):
                 continue
+            if _is_non_strategy_callback_receiver(node):
+                continue
             found.add((node.attr, node.lineno))
         if (
             isinstance(node, ast.Call)
@@ -74,6 +65,21 @@ def _callback_references(tree: ast.AST) -> tuple[tuple[str, int], ...]:
         ):
             found.add((str(node.args[1].value), node.lineno))
     return tuple(sorted(found, key=lambda item: (item[1], item[0])))
+
+
+def _is_non_strategy_callback_receiver(node: ast.Attribute) -> bool:
+    """Recognize typed collaborators without brittle path/line exceptions."""
+
+    if node.attr == "recover":
+        return isinstance(node.value, ast.Name) and node.value.id == "service"
+    if node.attr != "on_trade":
+        return False
+    if isinstance(node.value, ast.Name):
+        return node.value.id == "builder" or node.value.id.endswith("_builder")
+    return (
+        isinstance(node.value, ast.Attribute)
+        and node.value.attr.endswith("_builder")
+    )
 
 
 def _all_runtime_callback_references() -> set[tuple[str, str, int]]:
@@ -110,9 +116,6 @@ def test_direct_strategy_callback_locations_match_explicit_allowlist() -> None:
     actual = {name: set() for name in CALLBACK_ALLOWLIST}
     violations: list[str] = []
     for callback, relative_path, line in sorted(_all_runtime_callback_references()):
-        reference = (callback, relative_path, line)
-        if reference in NON_STRATEGY_CALLBACK_REFERENCES:
-            continue
         actual[callback].add(relative_path)
         if relative_path not in CALLBACK_ALLOWLIST[callback]:
             violations.append(
@@ -125,33 +128,21 @@ def test_direct_strategy_callback_locations_match_explicit_allowlist() -> None:
     assert actual == CALLBACK_ALLOWLIST
 
 
-def test_non_strategy_callback_exceptions_are_live_and_exact() -> None:
-    discovered = _all_runtime_callback_references()
-    stale = _stale_non_strategy_callback_references(
-        NON_STRATEGY_CALLBACK_REFERENCES,
-        discovered,
+def test_callback_scanner_ignores_typed_builder_and_service_receivers() -> None:
+    tree = ast.parse(
+        """
+builder.on_trade(event)
+self._builder.on_trade(event)
+service.recover(snapshot)
+strategy.on_trade(event)
+strategy.recover(snapshot)
+"""
     )
 
-    assert stale == set(), (
-        "Stale NON_STRATEGY_CALLBACK_REFERENCES entries:\n"
-        + "\n".join(
-            f"callback={callback} path={path} line={line}"
-            for callback, path, line in sorted(stale)
-        )
+    assert _callback_references(tree) == (
+        ("on_trade", 5),
+        ("recover", 6),
     )
-
-
-def test_stale_exception_detection_checks_callback_path_and_line() -> None:
-    live = ("on_trade", "src/runtime/feature_pipeline.py", 103)
-    missing_line = ("on_trade", "src/runtime/feature_pipeline.py", 104)
-    missing_path = ("on_trade", "src/runtime/missing.py", 103)
-    discovered = _all_runtime_callback_references()
-
-    assert live in discovered
-    assert _stale_non_strategy_callback_references(
-        {live, missing_line, missing_path},
-        discovered,
-    ) == {missing_line, missing_path}
 
 
 def test_runtime_has_no_concrete_strategy_imports() -> None:

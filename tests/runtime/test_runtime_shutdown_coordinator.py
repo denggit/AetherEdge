@@ -189,8 +189,7 @@ def test_default_coordinator_is_created_once_written_back_and_not_executed(
     coordinator = SimpleNamespace(execute=AsyncMock())
     factory = Mock(return_value=coordinator)
     monkeypatch.setattr(
-        runner_module,
-        "RuntimeShutdownCoordinator",
+        "src.runtime.components.wiring.RuntimeShutdownCoordinator",
         factory,
     )
 
@@ -211,12 +210,10 @@ def _install_shutdown_steps(
 ) -> None:
     errors = errors or {}
     for name in (
-        "_stop_range_speed_background_services",
+        "_stop_market_data_modules",
         "_stop_sync_tasks",
         "_stop_producers",
         "_stop_live_persistence_writer",
-        "_stop_range_repair_journal_writer",
-        "_stop_range_checkpoint_writer",
     ):
         label = name.removeprefix("_")
         monkeypatch.setattr(
@@ -235,7 +232,7 @@ def _install_shutdown_steps(
 
 
 @pytest.mark.asyncio
-async def test_final_shutdown_passes_exact_seven_bound_steps(monkeypatch) -> None:
+async def test_final_shutdown_passes_exact_five_bound_steps(monkeypatch) -> None:
     calls: list[str] = []
     captured = []
 
@@ -253,22 +250,18 @@ async def test_final_shutdown_passes_exact_seven_bound_steps(monkeypatch) -> Non
     assert result is None
     assert len(captured) == 1
     assert calls == [
-        "stop_range_speed_background_services",
+        "stop_market_data_modules",
         "stop_sync_tasks",
         "stop_producers",
         "stop_live_persistence_writer",
-        "stop_range_repair_journal_writer",
-        "stop_range_checkpoint_writer",
         "alerts.stop",
     ]
-    assert len(captured[0]) == 7
-    assert captured[0][0] is runner._stop_range_speed_background_services
+    assert len(captured[0]) == 5
+    assert captured[0][0] is runner._stop_market_data_modules
     assert captured[0][1] is runner._stop_sync_tasks
     assert captured[0][2] is runner._stop_producers
     assert captured[0][3] is runner._stop_live_persistence_writer
-    assert captured[0][4] is runner._stop_range_repair_journal_writer
-    assert captured[0][5] is runner._stop_range_checkpoint_writer
-    assert captured[0][6] is runner.context.alerts.stop
+    assert captured[0][4] is runner.context.alerts.stop
 
 
 @pytest.mark.asyncio
@@ -319,7 +312,7 @@ async def test_cleanup_error_propagates_and_skips_remaining_final_steps(
 
     assert raised.value is error
     assert calls == [
-        "stop_range_speed_background_services",
+        "stop_market_data_modules",
         "stop_sync_tasks",
     ]
 
@@ -350,7 +343,7 @@ async def test_cleanup_error_can_override_runtime_error(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_explicit_stop_sets_event_then_runs_exact_four_steps_and_health(
+async def test_explicit_stop_sets_event_then_runs_exact_three_steps_and_health(
     monkeypatch,
 ) -> None:
     calls: list[str] = []
@@ -383,22 +376,19 @@ async def test_explicit_stop_sets_event_then_runs_exact_four_steps_and_health(
     assert result is stopped
     assert calls == [
         "execute",
-        "stop_range_speed_background_services",
+        "stop_market_data_modules",
         "stop_producers",
         "stop_live_persistence_writer",
-        "stop_range_repair_journal_writer",
         "health",
     ]
     assert len(captured) == 1
     assert captured[0] == (
-        runner._stop_range_speed_background_services,
+        runner._stop_market_data_modules,
         runner._stop_producers,
         runner._stop_live_persistence_writer,
-        runner._stop_range_repair_journal_writer,
     )
     excluded = {
         runner._stop_sync_tasks,
-        runner._stop_range_checkpoint_writer,
         runner.context.alerts.stop,
     }
     assert excluded.isdisjoint(captured[0])

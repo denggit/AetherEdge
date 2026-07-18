@@ -18,6 +18,7 @@ from src.platform.config import ProjectEnvConfig
 from src.platform.exchanges.models import ExchangeName, PositionMode
 from src.planner import ExecutionPlanner
 from src.runtime import LiveRuntimeConfig, RuntimeMode
+from src.runtime.components.lifecycle import LifecycleComponent
 from src.runtime.position_mode_gate import PositionModeRequirement
 from src.runtime.runner import (
     LiveRuntimeError,
@@ -263,7 +264,7 @@ def test_v10b_is_not_subject_to_portfolio_gate() -> None:
 
 
 def test_gate_is_ordered_before_recovery_on_start_and_producers() -> None:
-    startup = inspect.getsource(LiveRuntimeRunner._startup)
+    startup = inspect.getsource(LifecycleComponent._run_startup_sequence)
     run = inspect.getsource(LiveRuntimeRunner.run)
     assert startup.index("_bootstrap_account_config_if_enabled") < (
         startup.index("_check_strategy_position_mode_requirements")

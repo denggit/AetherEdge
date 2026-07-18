@@ -3,6 +3,7 @@ from __future__ import annotations
 from src.app import AppConfig
 from src.platform import ExchangeName
 from src.runtime import RuntimeMode, live_runtime_config_from_app, runtime_mode_from_env
+from src.runtime.market_data.range_config import range_runtime_config_from_env
 
 
 def _app_config() -> AppConfig:
@@ -41,9 +42,8 @@ def test_live_runtime_config_wraps_existing_app_config(tmp_path):
     assert cfg.background_queue_maxsize == 7
 
 
-def test_live_runtime_config_loads_range_repair_cooldowns(tmp_path):
-    cfg = live_runtime_config_from_app(
-        _app_config(),
+def test_range_runtime_config_loads_repair_cooldowns(tmp_path):
+    cfg = range_runtime_config_from_env(
         defaults_path=tmp_path / "missing.json",
         environ={
             "AETHER_RANGE_REPAIR_FAILURE_COOLDOWN_SECONDS": "1234",
@@ -53,15 +53,14 @@ def test_live_runtime_config_loads_range_repair_cooldowns(tmp_path):
         },
     )
 
-    assert cfg.range_repair_failure_cooldown_seconds == 1234
-    assert cfg.range_repair_archive_not_ready_cooldown_seconds == 5678
-    assert cfg.range_repair_daily_retry_after_utc_hour == 2
-    assert cfg.range_backfill_archive_publish_lag_hours == 9.5
+    assert cfg.repair_failure_cooldown_seconds == 1234
+    assert cfg.repair_archive_not_ready_cooldown_seconds == 5678
+    assert cfg.repair_daily_retry_after_utc_hour == 2
+    assert cfg.backfill_archive_publish_lag_hours == 9.5
 
 
-def test_live_runtime_config_loads_micro_repair_limits(tmp_path):
-    cfg = live_runtime_config_from_app(
-        _app_config(),
+def test_range_runtime_config_loads_micro_repair_limits(tmp_path):
+    cfg = range_runtime_config_from_env(
         defaults_path=tmp_path / "missing.json",
         environ={
             "AETHER_RANGE_MICRO_REPAIR_ENABLED": "false",
@@ -82,21 +81,21 @@ def test_live_runtime_config_loads_micro_repair_limits(tmp_path):
         },
     )
 
-    assert cfg.range_micro_repair_enabled is False
-    assert cfg.range_micro_repair_max_gap_ms == 123
-    assert cfg.range_micro_repair_max_seconds == 7.5
-    assert cfg.range_micro_repair_max_pages == 8
-    assert cfg.range_micro_repair_page_limit == 9
-    assert cfg.range_micro_repair_monitor_seconds == 11
-    assert cfg.range_micro_repair_missing_bucket_grace_seconds == 12
-    assert cfg.range_micro_repair_status_path == "state/micro.json"
-    assert cfg.range_micro_repair_lock_path == "state/micro.lock"
-    assert cfg.range_repair_journal_enabled is True
-    assert cfg.range_repair_journal_db == "state/journal.sqlite3"
-    assert cfg.range_repair_journal_retention_hours == 13
-    assert cfg.range_repair_journal_writer_max_pending == 14
-    assert cfg.range_repair_journal_flush_interval_ms == 15
-    assert cfg.range_repair_journal_batch_size == 16
+    assert cfg.micro_repair_enabled is False
+    assert cfg.micro_repair_max_gap_ms == 123
+    assert cfg.micro_repair_max_seconds == 7.5
+    assert cfg.micro_repair_max_pages == 8
+    assert cfg.micro_repair_page_limit == 9
+    assert cfg.micro_repair_monitor_seconds == 11
+    assert cfg.micro_repair_missing_bucket_grace_seconds == 12
+    assert cfg.micro_repair_status_path == "state/micro.json"
+    assert cfg.micro_repair_lock_path == "state/micro.lock"
+    assert cfg.repair_journal_enabled is True
+    assert cfg.repair_journal_db == "state/journal.sqlite3"
+    assert cfg.repair_journal_retention_hours == 13
+    assert cfg.repair_journal_writer_max_pending == 14
+    assert cfg.repair_journal_flush_interval_ms == 15
+    assert cfg.repair_journal_batch_size == 16
 
 
 def test_live_runtime_config_injected_environ_ignores_project_master_follower_env(tmp_path, monkeypatch):

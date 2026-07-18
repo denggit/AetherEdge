@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from tests.runtime_surface_ast import runtime_surface_class
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = PROJECT_ROOT / "src"
@@ -29,6 +31,8 @@ def _tree(path: Path) -> ast.Module:
 
 
 def _class(path: Path, name: str) -> ast.ClassDef:
+    if path == RUNNER and name == "LiveRuntimeRunner":
+        return runtime_surface_class(SOURCE_ROOT)
     return next(
         node
         for node in _tree(path).body
@@ -211,10 +215,10 @@ def test_runner_selects_and_writes_back_one_reconciliation_coordinator() -> None
     selected = _assignment(initializer, "self._reconciliation_coordinator")
     writeback = _assignment(
         initializer,
-        "self.services['reconciliation_coordinator']",
+        "self.runtime_services.reconciliation_coordinator",
     )
     assert ast.unparse(injected.value) == (
-        "self.services.get('reconciliation_coordinator')"
+        "self.runtime_services.reconciliation_coordinator"
     )
     assert isinstance(selected.value, ast.IfExp)
     assert ast.unparse(selected.value.test) == (

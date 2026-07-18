@@ -126,7 +126,7 @@ def test_bar_builder_has_no_runtime_or_strategy_imports() -> None:
             f"{builder_path.name} imports platform exchanges"
 
 
-def test_trade_builder_creation_and_config_resolution_live_only_in_pipeline() -> None:
+def test_trade_builder_creation_and_one_time_config_resolution_live_only_in_pipeline() -> None:
     builder_names = {
         "FixedTimeTradeBarBuilder",
         "TradeFootprintBuilder",
@@ -140,12 +140,42 @@ def test_trade_builder_creation_and_config_resolution_live_only_in_pipeline() ->
     )
     assert "trade_feature_runtime_config" not in _getattr_names(RUNTIME_RUNNER)
 
+    tree = ast.parse(
+        TRADE_FEATURE_PIPELINE.read_text(encoding="utf-8"),
+        filename=str(TRADE_FEATURE_PIPELINE),
+    )
+    process_trade = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name == "process_trade"
+    )
+    assert "trade_feature_runtime_config" not in {
+        str(node.args[1].value)
+        for node in ast.walk(process_trade)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "getattr"
+        and len(node.args) >= 2
+        and isinstance(node.args[1], ast.Constant)
+    }
 
-def test_range_bar_builders_remain_owned_by_runner() -> None:
-    constructed = _constructed_names(RUNTIME_RUNNER)
 
-    assert "RangeBarBuilder" in constructed
-    assert "RangeBarAggregator" in constructed
+def test_range_bar_builders_are_owned_only_by_range_module() -> None:
+    range_module = PROJECT_ROOT / "src/runtime/market_data/range_module.py"
+    runner_constructed = _constructed_names(RUNTIME_RUNNER)
+    module_constructed = _constructed_names(range_module)
+
+    assert "RangeBarBuilder" not in runner_constructed
+    assert "RangeBarAggregator" not in runner_constructed
+    assert {"RangeBarBuilder", "RangeBarAggregator"} <= module_constructed
+    assert "src.market_data.derived.range_bar_builder" not in {
+        node.module
+        for node in ast.walk(
+            ast.parse(RUNTIME_RUNNER.read_text(encoding="utf-8"))
+        )
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
 
 
 # ---------------------------------------------------------------------------

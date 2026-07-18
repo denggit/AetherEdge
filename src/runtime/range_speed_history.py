@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import time
-from typing import Any
+from collections.abc import Callable
 
 from src.market_data.backfill.coverage import current_closed_bucket_end_ms
 from src.market_data.backfill.scanner import RangeBackfillScanner
@@ -43,7 +43,8 @@ class RangeSpeedHistoryRefresher:
     def __init__(
         self,
         *,
-        strategy: Any,
+        provider: Callable[[], RangeSpeedHistoryProvider | None] | None = None,
+        strategy: object | None = None,
         store: SqliteRangeCheckpointStore,
         symbol: str,
         exchange: str,
@@ -54,7 +55,13 @@ class RangeSpeedHistoryRefresher:
         backfill_enabled: bool = True,
         status_path: str = "data/state/range_backfill_status.json",
     ) -> None:
-        self.strategy = strategy
+        self._provider = provider or (
+            lambda: (
+                strategy
+                if isinstance(strategy, RangeSpeedHistoryProvider)
+                else None
+            )
+        )
         self.store = store
         self.symbol = symbol
         self.exchange = exchange
@@ -139,8 +146,9 @@ class RangeSpeedHistoryRefresher:
         refreshed = False
         if marker != self._last_marker or coverage_marker != self._last_coverage_marker:
             values = self._history_values_for_strategy(rows)
-            if isinstance(self.strategy, RangeSpeedHistoryProvider):
-                self.strategy.replace_range_speed_history(values)
+            provider = self._provider()
+            if provider is not None:
+                provider.replace_range_speed_history(values)
                 refreshed = True
             else:
                 logger.warning("Strategy has no replace_range_speed_history(); range speed refresh skipped")
@@ -261,9 +269,10 @@ class RangeSpeedHistoryRefresher:
         )
 
     def _strategy_status(self) -> dict[str, int | bool]:
-        if not isinstance(self.strategy, RangeSpeedHistoryProvider):
+        provider = self._provider()
+        if provider is None:
             return {}
-        return dict(self.strategy.range_speed_history_status())
+        return dict(provider.range_speed_history_status())
 
     def _rolling_window_bars(self) -> int:
         return int(self._strategy_status().get("rolling_window_bars", 1080))

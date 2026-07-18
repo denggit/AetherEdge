@@ -25,6 +25,7 @@ from src.platform.data.models import MarketTrade, TradeSide
 from src.platform.exchanges.models import ExchangeName
 from src.planner import ExecutionPlanner
 from src.runtime import LiveRuntimeConfig, LiveRuntimeRunner, RuntimeMode
+from src.runtime.market_data.range_config import RangeRuntimeConfig
 from src.runtime.requirements import StrategyRuntimeRequirements
 
 H4 = 4 * 60 * 60_000
@@ -126,9 +127,11 @@ async def test_live_main_launches_subprocess_without_touching_trade_flow(
     config = LiveRuntimeConfig(
         app=app,
         mode=RuntimeMode.LIVE_RUNTIME,
-        range_checkpoint_db_path=str(tmp_path / "checkpoint.sqlite3"),
+    )
+    range_config = RangeRuntimeConfig(
+        checkpoint_db_path=str(tmp_path / "checkpoint.sqlite3"),
         market_data_db_path=str(tmp_path / "market.sqlite3"),
-        range_repair_journal_db=str(tmp_path / "journal.sqlite3"),
+        repair_journal_db=str(tmp_path / "journal.sqlite3"),
     )
     requirements = StrategyRuntimeRequirements.from_mapping(
         {
@@ -141,6 +144,7 @@ async def test_live_main_launches_subprocess_without_touching_trade_flow(
         app_config=app,
         app_context=context,
         runtime_config=config,
+        range_config=range_config,
         services={
             "runtime_requirements": requirements,
             "range_checkpoint_store": checkpoint_store,
@@ -152,7 +156,7 @@ async def test_live_main_launches_subprocess_without_touching_trade_flow(
         },
     )
     monkeypatch.setattr(
-        "src.runtime.runner.time.time", lambda: NOW_MS / 1000
+        "src.runtime.components.catchup.time.time", lambda: NOW_MS / 1000
     )
 
     runner._initialize_rangebar_trust_window()

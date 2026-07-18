@@ -12,7 +12,9 @@ from src.app import AppConfig
 from src.platform import ExchangeName
 from src.platform.config import ProjectEnvConfig
 from src.runtime import LiveRuntimeConfig, RuntimeMode
-from src.runtime import runner as runner_module
+from src.runtime.components import lifecycle as lifecycle_component
+from src.runtime.market_data import range_speed_runtime
+from src.runtime.market_data.range_speed_runtime import RangeSpeedWarmup
 from src.runtime.models import RuntimePhase
 from src.runtime.requirements import StrategyRuntimeRequirements
 from src.runtime.runner import LiveRuntimeRunner
@@ -298,8 +300,7 @@ def test_injected_coordinator_has_priority_and_no_constructor_execution(
     coordinator = SimpleNamespace(execute=AsyncMock())
     default_factory = Mock()
     monkeypatch.setattr(
-        runner_module,
-        "RuntimeStartupPhaseCoordinator",
+        "src.runtime.components.wiring.RuntimeStartupPhaseCoordinator",
         default_factory,
     )
 
@@ -317,8 +318,7 @@ def test_default_coordinator_is_created_once_written_back_and_not_executed(
     coordinator = SimpleNamespace(execute=AsyncMock())
     factory = Mock(return_value=coordinator)
     monkeypatch.setattr(
-        runner_module,
-        "RuntimeStartupPhaseCoordinator",
+        "src.runtime.components.wiring.RuntimeStartupPhaseCoordinator",
         factory,
     )
 
@@ -343,7 +343,7 @@ async def test_runner_startup_builds_complete_plan_and_logs_around_delegate(
 
     runner = _runner(startup_phase_coordinator=Coordinator())
     logger = Mock()
-    monkeypatch.setattr(runner_module, "logger", logger)
+    monkeypatch.setattr(lifecycle_component, "logger", logger)
 
     result = await runner._startup()
 
@@ -383,7 +383,7 @@ async def test_runner_startup_failure_omits_completed_log(monkeypatch) -> None:
     coordinator = SimpleNamespace(execute=AsyncMock(side_effect=error))
     runner = _runner(startup_phase_coordinator=coordinator)
     logger = Mock()
-    monkeypatch.setattr(runner_module, "logger", logger)
+    monkeypatch.setattr(lifecycle_component, "logger", logger)
 
     with pytest.raises(RuntimeError) as raised:
         await runner._startup()
@@ -416,13 +416,13 @@ def test_health_wrappers_keep_exact_phase_values() -> None:
     ]
 
 
-def test_range_speed_result_wrapper_keeps_exact_warning(monkeypatch) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
-    runner._range_speed_min_periods = 10
+def test_range_speed_runtime_keeps_exact_warning(monkeypatch) -> None:
+    warmup = object.__new__(RangeSpeedWarmup)
+    warmup.min_periods = 10
     logger = Mock()
-    monkeypatch.setattr(runner_module, "logger", logger)
+    monkeypatch.setattr(range_speed_runtime, "logger", logger)
 
-    runner._handle_startup_range_speed_history_result(7)
+    warmup.warn_if_insufficient(7)
 
     logger.warning.assert_called_once_with(
         "Range-speed history insufficient; live runtime continues | complete_history=%s min_periods=%s missing=%s",
@@ -436,17 +436,17 @@ def test_range_speed_result_wrapper_keeps_exact_warning(monkeypatch) -> None:
     ("minimum", "loaded"),
     ((0, 0), (10, 10), (10, 11)),
 )
-def test_range_speed_warning_condition_is_not_expanded(
+def test_range_speed_runtime_warning_condition_is_not_expanded(
     monkeypatch,
     minimum: int,
     loaded: int,
 ) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
-    runner._range_speed_min_periods = minimum
+    warmup = object.__new__(RangeSpeedWarmup)
+    warmup.min_periods = minimum
     logger = Mock()
-    monkeypatch.setattr(runner_module, "logger", logger)
+    monkeypatch.setattr(range_speed_runtime, "logger", logger)
 
-    runner._handle_startup_range_speed_history_result(loaded)
+    warmup.warn_if_insufficient(loaded)
 
     logger.warning.assert_not_called()
 

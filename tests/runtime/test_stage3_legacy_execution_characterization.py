@@ -368,7 +368,13 @@ def test_runner_builds_feedback_request_with_current_propagation_contract() -> N
 
 
 def test_runner_order_result_feedback_depth_is_frozen_at_five() -> None:
-    path = PROJECT_ROOT / "src" / "runtime" / "runner.py"
+    path = (
+        PROJECT_ROOT
+        / "src"
+        / "runtime"
+        / "components"
+        / "signal_execution.py"
+    )
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     function = next(
         node

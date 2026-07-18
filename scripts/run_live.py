@@ -29,8 +29,9 @@ def bootstrap_live_process_config(project_root: Path = PROJECT_ROOT) -> ProjectE
 
 PROJECT_ENV_CONFIG = bootstrap_live_process_config()
 
-from src.app import AppConfig, build_app_context
-from src.runtime import LiveRuntimeRunner, RuntimeMode, live_runtime_config_from_app, runtime_mode_from_env
+from src.app import AppConfig
+from src.runtime import RuntimeMode, runtime_mode_from_env
+from src.runtime.composition import compose_live_runtime
 from src.runtime.runner import LiveRuntimeError, _is_fatal_startup_error
 from src.runtime.strategy_capabilities import StrategyCapabilityError
 from src.utils.log import get_logger
@@ -165,11 +166,9 @@ async def main() -> None:
                 "live preflight/smoke report gate failed | "
                 f"issues={list(gate.issues)}"
             )
-    context = build_app_context(config)
     logger.info("Live runner starting | runtime_mode=%s symbol=%s max_events=%s", runtime_mode.value, config.symbol, args.max_events)
-    runtime_config = live_runtime_config_from_app(config, defaults_path=args.defaults)
-    runner = LiveRuntimeRunner(app_config=config, app_context=context, runtime_config=runtime_config)
-    stats = await runner.run(max_market_events=args.max_events)
+    application = compose_live_runtime(config, defaults_path=args.defaults)
+    stats = await application.run(max_market_events=args.max_events)
     logger.info("Live runner stopped | stats=%s", stats)
 
 

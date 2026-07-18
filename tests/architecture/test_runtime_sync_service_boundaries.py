@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from tests.runtime_surface_ast import runtime_surface_class
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = PROJECT_ROOT / "src"
@@ -26,6 +28,8 @@ def _imports(path: Path) -> set[str]:
 
 
 def _class(path: Path, name: str) -> ast.ClassDef:
+    if path == RUNNER and name == "LiveRuntimeRunner":
+        return runtime_surface_class(SOURCE_ROOT)
     return next(
         node
         for node in _tree(path).body
@@ -222,7 +226,7 @@ def test_runner_init_syncs_compatibility_fields_from_selected_registry() -> None
         node
         for node in assignments
         if ast.unparse(node.targets[0])
-        == "self.services['sync_service_registry']"
+        == "self.runtime_services.sync_service_registry"
     )
     for field, property_name in (
         ("_account_sync_service", "account_service"),

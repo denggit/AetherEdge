@@ -19,20 +19,26 @@ from src.runtime.live_smoke import (
     strategy_plugin_path,
     write_live_smoke_report,
 )
+from src.runtime.market_data.range_config import (
+    range_runtime_config_from_env,
+)
 from src.platform.config import (
     load_project_env_config,
     set_project_env_config,
 )
 from src.app import AppConfig
-from src.runtime.config import live_runtime_config_from_app
 from src.platform.exchanges.credentials import validate_private_credentials
 from src.platform.exchanges.errors import ExchangeConfigError
 from src.platform.exchanges.models import ExchangeConfig
 from src.strategy import load_strategy
+from src.utils.log import get_logger
 from tools._sqlite_readonly_snapshot import (
     ReadOnlySnapshotError,
     stable_sqlite_snapshots,
 )
+
+
+logger = get_logger(__name__)
 
 
 async def run_server_smoke(
@@ -166,6 +172,7 @@ async def run_server_smoke(
             issues=[f"read_only_snapshot_failed:{exc}"],
         )
     except Exception as exc:
+        logger.exception("Live smoke bootstrap failed")
         return BootstrapFailureReport(
             verdict="fail_unknown",
             exit_code=7,
@@ -225,8 +232,7 @@ def _resolve_database_source_paths(
         defaults_path=defaults_path,
         environ=project_env.values,
     )
-    runtime_config = live_runtime_config_from_app(
-        app_config,
+    range_config = range_runtime_config_from_env(
         defaults_path=defaults_path,
         environ=project_env.values,
     )
@@ -245,10 +251,10 @@ def _resolve_database_source_paths(
             )
         ).expanduser().resolve(strict=False),
         "range_checkpoint": Path(
-            runtime_config.range_checkpoint_db_path
+            range_config.checkpoint_db_path
         ).expanduser().resolve(strict=False),
         "mf_feature": Path(
-            runtime_config.market_data_db_path
+            range_config.market_data_db_path
         ).expanduser().resolve(strict=False),
     }
 

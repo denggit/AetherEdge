@@ -156,7 +156,7 @@ def _live_runtime_project_env(tmp_path, *, dry_run: bool):
     )
 
 
-def test_direct_live_rejects_placeholder_credentials_before_app_context(
+def test_direct_live_rejects_placeholder_credentials_before_composition(
     tmp_path,
     monkeypatch,
 ):
@@ -171,7 +171,7 @@ def test_direct_live_rejects_placeholder_credentials_before_app_context(
             build_calls.append(object())
             raise AssertionError("app context built with invalid credentials")
 
-        monkeypatch.setattr(run_live, "build_app_context", forbidden_build)
+        monkeypatch.setattr(run_live, "compose_live_runtime", forbidden_build)
 
         with pytest.raises(LiveRuntimeError) as exc_info:
             asyncio.run(run_live.main())
@@ -199,15 +199,15 @@ def test_dry_run_does_not_require_private_credentials_at_live_validation_layer(
         monkeypatch.setattr(sys, "argv", ["run_live.py"])
 
         def stop_after_validation(*_args, **_kwargs):
-            raise BuildReached("build_app_context_reached")
+            raise BuildReached("composition_reached")
 
-        monkeypatch.setattr(run_live, "build_app_context", stop_after_validation)
+        monkeypatch.setattr(run_live, "compose_live_runtime", stop_after_validation)
 
-        with pytest.raises(BuildReached, match="build_app_context_reached"):
+        with pytest.raises(BuildReached, match="composition_reached"):
             asyncio.run(run_live.main())
 
 
-def test_legacy_runtime_mode_is_rejected_before_app_context(
+def test_legacy_runtime_mode_is_rejected_before_composition(
     tmp_path,
     monkeypatch,
 ):
@@ -228,16 +228,16 @@ def test_legacy_runtime_mode_is_rejected_before_app_context(
         platform_config.set_project_env_config(project_env)
         run_live.PROJECT_ENV_CONFIG = project_env
         monkeypatch.setattr(sys, "argv", ["run_live.py"])
-        build_context = Mock()
-        monkeypatch.setattr(run_live, "build_app_context", build_context)
+        compose = Mock()
+        monkeypatch.setattr(run_live, "compose_live_runtime", compose)
 
         with pytest.raises(LiveRuntimeError, match="unsupported runtime mode"):
             asyncio.run(run_live.main())
 
-    build_context.assert_not_called()
+    compose.assert_not_called()
 
 
-def test_invalid_runtime_mode_is_rejected_before_app_context(
+def test_invalid_runtime_mode_is_rejected_before_composition(
     tmp_path,
     monkeypatch,
 ):
@@ -258,10 +258,10 @@ def test_invalid_runtime_mode_is_rejected_before_app_context(
         platform_config.set_project_env_config(project_env)
         run_live.PROJECT_ENV_CONFIG = project_env
         monkeypatch.setattr(sys, "argv", ["run_live.py"])
-        build_context = Mock()
-        monkeypatch.setattr(run_live, "build_app_context", build_context)
+        compose = Mock()
+        monkeypatch.setattr(run_live, "compose_live_runtime", compose)
 
         with pytest.raises(LiveRuntimeError, match="unsupported runtime mode"):
             asyncio.run(run_live.main())
 
-    build_context.assert_not_called()
+    compose.assert_not_called()

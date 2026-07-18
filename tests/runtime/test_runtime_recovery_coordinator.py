@@ -12,12 +12,13 @@ from src.app import AppConfig
 from src.platform import ExchangeName
 from src.platform.config import ProjectEnvConfig
 from src.runtime import LiveRuntimeConfig, RuntimeMode
-from src.runtime import runner as runner_module
+from src.runtime.components import recovery as recovery_component
 from src.runtime.recovery_coordinator import (
     RuntimeRecoveryCoordinator,
     RuntimeRecoveryPlan,
 )
 from src.runtime.runner import LiveRuntimeError, LiveRuntimeRunner
+from src.runtime.services import DEFAULT_RUNTIME_SERVICE
 from src.runtime.requirements import StrategyRuntimeRequirements
 from src.signals.models import SignalAction
 from src.strategy import StrategyRecoveryStatus
@@ -294,7 +295,10 @@ def test_injected_coordinator_has_priority_without_default_construction(
 ) -> None:
     coordinator = SimpleNamespace(execute=AsyncMock())
     default_factory = Mock()
-    monkeypatch.setattr(runner_module, "RuntimeRecoveryCoordinator", default_factory)
+    monkeypatch.setattr(
+        "src.runtime.components.wiring.RuntimeRecoveryCoordinator",
+        default_factory,
+    )
 
     runner = _runner(recovery_coordinator=coordinator)
 
@@ -302,7 +306,7 @@ def test_injected_coordinator_has_priority_without_default_construction(
     coordinator.execute.assert_not_called()
     assert runner._recovery_coordinator is coordinator
     assert runner.services["recovery_coordinator"] is coordinator
-    assert runner._recovery_service == "__default__"
+    assert runner._recovery_service is DEFAULT_RUNTIME_SERVICE
 
 
 def test_default_coordinator_is_created_once_and_not_executed(
@@ -310,7 +314,10 @@ def test_default_coordinator_is_created_once_and_not_executed(
 ) -> None:
     coordinator = SimpleNamespace(execute=AsyncMock())
     factory = Mock(return_value=coordinator)
-    monkeypatch.setattr(runner_module, "RuntimeRecoveryCoordinator", factory)
+    monkeypatch.setattr(
+        "src.runtime.components.wiring.RuntimeRecoveryCoordinator",
+        factory,
+    )
 
     runner = _runner()
 
@@ -318,7 +325,7 @@ def test_default_coordinator_is_created_once_and_not_executed(
     coordinator.execute.assert_not_called()
     assert runner._recovery_coordinator is coordinator
     assert runner.services["recovery_coordinator"] is coordinator
-    assert runner._recovery_service == "__default__"
+    assert runner._recovery_service is DEFAULT_RUNTIME_SERVICE
 
 
 @pytest.mark.asyncio
@@ -511,7 +518,7 @@ def test_finalize_logs_and_updates_snapshot_compatibility_fields(
         issues=("warning",),
     )
     logger = Mock()
-    monkeypatch.setattr(runner_module, "logger", logger)
+    monkeypatch.setattr(recovery_component, "logger", logger)
 
     returned = runner._finalize_recovery_report(report)
 

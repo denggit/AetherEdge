@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from tests.runtime_surface_ast import runtime_surface_class
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = PROJECT_ROOT / "src"
@@ -70,14 +72,12 @@ def test_runtime_market_data_persistence_has_one_definition() -> None:
 def test_runner_keeps_aliases_without_private_class_definitions() -> None:
     tree = _tree(RUNNER)
     aliases = {
-        target.id: node.value.id
+        alias.asname: alias.name
         for node in tree.body
-        if isinstance(node, ast.Assign)
-        and len(node.targets) == 1
-        and isinstance(node.targets[0], ast.Name)
-        and isinstance(node.value, ast.Name)
-        for target in node.targets
-        if target.id in {"_BackgroundWriteItem", "_BackgroundWriteQueue"}
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "src.runtime.persistence"
+        for alias in node.names
+        if alias.asname in {"_BackgroundWriteItem", "_BackgroundWriteQueue"}
     }
 
     assert aliases == {
@@ -310,11 +310,7 @@ def test_market_data_persistence_holds_only_explicit_dependencies() -> None:
 
 
 def test_runner_market_data_persistence_wrappers_only_delegate() -> None:
-    runner_class = next(
-        node
-        for node in _tree(RUNNER).body
-        if isinstance(node, ast.ClassDef) and node.name == "LiveRuntimeRunner"
-    )
+    runner_class = runtime_surface_class(SOURCE_ROOT)
     methods = {
         node.name: node
         for node in runner_class.body
@@ -354,11 +350,7 @@ def test_market_data_descriptions_are_owned_only_by_gateway() -> None:
         for node in gateway_class.body
         if isinstance(node, ast.FunctionDef)
     }
-    runner_class = next(
-        node
-        for node in _tree(RUNNER).body
-        if isinstance(node, ast.ClassDef) and node.name == "LiveRuntimeRunner"
-    )
+    runner_class = runtime_surface_class(SOURCE_ROOT)
     runner_methods = {
         node.name: node
         for node in runner_class.body
@@ -454,11 +446,7 @@ def test_gateway_rejection_path_uses_submitted_description() -> None:
 
 
 def test_runner_owns_rejection_warning_and_wrappers_pass_callback() -> None:
-    runner_class = next(
-        node
-        for node in _tree(RUNNER).body
-        if isinstance(node, ast.ClassDef) and node.name == "LiveRuntimeRunner"
-    )
+    runner_class = runtime_surface_class(SOURCE_ROOT)
     methods = {
         node.name: node
         for node in runner_class.body
@@ -535,7 +523,7 @@ def test_gateway_has_no_logging_metrics_alerts_or_signal_execution() -> None:
 
 def test_gateway_excludes_error_handlers_checkpoint_and_repair_writers() -> None:
     gateway_tree = _tree(MARKET_DATA_PERSISTENCE)
-    runner_tree = _tree(RUNNER)
+    runner_tree = runtime_surface_class(SOURCE_ROOT)
     gateway_methods = {
         node.name
         for node in ast.walk(gateway_tree)
@@ -568,12 +556,7 @@ def test_gateway_excludes_error_handlers_checkpoint_and_repair_writers() -> None
 
 
 def test_runner_delegates_item_construction_submit_and_stop_to_service() -> None:
-    tree = _tree(RUNNER)
-    runner_class = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "LiveRuntimeRunner"
-    )
+    runner_class = runtime_surface_class(SOURCE_ROOT)
     methods = {
         node.name: node
         for node in runner_class.body
@@ -612,11 +595,7 @@ def test_runner_delegates_item_construction_submit_and_stop_to_service() -> None
 
 
 def test_runtime_persistence_wrappers_remain_in_runner() -> None:
-    runner_class = next(
-        node
-        for node in _tree(RUNNER).body
-        if isinstance(node, ast.ClassDef) and node.name == "LiveRuntimeRunner"
-    )
+    runner_class = runtime_surface_class(SOURCE_ROOT)
     methods = {
         node.name
         for node in runner_class.body
@@ -637,7 +616,9 @@ def test_independent_range_writers_were_not_moved() -> None:
         node.id for node in ast.walk(_tree(PERSISTENCE)) if isinstance(node, ast.Name)
     }
     runner_names = {
-        node.id for node in ast.walk(_tree(RUNNER)) if isinstance(node, ast.Name)
+        node.id
+        for node in ast.walk(runtime_surface_class(SOURCE_ROOT))
+        if isinstance(node, ast.Name)
     }
 
     assert "RangeCheckpointWriter" not in persistence_names

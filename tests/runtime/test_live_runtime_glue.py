@@ -31,6 +31,7 @@ from src.order_management import ExchangeOrderResult, OrderIntent, OrderIntentSt
 from src.order_management.position_plan.models import LegPlan, LegRole, LegSyncStatus, PositionPlan, PositionPlanStatus
 from src.planner import ExecutionPlanner
 from src.runtime import LiveRuntimeConfig, LiveRuntimeRunner, RuntimeMode, RuntimePhase, StrategyRuntimeRequirements
+from src.runtime.market_data.range_config import RangeRuntimeConfig
 from src.runtime.account_sync import RequestThrottle
 from src.runtime.recovery.models import RecoveryReport
 from src.runtime.recovery.service import (
@@ -438,13 +439,15 @@ def _runner(strategy, *, data=None, services=None, dry_run=False, data_streams=(
         app=cfg,
         mode=RuntimeMode.LIVE_RUNTIME,
         closed_bar_buffer_ms=60_000,
-        range_checkpoint_db_path=str(runtime_root / "range-checkpoint.sqlite3"),
-        range_repair_journal_db=str(runtime_root / "repair-journal.sqlite3"),
-        range_micro_repair_status_path=str(runtime_root / "micro-repair-status.json"),
-        range_micro_repair_lock_path=str(runtime_root / "micro-repair.lock"),
-        range_backfill_status_path=str(runtime_root / "backfill-status.json"),
-        range_backfill_lock_path=str(runtime_root / "backfill.lock"),
-        range_backfill_raw_root=str(runtime_root / "raw"),
+    )
+    range_config = RangeRuntimeConfig(
+        checkpoint_db_path=str(runtime_root / "range-checkpoint.sqlite3"),
+        repair_journal_db=str(runtime_root / "repair-journal.sqlite3"),
+        micro_repair_status_path=str(runtime_root / "micro-repair-status.json"),
+        micro_repair_lock_path=str(runtime_root / "micro-repair.lock"),
+        backfill_status_path=str(runtime_root / "backfill-status.json"),
+        backfill_lock_path=str(runtime_root / "backfill.lock"),
+        backfill_raw_root=str(runtime_root / "raw"),
         market_data_db_path=str(runtime_root / "market-data.sqlite3"),
     )
     resolved_services = dict(services or {})
@@ -480,7 +483,13 @@ def _runner(strategy, *, data=None, services=None, dry_run=False, data_streams=(
             "runtime_requirements",
             _feature_requirements(strategy_id=strategy_id),
         )
-    return LiveRuntimeRunner(app_config=cfg, app_context=context, runtime_config=runtime_config, services=resolved_services)
+    return LiveRuntimeRunner(
+        app_config=cfg,
+        app_context=context,
+        runtime_config=runtime_config,
+        range_config=range_config,
+        services=resolved_services,
+    )
 
 
 def _trade(*, trade_time_ms: int = 1_000) -> MarketTrade:
@@ -1348,7 +1357,7 @@ async def test_live_runtime_fails_when_closed_kline_warmup_loads_zero_records():
     )
     zero = _zero_warmup_result()
 
-    with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
+    with patch("src.runtime.components.startup.KlineWarmupService") as MockSvc:
         MockSvc.return_value.warmup = AsyncMock(return_value=zero)
         with pytest.raises(LiveRuntimeError, match="insufficient records"):
             await runner._run_requirement_warmup()
@@ -1374,7 +1383,7 @@ async def test_dry_run_allows_zero_closed_kline_warmup_with_warning():
     )
     zero = _zero_warmup_result()
 
-    with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
+    with patch("src.runtime.components.startup.KlineWarmupService") as MockSvc:
         MockSvc.return_value.warmup = AsyncMock(return_value=zero)
         # Must NOT raise
         await runner._run_requirement_warmup()
@@ -1427,7 +1436,7 @@ async def test_live_runtime_allows_warmup_with_records():
         caught_up=True,
     )
 
-    with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
+    with patch("src.runtime.components.startup.KlineWarmupService") as MockSvc:
         MockSvc.return_value.warmup = AsyncMock(return_value=result)
         # Must NOT raise: available_records=5 >= min_records=1
         await runner._run_requirement_warmup()
@@ -1492,7 +1501,7 @@ async def test_live_runtime_fails_when_closed_kline_warmup_below_min_records():
     )
     few = _few_records_warmup_result()  # records_loaded=5, min_records=1000
 
-    with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
+    with patch("src.runtime.components.startup.KlineWarmupService") as MockSvc:
         MockSvc.return_value.warmup = AsyncMock(return_value=few)
         with pytest.raises(LiveRuntimeError, match="insufficient records"):
             await runner._run_requirement_warmup()
@@ -1518,7 +1527,7 @@ async def test_dry_run_allows_closed_kline_warmup_below_min_records_with_warning
     )
     few = _few_records_warmup_result()  # records_loaded=5, min_records=1000
 
-    with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
+    with patch("src.runtime.components.startup.KlineWarmupService") as MockSvc:
         MockSvc.return_value.warmup = AsyncMock(return_value=few)
         # Must NOT raise
         await runner._run_requirement_warmup()
@@ -1548,7 +1557,7 @@ async def test_closed_kline_min_records_is_enforced_by_runtime():
     )
     few = _few_records_warmup_result()
 
-    with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
+    with patch("src.runtime.components.startup.KlineWarmupService") as MockSvc:
         MockSvc.return_value.warmup = AsyncMock(return_value=few)
         with pytest.raises(LiveRuntimeError) as exc_info:
             await runner._run_requirement_warmup()
@@ -1624,8 +1633,8 @@ async def test_live_runtime_uses_available_kline_records_not_newly_loaded_record
     )
 
     # Patch time range computation so it covers the test klines (0 .. H4*999).
-    with patch("src.runtime.runner.closed_bar_open_time_ms", return_value=H4 * 999):
-        with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
+    with patch("src.runtime.components.startup.closed_bar_open_time_ms", return_value=H4 * 999):
+        with patch("src.runtime.components.startup.KlineWarmupService") as MockSvc:
             MockSvc.return_value.warmup = AsyncMock(return_value=result)
             # Must NOT raise — available_records=1000 >= min_records=1000
             await runner._run_requirement_warmup()
@@ -1687,8 +1696,8 @@ async def test_live_runtime_backfills_when_available_records_below_min():
         success=True,
     )
 
-    with patch("src.runtime.runner.closed_bar_open_time_ms", return_value=H4 * 999):
-        with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
+    with patch("src.runtime.components.startup.closed_bar_open_time_ms", return_value=H4 * 999):
+        with patch("src.runtime.components.startup.KlineWarmupService") as MockSvc:
             MockSvc.return_value.warmup = AsyncMock(return_value=result)
             with patch("src.market_data.warmup.kline_provider.MarketDataKlineProvider") as MockProv:
                 MockProv.return_value.backfill_and_reload = AsyncMock(return_value=fake_diag)
@@ -1754,8 +1763,8 @@ async def test_live_runtime_fails_when_available_records_below_min_after_backfil
         success=False,
     )
 
-    with patch("src.runtime.runner.closed_bar_open_time_ms", return_value=H4 * 999):
-        with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
+    with patch("src.runtime.components.startup.closed_bar_open_time_ms", return_value=H4 * 999):
+        with patch("src.runtime.components.startup.KlineWarmupService") as MockSvc:
             MockSvc.return_value.warmup = AsyncMock(return_value=result)
             with patch("src.market_data.warmup.kline_provider.MarketDataKlineProvider") as MockProv:
                 MockProv.return_value.backfill_and_reload = AsyncMock(return_value=fake_diag)
@@ -1797,8 +1806,8 @@ async def test_live_runtime_skips_backfill_when_available_records_already_suffic
         caught_up=True,
     )
 
-    with patch("src.runtime.runner.closed_bar_open_time_ms", return_value=H4 * 999):
-        with patch("src.runtime.runner.KlineWarmupService") as MockSvc:
+    with patch("src.runtime.components.startup.closed_bar_open_time_ms", return_value=H4 * 999):
+        with patch("src.runtime.components.startup.KlineWarmupService") as MockSvc:
             MockSvc.return_value.warmup = AsyncMock(return_value=result)
             with patch("src.market_data.warmup.kline_provider.MarketDataKlineProvider") as MockProv:
                 await runner._run_requirement_warmup()

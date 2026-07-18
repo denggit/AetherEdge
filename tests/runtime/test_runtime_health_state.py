@@ -152,10 +152,12 @@ def test_runner_creates_one_default_state_with_exact_initial_snapshot(
     state = SimpleNamespace(current=current, update=Mock())
     state_factory = Mock(return_value=state)
     heartbeat = Mock()
-    monkeypatch.setattr(runner_module, "RuntimeHealthState", state_factory)
     monkeypatch.setattr(
-        runner_module,
-        "RuntimeHeartbeatService",
+        "src.runtime.components.wiring.RuntimeHealthState",
+        state_factory,
+    )
+    monkeypatch.setattr(
+        "src.runtime.components.wiring.RuntimeHeartbeatService",
         Mock(return_value=heartbeat),
     )
 
@@ -189,7 +191,10 @@ def test_injected_state_has_priority_and_is_not_updated_during_construction(
     )
     state = SimpleNamespace(current=current, update=Mock())
     default_factory = Mock()
-    monkeypatch.setattr(runner_module, "RuntimeHealthState", default_factory)
+    monkeypatch.setattr(
+        "src.runtime.components.wiring.RuntimeHealthState",
+        default_factory,
+    )
 
     runner = _runner(services={"runtime_health_state": state})
 
@@ -268,10 +273,9 @@ async def test_start_and_stop_return_the_final_compatibility_snapshots() -> None
     async def no_op() -> None:
         return None
 
-    runner._stop_range_speed_background_services = no_op
+    runner._stop_market_data_modules = no_op
     runner._stop_producers = no_op
     runner._stop_live_persistence_writer = no_op
-    runner._stop_range_repair_journal_writer = no_op
 
     running = await runner.start()
     stopped = await runner.stop()

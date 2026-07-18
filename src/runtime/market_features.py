@@ -60,10 +60,20 @@ async def _dispatch_to_strategy_observers(
     strategy: object,
     event: MarketFeatureEvent,
 ) -> tuple[TradeSignal, ...]:
-    """Dispatch through the dynamically resolved observer boundary."""
+    return await _dispatch_to_observers(
+        resolve_market_feature_observers(strategy),
+        event,
+    )
+
+
+async def _dispatch_to_observers(
+    observers: Sequence[MarketFeatureObserver],
+    event: MarketFeatureEvent,
+) -> tuple[TradeSignal, ...]:
+    """Dispatch through observers frozen during composition."""
 
     signals: list[TradeSignal] = []
-    for observer in resolve_market_feature_observers(strategy):
+    for observer in observers:
         result = observer.on_market_feature(event)
         if inspect.isawaitable(result):
             result = await result
@@ -81,19 +91,30 @@ async def _dispatch_to_strategy_observers(
 
 
 class MarketFeaturePipeline:
-    """Resolve and dispatch normalized market features to Strategy observers."""
+    """Dispatch features to observers resolved once during composition."""
 
-    def __init__(self, strategy: object) -> None:
-        self._strategy = strategy
+    def __init__(
+        self,
+        strategy: object | None = None,
+        *,
+        observers: Sequence[MarketFeatureObserver] | None = None,
+    ) -> None:
+        if strategy is not None and observers is not None:
+            raise ValueError("provide strategy or observers, not both")
+        self._observers = (
+            resolve_market_feature_observers(strategy)
+            if observers is None
+            else tuple(observers)
+        )
 
     def resolve_observers(self) -> tuple[MarketFeatureObserver, ...]:
-        return resolve_market_feature_observers(self._strategy)
+        return self._observers
 
     async def dispatch(
         self,
         event: MarketFeatureEvent,
     ) -> tuple[TradeSignal, ...]:
-        return await _dispatch_to_strategy_observers(self._strategy, event)
+        return await _dispatch_to_observers(self._observers, event)
 
 
 __all__ = [

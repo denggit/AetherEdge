@@ -21,7 +21,7 @@ from src.market_data.range_repair import (
     RangeRepairJournalWriter,
     SqliteRangeRepairJournalStore,
 )
-from src.runtime.config import LiveRuntimeConfig
+from src.runtime.market_data.range_config import RangeRuntimeConfig
 from src.runtime.range_micro_repair_supervisor import (
     RangeMicroRepairSupervisor,
     RangeMicroRepairSupervisorConfig,
@@ -47,7 +47,7 @@ class RangeRepairBootstrapService:
     def __init__(
         self,
         *,
-        runtime_config: LiveRuntimeConfig,
+        range_config: RangeRuntimeConfig,
         exchange: str,
         symbol: str,
         range_pct: str,
@@ -63,7 +63,7 @@ class RangeRepairBootstrapService:
         clock_ms: Callable[[], int] | None = None,
         repo_root: Path | None = None,
     ) -> None:
-        self.runtime_config = runtime_config
+        self.range_config = range_config
         self.exchange = str(exchange)
         self.symbol = symbol
         self.range_pct = str(range_pct)
@@ -91,7 +91,7 @@ class RangeRepairBootstrapService:
         *,
         initial_bucket_ms: int | None,
     ) -> RangeRepairBootstrapResult:
-        if not self.runtime_config.range_micro_repair_enabled:
+        if not self.range_config.micro_repair_enabled:
             return self._result()
         checkpoint = recovery.checkpoint
         repairable = (
@@ -101,7 +101,7 @@ class RangeRepairBootstrapService:
             and recovery.missing_gap_ms > 0
             and recovery.coverage_status
             != RangeCoverageStatus.COMPLETE.value
-            and self.runtime_config.range_repair_journal_enabled
+            and self.range_config.repair_journal_enabled
         )
         if not repairable:
             if recovery.missing_gap_ms > 0:
@@ -119,7 +119,7 @@ class RangeRepairBootstrapService:
                         reasons.append("checkpoint_last_trade_ts_ms_is_none")
                 if recovery.coverage_status == RangeCoverageStatus.COMPLETE.value:
                     reasons.append("bucket_already_complete")
-                if not self.runtime_config.range_repair_journal_enabled:
+                if not self.range_config.repair_journal_enabled:
                     reasons.append("repair_journal_disabled")
                 failure_reason = (
                     "+".join(reasons)
@@ -226,7 +226,7 @@ class RangeRepairBootstrapService:
     def get_journal_store(self) -> SqliteRangeRepairJournalStore:
         if self._journal_store is None:
             self._journal_store = self._journal_store_factory(
-                self.runtime_config.range_repair_journal_db
+                self.range_config.repair_journal_db
             )
         return self._journal_store
 
@@ -289,18 +289,16 @@ class RangeRepairBootstrapService:
             self._journal_writer = self._journal_writer_factory(
                 self.get_journal_store(),
                 max_pending=(
-                    self.runtime_config
-                    .range_repair_journal_writer_max_pending
+                    self.range_config.repair_journal_writer_max_pending
                 ),
                 flush_interval_ms=(
-                    self.runtime_config
-                    .range_repair_journal_flush_interval_ms
+                    self.range_config.repair_journal_flush_interval_ms
                 ),
                 batch_size=(
-                    self.runtime_config.range_repair_journal_batch_size
+                    self.range_config.repair_journal_batch_size
                 ),
                 retention_hours=(
-                    self.runtime_config.range_repair_journal_retention_hours
+                    self.range_config.repair_journal_retention_hours
                 ),
                 on_error=on_error,
                 on_invalidated=on_invalidated,
@@ -313,43 +311,40 @@ class RangeRepairBootstrapService:
                 self._micro_repair_supervisor_factory(
                     RangeMicroRepairSupervisorConfig(
                         enabled=(
-                            self.runtime_config.range_micro_repair_enabled
+                            self.range_config.micro_repair_enabled
                         ),
                         monitor_seconds=(
-                            self.runtime_config
-                            .range_micro_repair_monitor_seconds
+                            self.range_config.micro_repair_monitor_seconds
                         ),
                         status_path=Path(
-                            self.runtime_config
-                            .range_micro_repair_status_path
+                            self.range_config.micro_repair_status_path
                         ),
                         lock_path=Path(
-                            self.runtime_config.range_micro_repair_lock_path
+                            self.range_config.micro_repair_lock_path
                         ),
                         checkpoint_db_path=Path(
-                            self.runtime_config.range_checkpoint_db_path
+                            self.range_config.checkpoint_db_path
                         ),
                         market_db_path=Path(
-                            self.runtime_config.market_data_db_path
+                            self.range_config.market_data_db_path
                         ),
                         journal_db_path=Path(
-                            self.runtime_config.range_repair_journal_db
+                            self.range_config.repair_journal_db
                         ),
                         max_gap_ms=(
-                            self.runtime_config.range_micro_repair_max_gap_ms
+                            self.range_config.micro_repair_max_gap_ms
                         ),
                         page_limit=(
-                            self.runtime_config.range_micro_repair_page_limit
+                            self.range_config.micro_repair_page_limit
                         ),
                         max_pages=(
-                            self.runtime_config.range_micro_repair_max_pages
+                            self.range_config.micro_repair_max_pages
                         ),
                         max_seconds=(
-                            self.runtime_config.range_micro_repair_max_seconds
+                            self.range_config.micro_repair_max_seconds
                         ),
                         missing_bucket_grace_seconds=(
-                            self.runtime_config
-                            .range_micro_repair_missing_bucket_grace_seconds
+                            self.range_config.micro_repair_missing_bucket_grace_seconds
                         ),
                         repo_root=self._repo_root,
                     ),

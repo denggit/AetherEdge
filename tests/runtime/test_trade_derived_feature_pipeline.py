@@ -78,16 +78,11 @@ async def test_disabled_config_does_not_create_builders_or_emit(strategy) -> Non
 
 
 @pytest.mark.asyncio
-async def test_builders_are_created_lazily_once_and_reused() -> None:
+async def test_builders_are_created_once_at_startup_and_reused() -> None:
     pipeline = TradeDerivedFeaturePipeline(
         strategy=_EnabledStrategy(),
         emit_feature=_discard,
     )
-    assert pipeline.fixed_time_trade_bar_builder is None
-    assert pipeline.trade_footprint_builder is None
-    assert pipeline.range_footprint_builder is None
-
-    await pipeline.process_trade(_trade(trade_time_ms=100))
     builders = (
         pipeline.fixed_time_trade_bar_builder,
         pipeline.trade_footprint_builder,
@@ -95,6 +90,7 @@ async def test_builders_are_created_lazily_once_and_reused() -> None:
     )
     assert all(builder is not None for builder in builders)
 
+    await pipeline.process_trade(_trade(trade_time_ms=100))
     await pipeline.process_trade(_trade(trade_time_ms=101))
 
     assert pipeline.fixed_time_trade_bar_builder is builders[0]
@@ -222,9 +218,7 @@ async def test_config_provider_exception_propagates() -> None:
             raise expected
 
     with pytest.raises(RuntimeError) as raised:
-        await TradeDerivedFeaturePipeline(
-            strategy=Strategy(), emit_feature=_discard
-        ).process_trade(_trade())
+        TradeDerivedFeaturePipeline(strategy=Strategy(), emit_feature=_discard)
 
     assert raised.value is expected
 
@@ -274,7 +268,7 @@ async def test_emitter_exception_propagates_and_pipeline_has_no_execution_depend
 
     assert raised.value is expected
     assert set(vars(pipeline)) == {
-        "_strategy",
+        "_config",
         "_emit_feature",
         "fixed_time_trade_bar_builder",
         "trade_footprint_builder",

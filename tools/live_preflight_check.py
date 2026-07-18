@@ -59,12 +59,14 @@ from src.platform.execution.factory import create_execution_client
 from src.platform.snapshot import PlatformSnapshot, fetch_platform_snapshot
 from src.runtime import (
     RuntimeMode,
-    live_runtime_config_from_app,
     runtime_mode_from_env,
 )
 from src.runtime.live_smoke import (
     BootstrapFailureReport,
     strategy_plugin_path,
+)
+from src.runtime.market_data.range_config import (
+    range_runtime_config_from_env,
 )
 from src.runtime.tasks.scheduler import closed_bar_open_time_ms
 from src.strategy import load_strategy
@@ -497,8 +499,7 @@ def _resolve_database_source_paths(
     project_env,
     defaults_path: str | Path,
 ) -> dict[str, Path]:
-    runtime_config = live_runtime_config_from_app(
-        app_config,
+    range_config = range_runtime_config_from_env(
         defaults_path=defaults_path,
         environ=project_env.values,
     )
@@ -517,10 +518,10 @@ def _resolve_database_source_paths(
             )
         ).expanduser().resolve(strict=False),
         "range_checkpoint": Path(
-            runtime_config.range_checkpoint_db_path
+            range_config.checkpoint_db_path
         ).expanduser().resolve(strict=False),
         "mf_feature": Path(
-            runtime_config.market_data_db_path
+            range_config.market_data_db_path
         ).expanduser().resolve(strict=False),
     }
 

@@ -4,12 +4,15 @@ import ast
 import re
 from pathlib import Path
 
+from tests.runtime_surface_ast import runtime_surface_class
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 STRATEGY_PORT = PROJECT_ROOT / "src" / "strategy" / "market_features.py"
 RUNTIME_DISPATCHER = PROJECT_ROOT / "src" / "runtime" / "market_features.py"
 TRADE_FEATURE_PIPELINE = PROJECT_ROOT / "src" / "runtime" / "feature_pipeline.py"
 RUNNER = PROJECT_ROOT / "src" / "runtime" / "runner.py"
+WIRING = PROJECT_ROOT / "src" / "runtime" / "components" / "wiring.py"
 NEW_SOURCE_FILES = (
     STRATEGY_PORT,
     RUNTIME_DISPATCHER,
@@ -111,7 +114,7 @@ def test_market_feature_pipeline_has_one_definition_and_no_runtime_side_effects(
 
 
 def test_runner_uses_only_market_feature_pipeline_boundary() -> None:
-    tree = ast.parse(RUNNER.read_text(encoding="utf-8"), filename=str(RUNNER))
+    tree = ast.parse(WIRING.read_text(encoding="utf-8"), filename=str(WIRING))
     dispatcher_imports = [
         alias.name
         for node in ast.walk(tree)
@@ -140,12 +143,7 @@ def test_runner_uses_only_market_feature_pipeline_boundary() -> None:
 
 
 def test_runner_owns_feature_bookkeeping_and_trade_pipeline_emitter() -> None:
-    tree = ast.parse(RUNNER.read_text(encoding="utf-8"), filename=str(RUNNER))
-    runner_class = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "LiveRuntimeRunner"
-    )
+    runner_class = runtime_surface_class(PROJECT_ROOT / "src")
     assert any(
         isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and node.name == "process_market_feature"

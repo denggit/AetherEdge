@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +12,7 @@ from src.market_data.range_checkpoint import (
 from src.runtime.range_repair_bootstrap import (
     RangeRepairBootstrapService,
 )
+from src.runtime.market_data.range_config import RangeRuntimeConfig
 
 
 BUCKET_START = 1_780_000_000_000
@@ -59,24 +59,24 @@ class _Supervisor:
 
 
 def _config(tmp_path):
-    return SimpleNamespace(
-        range_micro_repair_enabled=True,
-        range_repair_journal_enabled=True,
-        range_repair_journal_db=str(tmp_path / "journal.sqlite3"),
-        range_repair_journal_writer_max_pending=20_000,
-        range_repair_journal_flush_interval_ms=500,
-        range_repair_journal_batch_size=1_000,
-        range_repair_journal_retention_hours=12,
-        range_micro_repair_monitor_seconds=30.0,
-        range_micro_repair_status_path=str(tmp_path / "status.json"),
-        range_micro_repair_lock_path=str(tmp_path / "repair.lock"),
-        range_checkpoint_db_path=str(tmp_path / "checkpoint.sqlite3"),
+    return RangeRuntimeConfig(
+        micro_repair_enabled=True,
+        repair_journal_enabled=True,
+        repair_journal_db=str(tmp_path / "journal.sqlite3"),
+        repair_journal_writer_max_pending=20_000,
+        repair_journal_flush_interval_ms=500,
+        repair_journal_batch_size=1_000,
+        repair_journal_retention_hours=12,
+        micro_repair_monitor_seconds=30.0,
+        micro_repair_status_path=str(tmp_path / "status.json"),
+        micro_repair_lock_path=str(tmp_path / "repair.lock"),
+        checkpoint_db_path=str(tmp_path / "checkpoint.sqlite3"),
         market_data_db_path=str(tmp_path / "market.sqlite3"),
-        range_micro_repair_max_gap_ms=600_000,
-        range_micro_repair_page_limit=100,
-        range_micro_repair_max_pages=20,
-        range_micro_repair_max_seconds=30.0,
-        range_micro_repair_missing_bucket_grace_seconds=120,
+        micro_repair_max_gap_ms=600_000,
+        micro_repair_page_limit=100,
+        micro_repair_max_pages=20,
+        micro_repair_max_seconds=30.0,
+        micro_repair_missing_bucket_grace_seconds=120,
     )
 
 
@@ -101,7 +101,7 @@ def _checkpoint() -> RangeBuilderCheckpoint:
 
 def _service(tmp_path, checkpoint_store, clock_ms):
     return RangeRepairBootstrapService(
-        runtime_config=_config(tmp_path),
+        range_config=_config(tmp_path),
         exchange="okx",
         symbol="ETH-USDT-PERP",
         range_pct="0.002",

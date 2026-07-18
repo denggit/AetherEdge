@@ -86,7 +86,7 @@ def _isolate_runtime_state_per_test(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     _apply_isolated_environment(test_root)
     from src.platform.config import reset_project_env_config_for_tests
     from src.runtime.heartbeat import RuntimeHeartbeatService, RuntimeHeartbeatStore
-    import src.runtime.runner as runner_module
+    import src.runtime.components.wiring as runtime_wiring
     from strategies.eth_portfolio_v1.domain.mf_data import MfDataBuffer, MfDataReadiness
 
     reset_project_env_config_for_tests()
@@ -98,7 +98,7 @@ def _isolate_runtime_state_per_test(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         return RuntimeHeartbeatService(store=resolved, interval_seconds=interval_seconds)
 
     monkeypatch.setattr(
-        runner_module,
+        runtime_wiring,
         "RuntimeHeartbeatService",
         isolated_heartbeat_service,
     )
