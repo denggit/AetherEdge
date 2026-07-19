@@ -3356,7 +3356,8 @@ async def test_drain_incomplete_marks_range_context_degraded(monkeypatch):
     assert runner._range_context_degraded_buckets[open_time_ms] == "market_queue_drain_incomplete_before_closed_bar"
     assert events == []
     assert runner._market_queue.qsize() == 1
-    assert runner._closed_bar_scheduler.last_emitted_open_time_ms is None
+    # Skipped windows are recorded so they are never retried.
+    assert runner._closed_bar_scheduler.is_skipped(open_time_ms)
 
 
 @pytest.mark.asyncio
@@ -3625,7 +3626,8 @@ async def test_incomplete_trade_window_suppresses_entire_closed_bar_decision():
 
     assert events == []
     assert runner.stats.closed_klines_seen == 0
-    assert runner._closed_bar_scheduler.last_emitted_open_time_ms is None
+    # Skipped windows are permanently recorded.
+    assert runner._closed_bar_scheduler.is_skipped(2 * H4)
     assert runner._market_queue.empty()
 
 

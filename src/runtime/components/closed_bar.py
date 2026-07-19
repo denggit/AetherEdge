@@ -61,10 +61,33 @@ class ClosedBarComponent(RuntimeComponent):
         if due is None:
             return []
         open_time_ms, closed_kline = due
-        if not await self._drain_before_closed_bar(
-            open_time_ms,
-            closed_kline,
-        ):
+        try:
+            drained = await self._drain_before_closed_bar(
+                open_time_ms,
+                closed_kline,
+            )
+        except Exception:
+            # Barrier / dispatcher / source failure → fatal.
+            self._mark_range_context_degraded_bucket(
+                bucket_start_ms=open_time_ms,
+                reason="fatal_pipeline_failure",
+                event_time_ms=closed_kline.close_time_ms,
+            )
+            raise
+        if not drained:
+            # Data incomplete → skip this window permanently.
+            scheduler = self._closed_bar_scheduler
+            mark = getattr(scheduler, "mark_skipped", None)
+            if callable(mark):
+                mark(open_time_ms, "trade_data_incomplete")
+            should_alert = getattr(scheduler, "should_alert_skipped", None)
+            if callable(should_alert) and should_alert(open_time_ms):
+                logger.error(
+                    "Closed-bar permanently skipped | open_time_ms=%s "
+                    "close_time_ms=%s reason=trade_data_incomplete",
+                    open_time_ms,
+                    closed_kline.close_time_ms,
+                )
             return []
         features = await self._emit_closed_kline_feature(
             open_time_ms,

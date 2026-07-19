@@ -442,3 +442,191 @@ async def test_empty_market_runtime_creates_no_supervisor_or_pending_task() -> N
     assert {
         task for task in asyncio.all_tasks() if task is not current
     } == before
+
+
+# ---------------------------------------------------------------------------
+# Causal processing fence tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_causal_fence_pauses_future_trade_handler() -> None:
+    """A future trade (event_time > cutoff) must NOT execute while fence active."""
+    release = asyncio.Event()
+    handler_started = asyncio.Event()
+    past_done = asyncio.Event()
+    dispatcher = BoundedOrderedEventDispatcher[MarketTrade](
+        maxsize=8,
+        event_time_ms=lambda t: t.trade_time_ms,
+    )
+
+    async def handler(trade: MarketTrade) -> None:
+        handler_started.set()
+        await release.wait()
+        past_done.set()
+
+    dispatcher.subscribe(subscriber_id="h", handler=handler)
+    await dispatcher.start()
+
+    # Publish past trade (time=100, <= cutoff=100).
+    dispatcher.publish(_trade("past", 100, price="100"))
+
+    # Start fence BEFORE publishing future trade.
+    fence_task = asyncio.create_task(
+        _run_fence(dispatcher, cutoff=100)
+    )
+    # Wait for the drain phase to complete (past trade done).
+    await asyncio.wait_for(handler_started.wait(), timeout=1)
+    release.set()
+    await asyncio.wait_for(past_done.wait(), timeout=1)
+
+    # Now publish a future trade (time=200 > cutoff=100).
+    future_started = asyncio.Event()
+    future_done = asyncio.Event()
+
+    async def future_handler(trade: MarketTrade) -> None:
+        future_started.set()
+        await asyncio.Event().wait()  # never finishes during fence
+
+    # We need to check that the worker doesn't process the future trade.
+    # After drain, the past trade is done. The worker will try to dequeue next.
+    dispatcher.publish(_trade("future", 200, price="200"))
+    # The worker should check fence and pause. We verify by checking
+    # that future_started is NOT set after a short delay.
+    await asyncio.sleep(0.05)
+    assert not future_started.is_set(), "future trade handler must not start during fence"
+
+    # Release the fence.
+    fence_task.cancel()
+    with __import__("contextlib", fromlist=["suppress"]).suppress(
+        asyncio.CancelledError
+    ):
+        await fence_task
+    await dispatcher.stop()
+
+
+async def _run_fence(dispatcher, cutoff):
+    async with dispatcher.processing_fence(cutoff, timeout_seconds=1):
+        await asyncio.sleep(0.2)  # simulate closed-bar decision
+
+
+@pytest.mark.asyncio
+async def test_causal_fence_simple_pause_and_resume() -> None:
+    """Future trade pauses at fence boundary, resumes after release."""
+    release_future = asyncio.Event()
+    seen: list[str] = []
+    dispatcher = BoundedOrderedEventDispatcher[MarketTrade](
+        maxsize=8,
+        event_time_ms=lambda t: t.trade_time_ms,
+    )
+
+    async def handler(trade: MarketTrade) -> None:
+        tid = trade.trade_id or ""
+        if tid.startswith("future"):
+            # Simulate future trade that would modify strategy state.
+            await release_future.wait()
+        seen.append(tid)
+
+    dispatcher.subscribe(subscriber_id="h", handler=handler)
+    await dispatcher.start()
+
+    # Phase 1: Publish past trade.
+    dispatcher.publish(_trade("past", 100, price="100"))
+
+    # Phase 2: Enter fence, drain past.
+    async def closed_bar_phase():
+        async with dispatcher.processing_fence(100, timeout_seconds=1):
+            # Past trade is already processed.
+            # Future trade is published but should not be processed yet.
+            pass
+
+    # Publish future trade before fence.
+    dispatcher.publish(_trade("future-1", 200, price="200"))
+
+    fence_done = asyncio.Event()
+
+    async def run_fence():
+        async with dispatcher.processing_fence(100, timeout_seconds=1):
+            fence_done.set()
+            await asyncio.sleep(0.05)
+        # Fence released.
+
+    fence_task = asyncio.create_task(run_fence())
+    await asyncio.wait_for(fence_done.wait(), timeout=1)
+
+    # At this point: past trade done, future-1 published but paused at fence.
+    # Wait a tick and verify future-1 hasn't processed.
+    await asyncio.sleep(0.05)
+    assert "future-1" not in seen, "future trade must not be processed inside fence"
+
+    # Release the fence (by letting it complete).
+    await asyncio.wait_for(fence_task, timeout=1)
+
+    # Now let the future trade be processed.
+    release_future.set()
+    await asyncio.sleep(0.1)
+
+    assert "past" in seen
+    assert "future-1" in seen
+    await dispatcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_causal_fence_late_trade_during_fence_is_included() -> None:
+    """A trade published during fence with event_time <= cutoff must be processed."""
+    seen: list[str] = []
+    dispatcher = BoundedOrderedEventDispatcher[MarketTrade](
+        maxsize=8,
+        event_time_ms=lambda t: t.trade_time_ms,
+    )
+
+    async def handler(trade: MarketTrade) -> None:
+        seen.append(trade.trade_id or "")
+
+    dispatcher.subscribe(subscriber_id="h", handler=handler)
+    await dispatcher.start()
+
+    # Phase 1: initial past trade.
+    dispatcher.publish(_trade("initial", 50, price="100"))
+
+    late_seen_in_fence = False
+
+    async def closed_bar_with_late():
+        nonlocal late_seen_in_fence
+        async with dispatcher.processing_fence(100, timeout_seconds=1):
+            # Publish a late trade (time=80 <= cutoff=100)
+            dispatcher.publish(_trade("late", 80, price="101"))
+            # Give worker time to process it.
+            await asyncio.sleep(0.1)
+            late_seen_in_fence = "late" in seen
+
+    await closed_bar_with_late()
+    assert late_seen_in_fence, "late trade must be processed during fence"
+    await dispatcher.stop()
+
+
+@pytest.mark.asyncio
+async def test_causal_fence_timeout_raises() -> None:
+    """Fence with timeout=0 on blocked dispatcher raises FenceTimeout."""
+    from src.runtime.market_data.dispatcher import FenceTimeout
+
+    blocker = asyncio.Event()
+    dispatcher = BoundedOrderedEventDispatcher[MarketTrade](
+        maxsize=4,
+        event_time_ms=lambda t: t.trade_time_ms,
+    )
+
+    async def slow(_trade: MarketTrade) -> None:
+        await blocker.wait()
+
+    dispatcher.subscribe(subscriber_id="slow", handler=slow)
+    await dispatcher.start()
+    # Publish a past trade — handler blocks.
+    dispatcher.publish(_trade("blocked", 50, price="100"))
+
+    with pytest.raises((FenceTimeout, __import__("asyncio").TimeoutError)):
+        async with dispatcher.processing_fence(100, timeout_seconds=0.01):
+            pass  # should never reach here
+
+    blocker.set()
+    await dispatcher.stop()

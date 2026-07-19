@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Generic, Protocol, TypeVar
@@ -354,6 +355,17 @@ class _CutoffBarrier(Generic[EventT]):
     publication_revision: int = 0
 
 
+@dataclass
+class _ProcessingFence:
+    cutoff_time_ms: int
+    released: asyncio.Event = field(default_factory=asyncio.Event)
+    boundary_reached: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+class FenceTimeout(RuntimeError):
+    pass
+
+
 class BoundedOrderedEventDispatcher(Generic[EventT]):
     """Bound WebSocket backpressure while preserving consumer call order."""
 
@@ -384,6 +396,7 @@ class BoundedOrderedEventDispatcher(Generic[EventT]):
         self._accepting = True
         self._error: BaseException | None = None
         self._barriers: list[_CutoffBarrier[EventT]] = []
+        self._active_fence: _ProcessingFence | None = None
 
     def subscribe(
         self,
@@ -475,6 +488,52 @@ class BoundedOrderedEventDispatcher(Generic[EventT]):
             dropped=len(dropped_events),
             dropped_events=dropped_events,
         )
+
+    @asynccontextmanager
+    async def processing_fence(
+        self,
+        cutoff_time_ms: int,
+        *,
+        timeout_seconds: float | None = None,
+    ):
+        """Prevent the worker from processing events with *event_time > cutoff*.
+
+        While the fence is active:
+        * ``publish()`` still accepts new events (backpressure applies).
+        * Events with ``event_time <= cutoff`` still flow through.
+        * Events with ``event_time > cutoff`` are dequeued but paused until
+          the fence exits.
+
+        The caller runs the closed-bar decision inside the ``async with`` body.
+        """
+
+        self.raise_if_failed()
+        if self._active_fence is not None:
+            raise RuntimeError("a processing fence is already active")
+        timeout = (
+            self._drain_timeout_seconds
+            if timeout_seconds is None
+            else max(0.0, float(timeout_seconds))
+        )
+        fence = _ProcessingFence(cutoff_time_ms=int(cutoff_time_ms))
+        self._active_fence = fence
+        try:
+            barrier = await self.drain_through(
+                cutoff_time_ms,
+                timeout_seconds=timeout,
+            )
+            if not barrier.completed:
+                raise FenceTimeout(
+                    "causal processing fence: drain incomplete | "
+                    f"cutoff={cutoff_time_ms} pending={barrier.pending}"
+                )
+            yield
+        except BaseException:
+            self.raise_if_failed()
+            raise
+        finally:
+            fence.released.set()
+            self._active_fence = None
 
     async def drain_through(
         self,
@@ -641,6 +700,17 @@ class BoundedOrderedEventDispatcher(Generic[EventT]):
         while True:
             queued = await self._queue.get()
             try:
+                # --- causal fence gate ---
+                fence = self._active_fence
+                if (
+                    fence is not None
+                    and queued.event_time_ms is not None
+                    and queued.event_time_ms > fence.cutoff_time_ms
+                ):
+                    if not fence.boundary_reached.is_set():
+                        fence.boundary_reached.set()
+                    await fence.released.wait()
+                # --- end causal fence gate ---
                 for subscriber in self._subscribers:
                     try:
                         result = subscriber.handler(queued.event)
@@ -695,5 +765,6 @@ __all__ = [
     "DispatcherBarrierResult",
     "DispatcherDrainTimeout",
     "EventDispatcher",
+    "FenceTimeout",
     "SubscriptionHealth",
 ]

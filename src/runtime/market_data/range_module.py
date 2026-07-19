@@ -177,6 +177,7 @@ class RangeBarModule:
         self._stop_event: asyncio.Event | None = None
         self._repair_bootstrap: Callable[[], RangeRepairBootstrapService] | None = None
         self.bars_closed = 0
+        self.builder_bars_closed = 0
         self.aggregates_created = 0
         self.bars_suppressed = 0
         dispatcher.subscribe(
@@ -359,11 +360,8 @@ class RangeBarModule:
             builder.discard_active_bar()
             self._builder_reset_at_bucket_ms = None
         for bar in builder.on_trade(trade):
+            self.builder_bars_closed += 1
             bucket = self._bucket_start(bar.end_time_ms)
-            self._bars_by_bucket.setdefault(bucket, []).append(bar)
-            self._bars_since_checkpoint += 1
-            self.bars_closed += 1
-            self._prune(current_bucket=bucket)
             invalid_reason = self._integrity.invalid_reason(
                 int(bar.start_time_ms),
                 int(bar.end_time_ms),
@@ -375,6 +373,11 @@ class RangeBarModule:
                 )
                 self.bars_suppressed += 1
                 continue
+            # -- bar is trusted from this point --
+            self._bars_by_bucket.setdefault(bucket, []).append(bar)
+            self._bars_since_checkpoint += 1
+            self.bars_closed += 1
+            self._prune(current_bucket=bucket)
             await self._publish(range_bar_closed_feature(bar, exchange=trade.exchange))
             self._persistence.persist_range_bar(
                 bar,
@@ -386,6 +389,11 @@ class RangeBarModule:
         self.submit_checkpoint_if_due(trade)
 
     def aggregates_for_bucket(self, bucket_start_ms: int) -> list[RangeBarAggregate]:
+        if (
+            bucket_start_ms in self._degraded_buckets
+            and bucket_start_ms not in self._repaired_complete_buckets
+        ):
+            return []
         rows = self.rows_for_bucket(bucket_start_ms)
         if not rows:
             return []
@@ -437,6 +445,12 @@ class RangeBarModule:
         return events
 
     def rows_for_bucket(self, bucket_start_ms: int) -> list[RangeBar]:
+        # Never return rows for degraded buckets that haven't been repaired.
+        if (
+            bucket_start_ms in self._degraded_buckets
+            and bucket_start_ms not in self._repaired_complete_buckets
+        ):
+            return []
         if bucket_start_ms in self._repaired_complete_buckets:
             rows = self._load_store_rows(bucket_start_ms)
             if rows:
@@ -454,8 +468,24 @@ class RangeBarModule:
         return rows
 
     def coverage(self, bucket_start_ms: int) -> RangeCheckpointRecovery:
+        if bucket_start_ms in self._repaired_complete_buckets:
+            return RangeCheckpointRecovery(
+                coverage_status=RangeCoverageStatus.COMPLETE.value,
+                checkpoint=None,
+                checkpoint_age_ms=None,
+                missing_gap_ms=0,
+                recovered_from_checkpoint=True,
+            )
         if bucket_start_ms == self._initial_bucket_ms and self._initial_recovery is not None:
             return self._initial_recovery
+        if bucket_start_ms in self._degraded_buckets:
+            return RangeCheckpointRecovery(
+                coverage_status=RangeCoverageStatus.RECOVERED_INCOMPLETE.value,
+                checkpoint=None,
+                checkpoint_age_ms=None,
+                missing_gap_ms=0,
+                recovered_from_checkpoint=False,
+            )
         return RangeCheckpointRecovery(
             coverage_status=RangeCoverageStatus.COMPLETE.value,
             checkpoint=None,
@@ -577,6 +607,12 @@ class RangeBarModule:
         if trade_time_ms is None:
             return False
         bucket = self._bucket_start(trade_time_ms)
+        # Never persist a normal checkpoint for a degraded, unrepaired bucket.
+        if (
+            bucket in self._degraded_buckets
+            and bucket not in self._repaired_complete_buckets
+        ):
+            return False
         bars = self.rows_for_bucket(bucket)
         aggregate = next(iter(self.aggregates_for_bucket(bucket)), None)
         coverage = self.coverage(bucket)
@@ -609,7 +645,7 @@ class RangeBarModule:
 
     @property
     def builder(self) -> RangeBarBuilderPort:
-        self._ensure_builder()
+        self._ensure_resources()
         assert self._builder is not None
         return self._builder
 
@@ -619,7 +655,7 @@ class RangeBarModule:
 
     @property
     def aggregator(self) -> RangeBarAggregator:
-        self._ensure_aggregator()
+        self._ensure_resources()
         assert self._aggregator is not None
         return self._aggregator
 
@@ -629,56 +665,40 @@ class RangeBarModule:
 
     @property
     def checkpoint_store(self) -> SqliteRangeCheckpointStore:
-        self._ensure_checkpoint_store()
+        self._ensure_resources()
         assert self._checkpoint_store is not None
         return self._checkpoint_store
 
     @property
     def checkpoint_writer(self) -> RangeCheckpointWriter:
-        self._ensure_checkpoint_writer()
+        self._ensure_resources()
         assert self._checkpoint_writer is not None
         return self._checkpoint_writer
 
     @property
     def bar_store(self) -> RangeBarStorePort:
-        self._ensure_bar_store()
+        self._ensure_resources()
         assert self._bar_store is not None
         return self._bar_store
 
     @bar_store.setter
     def bar_store(self, value: RangeBarStorePort | None) -> None:
         self._bar_store = value
-
     def _ensure_resources(self) -> None:
-        self._ensure_builder()
-        self._ensure_bar_store()
-        self._ensure_aggregator()
-        self._ensure_checkpoint_store()
-        self._ensure_checkpoint_writer()
-
-    def _ensure_builder(self) -> None:
         if self._builder is None:
             self._builder = RangeBarBuilder(
                 range_pct=self.config.range_pct,
                 contract_value=self.config.contract_value,
             )
-    def _ensure_bar_store(self) -> None:
         if self._bar_store is None:
             self._bar_store = SqliteRangeBarStore()
-
-    def _ensure_aggregator(self) -> None:
         if self._aggregator is None:
             self._aggregator = RangeBarAggregator()
-
-    def _ensure_checkpoint_store(self) -> None:
         if self._checkpoint_store is None:
             self._checkpoint_store = SqliteRangeCheckpointStore(
                 self.config.checkpoint_db_path
             )
-
-    def _ensure_checkpoint_writer(self) -> None:
         if self._checkpoint_writer is None:
-            self._ensure_checkpoint_store()
             assert self._checkpoint_store is not None
             self._checkpoint_writer = RangeCheckpointWriter(
                 self._checkpoint_store,
@@ -715,7 +735,7 @@ class RangeBarModule:
         )
 
     def _load_store_rows(self, bucket_start_ms: int) -> list[RangeBar]:
-        self._ensure_bar_store()
+        self._ensure_resources()
         assert self._bar_store is not None
         return list(
             self._bar_store.load(
