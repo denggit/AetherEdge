@@ -26,6 +26,10 @@ from src.runtime.market_data.features import (
     TradeFootprintModule,
     TradeFootprintModuleConfig,
 )
+from src.runtime.market_data.integrity import (
+    OrderBookDataIntegrityTracker,
+    TradeDataIntegrityTracker,
+)
 from src.runtime.market_data.sources import (
     OrderBookStreamModule,
     TradeStreamModule,
@@ -71,6 +75,8 @@ def build_market_data_registry(
     consume_trade: TradeConsumer | None = None,
     consume_dropped_trade: DroppedTradeConsumer | None = None,
     consume_order_book: OrderBookConsumer | None = None,
+    trade_integrity: TradeDataIntegrityTracker | None = None,
+    order_book_integrity: OrderBookDataIntegrityTracker | None = None,
 ) -> ModuleRegistry:
     """Build lazy definitions; no stream, task or store is created here."""
 
@@ -78,6 +84,8 @@ def build_market_data_registry(
         maxsize=config.trade_queue_maxsize,
     )
     order_book_dispatcher = order_book_dispatcher or BoundedEventDispatcher[MarketOrderBook]()
+    trade_integrity = trade_integrity or TradeDataIntegrityTracker()
+    order_book_integrity = order_book_integrity or OrderBookDataIntegrityTracker()
     if consume_trade is not None:
         trade_dispatcher.subscribe(
             subscriber_id="runtime-trade-consumer",
@@ -100,6 +108,7 @@ def build_market_data_registry(
                 stream=create_trade_stream(),
                 dispatcher=trade_dispatcher,
                 on_dropped=consume_dropped_trade,
+                integrity=trade_integrity,
             ),
         )
     )
@@ -120,6 +129,7 @@ def build_market_data_registry(
             factory=lambda: OrderBookStreamModule(
                 stream=create_order_book_stream(),
                 dispatcher=order_book_dispatcher,
+                integrity=order_book_integrity,
             ),
         )
     )
@@ -132,6 +142,7 @@ def build_market_data_registry(
                 config=config.fixed_time_trade_bars,
                 dispatcher=trade_dispatcher,
                 publish=publish_feature,
+                integrity=trade_integrity,
             ),
         )
     )
@@ -144,6 +155,7 @@ def build_market_data_registry(
                 config=config.trade_footprint,
                 dispatcher=trade_dispatcher,
                 publish=publish_feature,
+                integrity=trade_integrity,
             ),
         )
     )
@@ -156,6 +168,7 @@ def build_market_data_registry(
                 config=config.range_footprint,
                 dispatcher=trade_dispatcher,
                 publish=publish_feature,
+                integrity=trade_integrity,
             ),
         )
     )

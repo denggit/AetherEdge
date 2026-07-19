@@ -58,6 +58,8 @@ class RuntimeServices:
     warmup_service: object | None = None
     historical_trade_feed: object | None = None
     trade_store: object | None = None
+    trade_data_integrity_tracker: object | None = None
+    order_book_data_integrity_tracker: object | None = None
 
     # Range-only compatibility inputs.  They are consumed by the Range
     # composition boundary, never by the generic runtime orchestrator.

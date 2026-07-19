@@ -99,10 +99,13 @@ class MarketDataRuntime:
             raise
         self._supervisor_stop.clear()
         self._failure_event.clear()
-        self._supervisor_task = asyncio.create_task(
-            self._supervise(),
-            name="market-data-supervisor",
-        )
+        if host.modules:
+            self._supervisor_task = asyncio.create_task(
+                self._supervise(),
+                name="market-data-supervisor",
+            )
+        else:
+            self._supervisor_task = None
         plan = self._plan
         assert plan is not None
         self._log("Started modules | modules=%s", plan.module_ids)
@@ -127,8 +130,10 @@ class MarketDataRuntime:
         *,
         timeout_seconds: float,
     ) -> DispatcherBarrierResult:
+        self.raise_if_failed()
         host = self._host
         if host is None:
+            self.raise_if_failed()
             return DispatcherBarrierResult(
                 cutoff_time_ms=cutoff_time_ms,
                 pending=0,
@@ -142,7 +147,9 @@ class MarketDataRuntime:
                     timeout_seconds=timeout_seconds,
                 )
                 if result is not None:
+                    self.raise_if_failed()
                     return result
+        self.raise_if_failed()
         return DispatcherBarrierResult(
             cutoff_time_ms=cutoff_time_ms,
             pending=0,
@@ -202,6 +209,10 @@ class MarketDataRuntime:
             ),
             health=(() if host is None else host.health()),
         )
+
+    @property
+    def supervisor_task(self) -> asyncio.Task[None] | None:
+        return self._supervisor_task
 
     def _log_plan(self, plan: RuntimePlan) -> None:
         self._log(

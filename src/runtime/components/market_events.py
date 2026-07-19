@@ -19,6 +19,10 @@ from src.runtime.feature_pipeline import (
     TradeFeatureRuntimeConfig,
 )
 from src.runtime.models import RuntimePhase
+from src.runtime.market_data.integrity import (
+    OrderBookDataIntegrityTracker,
+    TradeDataIntegrityTracker,
+)
 from src.signals import TradeSignal
 
 from src.runtime.live_helpers import _event_time_ms, _is_trade_at_or_before
@@ -115,15 +119,38 @@ class MarketEventsComponent(RuntimeComponent):
         self._maybe_log_live_data_path_stats()
 
     async def _enqueue_market_event(self, event: MarketEvent) -> None:
+        dropped_event: MarketEvent | None = None
         if self._market_queue.full():
             self.stats.market_events_dropped += 1
-            self._emit_market_queue_full_alert(event)
-            self._mark_range_context_degraded_for_event(event, reason="market_queue_dropped_trade")
             try:
-                self._market_queue.get_nowait()
+                dropped_event = self._market_queue.get_nowait()
                 self._market_queue.task_done()
             except asyncio.QueueEmpty:
                 pass
+            dropped = dropped_event or event
+            self._emit_market_queue_full_alert(dropped)
+            if (
+                isinstance(dropped, MarketTrade)
+                or dropped.event_type is MarketEventType.TRADE
+            ):
+                self._mark_trade_integrity_dropped(
+                    dropped,
+                    reason="market_queue_dropped_trade",
+                )
+                self._mark_range_context_degraded_for_event(
+                    dropped,
+                    reason="market_queue_dropped_trade",
+                )
+            elif (
+                isinstance(dropped, MarketOrderBook)
+                or dropped.event_type is MarketEventType.ORDER_BOOK
+            ):
+                tracker = self._order_book_integrity_tracker()
+                if tracker is not None:
+                    tracker.mark_dropped("runtime_market_queue_drop")
+                raise LiveRuntimeError(
+                    "order book runtime queue overflow; snapshot/resync required"
+                )
         else:
             self._maybe_log_market_queue_backlog(event=event)
         await self._market_queue.put(event)
@@ -162,8 +189,15 @@ class MarketEventsComponent(RuntimeComponent):
     def _mark_range_context_degraded_bucket(self, *, bucket_start_ms: int, reason: str, event_time_ms: int | None = None) -> None:
         journal_status = {
             "market_queue_dropped_trade": JOURNAL_INVALID_DROPPED_TRADE,
+            "trade_dispatcher_drop": JOURNAL_INVALID_DROPPED_TRADE,
             "market_queue_drain_incomplete_before_closed_bar": (
                 JOURNAL_INVALID_MARKET_QUEUE_DRAIN_INCOMPLETE
+            ),
+            "market_data_barrier_failed": (
+                JOURNAL_INVALID_MARKET_QUEUE_DRAIN_INCOMPLETE
+            ),
+            "trade_data_incomplete_before_closed_bar": (
+                JOURNAL_INVALID_DROPPED_TRADE
             ),
             "producer_stale": JOURNAL_INVALID_PRODUCER_STALE,
             "producer_failed": JOURNAL_INVALID_PRODUCER_FAILED,
@@ -174,7 +208,10 @@ class MarketEventsComponent(RuntimeComponent):
                 status=journal_status,
                 reason=reason,
                 dropped_trades=(
-                    1 if reason == "market_queue_dropped_trade" else 0
+                    1
+                    if reason
+                    in {"market_queue_dropped_trade", "trade_dispatcher_drop"}
+                    else 0
                 ),
             )
         module = self._range_module
@@ -237,7 +274,7 @@ class MarketEventsComponent(RuntimeComponent):
         max_duration_seconds = max(float(max_duration_ms), 0.0) / 1000.0
         pipeline_completed = True
         pipeline_pending = 0
-        market_data_runtime = getattr(self, "_market_data_runtime", None)
+        market_data_runtime = self.market_state.runtime
         if market_data_runtime is not None:
             barrier = await market_data_runtime.drain_through(
                 closed_bar_close_time_ms,
@@ -312,10 +349,11 @@ class MarketEventsComponent(RuntimeComponent):
         while not self._stop_event.is_set():
             if max_market_events is not None and self.stats.market_events_seen >= max_market_events:
                 break
-            if self.requirements.closed_kline.enabled:
-                await self.poll_closed_bar_once()
             self._raise_on_unhealthy_market_data()
             self._raise_on_unhealthy_producer()
+            if self.requirements.closed_kline.enabled:
+                await self.poll_closed_bar_once(_health_prechecked=True)
+            self._raise_on_unhealthy_market_data()
             if self._all_producers_done() and self._market_queue.empty():
                 break
             try:
@@ -340,12 +378,44 @@ class MarketEventsComponent(RuntimeComponent):
                 break
 
     def _raise_on_unhealthy_market_data(self) -> None:
-        runtime = getattr(self, "_market_data_runtime", None)
+        integrity_error = self.market_state.integrity_error
+        if integrity_error is not None:
+            raise LiveRuntimeError(str(integrity_error)) from integrity_error
+        runtime = self.market_state.runtime
         if runtime is not None:
             runtime.raise_if_failed()
 
+    def _trade_integrity_tracker(self) -> TradeDataIntegrityTracker | None:
+        value = self.service_dependencies().trade_data_integrity_tracker
+        return value if isinstance(value, TradeDataIntegrityTracker) else None
+
+    def _order_book_integrity_tracker(
+        self,
+    ) -> OrderBookDataIntegrityTracker | None:
+        value = self.service_dependencies().order_book_data_integrity_tracker
+        return (
+            value
+            if isinstance(value, OrderBookDataIntegrityTracker)
+            else None
+        )
+
+    def _mark_trade_integrity_dropped(
+        self,
+        event: MarketEvent,
+        *,
+        reason: str,
+    ) -> None:
+        tracker = self._trade_integrity_tracker()
+        if tracker is None:
+            return
+        event_ms = _event_time_ms(event)
+        tracker.mark_dropped(
+            int(time.time() * 1000) if event_ms is None else event_ms,
+            reason,
+        )
+
     async def _process_trade(self, trade: MarketTrade) -> None:
-        if getattr(self, "_market_modules_managed", False):
+        if self.market_state.modules_managed:
             module = self._range_module
             if module is not None:
                 self.stats.range_bars_closed = module.bars_closed

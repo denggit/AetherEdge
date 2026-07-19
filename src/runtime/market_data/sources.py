@@ -10,6 +10,10 @@ from src.platform.data.websocket.ports import OrderBookStream, TradeStream
 from src.runtime.capabilities import MARKET_ORDER_BOOK, MARKET_TRADES
 from src.runtime.market_data.dispatcher import EventDispatcher
 from src.runtime.market_data.dispatcher import DispatcherBarrierResult
+from src.runtime.market_data.integrity import (
+    OrderBookDataIntegrityTracker,
+    TradeDataIntegrityTracker,
+)
 from src.runtime.module import (
     CapabilityId,
     ModuleHealth,
@@ -25,6 +29,10 @@ DroppedEventHandler = Callable[[EventT], Awaitable[None] | None]
 
 class _StreamIdentity(Protocol):
     async def stop(self) -> None: ...
+
+
+class OrderBookResyncRequired(RuntimeError):
+    pass
 
 
 class _StreamModule(Generic[EventT]):
@@ -125,11 +133,11 @@ class _StreamModule(Generic[EventT]):
                 self.events_seen += 1
                 result = self._dispatcher.publish(event)
                 self.events_dropped += result.dropped
-                if self._on_dropped is not None:
-                    for dropped in result.dropped_events:
-                        callback_result = self._on_dropped(dropped)
-                        if inspect.isawaitable(callback_result):
-                            await callback_result
+                for dropped in result.dropped_events:
+                    await self._handle_dropped_event(dropped)
+                if result.dropped and not result.dropped_events:
+                    for _ in range(result.dropped):
+                        await self._handle_dropped_event(event)
             if not self._stopping:
                 raise RuntimeError(
                     f"market source ended unexpectedly: {self.module_id}"
@@ -143,6 +151,13 @@ class _StreamModule(Generic[EventT]):
                 self._on_error(self.module_id, exc)
             raise
 
+    async def _handle_dropped_event(self, event: EventT) -> None:
+        if self._on_dropped is None:
+            return
+        callback_result = self._on_dropped(event)
+        if inspect.isawaitable(callback_result):
+            await callback_result
+
 
 class TradeStreamModule(_StreamModule[MarketTrade]):
     def __init__(
@@ -152,7 +167,9 @@ class TradeStreamModule(_StreamModule[MarketTrade]):
         dispatcher: EventDispatcher[MarketTrade],
         on_error: ModuleErrorHandler | None = None,
         on_dropped: DroppedEventHandler[MarketTrade] | None = None,
+        integrity: TradeDataIntegrityTracker | None = None,
     ) -> None:
+        self._integrity = integrity
         super().__init__(
             module_id="trade-stream",
             capability=MARKET_TRADES,
@@ -161,6 +178,15 @@ class TradeStreamModule(_StreamModule[MarketTrade]):
             on_error=on_error,
             on_dropped=on_dropped,
         )
+
+    async def _handle_dropped_event(self, event: MarketTrade) -> None:
+        if self._integrity is not None:
+            event_time_ms = event.trade_time_ms or event.event_time_ms
+            self._integrity.mark_dropped(
+                0 if event_time_ms is None else event_time_ms,
+                "trade_dispatcher_drop",
+            )
+        await super()._handle_dropped_event(event)
 
 
 class OrderBookStreamModule(_StreamModule[MarketOrderBook]):
@@ -171,7 +197,9 @@ class OrderBookStreamModule(_StreamModule[MarketOrderBook]):
         dispatcher: EventDispatcher[MarketOrderBook],
         on_error: ModuleErrorHandler | None = None,
         on_dropped: DroppedEventHandler[MarketOrderBook] | None = None,
+        integrity: OrderBookDataIntegrityTracker | None = None,
     ) -> None:
+        self._integrity = integrity
         super().__init__(
             module_id="order-book-stream",
             capability=MARKET_ORDER_BOOK,
@@ -181,5 +209,35 @@ class OrderBookStreamModule(_StreamModule[MarketOrderBook]):
             on_dropped=on_dropped,
         )
 
+    async def _handle_dropped_event(self, event: MarketOrderBook) -> None:
+        if self._integrity is not None:
+            self._integrity.mark_dropped("order_book_dispatcher_drop")
+        await super()._handle_dropped_event(event)
+        raise OrderBookResyncRequired(
+            "order book delta/snapshot sequence is incomplete; reconnect/resync required"
+        )
 
-__all__ = ["OrderBookStreamModule", "TradeStreamModule"]
+    def health(self) -> ModuleHealth:
+        health = super().health()
+        integrity = None if self._integrity is None else self._integrity.snapshot()
+        if integrity is None:
+            return health
+        return ModuleHealth(
+            module_id=health.module_id,
+            state=health.state,
+            healthy=health.healthy and not integrity.resync_required,
+            detail=health.detail or integrity.reason,
+            background_tasks=health.background_tasks,
+            metadata=health.metadata
+            + (
+                ("order_book_dropped", str(integrity.dropped_count)),
+                ("resync_required", str(integrity.resync_required).lower()),
+            ),
+        )
+
+
+__all__ = [
+    "OrderBookResyncRequired",
+    "OrderBookStreamModule",
+    "TradeStreamModule",
+]

@@ -23,6 +23,7 @@ from src.runtime.features import (
     trade_footprint_feature,
 )
 from src.runtime.market_data.dispatcher import BoundedOrderedEventDispatcher
+from src.runtime.market_data.integrity import TradeDataIntegrityTracker
 from src.runtime.module import CapabilityId, ModuleHealth, ModuleState
 
 
@@ -61,15 +62,19 @@ class _TradeFeatureModule:
         module_id: str,
         capability: CapabilityId,
         dispatcher: BoundedOrderedEventDispatcher[MarketTrade],
+        integrity: TradeDataIntegrityTracker,
     ) -> None:
         self.module_id = module_id
         self.provides = frozenset({capability})
         self.requires = frozenset({MARKET_TRADES})
         self._state = ModuleState.CREATED
         self._dispatcher = dispatcher
+        self._integrity = integrity
         self._error: BaseException | None = None
         self.events_seen = 0
         self.features_emitted = 0
+        self.features_suppressed = 0
+        self.last_invalid_reason: str | None = None
         dispatcher.subscribe(
             subscriber_id=module_id,
             handler=self._process_trade,
@@ -100,8 +105,13 @@ class _TradeFeatureModule:
             metadata=(
                 ("events_seen", str(self.events_seen)),
                 ("features_emitted", str(self.features_emitted)),
+                ("features_suppressed", str(self.features_suppressed)),
                 ("events_dropped", str(dispatcher_dropped)),
-                ("data_complete", str(dispatcher_dropped == 0).lower()),
+                (
+                    "data_complete",
+                    str(self.last_invalid_reason is None).lower(),
+                ),
+                ("invalid_reason", self.last_invalid_reason or ""),
             ),
         )
 
@@ -120,6 +130,15 @@ class _TradeFeatureModule:
         self._error = exc
         self._state = ModuleState.ERROR
 
+    def _window_is_complete(self, start_ms: int, end_ms: int) -> bool:
+        reason = self._integrity.invalid_reason(start_ms, end_ms)
+        if reason is None:
+            self.last_invalid_reason = None
+            return True
+        self.last_invalid_reason = reason
+        self.features_suppressed += 1
+        return False
+
 
 class FixedTimeTradeBarModule(_TradeFeatureModule):
     dispatch_priority = 200
@@ -131,11 +150,14 @@ class FixedTimeTradeBarModule(_TradeFeatureModule):
         dispatcher: BoundedOrderedEventDispatcher[MarketTrade],
         publish: FeaturePublisher,
         builder: TradeFeatureBuilder | None = None,
+        integrity: TradeDataIntegrityTracker | None = None,
     ) -> None:
+        integrity = integrity or TradeDataIntegrityTracker()
         super().__init__(
             module_id="fixed-time-trade-bars",
             capability=FEATURE_FIXED_TIME_TRADE_BARS,
             dispatcher=dispatcher,
+            integrity=integrity,
         )
         self.config = config
         self._publish = publish
@@ -148,6 +170,11 @@ class FixedTimeTradeBarModule(_TradeFeatureModule):
 
     async def process_trade(self, trade: MarketTrade) -> None:
         for bar in self._builder.on_trade(trade):
+            if not self._window_is_complete(
+                int(getattr(bar, "open_time_ms", _trade_time_ms(trade))),
+                int(getattr(bar, "close_time_ms", _trade_time_ms(trade))),
+            ):
+                continue
             await self._publish(
                 fixed_time_trade_bar_feature(
                     bar,
@@ -171,11 +198,14 @@ class TradeFootprintModule(_TradeFeatureModule):
         dispatcher: BoundedOrderedEventDispatcher[MarketTrade],
         publish: FeaturePublisher,
         builder: TradeFeatureBuilder | None = None,
+        integrity: TradeDataIntegrityTracker | None = None,
     ) -> None:
+        integrity = integrity or TradeDataIntegrityTracker()
         super().__init__(
             module_id="trade-footprint",
             capability=FEATURE_TRADE_FOOTPRINT,
             dispatcher=dispatcher,
+            integrity=integrity,
         )
         self.config = config
         self._publish = publish
@@ -186,6 +216,11 @@ class TradeFootprintModule(_TradeFeatureModule):
 
     async def process_trade(self, trade: MarketTrade) -> None:
         for feature in self._builder.on_trade(trade):
+            if not self._window_is_complete(
+                int(getattr(feature, "open_time_ms", _trade_time_ms(trade))),
+                int(getattr(feature, "close_time_ms", _trade_time_ms(trade))),
+            ):
+                continue
             await self._publish(
                 trade_footprint_feature(feature, exchange=trade.exchange)
             )
@@ -202,11 +237,14 @@ class RangeFootprintModule(_TradeFeatureModule):
         dispatcher: BoundedOrderedEventDispatcher[MarketTrade],
         publish: FeaturePublisher,
         builder: TradeFeatureBuilder | None = None,
+        integrity: TradeDataIntegrityTracker | None = None,
     ) -> None:
+        integrity = integrity or TradeDataIntegrityTracker()
         super().__init__(
             module_id="range-footprint",
             capability=FEATURE_RANGE_FOOTPRINT,
             dispatcher=dispatcher,
+            integrity=integrity,
         )
         self.config = config
         self._publish = publish
@@ -215,13 +253,43 @@ class RangeFootprintModule(_TradeFeatureModule):
             range_pct=config.range_pct,
             price_step=config.price_step,
         )
+        self._integrity_revision = integrity.revision
 
     async def process_trade(self, trade: MarketTrade) -> None:
+        if self._integrity.revision != self._integrity_revision:
+            discard = getattr(self._builder, "discard_active", None)
+            has_active = bool(
+                getattr(self._builder, "has_active_range", False)
+            )
+            if has_active and callable(discard):
+                discard()
+                issues = self._integrity.issues_since(
+                    self._integrity_revision
+                )
+                self.features_suppressed += 1
+                self.last_invalid_reason = (
+                    issues[-1].reason if issues else "trade_data_incomplete"
+                )
+            self._integrity_revision = self._integrity.revision
         for feature in self._builder.on_trade(trade):
+            if not self._window_is_complete(
+                int(
+                    getattr(feature, "range_start_ms", _trade_time_ms(trade))
+                ),
+                int(
+                    getattr(feature, "range_end_ms", _trade_time_ms(trade))
+                ),
+            ):
+                continue
             await self._publish(
                 range_footprint_feature(feature, exchange=trade.exchange)
             )
             self.features_emitted += 1
+
+
+def _trade_time_ms(trade: MarketTrade) -> int:
+    value = trade.trade_time_ms or trade.event_time_ms
+    return 0 if value is None else int(value)
 
 
 __all__ = [

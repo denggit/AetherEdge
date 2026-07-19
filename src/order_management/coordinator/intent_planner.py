@@ -1,38 +1,16 @@
 from __future__ import annotations
 
-import asyncio
 from dataclasses import replace
-from decimal import Decimal
-from enum import Enum
-from typing import Any, Mapping, Sequence
+from typing import Sequence
 
-from src.order_management.idempotency.client_order_id import DeterministicClientOrderIdFactory
-from src.order_management.idempotency.duplicate_guard import RepositoryDuplicateOrderGuard
-from src.order_management.models import ExchangeOrderResult, OrderIntent, OrderIntentStatus, OrderJournalEvent
-from src.order_management.position_plan import LegPlan, LegRole, LegSyncStatus, PositionPlan, PositionPlanStatus
-from src.order_management.ports import ClientOrderIdFactory, DuplicateOrderGuard, OrderIntentRepository
+from src.order_management.models import ExchangeOrderResult, OrderIntent
+from src.order_management.ports import ExecutionResultRecorderPort
 from src.order_management.quantity import (
     NativeQuantityConverter,
     resolve_executable_base_quantity,
 )
-from src.order_management.master_follower import MasterFollowerExecutionPolicy, MasterFollowerPolicyEvaluator
-from src.order_management.safety import ExitSafetyError, ExitSafetyGuard, is_exit_action, normalize_exit_request_for_exchange, target_position_side_for_action
-from src.order_management.sync import OrderStatusSynchronizer, extract_avg_fill_price, extract_fee
-from src.planner import ExecutionPlanner, PlannedExecution, PlannedExecutionAction
 from src.platform.execution import ExecutionClient
-from src.platform.exchanges.models import CancelStopOrderRequest, ExchangeName, Order, OrderRequest, OrderStatus, PositionMode, PositionSide, StopMarketOrderRequest
 from src.signals.models import SignalAction
-from src.utils.log import get_logger
-
-
-_MASTER_GATED_PURPOSES = {"normal_entry", "normal_close"}
-_BYPASS_MASTER_PURPOSES = {
-    "stop_sync",
-    "follower_recovery_topup",
-    "follower_close_after_master_close",
-}
-
-logger = get_logger(__name__)
 
 
 from src.order_management.coordinator.support import (
@@ -48,13 +26,13 @@ class OrderIntentPlanner:
         *,
         clients: Sequence[ExecutionClient],
         quantity_converter: NativeQuantityConverter,
-        result_recorder: object,
+        result_recorder: ExecutionResultRecorderPort,
     ) -> None:
         self.clients = tuple(clients)
         self.quantity_converter = quantity_converter
         self._result_recorder = result_recorder
 
-    async def _normalize_recovery_topup_intent(
+    async def normalize_recovery_topup_intent(
         self, intent: OrderIntent
     ) -> tuple[OrderIntent, list[ExchangeOrderResult] | None]:
         """Normalize follower top-ups before planning and turn dust into a no-op."""
@@ -133,6 +111,14 @@ class OrderIntentPlanner:
             signal=normalized_signal,
             target_exchanges=tuple(executable),
         ), None
+
+    async def _normalize_recovery_topup_intent(
+        self,
+        intent: OrderIntent,
+    ) -> tuple[OrderIntent, list[ExchangeOrderResult] | None]:
+        """Compatibility alias for callers predating service composition."""
+
+        return await self.normalize_recovery_topup_intent(intent)
 
 
 __all__ = ["OrderIntentPlanner"]

@@ -20,6 +20,10 @@ from src.runtime.market_data.features import (
     RangeFootprintModuleConfig,
     TradeFootprintModuleConfig,
 )
+from src.runtime.market_data.integrity import (
+    OrderBookDataIntegrityTracker,
+    TradeDataIntegrityTracker,
+)
 from src.runtime.market_data.range_config import (
     RangeRuntimeConfig,
     range_runtime_config_from_env,
@@ -71,6 +75,10 @@ def compose_live_runtime(
         defaults_path=defaults_path,
     )
     runtime_services = services or RuntimeServices()
+    trade_integrity = TradeDataIntegrityTracker()
+    order_book_integrity = OrderBookDataIntegrityTracker()
+    runtime_services.trade_data_integrity_tracker = trade_integrity
+    runtime_services.order_book_data_integrity_tracker = order_book_integrity
     trade_dispatcher = (
         runtime_services.range_trade_dispatcher
         or BoundedOrderedEventDispatcher(
@@ -89,6 +97,10 @@ def compose_live_runtime(
         managed_market_modules=True,
         services=runtime_services,
     )
+    range_module = runtime_services.range_bar_module
+    configure_integrity = getattr(range_module, "configure_integrity", None)
+    if callable(configure_integrity):
+        configure_integrity(trade_integrity)
 
     feature_config = runtime_services.trade_feature_config
     if not isinstance(feature_config, TradeFeatureRuntimeConfig):
@@ -126,6 +138,8 @@ def compose_live_runtime(
         consume_trade=runner.process_market_event,
         consume_dropped_trade=runner.handle_dropped_trade,
         consume_order_book=runner.enqueue_market_event,
+        trade_integrity=trade_integrity,
+        order_book_integrity=order_book_integrity,
     )
     market_data = MarketDataRuntime(registry=registry, logger=logger)
     request = capability_request_from_requirements(

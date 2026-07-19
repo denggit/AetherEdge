@@ -28,6 +28,7 @@ from src.platform.exchanges.models import ExchangeName
 from src.runtime.capabilities import FEATURE_RANGE_BARS, MARKET_TRADES
 from src.runtime.features import range_aggregate_feature, range_bar_closed_feature
 from src.runtime.market_data.dispatcher import BoundedOrderedEventDispatcher
+from src.runtime.market_data.integrity import TradeDataIntegrityTracker
 from src.runtime.module import CapabilityId, ModuleHealth, ModuleState
 from src.utils.log import get_logger
 
@@ -139,6 +140,7 @@ class RangeBarModule:
         on_bar_persist_error: BarErrorReporter | None = None,
         on_aggregate_persist_error: AggregateErrorReporter | None = None,
         on_rejected: Callable[[str], None] | None = None,
+        integrity: TradeDataIntegrityTracker | None = None,
     ) -> None:
         self.config = config
         self._dispatcher = dispatcher
@@ -154,6 +156,8 @@ class RangeBarModule:
         self._on_bar_persist_error = on_bar_persist_error
         self._on_aggregate_persist_error = on_aggregate_persist_error
         self._on_rejected = on_rejected
+        self._integrity = integrity or TradeDataIntegrityTracker()
+        self._integrity_revision = self._integrity.revision
         self._state = ModuleState.CREATED
         self._error: BaseException | None = None
         self._bars_by_bucket: dict[int, list[RangeBar]] = {}
@@ -174,6 +178,7 @@ class RangeBarModule:
         self._repair_bootstrap: Callable[[], RangeRepairBootstrapService] | None = None
         self.bars_closed = 0
         self.aggregates_created = 0
+        self.bars_suppressed = 0
         dispatcher.subscribe(
             subscriber_id=self.module_id,
             handler=self.process_trade,
@@ -271,6 +276,13 @@ class RangeBarModule:
         self._stop_event = stop_event
         self._repair_bootstrap = repair_bootstrap
 
+    def configure_integrity(
+        self,
+        tracker: TradeDataIntegrityTracker,
+    ) -> None:
+        self._integrity = tracker
+        self._integrity_revision = tracker.revision
+
     def repair_now(self) -> None:
         if (
             self._repair_bootstrap is None
@@ -323,14 +335,25 @@ class RangeBarModule:
                 ("events_dropped", str(self._dispatcher.dropped_count)),
                 (
                     "data_complete",
-                    str(self._dispatcher.dropped_count == 0).lower(),
+                    str(not self._degraded_buckets).lower(),
                 ),
+                ("bars_suppressed", str(self.bars_suppressed)),
             ),
         )
 
     async def process_trade(self, trade: MarketTrade) -> None:
         builder = self.builder
         trade_time_ms = _trade_time_ms(trade)
+        if self._integrity.revision != self._integrity_revision:
+            issues = self._integrity.issues_since(self._integrity_revision)
+            if issues:
+                builder.discard_active_bar()
+                for issue in issues:
+                    self.mark_degraded(
+                        bucket_start_ms=self._bucket_start(issue.event_time_ms),
+                        reason=issue.reason,
+                    )
+            self._integrity_revision = self._integrity.revision
         reset_at = self._builder_reset_at_bucket_ms
         if trade_time_ms is not None and reset_at is not None and trade_time_ms >= reset_at:
             builder.discard_active_bar()
@@ -341,6 +364,17 @@ class RangeBarModule:
             self._bars_since_checkpoint += 1
             self.bars_closed += 1
             self._prune(current_bucket=bucket)
+            invalid_reason = self._integrity.invalid_reason(
+                int(bar.start_time_ms),
+                int(bar.end_time_ms),
+            ) or self.degraded_reason(bucket)
+            if invalid_reason is not None:
+                self.mark_degraded(
+                    bucket_start_ms=bucket,
+                    reason=invalid_reason,
+                )
+                self.bars_suppressed += 1
+                continue
             await self._publish(range_bar_closed_feature(bar, exchange=trade.exchange))
             self._persistence.persist_range_bar(
                 bar,

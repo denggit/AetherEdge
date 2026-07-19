@@ -123,6 +123,15 @@ class _RunnerCompatibilityFacade:
         return getattr(self._ensure_runtime_components()[component_type], name)
 
     def __setattr__(self, name: str, value: object) -> None:
+        state = self._ensure_runtime_state()
+        if name == "_market_data_runtime":
+            state.market.runtime = value  # type: ignore[assignment]
+        elif name == "_market_data_capabilities":
+            state.market.capabilities = value  # type: ignore[assignment]
+        elif name == "_market_modules_managed":
+            state.market.modules_managed = bool(value)
+        elif name == "_pipeline_integrity_error":
+            state.market.integrity_error = value  # type: ignore[assignment]
         component_type = _COMPATIBILITY_COMPONENT_METHODS.get(name)
         descriptor = (
             None if component_type is None else component_type.__dict__.get(name)
@@ -197,8 +206,13 @@ class LiveRuntimeRunner(_RunnerCompatibilityFacade):
         runtime: MarketDataRuntime,
         capabilities: frozenset[CapabilityId],
     ) -> None:
-        if self._market_data_runtime is not None:
+        market_state = self._ensure_runtime_state().market
+        if market_state.runtime is not None:
             raise RuntimeError("market data runtime is already attached")
+        market_state.runtime = runtime
+        market_state.capabilities = capabilities
+        market_state.modules_managed = True
+        # Explicitly listed compatibility fields for older integrations.
         self._market_data_runtime = runtime
         self._market_data_capabilities = capabilities
         self._market_modules_managed = True
@@ -216,12 +230,13 @@ class LiveRuntimeRunner(_RunnerCompatibilityFacade):
         )._handle_market_data_trade_drop(event)
 
     async def _prepare_market_data_modules(self) -> None:
-        runtime = getattr(self, "_market_data_runtime", None)
+        market_state = self._ensure_runtime_state().market
+        runtime = market_state.runtime
         if runtime is not None:
-            await runtime.prepare(self._market_data_capabilities)
+            await runtime.prepare(market_state.capabilities)
 
     async def _start_market_data_modules(self) -> None:
-        runtime = getattr(self, "_market_data_runtime", None)
+        runtime = self._ensure_runtime_state().market.runtime
         if runtime is not None:
             await runtime.start_prepared()
 

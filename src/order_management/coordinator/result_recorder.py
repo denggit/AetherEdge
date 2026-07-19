@@ -1,36 +1,23 @@
 from __future__ import annotations
 
-import asyncio
 from dataclasses import replace
 from decimal import Decimal
-from enum import Enum
-from typing import Any, Mapping, Sequence
+from typing import Mapping, Sequence
 
-from src.order_management.idempotency.client_order_id import DeterministicClientOrderIdFactory
-from src.order_management.idempotency.duplicate_guard import RepositoryDuplicateOrderGuard
 from src.order_management.models import ExchangeOrderResult, OrderIntent, OrderIntentStatus, OrderJournalEvent
-from src.order_management.position_plan import LegPlan, LegRole, LegSyncStatus, PositionPlan, PositionPlanStatus
-from src.order_management.ports import ClientOrderIdFactory, DuplicateOrderGuard, OrderIntentRepository
-from src.order_management.quantity import (
-    NativeQuantityConverter,
-    resolve_executable_base_quantity,
+from src.order_management.position_plan import LegSyncStatus
+from src.order_management.ports import (
+    ExecutionPreviewPort,
+    OrderIntentRepository,
+    PositionPlanStorePort,
+    PositionPlanUpdaterPort,
 )
-from src.order_management.master_follower import MasterFollowerExecutionPolicy, MasterFollowerPolicyEvaluator
-from src.order_management.safety import ExitSafetyError, ExitSafetyGuard, is_exit_action, normalize_exit_request_for_exchange, target_position_side_for_action
-from src.order_management.sync import OrderStatusSynchronizer, extract_avg_fill_price, extract_fee
-from src.planner import ExecutionPlanner, PlannedExecution, PlannedExecutionAction
+from src.order_management.quantity import ExecutableQuantityResolution
+from src.order_management.safety import ExitSafetyError
+from src.planner import PlannedExecution
 from src.platform.execution import ExecutionClient
-from src.platform.exchanges.models import CancelStopOrderRequest, ExchangeName, Order, OrderRequest, OrderStatus, PositionMode, PositionSide, StopMarketOrderRequest
-from src.signals.models import SignalAction
+from src.platform.exchanges.models import ExchangeName, OrderStatus
 from src.utils.log import get_logger
-
-
-_MASTER_GATED_PURPOSES = {"normal_entry", "normal_close"}
-_BYPASS_MASTER_PURPOSES = {
-    "stop_sync",
-    "follower_recovery_topup",
-    "follower_close_after_master_close",
-}
 
 logger = get_logger(__name__)
 
@@ -40,8 +27,8 @@ class ExecutionResultRecorder:
         self,
         *,
         repository: OrderIntentRepository,
-        position_plan_store: object | None,
-        position_plan_updater: object,
+        position_plan_store: PositionPlanStorePort | None,
+        position_plan_updater: PositionPlanUpdaterPort,
     ) -> None:
         self.repository = repository
         self.position_plan_store = position_plan_store
@@ -51,7 +38,7 @@ class ExecutionResultRecorder:
         self,
         *,
         intent: OrderIntent,
-        resolutions: Mapping[ExchangeName, Any],
+        resolutions: Mapping[ExchangeName, ExecutableQuantityResolution],
     ) -> list[ExchangeOrderResult]:
         outcome = "skipped_non_executable_quantity"
         resolution_metadata = {
@@ -127,7 +114,7 @@ class ExecutionResultRecorder:
         *,
         clients: Sequence[ExecutionClient],
         items: Sequence[PlannedExecution],
-        preview_conversion,
+        preview_conversion: ExecutionPreviewPort,
     ) -> OrderIntent:
         conversions: list[dict[str, object]] = []
         for client in clients:

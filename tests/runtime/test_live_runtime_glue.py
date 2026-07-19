@@ -3560,6 +3560,72 @@ async def test_market_consumer_drains_batch(monkeypatch):
 
     assert len(processed) == 3
     assert producer_health_checks == 1
+
+
+@pytest.mark.asyncio
+async def test_market_failure_gate_runs_before_closed_bar_poll(monkeypatch):
+    runner = _runner(FeatureStrategy(), dry_run=True)
+    polled = False
+
+    def fail_market_data() -> None:
+        raise RuntimeError("market data already failed")
+
+    async def poll() -> list:
+        nonlocal polled
+        polled = True
+        return []
+
+    monkeypatch.setattr(runner, "_raise_on_unhealthy_market_data", fail_market_data)
+    monkeypatch.setattr(runner, "poll_closed_bar_once", poll)
+
+    with pytest.raises(RuntimeError, match="market data already failed"):
+        await runner._consume_market_events(max_market_events=1)
+    assert polled is False
+
+
+@pytest.mark.asyncio
+async def test_direct_closed_bar_poll_rejects_failed_market_runtime(monkeypatch):
+    runner = _runner(FeatureStrategy(), dry_run=True)
+    feature_calls = []
+
+    class FailedRuntime:
+        def raise_if_failed(self) -> None:
+            raise RuntimeError("feature pipeline unhealthy")
+
+    runner._market_data_runtime = FailedRuntime()
+
+    async def capture(event) -> None:
+        feature_calls.append(event)
+
+    monkeypatch.setattr(runner, "process_market_feature", capture)
+    with pytest.raises(RuntimeError, match="feature pipeline unhealthy"):
+        await runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
+    assert feature_calls == []
+
+
+@pytest.mark.asyncio
+async def test_incomplete_trade_window_suppresses_entire_closed_bar_decision():
+    from src.runtime.market_data.integrity import TradeDataIntegrityTracker
+
+    tracker = TradeDataIntegrityTracker()
+    tracker.mark_dropped(2 * H4 + 1_000, "trade_dispatcher_drop")
+    runner = _runner(
+        FeatureStrategy(),
+        data=FakeData(),
+        services={
+            "recovery_service": None,
+            "snapshot": _snapshot(),
+            "runtime_requirements": _feature_requirements(),
+            "trade_data_integrity_tracker": tracker,
+        },
+        dry_run=True,
+    )
+
+    events = await runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
+
+    assert events == []
+    assert runner.stats.closed_klines_seen == 0
+    assert runner._closed_bar_scheduler.last_emitted_open_time_ms is None
     assert runner._market_queue.empty()
 
 

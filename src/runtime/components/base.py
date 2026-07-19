@@ -1,10 +1,64 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+from src.runtime.module import CapabilityId
 from src.runtime.services import RuntimeServices
 
+if TYPE_CHECKING:
+    from src.runtime.market_data.runtime import MarketDataRuntime
 
+
+@dataclass
+class MarketRuntimeState:
+    runtime: MarketDataRuntime | None = None
+    capabilities: frozenset[CapabilityId] = frozenset()
+    modules_managed: bool = False
+    integrity_error: BaseException | None = None
+
+
+@dataclass
+class AccountRuntimeState:
+    startup_snapshot_loaded: bool = False
+    last_event_time_ms: int | None = None
+
+
+@dataclass
+class ExecutionRuntimeState:
+    accepting_signals: bool = True
+    orders_in_flight: int = 0
+
+
+@dataclass
+class ClosedBarRuntimeState:
+    active_open_time_ms: int | None = None
+    last_completed_open_time_ms: int | None = None
+
+
+@dataclass
+class RangeRuntimeState:
+    degraded_windows: dict[int, str] = field(default_factory=dict)
+
+
+@dataclass
+class OperationalRuntimeState:
+    stopping: bool = False
+    startup_complete: bool = False
+
+
+@dataclass
 class RuntimeSharedState:
-    """Explicit state context shared only where legacy components require it."""
+    """Domain state groups plus temporary attributes for legacy components."""
+
+    market: MarketRuntimeState = field(default_factory=MarketRuntimeState)
+    account: AccountRuntimeState = field(default_factory=AccountRuntimeState)
+    execution: ExecutionRuntimeState = field(default_factory=ExecutionRuntimeState)
+    closed_bar: ClosedBarRuntimeState = field(default_factory=ClosedBarRuntimeState)
+    range: RangeRuntimeState = field(default_factory=RangeRuntimeState)
+    operational: OperationalRuntimeState = field(
+        default_factory=OperationalRuntimeState
+    )
 
 
 class RuntimeComponent:
@@ -47,7 +101,16 @@ class RuntimeComponent:
         if isinstance(descriptor, property) and descriptor.fset is not None:
             object.__setattr__(self, name, value)
             return
-        setattr(object.__getattribute__(self, "_state"), name, value)
+        state = object.__getattribute__(self, "_state")
+        if name == "_market_data_runtime":
+            state.market.runtime = value  # type: ignore[assignment]
+        elif name == "_market_data_capabilities":
+            state.market.capabilities = value  # type: ignore[assignment]
+        elif name == "_market_modules_managed":
+            state.market.modules_managed = bool(value)
+        elif name == "_pipeline_integrity_error":
+            state.market.integrity_error = value  # type: ignore[assignment]
+        setattr(state, name, value)
 
     def service_dependencies(self) -> RuntimeServices:
         state = object.__getattribute__(self, "_state")
@@ -58,5 +121,18 @@ class RuntimeComponent:
             object.__setattr__(state, "services", services)
         return services
 
+    @property
+    def market_state(self) -> MarketRuntimeState:
+        return object.__getattribute__(self, "_state").market
 
-__all__ = ["RuntimeComponent", "RuntimeSharedState"]
+
+__all__ = [
+    "AccountRuntimeState",
+    "ClosedBarRuntimeState",
+    "ExecutionRuntimeState",
+    "MarketRuntimeState",
+    "OperationalRuntimeState",
+    "RangeRuntimeState",
+    "RuntimeComponent",
+    "RuntimeSharedState",
+]

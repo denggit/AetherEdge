@@ -1,36 +1,21 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
-from decimal import Decimal
-from enum import Enum
-from typing import Any, Mapping, Sequence
+from typing import Sequence
 
-from src.order_management.idempotency.client_order_id import DeterministicClientOrderIdFactory
-from src.order_management.idempotency.duplicate_guard import RepositoryDuplicateOrderGuard
-from src.order_management.models import ExchangeOrderResult, OrderIntent, OrderIntentStatus, OrderJournalEvent
-from src.order_management.position_plan import LegPlan, LegRole, LegSyncStatus, PositionPlan, PositionPlanStatus
-from src.order_management.ports import ClientOrderIdFactory, DuplicateOrderGuard, OrderIntentRepository
-from src.order_management.quantity import (
-    NativeQuantityConverter,
-    resolve_executable_base_quantity,
+from src.order_management.models import ExchangeOrderResult, OrderIntent
+from src.order_management.ports import (
+    ClientOrderIdFactory,
+    ExecutionResultRecorderPort,
+    OrderSafetyValidatorPort,
 )
-from src.order_management.master_follower import MasterFollowerExecutionPolicy, MasterFollowerPolicyEvaluator
-from src.order_management.safety import ExitSafetyError, ExitSafetyGuard, is_exit_action, normalize_exit_request_for_exchange, target_position_side_for_action
-from src.order_management.sync import OrderStatusSynchronizer, extract_avg_fill_price, extract_fee
-from src.planner import ExecutionPlanner, PlannedExecution, PlannedExecutionAction
+from src.order_management.quantity import NativeQuantityConverter
+from src.order_management.safety import ExitSafetyError
+from src.order_management.sync import OrderStatusSynchronizer
+from src.planner import PlannedExecution, PlannedExecutionAction
 from src.platform.execution import ExecutionClient
-from src.platform.exchanges.models import CancelStopOrderRequest, ExchangeName, Order, OrderRequest, OrderStatus, PositionMode, PositionSide, StopMarketOrderRequest
-from src.signals.models import SignalAction
+from src.platform.exchanges.models import Order, OrderRequest, StopMarketOrderRequest
 from src.utils.log import get_logger
-
-
-_MASTER_GATED_PURPOSES = {"normal_entry", "normal_close"}
-_BYPASS_MASTER_PURPOSES = {
-    "stop_sync",
-    "follower_recovery_topup",
-    "follower_close_after_master_close",
-}
 
 logger = get_logger(__name__)
 
@@ -55,8 +40,8 @@ class MultiExchangeExecutor:
         client_order_id_factory: ClientOrderIdFactory,
         quantity_converter: NativeQuantityConverter,
         order_status_synchronizer: OrderStatusSynchronizer,
-        safety_validator: object,
-        result_recorder: object,
+        safety_validator: OrderSafetyValidatorPort,
+        result_recorder: ExecutionResultRecorderPort,
     ) -> None:
         self.client_order_id_factory = client_order_id_factory
         self.quantity_converter = quantity_converter
@@ -64,7 +49,7 @@ class MultiExchangeExecutor:
         self._safety_validator = safety_validator
         self._result_recorder = result_recorder
 
-    async def _execute_for_client(
+    async def execute_for_client(
         self,
         client: ExecutionClient,
         intent: OrderIntent,
@@ -179,7 +164,7 @@ class MultiExchangeExecutor:
                 raise ValueError("order_request is required")
             if client_order_id is None:
                 raise ValueError("client_order_id is required")
-            request = await self._safety_validator._normalize_order_for_client(
+            request = await self._safety_validator.normalize_order(
                 client,
                 item.signal.action,
                 _with_exchange_quantity(item.order_request, intent=intent, exchange=client.exchange),
@@ -191,7 +176,7 @@ class MultiExchangeExecutor:
                 raise ValueError("stop_market_request is required")
             if client_order_id is None:
                 raise ValueError("client_order_id is required")
-            request = await self._safety_validator._normalize_stop_for_client(
+            request = await self._safety_validator.normalize_stop(
                 client,
                 item.signal.action,
                 _with_exchange_quantity(item.stop_market_request, intent=intent, exchange=client.exchange),
@@ -215,7 +200,7 @@ class MultiExchangeExecutor:
             return _with_scoped_cancel_audit(order, item.cancel_stop_request)
         raise ValueError(f"unsupported planned action: {item.action}")
 
-    def _preview_conversion(self, client: ExecutionClient, item: PlannedExecution, *, intent: OrderIntent) -> dict[str, object] | None:
+    def preview_conversion(self, client: ExecutionClient, item: PlannedExecution, *, intent: OrderIntent) -> dict[str, object] | None:
         profile = _client_market_profile(client)
         if profile is None:
             return None
@@ -261,6 +246,34 @@ class MultiExchangeExecutor:
             market_profile=profile,
         )
         return converted
+
+    async def _execute_for_client(
+        self,
+        client: ExecutionClient,
+        intent: OrderIntent,
+        items: Sequence[PlannedExecution],
+        *,
+        max_attempts: int = 1,
+        retry_delay_seconds: float = 0.0,
+    ) -> list[ExchangeOrderResult]:
+        """Compatibility alias; composed services use execute_for_client."""
+
+        return await self.execute_for_client(
+            client,
+            intent,
+            items,
+            max_attempts=max_attempts,
+            retry_delay_seconds=retry_delay_seconds,
+        )
+
+    def _preview_conversion(
+        self,
+        client: ExecutionClient,
+        item: PlannedExecution,
+        *,
+        intent: OrderIntent,
+    ) -> dict[str, object] | None:
+        return self.preview_conversion(client, item, intent=intent)
 
 
 __all__ = ["MultiExchangeExecutor"]

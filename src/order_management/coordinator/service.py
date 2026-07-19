@@ -1,27 +1,24 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
-from decimal import Decimal
-from enum import Enum
-from typing import Any, Mapping, Sequence
+from typing import Sequence
 
 from src.order_management.idempotency.client_order_id import DeterministicClientOrderIdFactory
 from src.order_management.idempotency.duplicate_guard import RepositoryDuplicateOrderGuard
 from src.order_management.models import ExchangeOrderResult, OrderIntent, OrderIntentStatus, OrderJournalEvent
-from src.order_management.position_plan import LegPlan, LegRole, LegSyncStatus, PositionPlan, PositionPlanStatus
-from src.order_management.ports import ClientOrderIdFactory, DuplicateOrderGuard, OrderIntentRepository
-from src.order_management.quantity import (
-    NativeQuantityConverter,
-    resolve_executable_base_quantity,
+from src.order_management.ports import (
+    ClientOrderIdFactory,
+    DuplicateOrderGuard,
+    OrderIntentRepository,
+    PositionPlanStorePort,
+    PostResultValidatorPort,
 )
+from src.order_management.quantity import NativeQuantityConverter
 from src.order_management.master_follower import MasterFollowerExecutionPolicy, MasterFollowerPolicyEvaluator
-from src.order_management.safety import ExitSafetyError, ExitSafetyGuard, is_exit_action, normalize_exit_request_for_exchange, target_position_side_for_action
-from src.order_management.sync import OrderStatusSynchronizer, extract_avg_fill_price, extract_fee
-from src.planner import ExecutionPlanner, PlannedExecution, PlannedExecutionAction
+from src.order_management.safety import ExitSafetyGuard
+from src.order_management.sync import OrderStatusSynchronizer
+from src.planner import ExecutionPlanner
 from src.platform.execution import ExecutionClient
-from src.platform.exchanges.models import CancelStopOrderRequest, ExchangeName, Order, OrderRequest, OrderStatus, PositionMode, PositionSide, StopMarketOrderRequest
-from src.signals.models import SignalAction
 from src.utils.log import get_logger
 
 
@@ -59,8 +56,8 @@ class MultiExchangeOrderCoordinator:
         order_status_synchronizer: OrderStatusSynchronizer | None = None,
         master_follower_policy: MasterFollowerExecutionPolicy | None = None,
         exit_safety_guard: ExitSafetyGuard | None = None,
-        position_plan_store=None,
-        post_result_validator=None,
+        position_plan_store: PositionPlanStorePort | None = None,
+        post_result_validator: PostResultValidatorPort | None = None,
     ) -> None:
         if not clients:
             raise ValueError("at least one execution client is required")
@@ -114,7 +111,7 @@ class MultiExchangeOrderCoordinator:
 
     async def execute(self, intent: OrderIntent) -> list[ExchangeOrderResult]:
         self.duplicate_guard.claim_or_raise(intent)
-        intent, skipped = await self.intent_planner._normalize_recovery_topup_intent(intent)
+        intent, skipped = await self.intent_planner.normalize_recovery_topup_intent(intent)
         if skipped is not None:
             return skipped
         plan = self.planner.plan(intent.signal)
@@ -124,7 +121,7 @@ class MultiExchangeOrderCoordinator:
             intent,
             clients=clients,
             items=plan.items,
-            preview_conversion=self.executor._preview_conversion,
+            preview_conversion=self.executor.preview_conversion,
         )
         logger.info(
             "Order intent planned | intent_id=%s action=%s targets=%s planned_items=%s master_follower=%s",
@@ -137,9 +134,9 @@ class MultiExchangeOrderCoordinator:
         self.repository.update_claimed_intent(intent)
         self.repository.update_status(intent_id=intent.intent_id, status=OrderIntentStatus.PLANNED)
         if self.master_follower_executor is not None:
-            results = await self.master_follower_executor._execute_master_follower(clients, intent, plan.items)
+            results = await self.master_follower_executor.execute(clients, intent, plan.items)
         else:
-            results_nested = await asyncio.gather(*(self.executor._execute_for_client(client, intent, plan.items) for client in clients))
+            results_nested = await asyncio.gather(*(self.executor.execute_for_client(client, intent, plan.items) for client in clients))
             results = [item for group in results_nested for item in group]
         if callable(self.post_result_validator):
             results = list(await self.post_result_validator(intent=intent, results=tuple(results)))
@@ -242,24 +239,24 @@ class MultiExchangeOrderCoordinator:
         return updater
 
     def _record_position_plan(self, intent, results) -> None:
-        self._compat_position_updater()._record_position_plan(intent, results)
+        self._compat_position_updater().record_position_plan(intent, results)
 
     def _record_open_or_topup_plan(self, intent, results, *, purpose) -> None:
-        self._compat_position_updater()._record_open_or_topup_plan(
+        self._compat_position_updater().record_open_or_topup_plan(
             intent,
             results,
             purpose=purpose,
         )
 
     def _record_close_plan(self, intent, results, *, purpose) -> None:
-        self._compat_position_updater()._record_close_plan(
+        self._compat_position_updater().record_close_plan(
             intent,
             results,
             purpose=purpose,
         )
 
     def _record_stop_plan(self, intent, results) -> None:
-        self._compat_position_updater()._record_stop_plan(intent, results)
+        self._compat_position_updater().record_stop_plan(intent, results)
 
 
 __all__ = ["MultiExchangeOrderCoordinator"]

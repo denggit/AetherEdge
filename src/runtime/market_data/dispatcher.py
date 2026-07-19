@@ -80,21 +80,21 @@ class _Subscription(Generic[EventT]):
         self.dropped = 0
         self.error: BaseException | None = None
 
-    def publish(self, event: EventT) -> tuple[bool, bool]:
+    def publish(self, event: EventT) -> tuple[bool, EventT | None]:
         try:
             self.queue.put_nowait(event)
-            return True, False
+            return True, None
         except asyncio.QueueFull:
             self.dropped += 1
             if self.policy is BackpressurePolicy.DROP_NEWEST:
-                return False, True
+                return False, event
             try:
-                self.queue.get_nowait()
+                dropped = self.queue.get_nowait()
                 self.queue.task_done()
             except asyncio.QueueEmpty:  # pragma: no cover - same-loop guard
-                return False, True
+                return False, event
             self.queue.put_nowait(event)
-            return True, True
+            return True, dropped
 
     def start(self) -> None:
         if self.task is None or self.task.done():
@@ -113,6 +113,14 @@ class _Subscription(Generic[EventT]):
             return
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+    def discard_pending(self) -> None:
+        while True:
+            try:
+                self.queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            self.queue.task_done()
 
     def health(self) -> SubscriptionHealth:
         return SubscriptionHealth(
@@ -156,6 +164,9 @@ class BoundedEventDispatcher(Generic[EventT]):
             raise ValueError("drain timeout must be non-negative")
         self._subscriptions: dict[str, _Subscription[EventT]] = {}
         self._started = False
+        self._accepting = True
+        self._error: BaseException | None = None
+        self._dropped = 0
         self._drain_timeout_seconds = float(drain_timeout_seconds)
 
     def subscribe(
@@ -170,12 +181,17 @@ class BoundedEventDispatcher(Generic[EventT]):
         normalized = subscriber_id.strip().lower()
         if normalized in self._subscriptions:
             raise ValueError(f"duplicate subscriber id: {normalized}")
+        def record_error(failed_id: str, exc: BaseException) -> None:
+            self._record_failure(failed_id, exc)
+            if on_error is not None:
+                on_error(failed_id, exc)
+
         subscription = _Subscription(
             subscriber_id=normalized,
             handler=handler,
             maxsize=maxsize,
             policy=policy,
-            on_error=on_error,
+            on_error=record_error,
         )
         self._subscriptions[normalized] = subscription
         if self._started:
@@ -185,28 +201,46 @@ class BoundedEventDispatcher(Generic[EventT]):
         if self._started:
             return
         self._started = True
+        self._accepting = True
+        self._error = None
         for subscription in self._subscriptions.values():
             subscription.start()
 
     def publish(self, event: EventT) -> DispatchResult:
+        if not self._accepting:
+            self._dropped += 1
+            return DispatchResult(
+                delivered=0,
+                dropped=1,
+                dropped_events=(event,),
+            )
         delivered = 0
         dropped = 0
+        dropped_events: list[EventT] = []
         for subscription in self._subscriptions.values():
             accepted, discarded = subscription.publish(event)
             if accepted:
                 delivered += 1
-            if discarded:
+            if discarded is not None:
                 dropped += 1
-        return DispatchResult(delivered=delivered, dropped=dropped)
+                self._dropped += 1
+                dropped_events.append(discarded)
+        return DispatchResult(
+            delivered=delivered,
+            dropped=dropped,
+            dropped_events=tuple(dropped_events),
+        )
 
     async def stop(self) -> None:
         if not self._started:
             return
         self._started = False
+        self._accepting = False
         drains = tuple(
             subscription.drain()
             for subscription in self._subscriptions.values()
         )
+        drain_error: BaseException | None = None
         if drains:
             try:
                 await asyncio.wait_for(
@@ -214,10 +248,23 @@ class BoundedEventDispatcher(Generic[EventT]):
                     timeout=self._drain_timeout_seconds,
                 )
             except TimeoutError:
-                pass
+                unfinished = sum(
+                    1
+                    for item in self._subscriptions.values()
+                    if item.task is not None and not item.task.done()
+                )
+                if unfinished > 0:
+                    drain_error = DispatcherDrainTimeout(
+                        "event dispatcher drain timed out | "
+                        f"pending={sum(item.queue.qsize() for item in self._subscriptions.values())}"
+                    )
+                    for subscription in self._subscriptions.values():
+                        subscription.discard_pending()
         await asyncio.gather(
             *(subscription.stop() for subscription in self._subscriptions.values())
         )
+        if drain_error is not None:
+            raise drain_error
 
     def health(self) -> tuple[SubscriptionHealth, ...]:
         return tuple(
@@ -237,6 +284,50 @@ class BoundedEventDispatcher(Generic[EventT]):
             for subscription in self._subscriptions.values()
         )
 
+    @property
+    def dropped_count(self) -> int:
+        return self._dropped
+
+    @property
+    def error(self) -> BaseException | None:
+        if self._error is not None:
+            return self._error
+        for subscription in self._subscriptions.values():
+            task = subscription.task
+            if subscription.error is not None:
+                return subscription.error
+            if task is not None and task.done() and not task.cancelled():
+                try:
+                    error = task.exception()
+                except asyncio.CancelledError:
+                    error = None
+                if error is not None:
+                    return error
+        return None
+
+    def raise_if_failed(self) -> None:
+        error = self.error
+        if error is not None:
+            raise RuntimeError(
+                "event dispatcher failed | "
+                f"error={type(error).__name__}: {error}"
+            ) from error
+
+    def _record_failure(self, subscriber_id: str, exc: BaseException) -> None:
+        if self._error is None:
+            self._error = RuntimeError(
+                "event subscriber failed | "
+                f"subscriber_id={subscriber_id} "
+                f"error={type(exc).__name__}: {exc}"
+            )
+            self._error.__cause__ = exc
+        self._accepting = False
+        current = asyncio.current_task()
+        for subscription in self._subscriptions.values():
+            subscription.discard_pending()
+            if subscription.task is not None and subscription.task is not current:
+                subscription.task.cancel()
+
 
 @dataclass
 class _OrderedSubscriber(Generic[EventT]):
@@ -254,6 +345,13 @@ class _QueuedEvent(Generic[EventT]):
     event: EventT
     event_time_ms: int | None
     done: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+@dataclass
+class _CutoffBarrier(Generic[EventT]):
+    cutoff_time_ms: int
+    pending: dict[int, _QueuedEvent[EventT]] = field(default_factory=dict)
+    publication_revision: int = 0
 
 
 class BoundedOrderedEventDispatcher(Generic[EventT]):
@@ -285,6 +383,7 @@ class BoundedOrderedEventDispatcher(Generic[EventT]):
         self._event_time_ms = event_time_ms
         self._accepting = True
         self._error: BaseException | None = None
+        self._barriers: list[_CutoffBarrier[EventT]] = []
 
     def subscribe(
         self,
@@ -364,6 +463,13 @@ class BoundedOrderedEventDispatcher(Generic[EventT]):
                 )
             self._queue.put_nowait(queued)
         self._pending[queued.sequence] = queued
+        for barrier in self._barriers:
+            if (
+                queued.event_time_ms is None
+                or queued.event_time_ms <= barrier.cutoff_time_ms
+            ):
+                barrier.pending[queued.sequence] = queued
+                barrier.publication_revision += 1
         return DispatchResult(
             delivered=len(self._subscribers),
             dropped=len(dropped_events),
@@ -376,38 +482,83 @@ class BoundedOrderedEventDispatcher(Generic[EventT]):
         *,
         timeout_seconds: float | None = None,
     ) -> DispatcherBarrierResult:
-        pending = tuple(
-            queued
-            for queued in self._pending.values()
-            if queued.event_time_ms is None
-            or queued.event_time_ms <= cutoff_time_ms
-        )
-        if not pending:
-            return DispatcherBarrierResult(
-                cutoff_time_ms=cutoff_time_ms,
-                pending=0,
-                completed=True,
-            )
-        waiter = asyncio.gather(*(queued.done.wait() for queued in pending))
+        self.raise_if_failed()
         timeout = (
             self._drain_timeout_seconds
             if timeout_seconds is None
             else max(0.0, float(timeout_seconds))
         )
-        try:
-            await asyncio.wait_for(waiter, timeout=timeout)
-        except TimeoutError:
-            return DispatcherBarrierResult(
-                cutoff_time_ms=cutoff_time_ms,
-                pending=sum(not queued.done.is_set() for queued in pending),
-                completed=False,
-            )
-        self.raise_if_failed()
-        return DispatcherBarrierResult(
-            cutoff_time_ms=cutoff_time_ms,
-            pending=0,
-            completed=True,
+        barrier = _CutoffBarrier[EventT](cutoff_time_ms=int(cutoff_time_ms))
+        barrier.pending.update(
+            {
+                queued.sequence: queued
+                for queued in self._pending.values()
+                if queued.event_time_ms is None
+                or queued.event_time_ms <= cutoff_time_ms
+            }
         )
+        self._barriers.append(barrier)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        try:
+            if timeout <= 0:
+                pending_count = sum(
+                    not item.done.is_set() for item in barrier.pending.values()
+                )
+                self.raise_if_failed()
+                return DispatcherBarrierResult(
+                    cutoff_time_ms=cutoff_time_ms,
+                    pending=pending_count,
+                    completed=pending_count == 0,
+                )
+            while True:
+                pending = tuple(
+                    item
+                    for item in barrier.pending.values()
+                    if not item.done.is_set()
+                )
+                if pending:
+                    remaining = max(0.0, deadline - loop.time())
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*(item.done.wait() for item in pending)),
+                            timeout=remaining,
+                        )
+                    except TimeoutError:
+                        self.raise_if_failed()
+                        return DispatcherBarrierResult(
+                            cutoff_time_ms=cutoff_time_ms,
+                            pending=sum(
+                                not item.done.is_set()
+                                for item in barrier.pending.values()
+                            ),
+                            completed=False,
+                        )
+                self.raise_if_failed()
+                revision = barrier.publication_revision
+                await _publication_checkpoint()
+                self.raise_if_failed()
+                if revision == barrier.publication_revision and not any(
+                    not item.done.is_set() for item in barrier.pending.values()
+                ):
+                    self.raise_if_failed()
+                    return DispatcherBarrierResult(
+                        cutoff_time_ms=cutoff_time_ms,
+                        pending=0,
+                        completed=True,
+                    )
+                if loop.time() >= deadline:
+                    self.raise_if_failed()
+                    return DispatcherBarrierResult(
+                        cutoff_time_ms=cutoff_time_ms,
+                        pending=sum(
+                            not item.done.is_set()
+                            for item in barrier.pending.values()
+                        ),
+                        completed=False,
+                    )
+        finally:
+            self._barriers.remove(barrier)
 
     async def stop(self) -> None:
         self._accepting = False
@@ -525,6 +676,15 @@ class BoundedOrderedEventDispatcher(Generic[EventT]):
             self._pending.pop(queued.sequence, None)
             queued.done.set()
             self._queue.task_done()
+
+
+async def _publication_checkpoint() -> None:
+    """Yield one explicit event-loop turn without time-based synchronization."""
+
+    loop = asyncio.get_running_loop()
+    ready = loop.create_future()
+    loop.call_soon(ready.set_result, None)
+    await ready
 
 
 __all__ = [

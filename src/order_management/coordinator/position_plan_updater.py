@@ -1,26 +1,14 @@
 from __future__ import annotations
 
-import asyncio
 from dataclasses import replace
 from decimal import Decimal
-from enum import Enum
-from typing import Any, Mapping, Sequence
+from typing import Mapping, Sequence
 
-from src.order_management.idempotency.client_order_id import DeterministicClientOrderIdFactory
-from src.order_management.idempotency.duplicate_guard import RepositoryDuplicateOrderGuard
 from src.order_management.models import ExchangeOrderResult, OrderIntent, OrderIntentStatus, OrderJournalEvent
 from src.order_management.position_plan import LegPlan, LegRole, LegSyncStatus, PositionPlan, PositionPlanStatus
-from src.order_management.ports import ClientOrderIdFactory, DuplicateOrderGuard, OrderIntentRepository
-from src.order_management.quantity import (
-    NativeQuantityConverter,
-    resolve_executable_base_quantity,
-)
-from src.order_management.master_follower import MasterFollowerExecutionPolicy, MasterFollowerPolicyEvaluator
-from src.order_management.safety import ExitSafetyError, ExitSafetyGuard, is_exit_action, normalize_exit_request_for_exchange, target_position_side_for_action
-from src.order_management.sync import OrderStatusSynchronizer, extract_avg_fill_price, extract_fee
-from src.planner import ExecutionPlanner, PlannedExecution, PlannedExecutionAction
-from src.platform.execution import ExecutionClient
-from src.platform.exchanges.models import CancelStopOrderRequest, ExchangeName, Order, OrderRequest, OrderStatus, PositionMode, PositionSide, StopMarketOrderRequest
+from src.order_management.ports import OrderIntentRepository, PositionPlanStorePort
+from src.order_management.master_follower import MasterFollowerExecutionPolicy
+from src.platform.exchanges.models import ExchangeName
 from src.signals.models import SignalAction
 from src.utils.log import get_logger
 
@@ -52,7 +40,7 @@ class PositionPlanUpdater:
         self,
         *,
         repository: OrderIntentRepository,
-        position_plan_store: object | None,
+        position_plan_store: PositionPlanStorePort | None,
         master_follower_policy: MasterFollowerExecutionPolicy | None,
     ) -> None:
         self.repository = repository
@@ -65,6 +53,31 @@ class PositionPlanUpdater:
         results: Sequence[ExchangeOrderResult],
     ) -> None:
         self._record_position_plan(intent, results)
+
+    def record_open_or_topup_plan(
+        self,
+        intent: OrderIntent,
+        results: Sequence[ExchangeOrderResult],
+        *,
+        purpose: str,
+    ) -> None:
+        self._record_open_or_topup_plan(intent, results, purpose=purpose)
+
+    def record_close_plan(
+        self,
+        intent: OrderIntent,
+        results: Sequence[ExchangeOrderResult],
+        *,
+        purpose: str,
+    ) -> None:
+        self._record_close_plan(intent, results, purpose=purpose)
+
+    def record_stop_plan(
+        self,
+        intent: OrderIntent,
+        results: Sequence[ExchangeOrderResult],
+    ) -> None:
+        self._record_stop_plan(intent, results)
 
     def advance_topup_generation(self, intent: OrderIntent) -> None:
         self._advance_topup_generation(intent)
