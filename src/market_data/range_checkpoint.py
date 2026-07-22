@@ -89,6 +89,20 @@ class RangeCheckpointRecovery:
 
 
 @dataclass(frozen=True)
+class RangeBucketIntegrityRecord:
+    exchange: str
+    symbol: str
+    range_pct: str
+    bucket_start_ms: int
+    last_issue_revision: int
+    repaired_through_revision: int
+    repair_started_revision: int | None
+    status: str
+    reason: str | None
+    updated_at_ms: int
+
+
+@dataclass(frozen=True)
 class RangeMicroRepairJob:
     exchange: str
     symbol: str
@@ -281,6 +295,53 @@ class SqliteRangeCheckpointStore:
                 ),
             ).fetchone()
         return None if row is None else _checkpoint_from_row(row)
+
+    def save_bucket_integrity(self, state: RangeBucketIntegrityRecord) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO range_bucket_integrity
+                    (exchange, symbol, range_pct, bucket_start_ms, last_issue_revision,
+                     repaired_through_revision, repair_started_revision, status, reason, updated_at_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(exchange, symbol, range_pct, bucket_start_ms)
+                DO UPDATE SET
+                    last_issue_revision=excluded.last_issue_revision,
+                    repaired_through_revision=excluded.repaired_through_revision,
+                    repair_started_revision=excluded.repair_started_revision,
+                    status=excluded.status,
+                    reason=excluded.reason,
+                    updated_at_ms=excluded.updated_at_ms
+                """,
+                (
+                    str(state.exchange).lower(), state.symbol, _decimal_text(state.range_pct),
+                    int(state.bucket_start_ms), int(state.last_issue_revision),
+                    int(state.repaired_through_revision), state.repair_started_revision,
+                    state.status, state.reason, int(state.updated_at_ms),
+                ),
+            )
+
+    def load_bucket_integrity(
+        self, *, exchange: str, symbol: str, range_pct: str
+    ) -> list[RangeBucketIntegrityRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT exchange, symbol, range_pct, bucket_start_ms, last_issue_revision,
+                       repaired_through_revision, repair_started_revision, status, reason, updated_at_ms
+                FROM range_bucket_integrity
+                WHERE exchange=? AND symbol=? AND range_pct=?
+                """,
+                (str(exchange).lower(), symbol, _decimal_text(range_pct)),
+            ).fetchall()
+        return [
+            RangeBucketIntegrityRecord(
+                str(row[0]), str(row[1]), str(row[2]), int(row[3]), int(row[4]),
+                int(row[5]), None if row[6] is None else int(row[6]), str(row[7]),
+                None if row[8] is None else str(row[8]), int(row[9])
+            )
+            for row in rows
+        ]
 
     def recover_current_bucket(
         self,
@@ -1084,6 +1145,23 @@ class SqliteRangeCheckpointStore:
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS range_bucket_integrity (
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    range_pct TEXT NOT NULL,
+                    bucket_start_ms INTEGER NOT NULL,
+                    last_issue_revision INTEGER NOT NULL,
+                    repaired_through_revision INTEGER NOT NULL,
+                    repair_started_revision INTEGER,
+                    status TEXT NOT NULL,
+                    reason TEXT,
+                    updated_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (exchange, symbol, range_pct, bucket_start_ms)
+                )
+                """
+            )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS range_builder_checkpoints (

@@ -33,7 +33,6 @@ from src.runtime.market_data.features import (
 from src.runtime.market_data.integrity import TradeDataIntegrityTracker
 from src.runtime.market_data.pipeline_plan import (
     ClosedBarControlEvent,
-    ResolvedMarketPipelinePlan,
 )
 from src.runtime.market_data.processor import MarketEventProcessor
 from src.runtime.market_features import MarketFeaturePipeline
@@ -242,15 +241,6 @@ async def _replay(*, ordered: bool, root) -> dict[str, object]:
     closed_handler = ClosedHandler()
     if ordered:
         processor = MarketEventProcessor(
-            plan=ResolvedMarketPipelinePlan(
-                trades_enabled=True,
-                closed_kline_enabled=True,
-                order_book_enabled=False,
-                enabled_module_ids=tuple(
-                    module.module_id for module in runtime_modules
-                ) + ("raw-trade-callback",),
-                execution_stages=(),
-            ),
             trade_modules=runtime_modules,
             closed_bar_handler=closed_handler,
             raw_trade_callback=process_raw,
@@ -259,6 +249,10 @@ async def _replay(*, ordered: bool, root) -> dict[str, object]:
         await processor.start()
         for trade in period_a:
             processor.submit_trade(trade)
+        processor.begin_closed_bar_cutoff(
+            kline.open_time_ms,
+            kline.close_time_ms,
+        )
         processor.submit_closed_bar(control)
         for trade in period_b:
             processor.submit_trade(trade)

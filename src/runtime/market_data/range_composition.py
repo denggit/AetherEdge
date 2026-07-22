@@ -23,7 +23,6 @@ from src.runtime.market_data.range_module import (
     FeaturePublisher,
     RangeBarModule,
     RangeBarModuleConfig,
-    RangeBarPersistence,
 )
 from src.runtime.market_data.range_repair_journal import (
     RangeRepairJournalConfig,
@@ -69,7 +68,7 @@ class RangeModuleComposition:
     runtime_config: RangeRuntimeConfig
     startup_catchup: StartupCatchupConfig
     publish: FeaturePublisher
-    persistence: RangeBarPersistence
+    persistence: object
     stop_event: asyncio.Event
     speed_provider: ProviderFactory
     repair_bootstrap: Callable[[], RangeRepairBootstrapService]

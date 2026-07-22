@@ -3,19 +3,13 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any
 
 from src.runtime.module import CapabilityId
 from src.runtime.module import ModuleHealth, ModuleHost
 from src.runtime.registry import DependencyResolver, ModuleRegistry, RuntimePlan
 from src.runtime.market_data.pipeline_plan import ResolvedMarketPipelinePlan
 from src.runtime.market_data.processor import MarketEventProcessor
-
-
-class RuntimeLog(Protocol):
-    def info(self, message: str, *args: object) -> None: ...
-
-    def error(self, message: str, *args: object) -> None: ...
 
 
 class MarketDataRuntimeError(RuntimeError):
@@ -36,7 +30,7 @@ class MarketDataRuntime:
         self,
         *,
         registry: ModuleRegistry,
-        logger: RuntimeLog | None = None,
+        logger: Any | None = None,
         event_processor: MarketEventProcessor | None = None,
         pipeline_plan: ResolvedMarketPipelinePlan | None = None,
     ) -> None:
@@ -47,6 +41,8 @@ class MarketDataRuntime:
         self._pipeline_plan = pipeline_plan
         self._plan: RuntimePlan | None = None
         self._host: ModuleHost | None = None
+        self._consumer_modules = ()
+        self._source_modules = ()
         self._error: BaseException | None = None
         self._supervisor_stop = asyncio.Event()
         self._supervisor_task: asyncio.Task[None] | None = None
@@ -89,12 +85,21 @@ class MarketDataRuntime:
                 for module_id in (
                     ()
                     if self._pipeline_plan is None
-                    else self._pipeline_plan.enabled_module_ids
+                    else self._pipeline_plan.ordered_trade_module_ids
                 )
                 if module_id in by_id
             )
             self._event_processor.set_trade_modules(ordered)
         host = ModuleHost(modules)
+        source_by_id = {module.module_id: module for module in modules}
+        self._source_modules = tuple(
+            source_by_id[module_id]
+            for module_id in ("trade-stream", "order-book-stream")
+            if module_id in source_by_id
+        )
+        self._consumer_modules = tuple(
+            module for module in modules if module not in self._source_modules
+        )
         self._log_plan(plan)
         try:
             await host.prepare()
@@ -112,13 +117,18 @@ class MarketDataRuntime:
         if host is None:
             raise RuntimeError("market data runtime is not prepared")
         try:
+            await host.start(self._consumer_modules)
             if self._event_processor is not None:
                 await self._event_processor.start()
-            await host.start()
+            await host.start(self._source_modules)
         except BaseException as exc:
             self._error = exc
             if self._event_processor is not None:
-                await self._event_processor.stop()
+                try:
+                    await self._event_processor.stop()
+                except BaseException:
+                    pass
+            await host.stop()
             self._host = None
             self._plan = None
             raise
@@ -139,17 +149,33 @@ class MarketDataRuntime:
         host = self._host
         self._host = None
         self._plan = None
-        self._supervisor_stop.set()
         supervisor = self._supervisor_task
         self._supervisor_task = None
+        errors: list[BaseException] = []
+        processor = self._event_processor
+        if processor is not None:
+            processor.stop_accepting()
         try:
+            operations = []
             if host is not None:
-                await host.stop()
+                operations.append(host.stop(self._source_modules))
+            if processor is not None:
+                operations.append(processor.stop())
+            if host is not None:
+                operations.append(host.stop())
+            for operation in operations:
+                try:
+                    await operation
+                except BaseException as exc:
+                    errors.append(exc)
         finally:
-            if self._event_processor is not None:
-                await self._event_processor.stop()
+            self._supervisor_stop.set()
             if supervisor is not None:
                 await asyncio.gather(supervisor, return_exceptions=True)
+        if errors:
+            self._error = errors[0]
+            detail = " | ".join(f"{type(exc).__name__}: {exc}" for exc in errors)
+            raise MarketDataRuntimeError(f"market data shutdown failed | {detail}") from errors[0]
 
     def raise_if_failed(self) -> None:
         if self._error is not None:
@@ -243,5 +269,4 @@ __all__ = [
     "MarketDataRuntime",
     "MarketDataRuntimeError",
     "MarketDataRuntimeState",
-    "RuntimeLog",
 ]

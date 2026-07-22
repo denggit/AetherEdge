@@ -105,7 +105,6 @@ def compose_live_runtime(
 
     trade_processor = (
         MarketEventProcessor(
-            plan=pipeline_plan,
             closed_bar_handler=(
                 runner.closed_bar
                 if pipeline_plan.closed_kline_enabled
@@ -118,7 +117,6 @@ def compose_live_runtime(
             ),
             integrity=trade_integrity,
             maxsize=max(1, app_config.market_queue_maxsize),
-            overflow_policy="fail_fast",
         )
         if pipeline_plan.trades_enabled or pipeline_plan.closed_kline_enabled
         else None

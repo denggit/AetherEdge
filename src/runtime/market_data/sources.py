@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Generic, Protocol, TypeVar
+from typing import Generic, TypeVar
 
 from src.platform.data.models import MarketOrderBook, MarketTrade
 from src.platform.data.websocket.ports import OrderBookStream, TradeStream
@@ -24,10 +24,6 @@ EventT = TypeVar("EventT")
 StreamFactory = Callable[[], AsyncIterator[EventT]]
 ModuleErrorHandler = Callable[[str, BaseException], None]
 DroppedEventHandler = Callable[[EventT], Awaitable[None] | None]
-
-
-class _StreamIdentity(Protocol):
-    async def stop(self) -> None: ...
 
 
 class OrderBookResyncRequired(RuntimeError):

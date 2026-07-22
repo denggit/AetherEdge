@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol, runtime_checkable
@@ -108,20 +108,30 @@ class ModuleHost:
             assert module is not None
             await self._raise_startup_error(module, exc)
 
-    async def start(self) -> None:
+    async def start(
+        self,
+        modules: Sequence[RuntimeModule] | None = None,
+    ) -> None:
         if not self._prepared:
             await self.prepare()
+        targets = self.modules if modules is None else modules
         try:
-            for module in self.modules:
+            for module in targets:
+                if module in self._started:
+                    continue
                 await module.start()
                 self._started.append(module)
                 self._observe(module)
         except BaseException as exc:
             await self._raise_startup_error(module, exc)
 
-    async def stop(self) -> None:
+    async def stop(
+        self,
+        modules: Sequence[RuntimeModule] | None = None,
+    ) -> None:
         errors: list[str] = []
-        prepared_in_reverse = list(reversed(self._prepared))
+        targets = self._prepared if modules is None else modules
+        prepared_in_reverse = list(reversed(targets))
         shutdown_order = sorted(
             prepared_in_reverse,
             key=lambda item: int(
@@ -133,12 +143,14 @@ class ModuleHost:
             try:
                 await module.stop()
                 self._observe(module)
+                if module in self._started:
+                    self._started.remove(module)
+                if module in self._prepared:
+                    self._prepared.remove(module)
             except BaseException as exc:
                 errors.append(
                     f"{module.module_id}={type(exc).__name__}: {exc}"
                 )
-        self._started.clear()
-        self._prepared.clear()
         if errors:
             raise ModuleLifecycleError(
                 "module shutdown failed | " + " | ".join(errors)
@@ -175,12 +187,6 @@ class ModuleHost:
             f"module startup failed | module={module.module_id} | "
             f"error={type(exc).__name__}: {exc}{shutdown_detail}"
         ) from exc
-
-
-async def run_lifecycle_step(step: Callable[[], Awaitable[None]]) -> None:
-    """Typed callback adapter for small lifecycle-only orchestration steps."""
-
-    await step()
 
 
 __all__ = [

@@ -10,7 +10,7 @@ from src.app import (
     NoopAlertSink,
 )
 from src.platform import ExchangeName
-from src.platform.data.models import MarketTrade, TradeSide
+from src.platform.data.models import MarketTicker
 from src.planner import ExecutionPlanner
 from src.runtime import (
     LiveRuntimeConfig,
@@ -110,7 +110,7 @@ def test_live_runtime_runner_exposes_health_without_replacing_app_runner_path():
     assert stopped.phase is RuntimePhase.STOPPED
 
 
-def test_market_queue_full_records_drop_and_emits_alert():
+def test_non_trade_market_queue_full_records_drop_and_emits_alert():
     app_config = _app_config()
     app_config = AppConfig(
         symbol=app_config.symbol,
@@ -145,8 +145,8 @@ def test_market_queue_full_records_drop_and_emits_alert():
     )
 
     async def scenario():
-        await runner._enqueue_market_event(_trade_event(1))
-        await runner._enqueue_market_event(_trade_event(2))
+        await runner._enqueue_market_event(_ticker_event(1))
+        await runner._enqueue_market_event(_ticker_event(2))
 
     asyncio.run(scenario())
 
@@ -154,14 +154,11 @@ def test_market_queue_full_records_drop_and_emits_alert():
     assert alerts._queue.qsize() == 1
 
 
-def _trade_event(ts: int) -> MarketTrade:
-    return MarketTrade(
+def _ticker_event(ts: int) -> MarketTicker:
+    return MarketTicker(
         exchange=ExchangeName.OKX,
         symbol="ETH-USDT-PERP",
         raw_symbol="ETH-USDT-SWAP",
         price=Decimal("100"),
-        quantity=Decimal("1"),
-        side=TradeSide.BUY,
-        trade_time_ms=ts,
-        trade_id=str(ts),
+        time_ms=ts,
     )

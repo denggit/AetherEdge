@@ -19,7 +19,6 @@ from src.runtime.market_data.catalog import (
 from src.runtime.market_data.range_module import (
     RangeBarModule,
     RangeBarModuleConfig,
-    RangeBarPersistence,
 )
 from src.runtime.market_data.features import (
     FixedTimeTradeBarModule,
@@ -43,7 +42,6 @@ __all__ = [
     "RangeFootprintModule",
     "RangeBarModule",
     "RangeBarModuleConfig",
-    "RangeBarPersistence",
     "RangeFootprintModuleConfig",
     "SubscriptionHealth",
     "TradeStreamModule",

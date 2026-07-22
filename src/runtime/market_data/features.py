@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any
 
 from src.market_data.derived import (
     FixedTimeTradeBarBuilder,
@@ -29,10 +29,6 @@ from src.runtime.module import CapabilityId, ModuleHealth, ModuleState
 FeaturePublisher = Callable[[MarketFeatureEvent], Awaitable[None]]
 
 
-class TradeFeatureBuilder(Protocol):
-    def on_trade(self, trade: MarketTrade) -> Sequence[object]: ...
-
-
 @dataclass(frozen=True)
 class FixedTimeTradeBarModuleConfig:
     contract_value: str = "0.01"
@@ -53,8 +49,6 @@ class RangeFootprintModuleConfig:
 
 
 class _TradeFeatureModule:
-    dispatch_priority = 0
-
     def __init__(
         self,
         *,
@@ -112,11 +106,7 @@ class _TradeFeatureModule:
     async def process_trade(self, trade: MarketTrade) -> None:
         raise NotImplementedError
 
-    def _on_dispatch_error(
-        self,
-        _subscriber_id: str,
-        exc: BaseException,
-    ) -> None:
+    def mark_failed(self, exc: BaseException) -> None:
         self._error = exc
         self._state = ModuleState.ERROR
 
@@ -131,14 +121,12 @@ class _TradeFeatureModule:
 
 
 class FixedTimeTradeBarModule(_TradeFeatureModule):
-    dispatch_priority = 200
-
     def __init__(
         self,
         *,
         config: FixedTimeTradeBarModuleConfig,
         publish: FeaturePublisher | None = None,
-        builder: TradeFeatureBuilder | None = None,
+        builder: Any | None = None,
         integrity: TradeDataIntegrityTracker | None = None,
     ) -> None:
         super().__init__(
@@ -177,14 +165,12 @@ class FixedTimeTradeBarModule(_TradeFeatureModule):
 
 
 class TradeFootprintModule(_TradeFeatureModule):
-    dispatch_priority = 300
-
     def __init__(
         self,
         *,
         config: TradeFootprintModuleConfig,
         publish: FeaturePublisher | None = None,
-        builder: TradeFeatureBuilder | None = None,
+        builder: Any | None = None,
         integrity: TradeDataIntegrityTracker | None = None,
     ) -> None:
         super().__init__(
@@ -214,14 +200,12 @@ class TradeFootprintModule(_TradeFeatureModule):
 
 
 class RangeFootprintModule(_TradeFeatureModule):
-    dispatch_priority = 100
-
     def __init__(
         self,
         *,
         config: RangeFootprintModuleConfig,
         publish: FeaturePublisher | None = None,
-        builder: TradeFeatureBuilder | None = None,
+        builder: Any | None = None,
         integrity: TradeDataIntegrityTracker | None = None,
     ) -> None:
         super().__init__(

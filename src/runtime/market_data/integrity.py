@@ -88,14 +88,19 @@ class TradeDataIntegrityTracker:
     ) -> None:
         start = int(window_start_ms)
         end = int(window_end_ms)
+        through = int(through_revision)
+        if through < 0 or through > self._revision:
+            raise ValueError(
+                "through_revision must be between zero and current revision"
+            )
         key = (start, end)
         existing = self._repaired_ranges.get(key, 0)
-        self._repaired_ranges[key] = max(existing, int(through_revision))
+        self._repaired_ranges[key] = max(existing, through)
         for wkey, wstate in list(self._windows.items()):
             if start <= wstate.start_ms and wstate.end_ms <= end:
                 wstate.repaired_through_revision = max(
                     wstate.repaired_through_revision,
-                    int(through_revision),
+                    through,
                 )
         self._compact_repaired_details()
 
@@ -112,23 +117,29 @@ class TradeDataIntegrityTracker:
         if end < start:
             raise ValueError("window end must not precede window start")
 
-        # Check repaired ranges first — repair through_revision must cover
-        # every issue in the window.
-        for (r_start, r_end), through_rev in self._repaired_ranges.items():
-            if r_start <= start and end <= r_end:
-                # Still need to check for issues AFTER the repair
-                unmatched: list[str] = []
-                for issue in self._issues:
-                    if start <= issue.event_time_ms <= end:
-                        if issue.revision > through_rev:
-                            unmatched.append(issue.reason)
-                if not unmatched:
-                    return None
-                return (
-                    "trade_data_incomplete;repaired_through="
-                    f"{through_rev};"
-                    "new_drop_after_repair=" + ",".join(unmatched)
-                )
+        through_rev = max(
+            (
+                revision
+                for (r_start, r_end), revision
+                in self._repaired_ranges.items()
+                if r_start <= start and end <= r_end
+            ),
+            default=None,
+        )
+        if through_rev is not None:
+            unmatched = [
+                issue.reason
+                for issue in self._issues
+                if start <= issue.event_time_ms <= end
+                and issue.revision > through_rev
+            ]
+            if not unmatched:
+                return None
+            return (
+                "trade_data_incomplete;repaired_through="
+                f"{through_rev};new_drop_after_repair="
+                + ",".join(unmatched)
+            )
 
         # No repair covers this window — check issues
         matched_reasons: dict[str, None] = {}
@@ -184,6 +195,13 @@ class TradeDataIntegrityTracker:
     def revision(self) -> int:
         """Monotonic counter — increments on every mark_dropped call."""
         return self._revision
+
+    def restore_revision(self, revision: int) -> None:
+        """Resume the durable monotonic revision without fabricating issues."""
+        value = int(revision)
+        if value < 0:
+            raise ValueError("revision must be non-negative")
+        self._revision = max(self._revision, value)
 
     @property
     def dropped_count(self) -> int:

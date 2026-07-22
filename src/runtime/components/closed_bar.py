@@ -76,18 +76,6 @@ class ClosedBarComponent(RuntimeComponent):
         )
 
     async def process_closed_bar(self, event: ClosedBarControlEvent) -> None:
-        if event.skip_reason is not None:
-            self._mark_range_context_degraded_bucket(
-                bucket_start_ms=event.open_time_ms,
-                reason="trade_data_incomplete_before_closed_bar",
-                event_time_ms=event.kline.close_time_ms,
-            )
-            scheduler = self._closed_bar_scheduler
-            mark = getattr(scheduler, "mark_skipped", None)
-            if callable(mark):
-                mark(event.open_time_ms, event.skip_reason)
-            event.result = ()
-            return
         event.result = tuple(
             await self._process_confirmed_closed_bar(
                 event.open_time_ms,
@@ -161,6 +149,12 @@ class ClosedBarComponent(RuntimeComponent):
         open_time_ms = self._closed_bar_scheduler.due_closed_bar(now_ms)
         if open_time_ms is None:
             return None
+        processor = self.service_dependencies().market_event_processor
+        if isinstance(processor, MarketEventProcessor):
+            processor.begin_closed_bar_cutoff(
+                open_time_ms,
+                open_time_ms + self._closed_bar_interval_ms - 1,
+            )
         rows = await self.context.data.fetch_klines(
             interval=self._closed_bar_interval,
             limit=10,
@@ -289,15 +283,11 @@ class ClosedBarComponent(RuntimeComponent):
         open_time_ms: int,
         closed_kline: MarketKline,
     ) -> MarketFeatureEvent | None:
-        if (
-            not self.requirements.trades.enabled
-            or open_time_ms not in self._range_context_degraded_buckets
-        ):
+        if not self.requirements.trades.enabled:
             return None
-        reason = self._range_context_degraded_buckets.get(
-            open_time_ms,
-            "range_context_degraded",
-        )
+        reason = self._require_range_module().degraded_reason(open_time_ms)
+        if reason is None:
+            return None
         logger.warning(
             "4H range context unavailable diagnostics | symbol=%s interval=%s bucket_start_ms=%s bucket_end_ms=%s reason=%s trust_start_bucket_ms=%s queue_size=%s",
             self.app_config.symbol,

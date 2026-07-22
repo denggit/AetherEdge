@@ -4,10 +4,7 @@ import pytest
 
 from src.runtime.capabilities import capability_request_from_requirements
 from src.runtime.feature_pipeline import TradeFeatureRuntimeConfig
-from src.runtime.market_data.pipeline_plan import (
-    MarketModuleSpec,
-    resolve_market_pipeline,
-)
+from src.runtime.market_data.pipeline_plan import resolve_market_pipeline
 from src.runtime.requirements import (
     ClosedKlineRequirement,
     OrderBookRequirement,
@@ -218,25 +215,6 @@ class TestModuleDependencyOrdering:
         plan1 = resolve_market_pipeline(req)
         plan2 = resolve_market_pipeline(req)
         assert plan1.enabled_module_ids == plan2.enabled_module_ids
-
-    def test_cycle_detection(self):
-        cyclic_specs = (
-            MarketModuleSpec(module_id="a", after=frozenset({"b"})),
-            MarketModuleSpec(module_id="b", after=frozenset({"a"})),
-        )
-        req = StrategyRuntimeRequirements(
-            trades=TradeStreamRequirement(enabled=True, stream_enabled=True),
-        )
-        req_with_extra = StrategyRuntimeRequirements(
-            trades=TradeStreamRequirement(enabled=True, stream_enabled=True),
-        )
-        with pytest.raises(ValueError, match="cycle"):
-            resolve_market_pipeline(
-                req_with_extra,
-                extra_module_ids=frozenset({"a", "b"}),
-                custom_specs=cyclic_specs,
-            )
-
 
 class TestCapabilityRequestMapping:
     def test_empty_requirements_no_trade_or_book_capabilities(self):

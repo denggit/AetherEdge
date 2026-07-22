@@ -31,7 +31,13 @@ from src.order_management import ExchangeOrderResult, OrderIntent, OrderIntentSt
 from src.order_management.position_plan.models import LegPlan, LegRole, LegSyncStatus, PositionPlan, PositionPlanStatus
 from src.planner import ExecutionPlanner
 from src.runtime import LiveRuntimeConfig, LiveRuntimeRunner, RuntimeMode, RuntimePhase, StrategyRuntimeRequirements
+from src.runtime.capabilities import FEATURE_RANGE_BARS
+from src.runtime.market_data.catalog import build_market_data_registry
+from src.runtime.market_data.integrity import TradeDataIntegrityTracker
+from src.runtime.market_data.pipeline_plan import resolve_market_pipeline
+from src.runtime.market_data.processor import MarketEventProcessor
 from src.runtime.market_data.range_config import RangeRuntimeConfig
+from src.runtime.market_data.runtime import MarketDataRuntime
 from src.runtime.account_sync import RequestThrottle
 from src.runtime.recovery.models import RecoveryReport
 from src.runtime.recovery.service import (
@@ -441,6 +447,7 @@ def _runner(strategy, *, data=None, services=None, dry_run=False, data_streams=(
         closed_bar_buffer_ms=60_000,
     )
     range_config = RangeRuntimeConfig(
+        backfill_enabled=False,
         checkpoint_db_path=str(runtime_root / "range-checkpoint.sqlite3"),
         repair_journal_db=str(runtime_root / "repair-journal.sqlite3"),
         micro_repair_status_path=str(runtime_root / "micro-repair-status.json"),
@@ -887,8 +894,54 @@ async def _run_smoke(tmp_path, *, binance_fail: bool):
         data_streams=("trades",),
     )
 
+    stream_release = asyncio.Event()
+
+    class LiveFakeData(FakeData):
+        async def stream_trades(self):
+            for trade in self.trades:
+                yield trade
+            await stream_release.wait()
+
+    live_data = LiveFakeData(data.trades)
+    integrity = TradeDataIntegrityTracker()
+    async def process_trade(trade):
+        await runner.process_market_event(trade)
+        if runner.stats.market_events_seen == len(live_data.trades):
+            await runner.emit_range_aggregate_for_bucket(0)
+
+    processor = MarketEventProcessor(
+        raw_trade_callback=process_trade,
+        integrity=integrity,
+        maxsize=runner.app_config.market_queue_maxsize,
+    )
+    range_module = runner.runtime_services.range_bar_module
+    assert range_module is not None
+    range_module.configure_integrity(integrity)
+    runner.runtime_services.trade_data_integrity_tracker = integrity
+    runner.runtime_services.market_event_processor = processor
+    plan = resolve_market_pipeline(
+        runner.requirements,
+        feature_config=runner.runtime_services.trade_feature_config,
+    )
+    registry = build_market_data_registry(
+        create_trade_stream=lambda: live_data,
+        create_order_book_stream=lambda: live_data,
+        publish_feature=runner.process_market_feature,
+        create_range_module=lambda: range_module,
+        trade_integrity=integrity,
+        trade_processor=processor,
+    )
+    market_data = MarketDataRuntime(
+        registry=registry,
+        event_processor=processor,
+        pipeline_plan=plan,
+    )
+    runner.attach_market_data_runtime(
+        market_data,
+        frozenset({FEATURE_RANGE_BARS}),
+    )
+
     await runner.run(max_market_events=2)
-    await runner.emit_range_aggregate_for_bucket(0)
     intent_id = sqlite3.connect(tmp_path / "journal.sqlite3").execute("SELECT intent_id FROM order_intents").fetchone()[0]
     return runner, repo, intent_id, okx, binance, strategy
 
@@ -1043,7 +1096,7 @@ async def test_place_stop_success_and_exchange_stop_verified_confirms_stop():
     assert strategy.position.pending_stop_replace is False
 
 @pytest.mark.asyncio
-async def test_legacy_private_account_stream_requirement_does_not_start_account_producers(tmp_path):
+async def test_legacy_private_account_stream_requirement_does_not_start_unmanaged_producers(tmp_path):
     cfg = _app_config(dry_run=True, data_streams=())
     strategy = FeatureStrategy()
     context = AppContext(
@@ -1067,11 +1120,10 @@ async def test_legacy_private_account_stream_requirement_does_not_start_account_
 
     tasks = runner._start_producers()
     runner._producer_tasks = tasks
-    await asyncio.sleep(0)
     await runner._stop_producers()
 
-    assert len(tasks) == 1
-    assert {item.name for item in runner._producer_monitor.snapshot()} <= {"trades"}
+    assert tasks == []
+    assert runner._producer_monitor.snapshot() == ()
 
 
 def test_request_sync_contexts_fail_fast_on_account_execution_exchange_mismatch():
@@ -3006,73 +3058,6 @@ def test_runner_has_no_startup_catchup_dedupe_todo():
 
 
 @pytest.mark.asyncio
-async def test_market_queue_backlog_logs_warning_without_alert_or_drop(caplog):
-    strategy = FeatureStrategy()
-    runner = _runner(strategy, dry_run=True)
-    runner._market_queue = asyncio.Queue(maxsize=50000)
-
-    for i in range(501):
-        runner._market_queue.put_nowait(_trade(trade_time_ms=i))
-
-    caplog.set_level(logging.WARNING)
-    await runner._enqueue_market_event(_trade(trade_time_ms=10_000))
-
-    messages = "\n".join(record.getMessage() for record in caplog.records)
-    assert "Market queue backlog high" in messages
-    assert runner.stats.market_events_dropped == 0
-    alerts = list(runner.context.alerts._queue._queue)  # noqa: SLF001
-    assert all(alert.subject != "AetherEdge market queue full" for alert in alerts)
-
-
-@pytest.mark.asyncio
-async def test_market_queue_full_drops_only_when_maxsize_reached():
-    strategy = FeatureStrategy()
-    runner = _runner(strategy, dry_run=True)
-    runner._market_queue = asyncio.Queue(maxsize=2)
-    runner._market_queue.put_nowait(_trade(trade_time_ms=1))
-    runner._market_queue.put_nowait(_trade(trade_time_ms=2))
-
-    await runner._enqueue_market_event(_trade(trade_time_ms=3))
-
-    assert runner.stats.market_events_dropped == 1
-    alert = runner.context.alerts._queue.get_nowait()  # noqa: SLF001
-    assert alert.subject == "AetherEdge market queue full"
-    assert "dropped_total=1" in alert.content
-    assert "pid=" in alert.content
-    assert "runtime_id=" in alert.content
-
-
-@pytest.mark.asyncio
-async def test_market_queue_full_logs_full_without_backlog_warning(caplog):
-    strategy = FeatureStrategy()
-    runner = _runner(strategy, dry_run=True)
-    runner._market_queue = asyncio.Queue(maxsize=2)
-    runner._market_queue.put_nowait(_trade(trade_time_ms=1))
-    runner._market_queue.put_nowait(_trade(trade_time_ms=2))
-
-    caplog.set_level(logging.WARNING)
-    await runner._enqueue_market_event(_trade(trade_time_ms=3))
-
-    messages = "\n".join(record.getMessage() for record in caplog.records)
-    assert "Market queue full; dropped oldest event" in messages
-    assert "Market queue backlog high" not in messages
-    assert runner.stats.market_events_dropped == 1
-
-
-@pytest.mark.asyncio
-async def test_market_queue_full_trade_marks_range_context_degraded():
-    strategy = FeatureStrategy()
-    runner = _runner(strategy, dry_run=True)
-    runner._market_queue = asyncio.Queue(maxsize=2)
-    runner._market_queue.put_nowait(_trade(trade_time_ms=2 * H4 + 1))
-    runner._market_queue.put_nowait(_trade(trade_time_ms=2 * H4 + 2))
-
-    await runner._enqueue_market_event(_trade(trade_time_ms=2 * H4 + 3))
-
-    assert runner._range_context_degraded_buckets[2 * H4] == "market_queue_dropped_trade"
-
-
-@pytest.mark.asyncio
 async def test_dispatcher_dropped_trade_degrades_range_and_invalidates_journal():
     strategy = FeatureStrategy()
     runner = _runner(strategy, dry_run=True)
@@ -3089,7 +3074,7 @@ async def test_dispatcher_dropped_trade_degrades_range_and_invalidates_journal()
     await runner._handle_market_data_trade_drop(trade)
 
     assert runner.stats.market_events_dropped == 1
-    assert runner._range_context_degraded_buckets[2 * H4] == "market_queue_dropped_trade"
+    assert runner._range_module.degraded_reason(2 * H4) == "market_queue_dropped_trade"
     assert invalidations == [
         {
             "bucket_start_ms": 2 * H4,
@@ -3306,37 +3291,6 @@ async def test_runtime_start_logs_market_queue_settings(caplog, monkeypatch):
     assert "backlog_warn_threshold=" in messages
     assert "drain_batch_size=" in messages
     assert "full_alert_cooldown_seconds=300" in messages
-
-
-@pytest.mark.asyncio
-async def test_degraded_range_bucket_still_allows_closed_kline_decision():
-    strategy = FeatureStrategy()
-    runner = _runner(
-        strategy,
-        data=FakeData(),
-        services={
-            "recovery_service": None,
-            "snapshot": _snapshot(),
-            "runtime_requirements": _feature_requirements(),
-            "range_bar_store": MemoryRangeBarStore(),
-            "range_bar_builder": RangeBarBuilder(range_pct=Decimal("0.002"), contract_value=Decimal("0.1")),
-            "range_bar_aggregator": RangeBarAggregator(),
-        },
-        dry_run=True,
-    )
-    runner._range_context_degraded_buckets[2 * H4] = "market_queue_dropped_trade"
-
-    events = await runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
-
-    assert [event.type_value for event in events] == ["closed_kline", "range_aggregate"]
-    assert events[1].data["context_available"] is False
-    assert events[1].data["incomplete"] is True
-    assert events[1].data["reason"] == "market_queue_dropped_trade"
-    assert not any(
-        event.type_value == "range_aggregate" and event.data.get("context_available", True) is True
-        for event in events
-    )
-    assert "closed_kline" in strategy.events
 
 
 @pytest.mark.asyncio

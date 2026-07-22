@@ -245,10 +245,6 @@ class RangeRuntimeComponent(RuntimeComponent):
         return self._require_range_module().bars_by_bucket
 
     @property
-    def _range_repaired_complete_buckets(self) -> set[int]:
-        return self._require_range_module().repaired_complete_buckets
-
-    @property
     def _range_repair_journal_store(self):
         journal = self._range_repair_journal
         return None if journal is None else journal.store
@@ -265,10 +261,6 @@ class RangeRuntimeComponent(RuntimeComponent):
     @_range_repair_journal_writer.setter
     def _range_repair_journal_writer(self, value) -> None:
         self._require_range_repair_journal().writer = value
-
-    @property
-    def _range_context_degraded_buckets(self) -> dict[int, str]:
-        return self._require_range_module().degraded_buckets
 
     @property
     def _last_range_checkpoint_submit_ms(self) -> int:

@@ -229,11 +229,8 @@ async def test_live_main_launches_subprocess_without_touching_trade_flow(
         missing_gap_ms=0,
         completed_at_ms=NOW_MS,
     )
-    runner._range_context_degraded_buckets[BUCKET_START] = (
-        "live_trade_collection_started_mid_bucket"
-    )
     runner._refresh_range_micro_repair_coverage(BUCKET_START)
     coverage = runner._range_coverage_for_bucket(BUCKET_START)
     assert coverage.coverage_status == RangeCoverageStatus.COMPLETE.value
     assert coverage.missing_gap_ms == 0
-    assert BUCKET_START not in runner._range_context_degraded_buckets
+    assert runner._range_module.degraded_reason(BUCKET_START) is None

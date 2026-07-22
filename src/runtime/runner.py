@@ -280,7 +280,7 @@ class LiveRuntimeRunner(_RunnerCompatibilityFacade):
             self._compat_override(
                 "_set_health",
                 self.lifecycle._set_health,
-            )(RuntimePhase.STOPPED, healthy=True)
+            )(RuntimePhase.STOPPED, healthy=self._health.healthy)
             logger.info("Live runtime stopped | stats=%s", self.stats)
             return self.stats
         except Exception as exc:

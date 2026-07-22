@@ -4,13 +4,15 @@ from decimal import Decimal
 
 import pytest
 
-from src.market_data.models import RangeBar
+from src.market_data.models import RangeBar, RangeCoverageStatus
+from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
 from src.platform.data.models import MarketTrade, TradeSide
 from src.platform.exchanges.models import ExchangeName
 from src.runtime.market_data import (
     RangeBarModule,
     RangeBarModuleConfig,
 )
+from src.runtime.market_data.integrity import TradeDataIntegrityTracker
 from src.runtime.module import ModuleState
 
 
@@ -128,6 +130,36 @@ def _module(*, builder, persistence, emitted, publish=None):
     )
 
 
+def test_integrity_persistence_failure_marks_range_module_unhealthy(tmp_path) -> None:
+    class FailingIntegrityStore(SqliteRangeCheckpointStore):
+        def save_bucket_integrity(self, state) -> None:
+            raise OSError("integrity disk failure")
+
+    module = RangeBarModule(
+        config=RangeBarModuleConfig(
+            symbol="ETH-USDT-PERP",
+            exchange=ExchangeName.OKX,
+            range_pct=Decimal("0.002"),
+            contract_value=Decimal("0.01"),
+            bucket_interval_ms=100,
+            aggregate_interval="100ms",
+        ),
+        builder=FakeBuilder(),
+        bar_store=FakeBarStore(),
+        checkpoint_store=FailingIntegrityStore(tmp_path / "checkpoint.sqlite3"),
+        checkpoint_writer=FakeCheckpointWriter(),
+        clock_ms=lambda: 1,
+    )
+
+    with pytest.raises(OSError, match="integrity disk failure"):
+        module.mark_degraded(bucket_start_ms=0, reason="processor_drop")
+
+    health = module.health()
+    assert health.state is ModuleState.ERROR
+    assert health.healthy is False
+    assert "integrity disk failure" in (health.detail or "")
+
+
 async def _append(target, value):
     target.append(value)
 
@@ -195,3 +227,56 @@ async def test_range_aggregate_publish_failure_is_retryable_and_commits_once() -
     assert len(retried) == 1
     assert duplicate == []
     assert emitted == retried
+
+
+def test_range_degraded_state_survives_restart_and_repair_is_revision_bound(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "range.sqlite3"
+    config = RangeBarModuleConfig(
+        symbol="ETH-USDT-PERP",
+        exchange=ExchangeName.OKX,
+        range_pct=Decimal("0.002"),
+        contract_value=Decimal("0.01"),
+        bucket_interval_ms=100,
+        aggregate_interval="100ms",
+        checkpoint_db_path=str(db_path),
+    )
+
+    first = RangeBarModule(
+        config=config,
+        builder=FakeBuilder(),
+        bar_store=FakeBarStore((_bar(),)),
+        checkpoint_store=SqliteRangeCheckpointStore(db_path),
+        checkpoint_writer=FakeCheckpointWriter(),
+        integrity=TradeDataIntegrityTracker(),
+        clock_ms=lambda: 50,
+    )
+    first.initialize_recovery()
+    first.mark_degraded(bucket_start_ms=0, reason="source_drop")
+    assert first.coverage(0).coverage_status != RangeCoverageStatus.COMPLETE.value
+    assert first.rows_for_bucket(0) == []
+
+    restarted = RangeBarModule(
+        config=config,
+        builder=FakeBuilder(),
+        bar_store=FakeBarStore((_bar(),)),
+        checkpoint_store=SqliteRangeCheckpointStore(db_path),
+        checkpoint_writer=FakeCheckpointWriter(),
+        integrity=TradeDataIntegrityTracker(),
+        clock_ms=lambda: 50,
+    )
+    restarted.initialize_recovery()
+    assert restarted.degraded_reason(0) == "source_drop"
+    assert restarted.rows_for_bucket(0) == []
+    assert not restarted.mark_repaired(0, through_revision=1)
+
+    token = restarted.begin_repair(0)
+    assert token == 1
+    assert restarted.mark_repaired(0, through_revision=token)
+    assert restarted.coverage(0).coverage_status == RangeCoverageStatus.COMPLETE.value
+    assert restarted.rows_for_bucket(0) == [_bar()]
+
+    restarted.mark_degraded(bucket_start_ms=0, reason="new_drop")
+    assert restarted.degraded_reason(0) == "new_drop"
+    assert restarted.coverage(0).coverage_status != RangeCoverageStatus.COMPLETE.value

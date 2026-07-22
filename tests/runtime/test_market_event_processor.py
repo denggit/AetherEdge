@@ -21,7 +21,6 @@ from src.runtime.market_data.integrity import (
 )
 from src.runtime.market_data.pipeline_plan import (
     ClosedBarControlEvent,
-    MarketModuleSpec,
     ResolvedMarketPipelinePlan,
     resolve_market_pipeline,
 )
@@ -30,7 +29,6 @@ from src.runtime.market_data.processor import (
     MarketEventProcessor,
     ProcessorFailureError,
     ProcessorOverflowError,
-    TradeProcessor,
 )
 from src.runtime.requirements import (
     ClosedKlineRequirement,
@@ -179,7 +177,7 @@ class TestPipelinePlanResolution:
         assert plan.trades_enabled is False
 
 
-class TestTopologicalOrder:
+class TestTradeModuleOrder:
     def test_default_order_is_respected(self):
         req = StrategyRuntimeRequirements(
             trades=TradeStreamRequirement(enabled=True, stream_enabled=True),
@@ -190,23 +188,6 @@ class TestTopologicalOrder:
         # range-footprint should come before range-bars
         if "range-footprint" in ids and "range-bars" in ids:
             assert ids.index("range-footprint") < ids.index("range-bars")
-
-    def test_custom_specs_can_reorder(self):
-        custom = (
-            MarketModuleSpec(
-                module_id="raw-trade-callback",
-                after=frozenset({"range-bars"}),
-            ),
-        )
-        req = StrategyRuntimeRequirements(
-            trades=TradeStreamRequirement(enabled=True, stream_enabled=True),
-            range_bars=RangeBarRequirement(enabled=True),
-        )
-        plan = resolve_market_pipeline(req, custom_specs=custom)
-        ids = list(plan.enabled_module_ids)
-        if "raw-trade-callback" in ids and "range-bars" in ids:
-            assert ids.index("range-bars") < ids.index("raw-trade-callback")
-
 
 # ---------------------------------------------------------------------------
 # IntegrityTracker tests
@@ -335,11 +316,9 @@ class TestProcessorBasic:
             closed_kline_enabled=False,
             order_book_enabled=False,
             enabled_module_ids=("mod-a",),
-            execution_stages=(("mod-a",),),
         )
         trace = _TraceProcessor("mod-a")
         processor = MarketEventProcessor(
-            plan=plan,
             trade_modules=[trace],
             maxsize=16,
         )
@@ -356,12 +335,10 @@ class TestProcessorBasic:
             closed_kline_enabled=False,
             order_book_enabled=False,
             enabled_module_ids=("mod-a", "mod-b"),
-            execution_stages=(("mod-a", "mod-b"),),
         )
         trace_a = _TraceProcessor("mod-a")
         trace_b = _TraceProcessor("mod-b")
         processor = MarketEventProcessor(
-            plan=plan,
             trade_modules=[trace_a, trace_b],
             maxsize=16,
         )
@@ -381,11 +358,9 @@ class TestProcessorBasic:
             closed_kline_enabled=False,
             order_book_enabled=False,
             enabled_module_ids=("mod-a",),
-            execution_stages=(("mod-a",),),
         )
         trace = _TraceProcessor("mod-a")
         processor = MarketEventProcessor(
-            plan=plan,
             trade_modules=[trace],
             maxsize=16,
         )
@@ -403,11 +378,9 @@ class TestProcessorBasic:
             closed_kline_enabled=False,
             order_book_enabled=False,
             enabled_module_ids=("mod-a",),
-            execution_stages=(("mod-a",),),
         )
         blocker = _BlockingProcessor("mod-a")
         processor = MarketEventProcessor(
-            plan=plan,
             trade_modules=[blocker],
             maxsize=16,
         )
@@ -435,11 +408,9 @@ class TestProcessorErrorHandling:
             closed_kline_enabled=False,
             order_book_enabled=False,
             enabled_module_ids=("mod-a",),
-            execution_stages=(("mod-a",),),
         )
         failing = _FailingProcessor("mod-a")
         processor = MarketEventProcessor(
-            plan=plan,
             trade_modules=[failing],
             maxsize=16,
         )
@@ -456,12 +427,9 @@ class TestProcessorErrorHandling:
             closed_kline_enabled=False,
             order_book_enabled=False,
             enabled_module_ids=(),
-            execution_stages=(),
         )
         processor = MarketEventProcessor(
-            plan=plan,
             maxsize=2,
-            overflow_policy="fail_fast",
         )
         await processor.start()
         # Fill the queue — worker is consuming asynchronously, so we need to
@@ -484,11 +452,9 @@ class TestProcessorShutdown:
             closed_kline_enabled=False,
             order_book_enabled=False,
             enabled_module_ids=("mod-a",),
-            execution_stages=(("mod-a",),),
         )
         trace = _TraceProcessor("mod-a")
         processor = MarketEventProcessor(
-            plan=plan,
             trade_modules=[trace],
             maxsize=16,
         )
@@ -505,16 +471,78 @@ class TestProcessorShutdown:
             closed_kline_enabled=False,
             order_book_enabled=False,
             enabled_module_ids=(),
-            execution_stages=(),
         )
-        processor = MarketEventProcessor(plan=plan, maxsize=16)
+        processor = MarketEventProcessor(maxsize=16)
         await processor.start()
         await processor.stop()
         with pytest.raises(ProcessorFailureError):
             processor.submit_trade(_trade("t1"))
 
+    @pytest.mark.asyncio
+    async def test_drain_timeout_fails_and_marks_integrity_incomplete(self):
+        plan = ResolvedMarketPipelinePlan(True, False, False, ("mod-a",))
+        blocker = _BlockingProcessor("mod-a")
+        integrity = TradeDataIntegrityTracker()
+        processor = MarketEventProcessor(
+            trade_modules=[blocker],
+            integrity=integrity,
+            drain_timeout_seconds=0.01,
+        )
+        await processor.start()
+        processor.submit_trade(_trade("blocked", 10))
+        await blocker.enter_event.wait()
+
+        with pytest.raises(ProcessorFailureError, match="drain timed out"):
+            await processor.stop()
+        assert integrity.invalid_reason(0, 100) is not None
+
 
 class TestProcessorClosedBar:
+    @pytest.mark.asyncio
+    async def test_future_trades_are_bounded_and_released_in_receive_order(self):
+        plan = ResolvedMarketPipelinePlan(True, True, False, ("mod-a",))
+        trace = _TraceProcessor("mod-a")
+
+        class Handler:
+            async def process_closed_bar(self, event):
+                assert trace.trade_ids == ["period-a"]
+
+        processor = MarketEventProcessor(
+            trade_modules=[trace],
+            closed_bar_handler=Handler(),
+            future_buffer_maxsize=2,
+        )
+        await processor.start()
+        processor.submit_trade(_trade("period-a", 900))
+        processor.begin_closed_bar_cutoff(0, 1000)
+        processor.submit_trade(_trade("period-b-1", 1001))
+        processor.submit_trade(_trade("period-b-2", 1002))
+        assert processor.future_buffer_size == 2
+
+        event = ClosedBarControlEvent(open_time_ms=0, kline=_kline())
+        processor.submit_closed_bar(event)
+        await event.completion
+        await processor.stop()
+
+        assert trace.trade_ids == ["period-a", "period-b-1", "period-b-2"]
+        assert processor.stats.max_future_buffer_depth == 2
+
+    @pytest.mark.asyncio
+    async def test_future_trade_overflow_is_fatal(self):
+        plan = ResolvedMarketPipelinePlan(True, True, False, ())
+        integrity = TradeDataIntegrityTracker()
+        processor = MarketEventProcessor(
+            integrity=integrity,
+            future_buffer_maxsize=1,
+        )
+        await processor.start()
+        processor.begin_closed_bar_cutoff(0, 1000)
+        processor.submit_trade(_trade("first", 1001))
+        with pytest.raises(ProcessorOverflowError, match="future Trade buffer"):
+            processor.submit_trade(_trade("overflow", 1002))
+        assert integrity.invalid_reason(1002, 1002) is not None
+        await processor.stop()
+
     @pytest.mark.asyncio
     async def test_closed_bar_control_event_processed(self):
         plan = ResolvedMarketPipelinePlan(
@@ -522,7 +550,6 @@ class TestProcessorClosedBar:
             closed_kline_enabled=True,
             order_book_enabled=False,
             enabled_module_ids=(),
-            execution_stages=(),
         )
         processed: list[int] = []
 
@@ -533,13 +560,13 @@ class TestProcessorClosedBar:
 
         handler = Handler()
         processor = MarketEventProcessor(
-            plan=plan,
             closed_bar_handler=handler,
             maxsize=16,
         )
         await processor.start()
         kline = _kline(open_time_ms=1000, close_time_ms=2000)
         event = ClosedBarControlEvent(open_time_ms=1000, kline=kline)
+        processor.begin_closed_bar_cutoff(1000, 2000)
         processor.submit_closed_bar(event)
         await asyncio.wait_for(event.completion, timeout=2.0)
         await processor.stop()
@@ -552,7 +579,6 @@ class TestProcessorClosedBar:
             closed_kline_enabled=True,
             order_book_enabled=False,
             enabled_module_ids=("mod-a",),
-            execution_stages=(("mod-a",),),
         )
         order: list[str] = []
 
@@ -570,7 +596,6 @@ class TestProcessorClosedBar:
 
         handler = Handler()
         processor = MarketEventProcessor(
-            plan=plan,
             trade_modules=[trace],
             closed_bar_handler=handler,
             maxsize=16,
@@ -580,16 +605,17 @@ class TestProcessorClosedBar:
         processor.submit_trade(_trade("t2"))
         kline = _kline(open_time_ms=1000, close_time_ms=2000)
         cb_event = ClosedBarControlEvent(open_time_ms=1000, kline=kline)
+        processor.begin_closed_bar_cutoff(1000, 2000)
         processor.submit_closed_bar(cb_event)
-        processor.submit_trade(_trade("t3"))
-        processor.submit_trade(_trade("t4"))
+        processor.submit_trade(_trade("t3", 2001))
+        processor.submit_trade(_trade("t4", 2002))
         await asyncio.wait_for(cb_event.completion, timeout=2.0)
         await processor.stop()
         assert order == ["t1", "t2", "closed-bar", "t3", "t4"]
 
     @pytest.mark.asyncio
     async def test_trade_at_completed_close_boundary_is_fatal(self):
-        plan = ResolvedMarketPipelinePlan(True, True, False, (), ())
+        plan = ResolvedMarketPipelinePlan(True, True, False, ())
 
         class Handler:
             async def process_closed_bar(self, event: ClosedBarControlEvent) -> None:
@@ -597,12 +623,12 @@ class TestProcessorClosedBar:
 
         integrity = TradeDataIntegrityTracker()
         processor = MarketEventProcessor(
-            plan=plan,
             closed_bar_handler=Handler(),
             integrity=integrity,
         )
         await processor.start()
         event = ClosedBarControlEvent(open_time_ms=0, kline=_kline())
+        processor.begin_closed_bar_cutoff(0, 1000)
         processor.submit_closed_bar(event)
         await event.completion
         with pytest.raises(CausalIntegrityError, match="completed closed-bar boundary"):
@@ -613,26 +639,27 @@ class TestProcessorClosedBar:
         await processor.stop()
 
     @pytest.mark.asyncio
-    async def test_late_trade_before_control_starts_skips_closed_bar(self):
-        plan = ResolvedMarketPipelinePlan(True, True, False, (), ())
-        reasons: list[str | None] = []
+    async def test_late_trade_before_control_starts_runs_before_closed_bar(self):
+        plan = ResolvedMarketPipelinePlan(True, True, False, ())
+        processed = []
 
         class Handler:
             async def process_closed_bar(self, event: ClosedBarControlEvent) -> None:
-                reasons.append(event.skip_reason)
+                processed.append(event.open_time_ms)
 
-        processor = MarketEventProcessor(plan=plan, closed_bar_handler=Handler())
+        processor = MarketEventProcessor(closed_bar_handler=Handler())
         event = ClosedBarControlEvent(open_time_ms=0, kline=_kline())
+        processor.begin_closed_bar_cutoff(0, 1000)
         processor.submit_closed_bar(event)
         processor.submit_trade(_trade("late", 1000))
         await processor.start()
         await processor.stop()
 
-        assert reasons == ["late_trade_before_closed_bar_started"]
+        assert processed == [0]
 
     @pytest.mark.asyncio
     async def test_late_trade_during_closed_bar_cancels_callback(self):
-        plan = ResolvedMarketPipelinePlan(True, True, False, (), ())
+        plan = ResolvedMarketPipelinePlan(True, True, False, ())
         started = asyncio.Event()
         finished = asyncio.Event()
 
@@ -642,9 +669,10 @@ class TestProcessorClosedBar:
                 await asyncio.Event().wait()
                 finished.set()
 
-        processor = MarketEventProcessor(plan=plan, closed_bar_handler=Handler())
+        processor = MarketEventProcessor(closed_bar_handler=Handler())
         await processor.start()
         event = ClosedBarControlEvent(open_time_ms=0, kline=_kline())
+        processor.begin_closed_bar_cutoff(0, 1000)
         processor.submit_closed_bar(event)
         await started.wait()
 
@@ -662,7 +690,6 @@ class TestProcessorClosedBar:
             closed_kline_enabled=True,
             order_book_enabled=False,
             enabled_module_ids=(),
-            execution_stages=(),
         )
 
         class FailingHandler:
@@ -671,13 +698,13 @@ class TestProcessorClosedBar:
 
         handler = FailingHandler()
         processor = MarketEventProcessor(
-            plan=plan,
             closed_bar_handler=handler,
             maxsize=16,
         )
         await processor.start()
         kline = _kline()
         cb_event = ClosedBarControlEvent(open_time_ms=0, kline=kline)
+        processor.begin_closed_bar_cutoff(0, 1000)
         processor.submit_closed_bar(cb_event)
         # Should eventually fail
         with pytest.raises(RuntimeError):
@@ -693,12 +720,10 @@ class TestProcessorDemandDriven:
             closed_kline_enabled=False,
             order_book_enabled=False,
             enabled_module_ids=("mod-a",),
-            execution_stages=(("mod-a",),),
         )
         trace_a = _TraceProcessor("mod-a")
         trace_b = _TraceProcessor("mod-b")  # not enabled!
         processor = MarketEventProcessor(
-            plan=plan,
             trade_modules=[trace_a],  # only mod-a enabled
             maxsize=16,
         )
@@ -715,11 +740,9 @@ class TestProcessorDemandDriven:
             closed_kline_enabled=False,
             order_book_enabled=False,
             enabled_module_ids=("mod-a",),
-            execution_stages=(("mod-a",),),
         )
         trace = _TraceProcessor("mod-a")
         processor = MarketEventProcessor(
-            plan=plan,
             trade_modules=[trace],
             maxsize=16,
         )
@@ -735,10 +758,8 @@ class TestProcessorPerformance:
     @pytest.mark.asyncio
     async def test_single_worker_smoke_records_latency_and_backlog(self):
         count = 5_000
-        plan = ResolvedMarketPipelinePlan(True, False, False, ("mod-a",), ())
         trace = _TraceProcessor("mod-a")
         processor = MarketEventProcessor(
-            plan=plan,
             trade_modules=[trace],
             maxsize=count + 1,
         )
@@ -758,6 +779,8 @@ class TestProcessorPerformance:
             f"p95_ms={p95:.6f} p99_ms={p99:.6f} "
             f"throughput_per_second={count / wall_seconds:.2f} "
             f"max_backlog={processor.stats.max_queue_depth} "
+            f"max_future_buffer={processor.stats.max_future_buffer_depth} "
+            f"closed_bar_pending_ms={processor.stats.closed_bar_pending_time_ms:.6f} "
             f"module_ms={processor.stats.module_timings['mod-a']:.6f}"
         )
         assert processor.stats.trades_processed == count

@@ -16,6 +16,7 @@ from src.runtime.registry import (
     ModuleDefinition,
     ModuleRegistry,
 )
+from src.runtime.market_data.runtime import MarketDataRuntime
 
 
 TRADES = CapabilityId("market.trades")
@@ -251,3 +252,105 @@ def test_duplicate_capability_provider_is_rejected() -> None:
                 ),
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_market_runtime_starts_consumers_then_processor_then_sources() -> None:
+    calls: list[str] = []
+    probe = FactoryProbe()
+    registry = _registry(probe)
+    for module_id, definition in list(registry._definitions.items()):
+        registry._definitions[module_id] = ModuleDefinition(
+            module_id=definition.module_id,
+            provides=definition.provides,
+            requires=definition.requires,
+            factory=lambda value=definition: FakeModule(
+                value.module_id, value.provides, value.requires, calls
+            ),
+        )
+
+    class Processor:
+        def set_trade_modules(self, modules):
+            self.modules = modules
+
+        async def start(self):
+            calls.append("start:processor")
+
+        def stop_accepting(self):
+            calls.append("stop-accepting:processor")
+
+        async def stop(self):
+            calls.append("stop:processor")
+
+        def raise_if_failed(self):
+            return None
+
+    runtime = MarketDataRuntime(registry=registry, event_processor=Processor())
+    await runtime.start((RANGE, BOOKS))
+    assert calls.index("start:range-bars") < calls.index("start:processor")
+    assert calls.index("start:processor") < calls.index("start:trade-stream")
+    assert calls.index("start:trade-stream") < calls.index("start:order-book-stream")
+
+    await runtime.stop()
+    assert calls.index("stop-accepting:processor") < calls.index("stop:trade-stream")
+    assert calls.index("stop:trade-stream") < calls.index("stop:processor")
+    assert calls.index("stop:processor") < calls.index("stop:range-bars")
+
+
+@pytest.mark.asyncio
+async def test_consumer_start_failure_never_starts_processor_or_trade_source() -> None:
+    calls: list[str] = []
+
+    class FailingConsumer(FakeModule):
+        async def start(self) -> None:
+            self.calls.append(f"start:{self.module_id}")
+            raise RuntimeError("consumer start failed")
+
+    registry = ModuleRegistry()
+    registry.register(
+        ModuleDefinition(
+            module_id="trade-stream",
+            provides=frozenset({TRADES}),
+            requires=frozenset(),
+            factory=lambda: FakeModule(
+                "trade-stream", frozenset({TRADES}), frozenset(), calls
+            ),
+        )
+    )
+    registry.register(
+        ModuleDefinition(
+            module_id="range-bars",
+            provides=frozenset({RANGE}),
+            requires=frozenset({TRADES}),
+            factory=lambda: FailingConsumer(
+                "range-bars",
+                frozenset({RANGE}),
+                frozenset({TRADES}),
+                calls,
+            ),
+        )
+    )
+
+    class Processor:
+        def set_trade_modules(self, modules):
+            return None
+
+        async def start(self):
+            calls.append("start:processor")
+
+        def stop_accepting(self):
+            return None
+
+        async def stop(self):
+            calls.append("stop:processor")
+
+        def raise_if_failed(self):
+            return None
+
+    runtime = MarketDataRuntime(registry=registry, event_processor=Processor())
+
+    with pytest.raises(RuntimeError, match="consumer start failed"):
+        await runtime.start((RANGE,))
+
+    assert "start:processor" not in calls
+    assert "start:trade-stream" not in calls

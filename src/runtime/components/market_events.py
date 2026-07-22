@@ -119,6 +119,8 @@ class MarketEventsComponent(RuntimeComponent):
         self._maybe_log_live_data_path_stats()
 
     async def _enqueue_market_event(self, event: MarketEvent) -> None:
+        if isinstance(event, MarketTrade) or event.event_type is MarketEventType.TRADE:
+            raise LiveRuntimeError("Trade events must enter MarketEventProcessor")
         dropped_event: MarketEvent | None = None
         if self._market_queue.full():
             self.stats.market_events_dropped += 1
@@ -130,18 +132,6 @@ class MarketEventsComponent(RuntimeComponent):
             dropped = dropped_event or event
             self._emit_market_queue_full_alert(dropped)
             if (
-                isinstance(dropped, MarketTrade)
-                or dropped.event_type is MarketEventType.TRADE
-            ):
-                self._mark_trade_integrity_dropped(
-                    dropped,
-                    reason="market_queue_dropped_trade",
-                )
-                self._mark_range_context_degraded_for_event(
-                    dropped,
-                    reason="market_queue_dropped_trade",
-                )
-            elif (
                 isinstance(dropped, MarketOrderBook)
                 or dropped.event_type is MarketEventType.ORDER_BOOK
             ):
@@ -311,21 +301,6 @@ class MarketEventsComponent(RuntimeComponent):
             value
             if isinstance(value, OrderBookDataIntegrityTracker)
             else None
-        )
-
-    def _mark_trade_integrity_dropped(
-        self,
-        event: MarketEvent,
-        *,
-        reason: str,
-    ) -> None:
-        tracker = self._trade_integrity_tracker()
-        if tracker is None:
-            return
-        event_ms = _event_time_ms(event)
-        tracker.mark_dropped(
-            int(time.time() * 1000) if event_ms is None else event_ms,
-            reason,
         )
 
     async def _process_trade(self, trade: MarketTrade) -> None:

@@ -221,24 +221,6 @@ class LifecycleComponent(RuntimeComponent):
         tasks: list[asyncio.Task] = []
         if (
             not getattr(self, "_market_modules_managed", False)
-            and self.requirements.trades.enabled
-            and self.requirements.trades.stream_enabled
-        ):
-            logger.info("Starting runtime producer | name=trades")
-            tasks.append(
-                asyncio.create_task(
-                    self._producer_supervisor.run_resilient_stream(
-                        name="trades",
-                        stream_factory=self.context.data.stream_trades,
-                        on_item=self._enqueue_market_event,
-                        on_transient_failure=(
-                            self._on_market_producer_transient_failure
-                        ),
-                    )
-                )
-            )
-        if (
-            not getattr(self, "_market_modules_managed", False)
             and self.requirements.order_book.enabled
             and self.requirements.order_book.stream_enabled
         ):
@@ -253,27 +235,6 @@ class LifecycleComponent(RuntimeComponent):
                 )
             )
         return tasks
-
-    def _on_market_producer_transient_failure(
-        self, name: str, exc: BaseException
-    ) -> None:
-        if name != "trades":
-            return
-        event_ms = int(time.time() * 1000)
-        bucket_start_ms = (
-            event_ms // self._closed_bar_interval_ms
-        ) * self._closed_bar_interval_ms
-        self._mark_range_context_degraded_bucket(
-            bucket_start_ms=bucket_start_ms,
-            reason="producer_failed",
-            event_time_ms=event_ms,
-        )
-        logger.warning(
-            "Range repair journal invalidated by transient trade stream "
-            "failure | bucket_start_ms=%s error=%s",
-            bucket_start_ms,
-            exc,
-        )
 
     def _start_sync_tasks(self) -> list[asyncio.Task]:
         task_factories: list[SyncTaskFactory] = []

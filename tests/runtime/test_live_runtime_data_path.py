@@ -24,6 +24,8 @@ from src.runtime import (
     RuntimeMode,
     StrategyRuntimeRequirements,
 )
+from src.runtime.market_data.processor import MarketEventProcessor
+from src.runtime.market_data.sources import TradeStreamModule
 from src.signals import SignalAction, TradeSignal
 
 
@@ -206,6 +208,12 @@ class _CheckpointStore:
         self.aggregates.append(kwargs)
         return True
 
+    def save_bucket_integrity(self, state):
+        self.integrity = state
+
+    def invalidate_completed_aggregate(self, **kwargs):
+        return False
+
 
 class _OneTradeRangeBarBuilder:
     def __init__(self) -> None:
@@ -351,6 +359,7 @@ def _runner(
     strategy,
     *,
     alerts: _Alerts | None = None,
+    data: _Data | None = None,
     requirements: StrategyRuntimeRequirements,
     services: dict | None = None,
 ) -> LiveRuntimeRunner:
@@ -368,7 +377,7 @@ def _runner(
         enable_email_alerts=False,
     )
     context = AppContext(
-        data=_Data(),
+        data=data or _Data(),
         execution=object(),
         state_store=_StateStore(),
         strategy=strategy,
@@ -535,6 +544,12 @@ class _RepairCheckpointStore:
             recovered_from_checkpoint=True,
         )
 
+    def save_bucket_integrity(self, state):
+        self.integrity = state
+
+    def invalidate_completed_aggregate(self, **kwargs):
+        return False
+
     def load_completed_aggregate(self, *, exchange, symbol, range_pct, bucket_end_ms):
         if not self._complete:
             return None
@@ -637,10 +652,11 @@ async def test_micro_repair_complete_forces_db_rows_for_4h_aggregate() -> None:
     )
 
     # Act: micro repair completes
+    runner._range_module.begin_repair(0)
     runner._refresh_range_micro_repair_coverage(0)
 
     # Assert: bucket marked repaired, partial memory cleared
-    assert 0 in runner._range_repaired_complete_buckets
+    assert runner._range_module.bucket_integrity(0).complete
     assert 0 not in runner._range_bars_by_bucket
 
     # Act: get rows for 4H aggregate
@@ -691,8 +707,9 @@ async def test_micro_repair_complete_checkpoint_uses_repaired_db_rows() -> None:
     )
 
     # Micro repair completes
+    runner._range_module.begin_repair(0)
     runner._refresh_range_micro_repair_coverage(0)
-    assert 0 in runner._range_repaired_complete_buckets
+    assert runner._range_module.bucket_integrity(0).complete
 
     # Force checkpoint due
     runner._last_range_checkpoint_submit_ms = 0
@@ -735,8 +752,6 @@ async def test_normal_live_bucket_remains_memory_first() -> None:
         _range_bar(bar_id=i + 1, start_time_ms=i * 1_000, end_time_ms=i * 1_000)
         for i in range(5)
     ]
-    runner._range_repaired_complete_buckets.clear()
-
     rows = runner._range_bar_rows_for_bucket(0)
 
     assert len(rows) == 5
@@ -770,7 +785,8 @@ async def test_repaired_complete_db_empty_no_fallback_to_partial_memory() -> Non
         for i in range(2)
     ]
     # Bucket is marked repaired complete
-    runner._range_repaired_complete_buckets.add(0)
+    runner._range_module.begin_repair(0)
+    assert runner._range_module.mark_repaired(0, through_revision=0)
 
     rows = runner._range_bar_rows_for_bucket(0)
 
@@ -908,3 +924,118 @@ def test_live_data_path_stats_respects_env_interval() -> None:
     assert runner._last_live_data_path_log_ms == last_after_first, (
         "Second stats call within interval should be skipped"
     )
+
+
+@pytest.mark.asyncio
+async def test_scheduler_registers_cutoff_before_blocked_rest_and_future_trade_release() -> None:
+    latest: dict[str, int] = {}
+    cutoff = 3 * H4 - 1
+    closed_checked = asyncio.Event()
+
+    class Strategy(_FeatureStrategy):
+        async def on_trade(self, trade):
+            event_ms = int(trade.trade_time_ms or trade.event_time_ms)
+            latest.update(
+                raw=event_ms,
+                strategy_observer=event_ms,
+                strategy_buffer=event_ms,
+            )
+            return []
+
+        async def on_market_feature(self, event):
+            if event.type_value == "closed_kline":
+                assert all(value <= cutoff for value in latest.values())
+                closed_checked.set()
+            return await super().on_market_feature(event)
+
+    class BlockingData(_Data):
+        def __init__(self):
+            self.fetch_started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def fetch_klines(self, **kwargs):
+            self.fetch_started.set()
+            await self.release.wait()
+            return [_kline(int(kwargs["start_time_ms"]))]
+
+    class RecordingModule:
+        def __init__(self, module_id, key, period_b_processed=None):
+            self.module_id = module_id
+            self.key = key
+            self.period_b_processed = period_b_processed
+
+        async def process_trade(self, trade):
+            event_ms = int(trade.trade_time_ms or trade.event_time_ms)
+            latest[self.key] = event_ms
+            if self.period_b_processed is not None and event_ms > cutoff:
+                self.period_b_processed.set()
+
+    class QueueTradeStream:
+        def __init__(self):
+            self.queue = asyncio.Queue()
+            self.accepted: dict[str, asyncio.Event] = {}
+
+        async def stream_trades(self):
+            while True:
+                trade = await self.queue.get()
+                yield trade
+                self.accepted[trade.trade_id].set()
+
+        async def send(self, trade):
+            self.accepted[trade.trade_id] = asyncio.Event()
+            await self.queue.put(trade)
+            await self.accepted[trade.trade_id].wait()
+
+    data = BlockingData()
+    strategy = Strategy()
+    runner = _runner(
+        strategy,
+        data=data,
+        requirements=StrategyRuntimeRequirements.from_mapping(
+            {
+                "trades": {"enabled": True, "stream_enabled": True},
+                "closed_kline": {"enabled": True, "interval": "4h"},
+            }
+        ),
+        services={"recovery_service": None, "snapshot": _snapshot()},
+    )
+    period_b_processed = asyncio.Event()
+    modules = (
+        RecordingModule("fixed-time-trade-bars", "fixed_trade_bar"),
+        RecordingModule("trade-footprint", "trade_footprint"),
+        RecordingModule("range-footprint", "range_footprint"),
+        RecordingModule("range-bars", "range_bar", period_b_processed),
+    )
+    processor = MarketEventProcessor(
+        trade_modules=modules,
+        closed_bar_handler=runner,
+        raw_trade_callback=runner.process_market_event,
+        maxsize=16,
+    )
+    runner.runtime_services.market_event_processor = processor
+    stream = QueueTradeStream()
+    source = TradeStreamModule(stream=stream, processor=processor)
+
+    await processor.start()
+    await source.prepare()
+    await source.start()
+    await stream.send(_trade(time_ms=cutoff, price="100"))
+    poll = asyncio.create_task(
+        runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
+    )
+    await data.fetch_started.wait()
+    assert processor.pending_cutoff == (2 * H4, cutoff)
+
+    await stream.send(_trade(time_ms=cutoff + 1, price="101"))
+    assert processor.future_buffer_size == 1
+    assert all(value <= cutoff for value in latest.values())
+    data.release.set()
+    await poll
+    await closed_checked.wait()
+    await period_b_processed.wait()
+    assert all(value == cutoff + 1 for value in latest.values())
+
+    processor.stop_accepting()
+    await source.stop()
+    await processor.stop()
+    await runner._stop_live_persistence_writer()
