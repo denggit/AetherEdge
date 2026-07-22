@@ -8,7 +8,8 @@ from typing import Protocol
 from src.runtime.module import CapabilityId
 from src.runtime.module import ModuleHealth, ModuleHost
 from src.runtime.registry import DependencyResolver, ModuleRegistry, RuntimePlan
-from src.runtime.market_data.dispatcher import DispatcherBarrierResult
+from src.runtime.market_data.pipeline_plan import ResolvedMarketPipelinePlan
+from src.runtime.market_data.processor import MarketEventProcessor
 
 
 class RuntimeLog(Protocol):
@@ -36,10 +37,14 @@ class MarketDataRuntime:
         *,
         registry: ModuleRegistry,
         logger: RuntimeLog | None = None,
+        event_processor: MarketEventProcessor | None = None,
+        pipeline_plan: ResolvedMarketPipelinePlan | None = None,
     ) -> None:
         self._registry = registry
         self._resolver = DependencyResolver(registry)
         self._logger = logger
+        self._event_processor = event_processor
+        self._pipeline_plan = pipeline_plan
         self._plan: RuntimePlan | None = None
         self._host: ModuleHost | None = None
         self._error: BaseException | None = None
@@ -73,6 +78,22 @@ class MarketDataRuntime:
             else self.plan(requested)
         )
         modules = self._registry.instantiate(plan)
+        if self._event_processor is not None:
+            by_id = {
+                module.module_id: module
+                for module in modules
+                if callable(getattr(module, "process_trade", None))
+            }
+            ordered = tuple(
+                by_id[module_id]
+                for module_id in (
+                    ()
+                    if self._pipeline_plan is None
+                    else self._pipeline_plan.enabled_module_ids
+                )
+                if module_id in by_id
+            )
+            self._event_processor.set_trade_modules(ordered)
         host = ModuleHost(modules)
         self._log_plan(plan)
         try:
@@ -91,15 +112,19 @@ class MarketDataRuntime:
         if host is None:
             raise RuntimeError("market data runtime is not prepared")
         try:
+            if self._event_processor is not None:
+                await self._event_processor.start()
             await host.start()
         except BaseException as exc:
             self._error = exc
+            if self._event_processor is not None:
+                await self._event_processor.stop()
             self._host = None
             self._plan = None
             raise
         self._supervisor_stop.clear()
         self._failure_event.clear()
-        if host.modules:
+        if host.modules or self._event_processor is not None:
             self._supervisor_task = asyncio.create_task(
                 self._supervise(),
                 name="market-data-supervisor",
@@ -121,40 +146,10 @@ class MarketDataRuntime:
             if host is not None:
                 await host.stop()
         finally:
+            if self._event_processor is not None:
+                await self._event_processor.stop()
             if supervisor is not None:
                 await asyncio.gather(supervisor, return_exceptions=True)
-
-    async def drain_through(
-        self,
-        cutoff_time_ms: int,
-        *,
-        timeout_seconds: float,
-    ) -> DispatcherBarrierResult:
-        self.raise_if_failed()
-        host = self._host
-        if host is None:
-            self.raise_if_failed()
-            return DispatcherBarrierResult(
-                cutoff_time_ms=cutoff_time_ms,
-                pending=0,
-                completed=True,
-            )
-        for module in host.modules:
-            drain = getattr(module, "drain_through", None)
-            if callable(drain):
-                result = await drain(
-                    cutoff_time_ms,
-                    timeout_seconds=timeout_seconds,
-                )
-                if result is not None:
-                    self.raise_if_failed()
-                    return result
-        self.raise_if_failed()
-        return DispatcherBarrierResult(
-            cutoff_time_ms=cutoff_time_ms,
-            pending=0,
-            completed=True,
-        )
 
     def raise_if_failed(self) -> None:
         if self._error is not None:
@@ -162,6 +157,15 @@ class MarketDataRuntime:
                 "market data runtime failed | "
                 f"error={type(self._error).__name__}: {self._error}"
             ) from self._error
+        if self._event_processor is not None:
+            try:
+                self._event_processor.raise_if_failed()
+            except BaseException as exc:
+                self._error = exc
+                raise MarketDataRuntimeError(
+                    "market event processor failed | "
+                    f"error={type(exc).__name__}: {exc}"
+                ) from exc
         host = self._host
         if host is None:
             return

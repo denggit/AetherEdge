@@ -60,11 +60,11 @@ class RuntimeServices:
     trade_store: object | None = None
     trade_data_integrity_tracker: object | None = None
     order_book_data_integrity_tracker: object | None = None
+    market_event_processor: object | None = None
 
     # Range-only compatibility inputs.  They are consumed by the Range
     # composition boundary, never by the generic runtime orchestrator.
     range_bar_module: object | None = None
-    range_trade_dispatcher: object | None = None
     range_bar_store: object | None = None
     range_bar_builder: object | None = None
     range_bar_aggregator: object | None = None

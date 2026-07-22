@@ -15,6 +15,7 @@ from src.runtime.composition import compose_live_runtime
 from src.runtime.market_data.runtime import MarketDataRuntimeError
 from src.runtime.requirements import (
     AccountStateRequirement,
+    ClosedKlineRequirement,
     OrderBookRequirement,
     OrderStateRequirement,
     RangeBarRequirement,
@@ -39,13 +40,17 @@ class _IdleOrderBookStream:
 
 
 class _Strategy:
-    def __init__(self, *, trade_features: bool = False) -> None:
+    def __init__(self, *, trade_features=False) -> None:
         self.trade_features = trade_features
         self.config_reads = 0
 
     def trade_feature_runtime_config(self):
         self.config_reads += 1
-        return {"enabled": self.trade_features}
+        return (
+            dict(self.trade_features)
+            if isinstance(self.trade_features, dict)
+            else {"enabled": self.trade_features}
+        )
 
 
 class _Alerts:
@@ -93,6 +98,7 @@ def _requirements(
     trades: bool = False,
     order_book: bool = False,
     range_bars: bool = False,
+    closed_kline: bool = False,
 ) -> StrategyRuntimeRequirements:
     return StrategyRuntimeRequirements(
         trades=TradeStreamRequirement(
@@ -104,6 +110,10 @@ def _requirements(
             stream_enabled=order_book,
         ),
         range_bars=RangeBarRequirement(enabled=range_bars),
+        closed_kline=ClosedKlineRequirement(
+            enabled=closed_kline,
+            interval="4h",
+        ),
         account_state=AccountStateRequirement(
             startup_snapshot_enabled=False,
             poll_enabled=False,
@@ -256,6 +266,83 @@ async def test_empty_formal_composition_starts_no_market_resources(
 
     await application.market_data.stop()
     assert application.market_data.state().plan is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("feature_config", "expected_module"),
+    [
+        ({"fixed_time_trade_bars_enabled": True}, "fixed-time-trade-bars"),
+        ({"trade_footprint_enabled": True}, "trade-footprint"),
+        ({"range_footprint_enabled": True}, "range-footprint"),
+    ],
+)
+async def test_formal_composition_instantiates_only_selected_trade_feature(
+    tmp_path,
+    monkeypatch,
+    feature_config,
+    expected_module,
+) -> None:
+    created = {"trades": 0, "books": 0}
+
+    def create_trade(*_args, **_kwargs):
+        created["trades"] += 1
+        return _IdleTradeStream()
+
+    def create_book(*_args, **_kwargs):
+        created["books"] += 1
+        return _IdleOrderBookStream()
+
+    monkeypatch.setattr("src.runtime.composition.create_trade_stream", create_trade)
+    monkeypatch.setattr("src.runtime.composition.create_order_book_stream", create_book)
+    application = _compose(
+        tmp_path,
+        _requirements(),
+        _Strategy(trade_features=feature_config),
+    )
+    plan = await application.market_data.start(
+        application.runner._market_data_capabilities
+    )
+
+    assert plan.module_ids == ("trade-stream", expected_module)
+    processor = application.market_data._event_processor
+    assert processor is not None
+    assert processor.trade_module_ids == (expected_module,)
+    assert created == {"trades": 1, "books": 0}
+    await application.market_data.stop()
+
+
+@pytest.mark.asyncio
+async def test_closed_kline_only_creates_control_processor_without_trade_source(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    created = {"trades": 0, "books": 0}
+
+    def create_trade(*_args, **_kwargs):
+        created["trades"] += 1
+        return _IdleTradeStream()
+
+    def create_book(*_args, **_kwargs):
+        created["books"] += 1
+        return _IdleOrderBookStream()
+
+    monkeypatch.setattr("src.runtime.composition.create_trade_stream", create_trade)
+    monkeypatch.setattr("src.runtime.composition.create_order_book_stream", create_book)
+    application = _compose(
+        tmp_path,
+        _requirements(closed_kline=True),
+        _Strategy(),
+    )
+    plan = await application.market_data.start(
+        application.runner._market_data_capabilities
+    )
+
+    assert plan.module_ids == ()
+    assert application.market_data._event_processor is not None
+    assert application.market_data._event_processor.trade_module_ids == ()
+    assert created == {"trades": 0, "books": 0}
+    await application.market_data.stop()
 
 
 @pytest.mark.asyncio

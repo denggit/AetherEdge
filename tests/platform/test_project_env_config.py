@@ -129,14 +129,19 @@ def test_runtime_env_loaders_accept_custom_env_filename(tmp_path, loader):
     assert values["AETHER_MARKET"] == "ETH-USDT-PERP"
 
 
-def test_project_env_loader_rejects_symlink_to_env_example(tmp_path):
+def test_project_env_loader_rejects_symlink_to_env_example(tmp_path, monkeypatch):
     example = tmp_path / ".env.example"
     link = tmp_path / ".env"
     example.write_text("OKX_API_KEY=fake-symlink-secret\n", encoding="utf-8")
     try:
         link.symlink_to(example)
-    except OSError as exc:
-        pytest.skip(f"symlink creation is unavailable: {type(exc).__name__}")
+    except OSError:
+        original_resolve = Path.resolve
+        monkeypatch.setattr(
+            Path,
+            "resolve",
+            lambda self: example if self == link else original_resolve(self),
+        )
 
     with pytest.raises(ValueError, match="documentation-only"):
         load_project_env_config(env_file=link, process_env={})

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, MutableMapping, MutableSet, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Protocol
@@ -27,8 +27,12 @@ from src.platform.data.models import MarketTrade
 from src.platform.exchanges.models import ExchangeName
 from src.runtime.capabilities import FEATURE_RANGE_BARS, MARKET_TRADES
 from src.runtime.features import range_aggregate_feature, range_bar_closed_feature
-from src.runtime.market_data.dispatcher import BoundedOrderedEventDispatcher
 from src.runtime.market_data.integrity import TradeDataIntegrityTracker
+from src.runtime.market_data.range_integrity import (
+    DegradedBucketView,
+    RangeBucketIntegrityState,
+    RepairedBucketView,
+)
 from src.runtime.module import CapabilityId, ModuleHealth, ModuleState
 from src.utils.log import get_logger
 
@@ -127,9 +131,8 @@ class RangeBarModule:
         self,
         *,
         config: RangeBarModuleConfig,
-        dispatcher: BoundedOrderedEventDispatcher[MarketTrade],
-        publish: FeaturePublisher,
-        persistence: RangeBarPersistence,
+        publish: FeaturePublisher | None = None,
+        persistence: RangeBarPersistence | None = None,
         builder: RangeBarBuilderPort | None = None,
         bar_store: RangeBarStorePort | None = None,
         aggregator: RangeBarAggregator | None = None,
@@ -143,7 +146,6 @@ class RangeBarModule:
         integrity: TradeDataIntegrityTracker | None = None,
     ) -> None:
         self.config = config
-        self._dispatcher = dispatcher
         self._publish = publish
         self._persistence = persistence
         self._builder = builder
@@ -161,9 +163,11 @@ class RangeBarModule:
         self._state = ModuleState.CREATED
         self._error: BaseException | None = None
         self._bars_by_bucket: dict[int, list[RangeBar]] = {}
-        self._repaired_complete_buckets: set[int] = set()
         self._emitted_aggregate_buckets: set[tuple[str, str, int]] = set()
-        self._degraded_buckets: dict[int, str] = {}
+        self._bucket_states: dict[int, RangeBucketIntegrityState] = {}
+        self._degraded_bucket_view = DegradedBucketView(self)
+        self._repaired_bucket_view = RepairedBucketView(self)
+        self._repair_started_revision_by_bucket: dict[int, int] = {}
         self._initial_bucket_ms: int | None = None
         self._initial_recovery: RangeCheckpointRecovery | None = None
         self._trust_start_bucket_ms: int | None = None
@@ -176,16 +180,9 @@ class RangeBarModule:
         self._speed_warmup: RangeSpeedWarmup | None = None
         self._stop_event: asyncio.Event | None = None
         self._repair_bootstrap: Callable[[], RangeRepairBootstrapService] | None = None
-        self.bars_closed = 0
-        self.builder_bars_closed = 0
+        self.bars_closed = self.builder_bars_closed = 0
         self.aggregates_created = 0
         self.bars_suppressed = 0
-        dispatcher.subscribe(
-            subscriber_id=self.module_id,
-            handler=self.process_trade,
-            on_error=self._handle_dispatch_error,
-            order=self.dispatch_priority,
-        )
 
     async def prepare(self) -> None:
         self._ensure_resources()
@@ -291,6 +288,10 @@ class RangeBarModule:
             or self._initial_recovery is None
         ):
             return
+        if self._initial_bucket_ms is not None:
+            self._repair_started_revision_by_bucket[
+                self._initial_bucket_ms
+            ] = self._integrity.revision
         result = self._repair_bootstrap().start_if_needed(
             self._initial_recovery,
             initial_bucket_ms=self._initial_bucket_ms,
@@ -333,10 +334,10 @@ class RangeBarModule:
                 ("bars_closed", str(self.bars_closed)),
                 ("aggregates_created", str(self.aggregates_created)),
                 ("cached_buckets", str(len(self._bars_by_bucket))),
-                ("events_dropped", str(self._dispatcher.dropped_count)),
+                ("events_dropped", "0"),
                 (
                     "data_complete",
-                    str(not self._degraded_buckets).lower(),
+                    str(not any(not state.complete for state in self._bucket_states.values())).lower(),
                 ),
                 ("bars_suppressed", str(self.bars_suppressed)),
             ),
@@ -353,6 +354,7 @@ class RangeBarModule:
                     self.mark_degraded(
                         bucket_start_ms=self._bucket_start(issue.event_time_ms),
                         reason=issue.reason,
+                        revision=issue.revision,
                     )
             self._integrity_revision = self._integrity.revision
         reset_at = self._builder_reset_at_bucket_ms
@@ -378,21 +380,24 @@ class RangeBarModule:
             self._bars_since_checkpoint += 1
             self.bars_closed += 1
             self._prune(current_bucket=bucket)
-            await self._publish(range_bar_closed_feature(bar, exchange=trade.exchange))
-            self._persistence.persist_range_bar(
-                bar,
-                on_error=lambda exc, value=bar: self._report_bar_error(
-                    value, exc
-                ),
-                on_rejected=self._on_rejected,
-            )
+            if self._publish is not None:
+                await self._publish(range_bar_closed_feature(bar, exchange=trade.exchange))
+            if self._persistence is not None:
+                self._persistence.persist_range_bar(
+                    bar,
+                    on_error=lambda exc, value=bar: self._report_bar_error(
+                        value, exc
+                    ),
+                    on_rejected=self._on_rejected,
+                )
         self.submit_checkpoint_if_due(trade)
 
+    def _bucket_is_degraded(self, bucket_start_ms: int) -> bool:
+        state = self._bucket_states.get(bucket_start_ms)
+        return state is not None and not state.complete
+
     def aggregates_for_bucket(self, bucket_start_ms: int) -> list[RangeBarAggregate]:
-        if (
-            bucket_start_ms in self._degraded_buckets
-            and bucket_start_ms not in self._repaired_complete_buckets
-        ):
+        if self._bucket_is_degraded(bucket_start_ms):
             return []
         rows = self.rows_for_bucket(bucket_start_ms)
         if not rows:
@@ -446,12 +451,10 @@ class RangeBarModule:
 
     def rows_for_bucket(self, bucket_start_ms: int) -> list[RangeBar]:
         # Never return rows for degraded buckets that haven't been repaired.
-        if (
-            bucket_start_ms in self._degraded_buckets
-            and bucket_start_ms not in self._repaired_complete_buckets
-        ):
+        if self._bucket_is_degraded(bucket_start_ms):
             return []
-        if bucket_start_ms in self._repaired_complete_buckets:
+        state = self._bucket_states.get(bucket_start_ms)
+        if state is not None and state.complete and state.repaired_through_revision > 0:
             rows = self._load_store_rows(bucket_start_ms)
             if rows:
                 self._bars_by_bucket[bucket_start_ms] = rows
@@ -468,7 +471,8 @@ class RangeBarModule:
         return rows
 
     def coverage(self, bucket_start_ms: int) -> RangeCheckpointRecovery:
-        if bucket_start_ms in self._repaired_complete_buckets:
+        state = self._bucket_states.get(bucket_start_ms)
+        if state is not None and state.complete and state.repaired_through_revision > 0:
             return RangeCheckpointRecovery(
                 coverage_status=RangeCoverageStatus.COMPLETE.value,
                 checkpoint=None,
@@ -478,7 +482,7 @@ class RangeBarModule:
             )
         if bucket_start_ms == self._initial_bucket_ms and self._initial_recovery is not None:
             return self._initial_recovery
-        if bucket_start_ms in self._degraded_buckets:
+        if self._bucket_is_degraded(bucket_start_ms):
             return RangeCheckpointRecovery(
                 coverage_status=RangeCoverageStatus.RECOVERED_INCOMPLETE.value,
                 checkpoint=None,
@@ -494,11 +498,36 @@ class RangeBarModule:
             recovered_from_checkpoint=False,
         )
 
-    def mark_degraded(self, *, bucket_start_ms: int, reason: str) -> None:
-        self._degraded_buckets.setdefault(bucket_start_ms, reason)
+    def _bucket_state(self, bucket_start_ms: int) -> RangeBucketIntegrityState:
+        if bucket_start_ms not in self._bucket_states:
+            self._bucket_states[bucket_start_ms] = RangeBucketIntegrityState()
+        return self._bucket_states[bucket_start_ms]
+
+    def mark_degraded(
+        self,
+        *,
+        bucket_start_ms: int,
+        reason: str,
+        revision: int | None = None,
+    ) -> None:
+        state = self._bucket_state(bucket_start_ms)
+        state.reason = reason
+        observed_revision = self._integrity.revision if revision is None else int(revision)
+        if state.complete:
+            state.last_issue_revision = max(
+                state.last_issue_revision + 1,
+                state.repaired_through_revision + 1,
+                observed_revision,
+            )
+        else:
+            state.last_issue_revision = max(
+                state.last_issue_revision,
+                observed_revision,
+            )
 
     def degraded_reason(self, bucket_start_ms: int) -> str | None:
-        return self._degraded_buckets.get(bucket_start_ms)
+        state = self._bucket_states.get(bucket_start_ms)
+        return None if state is None or state.complete else state.reason
 
     @property
     def trust_start_bucket_ms(self) -> int | None:
@@ -529,12 +558,12 @@ class RangeBarModule:
         return self._bars_by_bucket
 
     @property
-    def degraded_buckets(self) -> dict[int, str]:
-        return self._degraded_buckets
+    def degraded_buckets(self) -> MutableMapping[int, str]:
+        return self._degraded_bucket_view
 
     @property
-    def repaired_complete_buckets(self) -> set[int]:
-        return self._repaired_complete_buckets
+    def repaired_complete_buckets(self) -> MutableSet[int]:
+        return self._repaired_bucket_view
 
     @property
     def last_checkpoint_submit_ms(self) -> int:
@@ -574,6 +603,27 @@ class RangeBarModule:
             != RangeCoverageStatus.COMPLETE.value
         ):
             return False
+        state = self._bucket_state(bucket_start_ms)
+        state.last_issue_revision = max(state.last_issue_revision, 1)
+        repair_started_revision = self._repair_started_revision_by_bucket.pop(
+            bucket_start_ms,
+            self._integrity.revision,
+        )
+        through_rev = repair_started_revision
+        if self._integrity.revision == repair_started_revision:
+            through_rev = max(through_rev, state.last_issue_revision)
+        state.repaired_through_revision = max(
+            state.repaired_through_revision,
+            through_rev,
+        )
+        self._integrity.mark_repaired(
+            bucket_start_ms,
+            bucket_start_ms + self.config.bucket_interval_ms - 1,
+            through_revision=through_rev,
+        )
+        if not state.complete:
+            return False
+        state.reason = None
         self._initial_recovery = RangeCheckpointRecovery(
             coverage_status=RangeCoverageStatus.COMPLETE.value,
             checkpoint=None,
@@ -582,8 +632,6 @@ class RangeBarModule:
             recovered_from_checkpoint=True,
         )
         self._trust_start_bucket_ms = bucket_start_ms
-        self._degraded_buckets.pop(bucket_start_ms, None)
-        self._repaired_complete_buckets.add(bucket_start_ms)
         self._bars_by_bucket.pop(bucket_start_ms, None)
         return True
 
@@ -608,10 +656,7 @@ class RangeBarModule:
             return False
         bucket = self._bucket_start(trade_time_ms)
         # Never persist a normal checkpoint for a degraded, unrepaired bucket.
-        if (
-            bucket in self._degraded_buckets
-            and bucket not in self._repaired_complete_buckets
-        ):
+        if self._bucket_is_degraded(bucket):
             return False
         bars = self.rows_for_bucket(bucket)
         aggregate = next(iter(self.aggregates_for_bucket(bucket)), None)
@@ -797,4 +842,5 @@ __all__ = [
     "RangeBarModuleConfig",
     "RangeBarPersistence",
     "RangeBarStorePort",
+    "RangeBucketIntegrityState",
 ]

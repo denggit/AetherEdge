@@ -1,7 +1,6 @@
 from src.runtime.market_data.dispatcher import (
     BackpressurePolicy,
     BoundedEventDispatcher,
-    BoundedOrderedEventDispatcher,
     DispatchResult,
     SubscriptionHealth,
 )
@@ -34,7 +33,6 @@ from src.runtime.market_data.features import (
 __all__ = [
     "BackpressurePolicy",
     "BoundedEventDispatcher",
-    "BoundedOrderedEventDispatcher",
     "DispatchResult",
     "FixedTimeTradeBarModule",
     "FixedTimeTradeBarModuleConfig",

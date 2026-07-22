@@ -27,7 +27,6 @@ from src.runtime.feature_pipeline import (
 )
 from src.runtime.health_state import RuntimeHealthState
 from src.runtime.heartbeat import RuntimeHeartbeatService
-from src.runtime.market_data.dispatcher import BoundedOrderedEventDispatcher
 from src.runtime.market_data.range_module import RangeBarModule
 from src.runtime.market_data.range_config import (
     RangeRuntimeConfig,
@@ -416,12 +415,6 @@ class WiringComponent(RuntimeComponent):
                 min_bars=self.requirements.range_bars.min_bars,
                 runtime_config=self.range_config,
                 startup_catchup=self.runtime_config.startup_catchup,
-                dispatcher=(
-                    self.runtime_services.range_trade_dispatcher
-                    or BoundedOrderedEventDispatcher(
-                        maxsize=max(1, self.app_config.market_queue_maxsize),
-                    )
-                ),
                 publish=self.process_market_feature,
                 persistence=self._get_market_data_persistence(),
                 stop_event=self._stop_event,

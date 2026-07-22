@@ -25,9 +25,9 @@ from src.runtime.market_data.integrity import (
 )
 from src.signals import TradeSignal
 
-from src.runtime.live_helpers import _event_time_ms, _is_trade_at_or_before
+from src.runtime.live_helpers import _event_time_ms
 from src.runtime.live_types import (
-    LiveRuntimeError, LiveRuntimeStats, MarketQueueDrainResult,
+    LiveRuntimeError, LiveRuntimeStats,
     StartupPreviewState, logger,
 )
 from src.runtime.components.base import RuntimeComponent
@@ -257,92 +257,6 @@ class MarketEventsComponent(RuntimeComponent):
                 ),
                 severity="error",
             )
-        )
-
-    async def _drain_market_events_before_closed_bar(
-        self,
-        *,
-        closed_bar_close_time_ms: int,
-        max_events: int = 10_000,
-        max_duration_ms: int = 3_000,
-    ) -> MarketQueueDrainResult:
-        queue_size_before = self._market_queue.qsize()
-        started = time.monotonic()
-        processed = 0
-        examined = 0
-        deferred: list[MarketEvent] = []
-        max_duration_seconds = max(float(max_duration_ms), 0.0) / 1000.0
-        pipeline_completed = True
-        pipeline_pending = 0
-        market_data_runtime = self.market_state.runtime
-        if market_data_runtime is not None:
-            barrier = await market_data_runtime.drain_through(
-                closed_bar_close_time_ms,
-                timeout_seconds=max_duration_seconds,
-            )
-            pipeline_completed = barrier.completed
-            pipeline_pending = barrier.pending
-            if not pipeline_completed:
-                elapsed_seconds = time.monotonic() - started
-                return MarketQueueDrainResult(
-                    processed=0,
-                    deferred=0,
-                    examined=0,
-                    queue_size_before=queue_size_before,
-                    queue_size_after=self._market_queue.qsize(),
-                    duration_ms=int(elapsed_seconds * 1000),
-                    hit_event_limit=False,
-                    hit_time_limit=True,
-                    pipeline_completed=False,
-                    pipeline_pending=pipeline_pending,
-                )
-
-        while examined < max_events:
-            if max_duration_seconds and time.monotonic() - started >= max_duration_seconds:
-                break
-            try:
-                event = self._market_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-
-            examined += 1
-            try:
-                if _is_trade_at_or_before(event, closed_bar_close_time_ms):
-                    await self.process_market_event(event)
-                    processed += 1
-                else:
-                    deferred.append(event)
-            finally:
-                self._market_queue.task_done()
-
-        for event in deferred:
-            await self._market_queue.put(event)
-
-        elapsed_seconds = time.monotonic() - started
-        duration_ms = int(elapsed_seconds * 1000)
-        queue_size_after = self._market_queue.qsize()
-        hit_event_limit = examined >= max_events
-        hit_time_limit = max_duration_seconds > 0 and elapsed_seconds >= max_duration_seconds
-        logger.info(
-            "Drained market events before closed-bar decision | close_time_ms=%s processed=%s deferred=%s queue_size_before=%s queue_size_after=%s duration_ms=%s",
-            closed_bar_close_time_ms,
-            processed,
-            len(deferred),
-            queue_size_before,
-            queue_size_after,
-            duration_ms,
-        )
-        return MarketQueueDrainResult(
-            processed=processed,
-            deferred=len(deferred),
-            examined=examined,
-            queue_size_before=queue_size_before,
-            queue_size_after=queue_size_after,
-            duration_ms=duration_ms,
-            hit_event_limit=hit_event_limit,
-            hit_time_limit=hit_time_limit,
-            pipeline_completed=pipeline_completed,
-            pipeline_pending=pipeline_pending,
         )
 
     async def _consume_market_events(self, *, max_market_events: int | None) -> None:

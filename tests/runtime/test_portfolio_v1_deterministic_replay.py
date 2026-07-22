@@ -22,7 +22,6 @@ from src.runtime.features import (
     closed_kline_feature,
     range_bar_closed_feature,
 )
-from src.runtime.market_data.dispatcher import BoundedOrderedEventDispatcher
 from src.runtime.market_data.features import (
     FixedTimeTradeBarModule,
     FixedTimeTradeBarModuleConfig,
@@ -32,6 +31,11 @@ from src.runtime.market_data.features import (
     TradeFootprintModuleConfig,
 )
 from src.runtime.market_data.integrity import TradeDataIntegrityTracker
+from src.runtime.market_data.pipeline_plan import (
+    ClosedBarControlEvent,
+    ResolvedMarketPipelinePlan,
+)
+from src.runtime.market_data.processor import MarketEventProcessor
 from src.runtime.market_features import MarketFeaturePipeline
 from src.runtime.orders import LiveOrderIntentFactory
 from src.runtime.strategy_host import StrategyHost
@@ -124,12 +128,9 @@ async def _replay(*, ordered: bool, root) -> dict[str, object]:
     strategy_host = StrategyHost(strategy)
     feature_pipeline = MarketFeaturePipeline(strategy)
     integrity = TradeDataIntegrityTracker()
-    dispatcher = BoundedOrderedEventDispatcher[MarketTrade](
-        maxsize=256,
-        event_time_ms=lambda trade: trade.trade_time_ms,
-    )
     feature_trace: list[tuple[str, dict[str, object]]] = []
     callback_trace: list[tuple[str, int]] = []
+    closed_bar_observations: list[dict[str, int]] = []
     signals = []
 
     async def publish_feature(event) -> None:
@@ -157,7 +158,6 @@ async def _replay(*, ordered: bool, root) -> dict[str, object]:
                 range_pct="0.002",
                 price_step="1",
             ),
-            dispatcher=dispatcher,
             publish=publish_feature,
             integrity=integrity,
         ),
@@ -166,7 +166,6 @@ async def _replay(*, ordered: bool, root) -> dict[str, object]:
                 contract_value="1",
                 large_trade_threshold_notional="1",
             ),
-            dispatcher=dispatcher,
             publish=publish_feature,
             integrity=integrity,
         ),
@@ -175,60 +174,105 @@ async def _replay(*, ordered: bool, root) -> dict[str, object]:
                 contract_value="1",
                 price_bucket_size="1",
             ),
-            dispatcher=dispatcher,
             publish=publish_feature,
             integrity=integrity,
         ),
     )
-    dispatcher.subscribe(
-        subscriber_id="range-bar-replay",
-        handler=process_range,
-        order=400,
-    )
-    dispatcher.subscribe(
-        subscriber_id="raw-replay",
-        handler=process_raw,
-        order=500,
-    )
+    class RangeReplayModule:
+        module_id = "range-bars"
+
+        async def process_trade(self, trade: MarketTrade) -> None:
+            await process_range(trade)
+
+    runtime_modules = (*modules, RangeReplayModule())
 
     trades = _fixture_trades()
-    if ordered:
-        await dispatcher.start()
-        for trade in trades:
-            dispatcher.publish(trade)
-        barrier = await dispatcher.drain_through(
-            trades[-1].trade_time_ms or 0,
-            timeout_seconds=2,
-        )
-        assert barrier.completed
-        await dispatcher.stop()
-    else:
-        # Parent contract executor: the same real modules/builders/strategy are
-        # invoked synchronously in the established priority order.
-        for trade in trades:
-            await modules[0].process_trade(trade)
-            await modules[1].process_trade(trade)
-            await modules[2].process_trade(trade)
-            await process_range(trade)
-            await process_raw(trade)
-
+    split = 24
+    period_a, period_b = trades[:split], trades[split:]
+    close_time_ms = period_a[-1].event_time_ms
     kline = MarketKline(
         exchange=ExchangeName.OKX,
         symbol="ETH-USDT-PERP",
         raw_symbol="ETH-USDT-SWAP",
         interval="4h",
-        open_time_ms=BASE_MS - 4 * 60 * MINUTE_MS,
-        close_time_ms=BASE_MS - 1,
+        open_time_ms=close_time_ms - 4 * 60 * MINUTE_MS + 1,
+        close_time_ms=close_time_ms,
         open=Decimal("100"),
         high=Decimal("102"),
         low=Decimal("90"),
         close=Decimal("100"),
         volume=Decimal("10"),
     )
-    closed_event = closed_kline_feature(kline)
-    feature_trace.append((closed_event.type_value, dict(closed_event.data)))
-    callback_trace.append(("strategy:closed_kline", closed_event.event_time_ms))
-    signals.extend(await feature_pipeline.dispatch(closed_event))
+
+    class ClosedHandler:
+        async def process_closed_bar(self, event: ClosedBarControlEvent) -> None:
+            closed_event = closed_kline_feature(event.kline)
+            feature_trace.append((closed_event.type_value, dict(closed_event.data)))
+            callback_trace.append(("strategy:closed_kline", closed_event.event_time_ms))
+            signals.extend(await feature_pipeline.dispatch(closed_event))
+            latest = {
+                name: max(
+                    time_ms
+                    for callback, time_ms in callback_trace
+                    if callback == name
+                )
+                for name in (
+                    "strategy:raw_trade_skipped",
+                    "feature:fixed_time_trade_bar",
+                    "feature:trade_footprint_feature",
+                    "feature:range_footprint_feature",
+                    "feature:range_bar_closed",
+                )
+            }
+            observer = strategy.mf_feature_observer
+            latest["strategy:observer"] = max(
+                observer._last_tradebar_ms,
+                observer._last_footprint_ms,
+                observer._last_range_footprint_ms,
+            )
+            buffer = strategy.mf_data_buffer
+            latest["strategy:buffer"] = max(
+                buffer._bars[-1].available_time_ms,
+                buffer._range_footprints[-1].available_time_ms,
+            )
+            assert all(value <= event.kline.close_time_ms for value in latest.values())
+            closed_bar_observations.append(latest)
+
+    control = ClosedBarControlEvent(open_time_ms=kline.open_time_ms, kline=kline)
+    closed_handler = ClosedHandler()
+    if ordered:
+        processor = MarketEventProcessor(
+            plan=ResolvedMarketPipelinePlan(
+                trades_enabled=True,
+                closed_kline_enabled=True,
+                order_book_enabled=False,
+                enabled_module_ids=tuple(
+                    module.module_id for module in runtime_modules
+                ) + ("raw-trade-callback",),
+                execution_stages=(),
+            ),
+            trade_modules=runtime_modules,
+            closed_bar_handler=closed_handler,
+            raw_trade_callback=process_raw,
+            maxsize=256,
+        )
+        await processor.start()
+        for trade in period_a:
+            processor.submit_trade(trade)
+        processor.submit_closed_bar(control)
+        for trade in period_b:
+            processor.submit_trade(trade)
+        await processor.stop()
+    else:
+        for period in (period_a, period_b):
+            if period is period_b:
+                await closed_handler.process_closed_bar(control)
+            for trade in period:
+                await modules[0].process_trade(trade)
+                await modules[1].process_trade(trade)
+                await modules[2].process_trade(trade)
+                await process_range(trade)
+                await process_raw(trade)
     account = AccountEvent(
         exchange=ExchangeName.OKX,
         event_type=AccountEventType.POSITION,
@@ -288,6 +332,7 @@ async def _replay(*, ordered: bool, root) -> dict[str, object]:
     return {
         "feature_trace": feature_trace,
         "callback_trace": callback_trace,
+        "closed_bar_observations": closed_bar_observations,
         "signal": signal,
         "signal_metadata": dict(signal.metadata),
         "intent": (
@@ -319,6 +364,7 @@ async def test_real_portfolio_v1_parent_and_runtime_replay_parity(tmp_path) -> N
     runtime = _normalize_replay(await _replay(ordered=True, root=tmp_path / "runtime"))
 
     assert runtime == parent
+    print("portfolio_v1_closed_bar_observations", runtime["closed_bar_observations"])
     assert runtime["signal_metadata"]["engine"] == "MF_LOW_SWEEP_TIME48"
     assert runtime["position"] is not None
     assert runtime["legs"]

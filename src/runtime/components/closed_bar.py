@@ -8,6 +8,8 @@ from src.market_data.models import MarketDataSet, RangeBar, RangeBarAggregate, R
 from src.platform.data.models import MarketEvent, MarketEventType, MarketKline, MarketOrderBook, MarketTicker, MarketTrade
 from src.runtime.features import closed_kline_feature, range_aggregate_unavailable_feature
 from src.runtime.strategy_diagnostics import log_closed_bar_decision
+from src.runtime.market_data.pipeline_plan import ClosedBarControlEvent
+from src.runtime.market_data.processor import MarketEventProcessor
 from src.strategy.ports import (
     RangeSpeedHistoryProvider,
     StrategyDecisionAuditProvider,
@@ -18,10 +20,7 @@ from src.strategy.ports import (
     StrategyStopAdoptionProvider,
 )
 
-from src.runtime.live_types import (
-    LiveRuntimeError, LiveRuntimeStats, MarketQueueDrainResult,
-    StartupPreviewState, logger,
-)
+from src.runtime.live_types import LiveRuntimeStats, StartupPreviewState, logger
 from src.runtime.components.base import RuntimeComponent
 
 
@@ -61,21 +60,64 @@ class ClosedBarComponent(RuntimeComponent):
         if due is None:
             return []
         open_time_ms, closed_kline = due
-        try:
-            drained = await self._drain_before_closed_bar(
-                open_time_ms,
-                closed_kline,
+        processor = self.service_dependencies().market_event_processor
+        if isinstance(processor, MarketEventProcessor):
+            event = ClosedBarControlEvent(
+                open_time_ms=open_time_ms,
+                kline=closed_kline,
             )
-        except Exception:
-            # Barrier / dispatcher / source failure → fatal.
+            processor.submit_closed_bar(event)
+            await event.completion
+            return list(event.result or ())
+        return await self._process_confirmed_closed_bar(
+            open_time_ms,
+            closed_kline,
+            finalized_at_ms=now,
+        )
+
+    async def process_closed_bar(self, event: ClosedBarControlEvent) -> None:
+        if event.skip_reason is not None:
+            self._mark_range_context_degraded_bucket(
+                bucket_start_ms=event.open_time_ms,
+                reason="trade_data_incomplete_before_closed_bar",
+                event_time_ms=event.kline.close_time_ms,
+            )
+            scheduler = self._closed_bar_scheduler
+            mark = getattr(scheduler, "mark_skipped", None)
+            if callable(mark):
+                mark(event.open_time_ms, event.skip_reason)
+            event.result = ()
+            return
+        event.result = tuple(
+            await self._process_confirmed_closed_bar(
+                event.open_time_ms,
+                event.kline,
+                finalized_at_ms=int(time.time() * 1000),
+            )
+        )
+
+    async def _process_confirmed_closed_bar(
+        self,
+        open_time_ms: int,
+        closed_kline: MarketKline,
+        *,
+        finalized_at_ms: int,
+    ) -> list[MarketFeatureEvent]:
+        tracker = self._trade_integrity_tracker()
+        invalid_reason = (
+            None
+            if tracker is None or not self.requirements.trades.enabled
+            else tracker.invalid_reason(
+                open_time_ms,
+                closed_kline.close_time_ms,
+            )
+        )
+        if invalid_reason is not None:
             self._mark_range_context_degraded_bucket(
                 bucket_start_ms=open_time_ms,
-                reason="fatal_pipeline_failure",
+                reason="trade_data_incomplete_before_closed_bar",
                 event_time_ms=closed_kline.close_time_ms,
             )
-            raise
-        if not drained:
-            # Data incomplete → skip this window permanently.
             scheduler = self._closed_bar_scheduler
             mark = getattr(scheduler, "mark_skipped", None)
             if callable(mark):
@@ -92,7 +134,7 @@ class ClosedBarComponent(RuntimeComponent):
         features = await self._emit_closed_kline_feature(
             open_time_ms,
             closed_kline,
-            finalized_at_ms=now,
+            finalized_at_ms=finalized_at_ms,
         )
         if not self.requirements.range_bars.enabled:
             return self._finish_closed_bar_decision(
@@ -171,125 +213,6 @@ class ClosedBarComponent(RuntimeComponent):
             open_time_ms,
             close_time_ms,
             now_ms,
-        )
-
-    async def _drain_before_closed_bar(
-        self,
-        open_time_ms: int,
-        closed_kline: MarketKline,
-    ) -> bool:
-        try:
-            result = await self._drain_market_events_before_closed_bar(
-                closed_bar_close_time_ms=closed_kline.close_time_ms,
-            )
-        except Exception as exc:
-            self._mark_range_context_degraded_bucket(
-                bucket_start_ms=open_time_ms,
-                reason="market_data_barrier_failed",
-                event_time_ms=closed_kline.close_time_ms,
-            )
-            self.market_state.integrity_error = exc
-            self._alert_closed_bar_integrity_failure(
-                closed_kline=closed_kline,
-                reason=f"{type(exc).__name__}: {exc}",
-                result=MarketQueueDrainResult(
-                    processed=0,
-                    deferred=0,
-                    examined=0,
-                    queue_size_before=self._market_queue.qsize(),
-                    queue_size_after=self._market_queue.qsize(),
-                    duration_ms=0,
-                    hit_event_limit=False,
-                    hit_time_limit=False,
-                    pipeline_completed=False,
-                    pipeline_pending=0,
-                ),
-            )
-            raise
-        tracker = self._trade_integrity_tracker()
-        invalid_reason = (
-            None
-            if tracker is None or not self.requirements.trades.enabled
-            else tracker.invalid_reason(
-                open_time_ms,
-                closed_kline.close_time_ms,
-            )
-        )
-        if invalid_reason is not None:
-            self._mark_range_context_degraded_bucket(
-                bucket_start_ms=open_time_ms,
-                reason="trade_data_incomplete_before_closed_bar",
-                event_time_ms=closed_kline.close_time_ms,
-            )
-            self._alert_closed_bar_integrity_failure(
-                closed_kline=closed_kline,
-                reason=invalid_reason,
-                result=result,
-            )
-            return False
-        if not (result.hit_event_limit or result.hit_time_limit):
-            return True
-        self._mark_range_context_degraded_bucket(
-            bucket_start_ms=open_time_ms,
-            reason="market_queue_drain_incomplete_before_closed_bar",
-            event_time_ms=closed_kline.close_time_ms,
-        )
-        logger.warning(
-            "Market queue drain incomplete before closed-bar decision | close_time_ms=%s processed=%s deferred=%s examined=%s queue_size_before=%s queue_size_after=%s hit_event_limit=%s hit_time_limit=%s",
-            closed_kline.close_time_ms,
-            result.processed,
-            result.deferred,
-            result.examined,
-            result.queue_size_before,
-            result.queue_size_after,
-            result.hit_event_limit,
-            result.hit_time_limit,
-        )
-        self.context.alerts.emit(
-            AppAlert(
-                subject="AetherEdge closed-bar trade barrier incomplete",
-                severity="error",
-                content=(
-                    f"symbol={self.app_config.symbol}\n"
-                    f"close_time_ms={closed_kline.close_time_ms}\n"
-                    f"pipeline_completed={result.pipeline_completed}\n"
-                    f"pipeline_pending={result.pipeline_pending}\n"
-                    f"queue_size_after={result.queue_size_after}\n"
-                ),
-            )
-        )
-        self.market_state.integrity_error = LiveRuntimeError(
-            "closed-bar Trade pipeline barrier incomplete | "
-            f"close_time_ms={closed_kline.close_time_ms} "
-            f"pending={result.pipeline_pending}"
-        )
-        return False
-
-    def _alert_closed_bar_integrity_failure(
-        self,
-        *,
-        closed_kline: MarketKline,
-        reason: str,
-        result: MarketQueueDrainResult,
-    ) -> None:
-        logger.error(
-            "Closed-bar decision suppressed for incomplete Trade data | "
-            "close_time_ms=%s reason=%s pipeline_pending=%s",
-            closed_kline.close_time_ms,
-            reason,
-            result.pipeline_pending,
-        )
-        self.context.alerts.emit(
-            AppAlert(
-                subject="AetherEdge closed-bar Trade data incomplete",
-                severity="error",
-                content=(
-                    f"symbol={self.app_config.symbol}\n"
-                    f"close_time_ms={closed_kline.close_time_ms}\n"
-                    f"reason={reason}\n"
-                    f"pipeline_pending={result.pipeline_pending}\n"
-                ),
-            )
         )
 
     async def _emit_closed_kline_feature(

@@ -8,7 +8,6 @@ from src.market_data.models import RangeBar
 from src.platform.data.models import MarketTrade, TradeSide
 from src.platform.exchanges.models import ExchangeName
 from src.runtime.market_data import (
-    BoundedOrderedEventDispatcher,
     RangeBarModule,
     RangeBarModuleConfig,
 )
@@ -119,7 +118,6 @@ def _module(*, builder, persistence, emitted, publish=None):
             aggregate_interval="100ms",
             checkpoint_interval_ms=10_000,
         ),
-        dispatcher=BoundedOrderedEventDispatcher(maxsize=4),
         publish=publish or (lambda event: _append(emitted, event)),
         persistence=persistence,
         builder=builder,
@@ -162,13 +160,6 @@ async def test_range_module_owns_builder_persistence_and_shutdown() -> None:
     await module.stop()
     assert module.health().state is ModuleState.STOPPED
     assert module.checkpoint_writer.stopped == 1
-
-
-def test_range_module_has_no_resources_before_instantiation() -> None:
-    dispatcher = BoundedOrderedEventDispatcher(maxsize=4)
-
-    assert dispatcher.subscriber_ids == ()
-    assert dispatcher.task_count == 0
 
 
 @pytest.mark.asyncio

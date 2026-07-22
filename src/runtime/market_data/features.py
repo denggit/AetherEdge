@@ -22,7 +22,6 @@ from src.runtime.features import (
     range_footprint_feature,
     trade_footprint_feature,
 )
-from src.runtime.market_data.dispatcher import BoundedOrderedEventDispatcher
 from src.runtime.market_data.integrity import TradeDataIntegrityTracker
 from src.runtime.module import CapabilityId, ModuleHealth, ModuleState
 
@@ -61,26 +60,18 @@ class _TradeFeatureModule:
         *,
         module_id: str,
         capability: CapabilityId,
-        dispatcher: BoundedOrderedEventDispatcher[MarketTrade],
-        integrity: TradeDataIntegrityTracker,
+        integrity: TradeDataIntegrityTracker | None = None,
     ) -> None:
         self.module_id = module_id
         self.provides = frozenset({capability})
         self.requires = frozenset({MARKET_TRADES})
         self._state = ModuleState.CREATED
-        self._dispatcher = dispatcher
-        self._integrity = integrity
+        self._integrity = integrity or TradeDataIntegrityTracker()
         self._error: BaseException | None = None
         self.events_seen = 0
         self.features_emitted = 0
         self.features_suppressed = 0
         self.last_invalid_reason: str | None = None
-        dispatcher.subscribe(
-            subscriber_id=module_id,
-            handler=self._process_trade,
-            on_error=self._on_dispatch_error,
-            order=self.dispatch_priority,
-        )
 
     async def prepare(self) -> None:
         self._state = ModuleState.PREPARED
@@ -92,7 +83,6 @@ class _TradeFeatureModule:
         self._state = ModuleState.STOPPED
 
     def health(self) -> ModuleHealth:
-        dispatcher_dropped = self._dispatcher.dropped_count
         return ModuleHealth(
             module_id=self.module_id,
             state=self._state,
@@ -106,7 +96,7 @@ class _TradeFeatureModule:
                 ("events_seen", str(self.events_seen)),
                 ("features_emitted", str(self.features_emitted)),
                 ("features_suppressed", str(self.features_suppressed)),
-                ("events_dropped", str(dispatcher_dropped)),
+                ("events_dropped", "0"),
                 (
                     "data_complete",
                     str(self.last_invalid_reason is None).lower(),
@@ -147,16 +137,13 @@ class FixedTimeTradeBarModule(_TradeFeatureModule):
         self,
         *,
         config: FixedTimeTradeBarModuleConfig,
-        dispatcher: BoundedOrderedEventDispatcher[MarketTrade],
-        publish: FeaturePublisher,
+        publish: FeaturePublisher | None = None,
         builder: TradeFeatureBuilder | None = None,
         integrity: TradeDataIntegrityTracker | None = None,
     ) -> None:
-        integrity = integrity or TradeDataIntegrityTracker()
         super().__init__(
             module_id="fixed-time-trade-bars",
             capability=FEATURE_FIXED_TIME_TRADE_BARS,
-            dispatcher=dispatcher,
             integrity=integrity,
         )
         self.config = config
@@ -175,17 +162,18 @@ class FixedTimeTradeBarModule(_TradeFeatureModule):
                 int(getattr(bar, "close_time_ms", _trade_time_ms(trade))),
             ):
                 continue
-            await self._publish(
-                fixed_time_trade_bar_feature(
-                    bar,
-                    exchange=trade.exchange,
-                    next_open_price=trade.price,
-                    next_open_time_ms=(
-                        trade.trade_time_ms or trade.event_time_ms
-                    ),
-                )
-            )
             self.features_emitted += 1
+            if self._publish is not None:
+                await self._publish(
+                    fixed_time_trade_bar_feature(
+                        bar,
+                        exchange=trade.exchange,
+                        next_open_price=trade.price,
+                        next_open_time_ms=(
+                            trade.trade_time_ms or trade.event_time_ms
+                        ),
+                    )
+                )
 
 
 class TradeFootprintModule(_TradeFeatureModule):
@@ -195,16 +183,13 @@ class TradeFootprintModule(_TradeFeatureModule):
         self,
         *,
         config: TradeFootprintModuleConfig,
-        dispatcher: BoundedOrderedEventDispatcher[MarketTrade],
-        publish: FeaturePublisher,
+        publish: FeaturePublisher | None = None,
         builder: TradeFeatureBuilder | None = None,
         integrity: TradeDataIntegrityTracker | None = None,
     ) -> None:
-        integrity = integrity or TradeDataIntegrityTracker()
         super().__init__(
             module_id="trade-footprint",
             capability=FEATURE_TRADE_FOOTPRINT,
-            dispatcher=dispatcher,
             integrity=integrity,
         )
         self.config = config
@@ -221,10 +206,11 @@ class TradeFootprintModule(_TradeFeatureModule):
                 int(getattr(feature, "close_time_ms", _trade_time_ms(trade))),
             ):
                 continue
-            await self._publish(
-                trade_footprint_feature(feature, exchange=trade.exchange)
-            )
             self.features_emitted += 1
+            if self._publish is not None:
+                await self._publish(
+                    trade_footprint_feature(feature, exchange=trade.exchange)
+                )
 
 
 class RangeFootprintModule(_TradeFeatureModule):
@@ -234,16 +220,13 @@ class RangeFootprintModule(_TradeFeatureModule):
         self,
         *,
         config: RangeFootprintModuleConfig,
-        dispatcher: BoundedOrderedEventDispatcher[MarketTrade],
-        publish: FeaturePublisher,
+        publish: FeaturePublisher | None = None,
         builder: TradeFeatureBuilder | None = None,
         integrity: TradeDataIntegrityTracker | None = None,
     ) -> None:
-        integrity = integrity or TradeDataIntegrityTracker()
         super().__init__(
             module_id="range-footprint",
             capability=FEATURE_RANGE_FOOTPRINT,
-            dispatcher=dispatcher,
             integrity=integrity,
         )
         self.config = config
@@ -253,7 +236,7 @@ class RangeFootprintModule(_TradeFeatureModule):
             range_pct=config.range_pct,
             price_step=config.price_step,
         )
-        self._integrity_revision = integrity.revision
+        self._integrity_revision = self._integrity.revision
 
     async def process_trade(self, trade: MarketTrade) -> None:
         if self._integrity.revision != self._integrity_revision:
@@ -281,10 +264,11 @@ class RangeFootprintModule(_TradeFeatureModule):
                 ),
             ):
                 continue
-            await self._publish(
-                range_footprint_feature(feature, exchange=trade.exchange)
-            )
             self.features_emitted += 1
+            if self._publish is not None:
+                await self._publish(
+                    range_footprint_feature(feature, exchange=trade.exchange)
+                )
 
 
 def _trade_time_ms(trade: MarketTrade) -> int:

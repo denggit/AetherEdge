@@ -11,9 +11,7 @@ from src.market_data.range_checkpoint import (
     RangeCheckpointWriter,
     SqliteRangeCheckpointStore,
 )
-from src.platform.data.models import MarketTrade
 from src.platform.exchanges.models import ExchangeName
-from src.runtime.market_data.dispatcher import BoundedOrderedEventDispatcher
 from src.runtime.market_data.range_background import (
     RangeBackgroundServices,
     range_background_config,
@@ -70,7 +68,6 @@ class RangeModuleComposition:
     min_bars: int
     runtime_config: RangeRuntimeConfig
     startup_catchup: StartupCatchupConfig
-    dispatcher: BoundedOrderedEventDispatcher[MarketTrade]
     publish: FeaturePublisher
     persistence: RangeBarPersistence
     stop_event: asyncio.Event
@@ -109,7 +106,6 @@ class RangeModuleComposition:
                     self.runtime_config.checkpoint_max_age_for_restore_ms
                 ),
             ),
-            dispatcher=self.dispatcher,
             publish=self.publish,
             persistence=self.persistence,
             builder=self.overrides.bar_builder,

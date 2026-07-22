@@ -13,10 +13,7 @@ from src.runtime.capabilities import (
     MARKET_ORDER_BOOK,
     MARKET_TRADES,
 )
-from src.runtime.market_data.dispatcher import (
-    BoundedEventDispatcher,
-    BoundedOrderedEventDispatcher,
-)
+from src.runtime.market_data.dispatcher import BoundedEventDispatcher
 from src.runtime.market_data.features import (
     FeaturePublisher,
     FixedTimeTradeBarModule,
@@ -34,23 +31,20 @@ from src.runtime.market_data.sources import (
     OrderBookStreamModule,
     TradeStreamModule,
 )
+from src.runtime.market_data.processor import MarketEventProcessor
 from src.runtime.registry import ModuleDefinition, ModuleRegistry
 from src.runtime.module import RuntimeModule
 
 
 TradeStreamFactory = Callable[[], TradeStream]
 OrderBookStreamFactory = Callable[[], OrderBookStream]
-RangeModuleFactory = Callable[
-    [BoundedOrderedEventDispatcher[MarketTrade]], RuntimeModule
-]
-TradeConsumer = Callable[[MarketTrade], Awaitable[None] | None]
+RangeModuleFactory = Callable[[], RuntimeModule]
 OrderBookConsumer = Callable[[MarketOrderBook], Awaitable[None] | None]
 DroppedTradeConsumer = Callable[[MarketTrade], Awaitable[None] | None]
 
 
 @dataclass(frozen=True)
 class MarketDataModuleConfig:
-    trade_queue_maxsize: int = 1_000
     order_book_queue_maxsize: int = 100
     fixed_time_trade_bars: FixedTimeTradeBarModuleConfig = field(
         default_factory=FixedTimeTradeBarModuleConfig
@@ -70,35 +64,28 @@ def build_market_data_registry(
     publish_feature: FeaturePublisher,
     config: MarketDataModuleConfig = MarketDataModuleConfig(),
     create_range_module: RangeModuleFactory | None = None,
-    trade_dispatcher: BoundedOrderedEventDispatcher[MarketTrade] | None = None,
     order_book_dispatcher: BoundedEventDispatcher[MarketOrderBook] | None = None,
-    consume_trade: TradeConsumer | None = None,
     consume_dropped_trade: DroppedTradeConsumer | None = None,
     consume_order_book: OrderBookConsumer | None = None,
     trade_integrity: TradeDataIntegrityTracker | None = None,
     order_book_integrity: OrderBookDataIntegrityTracker | None = None,
+    trade_processor: MarketEventProcessor | None = None,
 ) -> ModuleRegistry:
-    """Build lazy definitions; no stream, task or store is created here."""
+    """Build lazy module definitions without opening streams or stores."""
 
-    trade_dispatcher = trade_dispatcher or BoundedOrderedEventDispatcher[MarketTrade](
-        maxsize=config.trade_queue_maxsize,
-    )
     order_book_dispatcher = order_book_dispatcher or BoundedEventDispatcher[MarketOrderBook]()
     trade_integrity = trade_integrity or TradeDataIntegrityTracker()
     order_book_integrity = order_book_integrity or OrderBookDataIntegrityTracker()
-    if consume_trade is not None:
-        trade_dispatcher.subscribe(
-            subscriber_id="runtime-trade-consumer",
-            handler=consume_trade,
-            order=500,
-        )
+
     if consume_order_book is not None:
         order_book_dispatcher.subscribe(
             subscriber_id="runtime-order-book-consumer",
             handler=consume_order_book,
             maxsize=config.order_book_queue_maxsize,
         )
+
     registry = ModuleRegistry()
+
     registry.register(
         ModuleDefinition(
             module_id="trade-stream",
@@ -106,21 +93,22 @@ def build_market_data_registry(
             requires=frozenset(),
             factory=lambda: TradeStreamModule(
                 stream=create_trade_stream(),
-                dispatcher=trade_dispatcher,
+                processor=trade_processor,
                 on_dropped=consume_dropped_trade,
-                integrity=trade_integrity,
             ),
         )
     )
+
     if create_range_module is not None:
         registry.register(
             ModuleDefinition(
                 module_id="range-bars",
                 provides=frozenset({FEATURE_RANGE_BARS}),
                 requires=frozenset({MARKET_TRADES}),
-                factory=lambda: create_range_module(trade_dispatcher),
+                factory=create_range_module,
             )
         )
+
     registry.register(
         ModuleDefinition(
             module_id="order-book-stream",
@@ -133,6 +121,7 @@ def build_market_data_registry(
             ),
         )
     )
+
     registry.register(
         ModuleDefinition(
             module_id="fixed-time-trade-bars",
@@ -140,7 +129,6 @@ def build_market_data_registry(
             requires=frozenset({MARKET_TRADES}),
             factory=lambda: FixedTimeTradeBarModule(
                 config=config.fixed_time_trade_bars,
-                dispatcher=trade_dispatcher,
                 publish=publish_feature,
                 integrity=trade_integrity,
             ),
@@ -153,7 +141,6 @@ def build_market_data_registry(
             requires=frozenset({MARKET_TRADES}),
             factory=lambda: TradeFootprintModule(
                 config=config.trade_footprint,
-                dispatcher=trade_dispatcher,
                 publish=publish_feature,
                 integrity=trade_integrity,
             ),
@@ -166,12 +153,12 @@ def build_market_data_registry(
             requires=frozenset({MARKET_TRADES}),
             factory=lambda: RangeFootprintModule(
                 config=config.range_footprint,
-                dispatcher=trade_dispatcher,
                 publish=publish_feature,
                 integrity=trade_integrity,
             ),
         )
     )
+
     return registry
 
 
