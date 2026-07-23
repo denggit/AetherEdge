@@ -208,6 +208,21 @@ async def test_live_main_launches_subprocess_without_touching_trade_flow(
     assert journal_state.checkpoint_last_trade_ts_ms == NOW_MS - 100
     assert journal_state.first_live_trade_ts_ms - 1 == NOW_MS + 87
 
+    repaired_rows = builder.on_trade(
+        MarketTrade(
+            exchange=ExchangeName.OKX,
+            symbol=app.symbol,
+            raw_symbol="ETH-USDT-SWAP",
+            price=Decimal("100.2"),
+            quantity=Decimal("1"),
+            side=TradeSide.BUY,
+            trade_id="first-live",
+            trade_time_ms=NOW_MS + 88,
+        )
+    )
+    assert len(repaired_rows) == 1
+    SqliteRangeBarStore(tmp_path / "market.sqlite3").save(repaired_rows)
+
     checkpoint_store.save_completed_aggregate(
         exchange="okx",
         aggregate=RangeBarAggregate(

@@ -26,6 +26,7 @@ class ProcessorStats:
     max_queue_depth: int = 0
     max_future_buffer_depth: int = 0
     closed_bar_pending_time_ms: float = 0.0
+    rest_pending_time_ms: float = 0.0
     total_processing_time_ms: float = 0.0
     last_event_time_ms: int = 0
     module_timings: dict[str, float] = field(default_factory=dict)
@@ -65,6 +66,9 @@ class MarketEventProcessor:
             raise ValueError("future_buffer_maxsize must be positive")
         self._queue: asyncio.Queue[MarketTrade | ClosedBarControlEvent] = asyncio.Queue(maxsize)
         self._future_trades: deque[MarketTrade] = deque()
+        self._pending_trades: deque[MarketTrade] = deque()
+        self._pending_done = asyncio.Event()
+        self._pending_done.set()
         self._future_maxsize = future_buffer_maxsize or maxsize
         self._modules = list(trade_modules)
         self._closed_bar_handler = closed_bar_handler
@@ -75,10 +79,13 @@ class MarketEventProcessor:
         self._task: asyncio.Task[None] | None = None
         self._failure_event = asyncio.Event()
         self._pending_cutoff: tuple[int, int, float] | None = None
+        self._cutoff_active = False
         self._pending_control: ClosedBarControlEvent | None = None
+        self._processing_trade_time_ms: int | None = None
         self._cutoff_timer: asyncio.TimerHandle | None = None
         self._closed_through_ms = -1
         self._accepting = True
+        self._accepting_controls = True
         self._error: BaseException | None = None
         self.stats = ProcessorStats()
 
@@ -106,8 +113,8 @@ class MarketEventProcessor:
         pending = self._pending_cutoff
         return None if pending is None else pending[:2]
 
-    def begin_closed_bar_cutoff(self, open_time_ms: int, close_time_ms: int) -> None:
-        if not self._accepting:
+    def arm_closed_bar_cutoff(self, open_time_ms: int, close_time_ms: int) -> None:
+        if not self._accepting_controls:
             raise ProcessorFailureError("MarketEventProcessor is not accepting events")
         boundary = (int(open_time_ms), int(close_time_ms))
         if boundary[1] < boundary[0]:
@@ -120,11 +127,15 @@ class MarketEventProcessor:
             )
             self._fail(error)
             raise error
-        self._pending_cutoff = (*boundary, time.monotonic())
-        if self._cutoff_timeout > 0:
-            self._cutoff_timer = asyncio.get_running_loop().call_later(
-                self._cutoff_timeout, self._expire_cutoff
-            )
+        self._pending_cutoff = (*boundary, 0.0)
+
+    def begin_closed_bar_cutoff(self, open_time_ms: int, close_time_ms: int) -> None:
+        self.arm_closed_bar_cutoff(open_time_ms, close_time_ms)
+
+    def activate_closed_bar_cutoff(self, now_ms: int) -> None:
+        pending = self._pending_cutoff
+        if pending is not None and int(now_ms) > pending[1]:
+            self._activate_cutoff()
 
     def submit_trade(self, trade: MarketTrade) -> None:
         if not self._accepting:
@@ -143,9 +154,12 @@ class MarketEventProcessor:
             cutoff = pending[1]
             control = self._pending_control
             if event_ms > cutoff:
+                self._activate_cutoff()
                 self._buffer_future_trade(trade, event_ms)
                 return
-            if control is not None and (control.started or control.completion.done()):
+            if self._cutoff_active and control is not None and (
+                control.started or control.completion.done()
+            ):
                 error = CausalIntegrityError(
                     "late trade crossed an active closed-bar boundary | "
                     f"trade_time_ms={event_ms} close_time_ms={cutoff}"
@@ -156,7 +170,7 @@ class MarketEventProcessor:
         self._put(trade, event_ms=event_ms)
 
     def submit_closed_bar(self, event: ClosedBarControlEvent) -> None:
-        if not self._accepting:
+        if not self._accepting_controls:
             event.completion.set_exception(
                 ProcessorFailureError("MarketEventProcessor is not accepting events")
             )
@@ -170,6 +184,7 @@ class MarketEventProcessor:
             event.completion.set_exception(error)
             self._fail(error)
             return
+        self._activate_cutoff()
         if self._pending_control is not None:
             event.completion.set_exception(CausalIntegrityError(
                 "closed-bar control is already pending"
@@ -219,6 +234,7 @@ class MarketEventProcessor:
         if self._task is not None and not self._task.done():
             return
         self._accepting = True
+        self._accepting_controls = True
         self._error = None
         self._failure_event.clear()
         self._task = asyncio.create_task(self._worker(), name="market-event-processor")
@@ -226,18 +242,29 @@ class MarketEventProcessor:
     def stop_accepting(self) -> None:
         self._accepting = False
 
+    def stop_accepting_controls(self) -> None:
+        self._accepting_controls = False
+
+    def mark_source_incomplete(self, event_time_ms: int, reason: str) -> None:
+        self._mark_incomplete(event_time_ms, reason)
+
     async def stop(self) -> None:
         self.stop_accepting()
+        self.stop_accepting_controls()
         drain_error: BaseException | None = None
         if self._error is None:
             try:
-                await asyncio.wait_for(self._queue.join(), self._drain_timeout)
+                await asyncio.wait_for(
+                    asyncio.gather(self._queue.join(), self._pending_done.wait()),
+                    self._drain_timeout,
+                )
             except TimeoutError:
                 drain_error = ProcessorFailureError(
                     "MarketEventProcessor drain timed out | "
-                    f"pending={self._queue.qsize()} future={len(self._future_trades)}"
+                    f"pending={self._queue.qsize() + len(self._pending_trades)} "
+                    f"future={len(self._future_trades)}"
                 )
-            if drain_error is None and (self._pending_cutoff or self._future_trades):
+            if drain_error is None and (self._cutoff_active or self._future_trades):
                 drain_error = ProcessorFailureError(
                     "MarketEventProcessor stopped with an unresolved closed-bar cutoff"
                 )
@@ -249,6 +276,8 @@ class MarketEventProcessor:
                 self._mark_incomplete(event_ms, "processor_drain_incomplete")
                 self._fail(drain_error)
                 self._discard_pending(drain_error)
+            elif self._pending_cutoff is not None:
+                self._finish_cutoff()
         else:
             self._discard_pending(self._error)
         task, self._task = self._task, None
@@ -268,17 +297,22 @@ class MarketEventProcessor:
 
     async def _worker(self) -> None:
         while True:
-            event = await self._queue.get()
+            from_pending = bool(self._pending_trades)
+            event = (
+                self._pending_trades.popleft()
+                if from_pending
+                else await self._queue.get()
+            )
             try:
                 if isinstance(event, ClosedBarControlEvent):
-                    await self._drain_cutoff_trades()
+                    await self._classify_queued_for_cutoff()
                     await self._record_processing(event)
-                    await self._release_future_trades()
-                    self._finish_cutoff()
+                    self._queue_future_snapshot()
+                    self._advance_cutoff(event)
                     if not event.completion.done():
                         event.completion.set_result(None)
                 else:
-                    await self._record_processing(event)
+                    await self._handle_trade(event)
             except asyncio.CancelledError:
                 raise
             except BaseException as exc:
@@ -288,7 +322,11 @@ class MarketEventProcessor:
                 logger.exception("MarketEventProcessor worker error | %s", exc)
                 raise
             finally:
-                self._queue.task_done()
+                if from_pending:
+                    if not self._pending_trades:
+                        self._pending_done.set()
+                else:
+                    self._queue.task_done()
 
     async def _record_processing(self, event: MarketTrade | ClosedBarControlEvent) -> None:
         started = time.monotonic()
@@ -302,7 +340,20 @@ class MarketEventProcessor:
         self.stats.total_processing_time_ms += elapsed_ms
         self.stats.processing_times_ms.append(elapsed_ms)
 
-    async def _drain_cutoff_trades(self) -> None:
+    async def _handle_trade(self, trade: MarketTrade) -> None:
+        event_ms = trade.trade_time_ms or trade.event_time_ms or 0
+        pending = self._pending_cutoff
+        if pending is not None and event_ms > pending[1]:
+            self._activate_cutoff()
+            self._buffer_future_trade(trade, event_ms)
+            return
+        self._processing_trade_time_ms = event_ms
+        try:
+            await self._record_processing(trade)
+        finally:
+            self._processing_trade_time_ms = None
+
+    async def _classify_queued_for_cutoff(self) -> None:
         while True:
             try:
                 event = self._queue.get_nowait()
@@ -311,13 +362,16 @@ class MarketEventProcessor:
             try:
                 if not isinstance(event, MarketTrade):
                     raise CausalIntegrityError("multiple closed-bar controls queued")
-                await self._record_processing(event)
+                await self._handle_trade(event)
             finally:
                 self._queue.task_done()
 
-    async def _release_future_trades(self) -> None:
-        while self._future_trades:
-            await self._record_processing(self._future_trades.popleft())
+    def _queue_future_snapshot(self) -> None:
+        if not self._future_trades:
+            return
+        self._pending_trades.extend(self._future_trades)
+        self._future_trades.clear()
+        self._pending_done.clear()
 
     async def _process_trade(self, trade: MarketTrade) -> None:
         self.stats.last_event_time_ms = trade.trade_time_ms or trade.event_time_ms or 0
@@ -358,13 +412,42 @@ class MarketEventProcessor:
 
     def _finish_cutoff(self) -> None:
         pending = self._pending_cutoff
-        if pending is not None:
+        if pending is not None and pending[2] > 0:
             self.stats.closed_bar_pending_time_ms = (time.monotonic() - pending[2]) * 1000
         self._pending_cutoff = None
+        self._cutoff_active = False
         self._pending_control = None
         if self._cutoff_timer is not None:
             self._cutoff_timer.cancel()
             self._cutoff_timer = None
+
+    def _advance_cutoff(self, event: ClosedBarControlEvent) -> None:
+        interval_ms = event.kline.close_time_ms - event.open_time_ms + 1
+        next_open = event.open_time_ms + interval_ms
+        self._finish_cutoff()
+        if self._accepting_controls:
+            self.arm_closed_bar_cutoff(next_open, next_open + interval_ms - 1)
+
+    def _activate_cutoff(self) -> None:
+        pending = self._pending_cutoff
+        if pending is None or self._cutoff_active:
+            return
+        cutoff = pending[1]
+        processing = self._processing_trade_time_ms
+        if processing is not None and processing > cutoff:
+            error = CausalIntegrityError(
+                "future Trade entered a business module before cutoff activation | "
+                f"trade_time_ms={processing} close_time_ms={cutoff}"
+            )
+            self._mark_incomplete(processing, "future_trade_processed_before_cutoff")
+            self._fail(error)
+            raise error
+        self._cutoff_active = True
+        self._pending_cutoff = (pending[0], cutoff, time.monotonic())
+        if self._cutoff_timeout > 0:
+            self._cutoff_timer = asyncio.get_running_loop().call_later(
+                self._cutoff_timeout, self._expire_cutoff
+            )
 
     def _expire_cutoff(self) -> None:
         if self._pending_cutoff is None:
@@ -385,6 +468,7 @@ class MarketEventProcessor:
 
     def _fail(self, error: BaseException) -> None:
         self._accepting = False
+        self._accepting_controls = False
         self._error = self._error or error
         self._failure_event.set()
         if self._task is not None and self._task is not asyncio.current_task():
@@ -403,6 +487,8 @@ class MarketEventProcessor:
         if control is not None and not control.completion.done():
             control.completion.set_exception(error)
         self._future_trades.clear()
+        self._pending_trades.clear()
+        self._pending_done.set()
         self._finish_cutoff()
 
 

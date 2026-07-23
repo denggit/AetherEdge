@@ -747,7 +747,7 @@ async def test_poll_closed_bar_logs_4h_decision_summary_when_range_unavailable(c
         },
         dry_run=True,
     )
-    runner._rangebar_trust_start_bucket_ms = 3 * H4
+    runner._range_module._trust_start_bucket_ms = 3 * H4
 
     caplog.set_level(logging.INFO)
     await runner.poll_closed_bar_once(now_ms=12 * 60 * 60_000 + 60_000)
@@ -1325,7 +1325,7 @@ async def test_closed_bar_poll_emits_unavailable_range_aggregate_for_live_only_p
         },
         dry_run=True,
     )
-    runner._rangebar_trust_start_bucket_ms = 3 * H4
+    runner._range_module._trust_start_bucket_ms = 3 * H4
 
     events = await runner.poll_closed_bar_once(now_ms=12 * 60 * 60_000 + 60_000)
 
@@ -3110,7 +3110,7 @@ async def test_mid_bucket_restart_uses_store_range_aggregate_when_enough_rows():
         },
         dry_run=True,
     )
-    runner._rangebar_trust_start_bucket_ms = open_time_ms + H4
+    runner._range_module._trust_start_bucket_ms = open_time_ms + H4
 
     events = await runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
 
@@ -3138,7 +3138,7 @@ async def test_mid_bucket_restart_without_store_rows_emits_unavailable():
         },
         dry_run=True,
     )
-    runner._rangebar_trust_start_bucket_ms = open_time_ms + H4
+    runner._range_module._trust_start_bucket_ms = open_time_ms + H4
 
     events = await runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
 
@@ -3173,7 +3173,7 @@ async def test_mid_bucket_restart_with_insufficient_store_rows_does_not_emit_par
         },
         dry_run=True,
     )
-    runner._rangebar_trust_start_bucket_ms = open_time_ms + H4
+    runner._range_module._trust_start_bucket_ms = open_time_ms + H4
     processed_features = []
     original_process_market_feature = runner.process_market_feature
 
@@ -3224,7 +3224,7 @@ async def test_non_mid_bucket_emits_range_aggregate_even_when_store_rows_exist()
         },
         dry_run=True,
     )
-    runner._rangebar_trust_start_bucket_ms = None
+    runner._range_module._trust_start_bucket_ms = None
 
     events = await runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
 

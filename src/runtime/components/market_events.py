@@ -308,7 +308,6 @@ class MarketEventsComponent(RuntimeComponent):
             module = self._range_module
             if module is not None:
                 self.stats.range_bars_closed = module.bars_closed
-                self._append_range_repair_trade(trade)
             return
         await self._dispatch_trade_derived_features(trade)
         if not self.requirements.range_bars.enabled:
@@ -317,7 +316,6 @@ class MarketEventsComponent(RuntimeComponent):
         before = module.bars_closed
         await module.process_trade(trade)
         self.stats.range_bars_closed += module.bars_closed - before
-        self._append_range_repair_trade(trade)
 
     async def _dispatch_trade_derived_features(
         self, trade: MarketTrade
@@ -365,12 +363,6 @@ class MarketEventsComponent(RuntimeComponent):
         pipeline = getattr(self, "_trade_derived_feature_pipeline", None)
         if isinstance(pipeline, TradeDerivedFeaturePipeline):
             pipeline.range_footprint_builder = value
-
-    def _submit_range_checkpoint_if_due(self, trade: MarketTrade) -> bool:
-        return self._require_range_module().submit_checkpoint_if_due(trade)
-
-    def _prune_range_bars_by_bucket(self, *, current_bucket: int) -> None:
-        self._require_range_module().prune(current_bucket=current_bucket)
 
     async def _call_strategy_market_event(self, event: MarketEvent) -> Sequence[TradeSignal]:
         return await self._strategy_host.on_market_event(event)

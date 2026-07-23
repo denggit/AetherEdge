@@ -244,7 +244,7 @@ async def test_4h_range_aggregate_uses_memory_when_store_is_empty() -> None:
             "range_checkpoint_store": _CheckpointStore(),
         },
     )
-    runner._range_bars_by_bucket[0] = [
+    runner._range_module._bars_by_bucket[0] = [
         _range_bar(bar_id=i + 1, start_time_ms=i * 1_000, end_time_ms=i * 1_000)
         for i in range(5)
     ]
@@ -280,7 +280,7 @@ async def test_range_bar_save_failure_does_not_block_closed_feature_dispatch() -
     assert [event.type_value for event in strategy.events] == [
         "range_bar_closed"
     ]
-    assert runner._range_bars_by_bucket[0]
+    assert runner._range_module._bars_by_bucket[0]
 
     await runner._stop_live_persistence_writer()
     await asyncio.sleep(0)
@@ -641,9 +641,9 @@ async def test_micro_repair_complete_forces_db_rows_for_4h_aggregate() -> None:
         _range_bar(bar_id=i + 1, start_time_ms=i * 1_000, end_time_ms=i * 1_000)
         for i in range(2)
     ]
-    runner._range_bars_by_bucket[0] = list(partial_rows)
-    runner._initial_range_bucket_ms = 0
-    runner._initial_range_recovery = RangeCheckpointRecovery(
+    runner._range_module._bars_by_bucket[0] = list(partial_rows)
+    runner._range_module._initial_bucket_ms = 0
+    runner._range_module._initial_recovery = RangeCheckpointRecovery(
         coverage_status=RangeCoverageStatus.RECOVERED_INCOMPLETE.value,
         checkpoint=None,
         checkpoint_age_ms=1000,
@@ -657,7 +657,7 @@ async def test_micro_repair_complete_forces_db_rows_for_4h_aggregate() -> None:
 
     # Assert: bucket marked repaired, partial memory cleared
     assert runner._range_module.bucket_integrity(0).complete
-    assert 0 not in runner._range_bars_by_bucket
+    assert 0 not in runner._range_module._bars_by_bucket
 
     # Act: get rows for 4H aggregate
     rows = runner._range_bar_rows_for_bucket(0)
@@ -665,7 +665,7 @@ async def test_micro_repair_complete_forces_db_rows_for_4h_aggregate() -> None:
     # Assert: 5 repaired DB rows returned, NOT 2 partial
     assert len(rows) == 5, f"Expected 5 repaired DB rows, got {len(rows)}"
     # Assert: cache repopulated from DB
-    assert len(runner._range_bars_by_bucket.get(0, [])) == 5
+    assert len(runner._range_module._bars_by_bucket.get(0, [])) == 5
 
     await runner._stop_live_persistence_writer()
 
@@ -693,12 +693,12 @@ async def test_micro_repair_complete_checkpoint_uses_repaired_db_rows() -> None:
             "range_checkpoint_store": checkpoint_store,
         },
     )
-    runner._range_bars_by_bucket[0] = [
+    runner._range_module._bars_by_bucket[0] = [
         _range_bar(bar_id=i + 1, start_time_ms=i * 1_000, end_time_ms=i * 1_000)
         for i in range(2)
     ]
-    runner._initial_range_bucket_ms = 0
-    runner._initial_range_recovery = RangeCheckpointRecovery(
+    runner._range_module._initial_bucket_ms = 0
+    runner._range_module._initial_recovery = RangeCheckpointRecovery(
         coverage_status=RangeCoverageStatus.RECOVERED_INCOMPLETE.value,
         checkpoint=None,
         checkpoint_age_ms=1000,
@@ -712,12 +712,12 @@ async def test_micro_repair_complete_checkpoint_uses_repaired_db_rows() -> None:
     assert runner._range_module.bucket_integrity(0).complete
 
     # Force checkpoint due
-    runner._last_range_checkpoint_submit_ms = 0
-    runner._range_bars_since_checkpoint = 999
+    runner._range_module._last_checkpoint_submit_ms = 0
+    runner._range_module._bars_since_checkpoint = 999
 
     # Submit checkpoint for this bucket
     trade = _trade(time_ms=5_000, price="105")
-    accepted = runner._submit_range_checkpoint_if_due(trade)
+    accepted = runner._range_module.submit_checkpoint_if_due(trade)
 
     # The checkpoint writer is _RangeCheckpointWriter in test — need to verify
     # what was submitted. Since the test runner uses a real RangeBarAggregator
@@ -748,7 +748,7 @@ async def test_normal_live_bucket_remains_memory_first() -> None:
         },
     )
     # Normal live bucket: memory has rows, bucket NOT in repaired set
-    runner._range_bars_by_bucket[0] = [
+    runner._range_module._bars_by_bucket[0] = [
         _range_bar(bar_id=i + 1, start_time_ms=i * 1_000, end_time_ms=i * 1_000)
         for i in range(5)
     ]
@@ -780,7 +780,7 @@ async def test_repaired_complete_db_empty_no_fallback_to_partial_memory() -> Non
         },
     )
     # Partial memory rows exist
-    runner._range_bars_by_bucket[0] = [
+    runner._range_module._bars_by_bucket[0] = [
         _range_bar(bar_id=i + 1, start_time_ms=i * 1_000, end_time_ms=i * 1_000)
         for i in range(2)
     ]
@@ -1019,23 +1019,26 @@ async def test_scheduler_registers_cutoff_before_blocked_rest_and_future_trade_r
     await processor.start()
     await source.prepare()
     await source.start()
+    runner._closed_bar_scheduler.mark_emitted(H4)
+    assert await runner.poll_closed_bar_once(now_ms=cutoff - 1_000) == []
+    assert processor.pending_cutoff == (2 * H4, cutoff)
     await stream.send(_trade(time_ms=cutoff, price="100"))
+    await stream.send(_trade(time_ms=cutoff + 1, price="101"))
+    assert processor.future_buffer_size == 1
+    assert all(value <= cutoff for value in latest.values())
     poll = asyncio.create_task(
         runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
     )
     await data.fetch_started.wait()
     assert processor.pending_cutoff == (2 * H4, cutoff)
 
-    await stream.send(_trade(time_ms=cutoff + 1, price="101"))
-    assert processor.future_buffer_size == 1
-    assert all(value <= cutoff for value in latest.values())
     data.release.set()
     await poll
     await closed_checked.wait()
     await period_b_processed.wait()
     assert all(value == cutoff + 1 for value in latest.values())
 
-    processor.stop_accepting()
     await source.stop()
+    processor.stop_accepting()
     await processor.stop()
     await runner._stop_live_persistence_writer()

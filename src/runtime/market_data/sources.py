@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Generic, TypeVar
 
@@ -167,9 +168,11 @@ class TradeStreamModule(_StreamModule[MarketTrade]):
         )
 
     async def _consume(self) -> None:
+        last_event_time_ms = 0
         try:
             async for event in self._stream():
                 self.events_seen += 1
+                last_event_time_ms = event.trade_time_ms or event.event_time_ms or 0
                 try:
                     self._processor.submit_trade(event)
                 except Exception:
@@ -183,6 +186,11 @@ class TradeStreamModule(_StreamModule[MarketTrade]):
         except asyncio.CancelledError:
             raise
         except BaseException as exc:
+            if not self._stopping and self._processor.is_accepting:
+                self._processor.mark_source_incomplete(
+                    last_event_time_ms or int(time.time() * 1000),
+                    "trade_source_disconnected",
+                )
             self._error = exc
             self._state = ModuleState.ERROR
             if self._on_error is not None:

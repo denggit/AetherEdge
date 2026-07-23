@@ -271,6 +271,31 @@ class TestIntegrityRepair:
         tracker = TradeDataIntegrityTracker()
         assert tracker.is_complete(0, 10000)
 
+    def test_durable_window_restores_without_fabricating_live_drop(self):
+        tracker = TradeDataIntegrityTracker()
+        tracker.restore_window(
+            0,
+            999,
+            last_issue_revision=7,
+            repaired_through_revision=3,
+            reason="source_disconnect",
+        )
+        assert "source_disconnect" in (tracker.invalid_reason(0, 999) or "")
+        assert tracker.revision == 7
+        assert tracker.dropped_count == 0
+        assert tracker.issues_since(0) == ()
+
+    def test_durable_repaired_window_restores_complete(self):
+        tracker = TradeDataIntegrityTracker()
+        tracker.restore_window(
+            0,
+            999,
+            last_issue_revision=7,
+            repaired_through_revision=7,
+            reason=None,
+        )
+        assert tracker.is_complete(0, 999)
+
 
 class TestIntegrityPrune:
     def test_prune_removes_old_complete_windows(self):
@@ -498,6 +523,69 @@ class TestProcessorShutdown:
 
 
 class TestProcessorClosedBar:
+    @pytest.mark.asyncio
+    async def test_queued_future_trade_is_reclassified_after_cutoff_arms(self):
+        blocker = _BlockingProcessor("blocking")
+        trace = _TraceProcessor("trace")
+        processor = MarketEventProcessor(trade_modules=[blocker, trace])
+        await processor.start()
+        processor.submit_trade(_trade("period-a", 900))
+        await blocker.enter_event.wait()
+        processor.submit_trade(_trade("already-queued", 1001))
+        processor.arm_closed_bar_cutoff(0, 1000)
+        processor.activate_closed_bar_cutoff(1001)
+        blocker.block_event.set()
+        event = ClosedBarControlEvent(open_time_ms=0, kline=_kline())
+        processor.submit_closed_bar(event)
+        await event.completion
+        await processor.stop()
+        assert trace.trade_ids == ["period-a", "already-queued"]
+
+    @pytest.mark.asyncio
+    async def test_in_flight_future_trade_makes_cutoff_activation_fatal(self):
+        blocker = _BlockingProcessor("blocking")
+        integrity = TradeDataIntegrityTracker()
+        processor = MarketEventProcessor(
+            trade_modules=[blocker], integrity=integrity
+        )
+        await processor.start()
+        processor.submit_trade(_trade("future", 1001))
+        await blocker.enter_event.wait()
+        processor.arm_closed_bar_cutoff(0, 1000)
+        with pytest.raises(CausalIntegrityError, match="entered a business module"):
+            processor.activate_closed_bar_cutoff(1001)
+        assert integrity.invalid_reason(1001, 1001) is not None
+        await processor.stop()
+
+    @pytest.mark.asyncio
+    async def test_control_completes_before_future_business_processing(self):
+        blocker = _BlockingProcessor("blocking")
+        processor = MarketEventProcessor(trade_modules=[blocker])
+        await processor.start()
+        processor.arm_closed_bar_cutoff(0, 1000)
+        processor.submit_trade(_trade("period-b", 1001))
+        event = ClosedBarControlEvent(open_time_ms=0, kline=_kline())
+        processor.submit_closed_bar(event)
+        await asyncio.wait_for(event.completion, timeout=1)
+        await asyncio.wait_for(blocker.enter_event.wait(), timeout=1)
+        assert event.completion.done()
+        blocker.block_event.set()
+        await processor.stop()
+
+    @pytest.mark.asyncio
+    async def test_active_cutoff_timeout_is_fatal_and_keeps_future_buffered(self):
+        integrity = TradeDataIntegrityTracker()
+        processor = MarketEventProcessor(
+            integrity=integrity, cutoff_timeout_seconds=0.01
+        )
+        await processor.start()
+        processor.arm_closed_bar_cutoff(0, 1000)
+        processor.submit_trade(_trade("period-b", 1001))
+        with pytest.raises(ProcessorFailureError, match="safety timeout"):
+            await asyncio.wait_for(processor.wait_failed(), timeout=1)
+        assert integrity.invalid_reason(1000, 1001) is not None
+        await processor.stop()
+
     @pytest.mark.asyncio
     async def test_future_trades_are_bounded_and_released_in_receive_order(self):
         plan = ResolvedMarketPipelinePlan(True, True, False, ("mod-a",))
@@ -781,6 +869,7 @@ class TestProcessorPerformance:
             f"max_backlog={processor.stats.max_queue_depth} "
             f"max_future_buffer={processor.stats.max_future_buffer_depth} "
             f"closed_bar_pending_ms={processor.stats.closed_bar_pending_time_ms:.6f} "
+            f"rest_pending_ms={processor.stats.rest_pending_time_ms:.6f} "
             f"module_ms={processor.stats.module_timings['mod-a']:.6f}"
         )
         assert processor.stats.trades_processed == count

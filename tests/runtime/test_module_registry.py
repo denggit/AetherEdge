@@ -276,6 +276,9 @@ async def test_market_runtime_starts_consumers_then_processor_then_sources() -> 
         async def start(self):
             calls.append("start:processor")
 
+        def stop_accepting_controls(self):
+            calls.append("stop-controls:processor")
+
         def stop_accepting(self):
             calls.append("stop-accepting:processor")
 
@@ -292,8 +295,9 @@ async def test_market_runtime_starts_consumers_then_processor_then_sources() -> 
     assert calls.index("start:trade-stream") < calls.index("start:order-book-stream")
 
     await runtime.stop()
-    assert calls.index("stop-accepting:processor") < calls.index("stop:trade-stream")
-    assert calls.index("stop:trade-stream") < calls.index("stop:processor")
+    assert calls.index("stop-controls:processor") < calls.index("stop:trade-stream")
+    assert calls.index("stop:trade-stream") < calls.index("stop-accepting:processor")
+    assert calls.index("stop-accepting:processor") < calls.index("stop:processor")
     assert calls.index("stop:processor") < calls.index("stop:range-bars")
 
 

@@ -184,6 +184,28 @@ def test_formal_composition_resolves_exact_demand_without_opening_streams(
 
 
 @pytest.mark.asyncio
+async def test_formal_trade_feed_disables_transparent_reconnect(
+    tmp_path, monkeypatch
+) -> None:
+    observed = {}
+
+    def trade_factory(*_args, **kwargs):
+        observed.update(kwargs)
+        return _IdleTradeStream()
+
+    monkeypatch.setattr("src.runtime.composition.create_trade_stream", trade_factory)
+    monkeypatch.setattr(
+        "src.runtime.composition.create_order_book_stream",
+        lambda *_args, **_kwargs: _IdleOrderBookStream(),
+    )
+    application = _compose(tmp_path, _requirements(trades=True), _Strategy())
+    await application.market_data.start(application.runner._market_data_capabilities)
+    assert observed["reconnect"] is False
+    assert observed["max_reconnects"] == 0
+    await application.market_data.stop()
+
+
+@pytest.mark.asyncio
 async def test_formal_shared_features_use_one_trade_stream_and_shutdown_cleanly(
     tmp_path,
     monkeypatch,

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import time
-from src.market_data.models import MarketDataSet, RangeBar, RangeBarAggregate, RangeCoverageStatus, TimeRange, WarmupRequest
 from src.market_data.range_checkpoint import (
     RangeCheckpointRecovery,
     RangeCheckpointWriter,
@@ -15,7 +14,6 @@ from src.market_data.range_repair import (
     RangeRepairJournalWriter,
 )
 from src.market_data.storage import SqliteKlineStore
-from src.platform.data.models import MarketEvent, MarketEventType, MarketKline, MarketOrderBook, MarketTicker, MarketTrade
 from src.runtime.market_data.range_module import (
     RangeBarModule,
     RangeBarModuleConfig,
@@ -103,9 +101,6 @@ class RangeRuntimeComponent(RuntimeComponent):
             )
         assert journal.writer is not None
         return journal.writer
-
-    def _append_range_repair_trade(self, trade: MarketTrade) -> None:
-        self._require_range_repair_journal().append(trade)
 
     def _invalidate_range_repair_journal(
         self,
@@ -209,167 +204,3 @@ class RangeRuntimeComponent(RuntimeComponent):
         if journal is None:
             raise LiveRuntimeError("Range capability is not enabled")
         return journal
-
-    @property
-    def _rangebar_trust_start_bucket_ms(self) -> int | None:
-        module = self._range_module
-        return None if module is None else module.trust_start_bucket_ms
-
-    @_rangebar_trust_start_bucket_ms.setter
-    def _rangebar_trust_start_bucket_ms(self, value: int | None) -> None:
-        self._require_range_module().trust_start_bucket_ms = value
-
-    @property
-    def _initial_range_bucket_ms(self) -> int | None:
-        module = self._range_module
-        return None if module is None else module.initial_bucket_ms
-
-    @_initial_range_bucket_ms.setter
-    def _initial_range_bucket_ms(self, value: int | None) -> None:
-        self._require_range_module().initial_bucket_ms = value
-
-    @property
-    def _initial_range_recovery(self) -> RangeCheckpointRecovery | None:
-        module = self._range_module
-        return None if module is None else module.initial_recovery
-
-    @_initial_range_recovery.setter
-    def _initial_range_recovery(
-        self,
-        value: RangeCheckpointRecovery | None,
-    ) -> None:
-        self._require_range_module().initial_recovery = value
-
-    @property
-    def _range_bars_by_bucket(self) -> dict[int, list[RangeBar]]:
-        return self._require_range_module().bars_by_bucket
-
-    @property
-    def _range_repair_journal_store(self):
-        journal = self._range_repair_journal
-        return None if journal is None else journal.store
-
-    @_range_repair_journal_store.setter
-    def _range_repair_journal_store(self, value) -> None:
-        self._require_range_repair_journal().store = value
-
-    @property
-    def _range_repair_journal_writer(self):
-        journal = self._range_repair_journal
-        return None if journal is None else journal.writer
-
-    @_range_repair_journal_writer.setter
-    def _range_repair_journal_writer(self, value) -> None:
-        self._require_range_repair_journal().writer = value
-
-    @property
-    def _last_range_checkpoint_submit_ms(self) -> int:
-        return self._require_range_module().last_checkpoint_submit_ms
-
-    @_last_range_checkpoint_submit_ms.setter
-    def _last_range_checkpoint_submit_ms(self, value: int) -> None:
-        self._require_range_module().last_checkpoint_submit_ms = value
-
-    @property
-    def _range_bars_since_checkpoint(self) -> int:
-        return self._require_range_module().bars_since_checkpoint
-
-    @_range_bars_since_checkpoint.setter
-    def _range_bars_since_checkpoint(self, value: int) -> None:
-        self._require_range_module().bars_since_checkpoint = value
-
-    @property
-    def _range_speed_min_periods(self) -> int:
-        warmup = getattr(self, "_range_speed_warmup", None)
-        return (
-            int(self.__dict__.get("_range_speed_min_periods_compat", 0))
-            if warmup is None
-            else warmup.min_periods
-        )
-
-    @_range_speed_min_periods.setter
-    def _range_speed_min_periods(self, value: int) -> None:
-        warmup = getattr(self, "_range_speed_warmup", None)
-        if warmup is None:
-            self.__dict__["_range_speed_min_periods_compat"] = int(value)
-        else:
-            warmup.min_periods = int(value)
-
-    @property
-    def _range_speed_complete_history(self) -> int:
-        warmup = getattr(self, "_range_speed_warmup", None)
-        return (
-            int(self.__dict__.get("_range_speed_complete_history_compat", 0))
-            if warmup is None
-            else warmup.complete_history
-        )
-
-    @_range_speed_complete_history.setter
-    def _range_speed_complete_history(self, value: int) -> None:
-        warmup = getattr(self, "_range_speed_warmup", None)
-        if warmup is None:
-            self.__dict__["_range_speed_complete_history_compat"] = int(value)
-        else:
-            warmup.complete_history = int(value)
-
-    @property
-    def _range_speed_warmup_excluded_previous(self) -> bool:
-        warmup = getattr(self, "_range_speed_warmup", None)
-        return (
-            bool(self.__dict__.get("_range_speed_excluded_compat", False))
-            if warmup is None
-            else warmup.excluded_previous
-        )
-
-    @_range_speed_warmup_excluded_previous.setter
-    def _range_speed_warmup_excluded_previous(self, value: bool) -> None:
-        warmup = getattr(self, "_range_speed_warmup", None)
-        if warmup is None:
-            self.__dict__["_range_speed_excluded_compat"] = bool(value)
-        else:
-            warmup.excluded_previous = bool(value)
-
-    @property
-    def _range_bar_builder(self):
-        module = getattr(self, "_range_module", None)
-        if module is None:
-            return self.__dict__.get("_range_bar_builder_compat")
-        return module.builder
-
-    @_range_bar_builder.setter
-    def _range_bar_builder(self, value) -> None:
-        module = getattr(self, "_range_module", None)
-        if module is None:
-            self.__dict__["_range_bar_builder_compat"] = value
-        else:
-            module.builder = value
-
-    @property
-    def _range_bar_store(self):
-        module = getattr(self, "_range_module", None)
-        if module is None:
-            return self.__dict__.get("_range_bar_store_compat")
-        return module.bar_store
-
-    @_range_bar_store.setter
-    def _range_bar_store(self, value) -> None:
-        module = getattr(self, "_range_module", None)
-        if module is None:
-            self.__dict__["_range_bar_store_compat"] = value
-        else:
-            module.bar_store = value
-
-    @property
-    def _range_bar_aggregator(self):
-        module = getattr(self, "_range_module", None)
-        if module is None:
-            return self.__dict__.get("_range_bar_aggregator_compat")
-        return module.aggregator
-
-    @_range_bar_aggregator.setter
-    def _range_bar_aggregator(self, value) -> None:
-        module = getattr(self, "_range_module", None)
-        if module is None:
-            self.__dict__["_range_bar_aggregator_compat"] = value
-        else:
-            module.aggregator = value

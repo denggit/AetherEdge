@@ -138,9 +138,9 @@ def compose_live_runtime(
             symbol=app_config.symbol,
             config=exchange_config,
             connector=connector,
-            reconnect=True,
+            reconnect=False,
             reconnect_delay_seconds=1.0,
-            max_reconnects=None,
+            max_reconnects=0,
         ),
         create_order_book_stream=lambda: create_order_book_stream(
             app_config.data_exchange,

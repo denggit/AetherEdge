@@ -152,7 +152,6 @@ async def test_startup_uses_injected_heartbeat_once_in_existing_order(
     )
     runner = _runner(heartbeat_service=heartbeat)
     snapshots = (object(),)
-    runner._range_speed_min_periods = 0
     runner._account_config_new_entries_blocked = False
     monkeypatch.setattr(
         runner,

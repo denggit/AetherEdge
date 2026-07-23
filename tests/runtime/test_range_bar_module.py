@@ -13,6 +13,7 @@ from src.runtime.market_data import (
     RangeBarModuleConfig,
 )
 from src.runtime.market_data.integrity import TradeDataIntegrityTracker
+from src.runtime.market_data.range_integrity import RangeBucketIntegrityStatus
 from src.runtime.module import ModuleState
 
 
@@ -44,7 +45,8 @@ class FakeBarStore:
 
 
 class FakeCheckpointStore:
-    pass
+    def save_bucket_integrity(self, _state) -> None:
+        return None
 
 
 class FakeCheckpointWriter:
@@ -254,6 +256,7 @@ def test_range_degraded_state_survives_restart_and_repair_is_revision_bound(
     )
     first.initialize_recovery()
     first.mark_degraded(bucket_start_ms=0, reason="source_drop")
+    assert first.bucket_integrity(0).status is RangeBucketIntegrityStatus.DEGRADED
     assert first.coverage(0).coverage_status != RangeCoverageStatus.COMPLETE.value
     assert first.rows_for_bucket(0) == []
 
@@ -273,10 +276,92 @@ def test_range_degraded_state_survives_restart_and_repair_is_revision_bound(
 
     token = restarted.begin_repair(0)
     assert token == 1
+    assert restarted.bucket_integrity(0).status is RangeBucketIntegrityStatus.REPAIRING
+    assert restarted.coverage(0).coverage_status != RangeCoverageStatus.COMPLETE.value
+    assert restarted.rows_for_bucket(0) == []
     assert restarted.mark_repaired(0, through_revision=token)
+    assert restarted.bucket_integrity(0).status is RangeBucketIntegrityStatus.REPAIRED
     assert restarted.coverage(0).coverage_status == RangeCoverageStatus.COMPLETE.value
     assert restarted.rows_for_bucket(0) == [_bar()]
 
     restarted.mark_degraded(bucket_start_ms=0, reason="new_drop")
     assert restarted.degraded_reason(0) == "new_drop"
     assert restarted.coverage(0).coverage_status != RangeCoverageStatus.COMPLETE.value
+
+
+def test_repairing_and_durable_trade_window_remain_incomplete_after_restart(
+    tmp_path,
+) -> None:
+    db_path = tmp_path / "range.sqlite3"
+    config = RangeBarModuleConfig(
+        symbol="ETH-USDT-PERP",
+        exchange=ExchangeName.OKX,
+        range_pct=Decimal("0.002"),
+        contract_value=Decimal("0.01"),
+        bucket_interval_ms=100,
+        aggregate_interval="100ms",
+        checkpoint_db_path=str(db_path),
+    )
+    first_tracker = TradeDataIntegrityTracker()
+    first = RangeBarModule(
+        config=config,
+        builder=FakeBuilder(),
+        bar_store=FakeBarStore((_bar(),)),
+        checkpoint_store=SqliteRangeCheckpointStore(db_path),
+        checkpoint_writer=FakeCheckpointWriter(),
+        integrity=first_tracker,
+        clock_ms=lambda: 50,
+    )
+    first.initialize_recovery()
+    first.mark_degraded(bucket_start_ms=0, reason="disconnect")
+    first.begin_repair(0)
+
+    restarted_tracker = TradeDataIntegrityTracker()
+    restarted = RangeBarModule(
+        config=config,
+        builder=FakeBuilder(),
+        bar_store=FakeBarStore((_bar(),)),
+        checkpoint_store=SqliteRangeCheckpointStore(db_path),
+        checkpoint_writer=FakeCheckpointWriter(),
+        integrity=restarted_tracker,
+        clock_ms=lambda: 50,
+    )
+    restarted.initialize_recovery()
+    state = restarted.bucket_integrity(0)
+    assert state.status is RangeBucketIntegrityStatus.REPAIRING
+    assert not state.complete
+    assert restarted.rows_for_bucket(0) == []
+    assert restarted.aggregates_for_bucket(0) == []
+    assert restarted_tracker.invalid_reason(0, 99) is not None
+    assert restarted_tracker.dropped_count == 0
+    assert restarted_tracker.issues_since(0) == ()
+
+
+@pytest.mark.asyncio
+async def test_range_module_appends_repair_journal_without_raw_trade_callback() -> None:
+    class Journal:
+        def __init__(self) -> None:
+            self.trades = []
+
+        def append(self, trade) -> None:
+            self.trades.append(trade)
+
+    journal = Journal()
+    module = _module(
+        builder=FakeBuilder(), persistence=FakePersistence(), emitted=[]
+    )
+    module._repair_journal = journal
+    trade = _trade()
+    await module.process_trade(trade)
+    assert journal.trades == [trade]
+
+
+def test_repairing_clean_revision_still_fails_closed() -> None:
+    tracker = TradeDataIntegrityTracker()
+    module = _module(
+        builder=FakeBuilder(), persistence=FakePersistence(), emitted=[]
+    )
+    module.configure_integrity(tracker)
+    assert module.begin_repair(0) == 0
+    assert tracker.invalid_reason(0, 99) is not None
+    assert module.coverage(0).coverage_status != RangeCoverageStatus.COMPLETE.value

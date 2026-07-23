@@ -153,19 +153,30 @@ class MarketDataRuntime:
         self._supervisor_task = None
         errors: list[BaseException] = []
         processor = self._event_processor
+        controls_blocked_separately = False
         if processor is not None:
-            processor.stop_accepting()
+            stop_controls = getattr(processor, "stop_accepting_controls", None)
+            if callable(stop_controls):
+                stop_controls()
+                controls_blocked_separately = True
+            else:
+                processor.stop_accepting()
         try:
-            operations = []
             if host is not None:
-                operations.append(host.stop(self._source_modules))
-            if processor is not None:
-                operations.append(processor.stop())
-            if host is not None:
-                operations.append(host.stop())
-            for operation in operations:
                 try:
-                    await operation
+                    await host.stop(self._source_modules)
+                except BaseException as exc:
+                    errors.append(exc)
+            if processor is not None:
+                if controls_blocked_separately:
+                    processor.stop_accepting()
+                try:
+                    await processor.stop()
+                except BaseException as exc:
+                    errors.append(exc)
+            if host is not None:
+                try:
+                    await host.stop()
                 except BaseException as exc:
                     errors.append(exc)
         finally:

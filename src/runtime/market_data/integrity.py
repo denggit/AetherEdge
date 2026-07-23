@@ -22,6 +22,7 @@ class IntegrityWindowState:
     repaired_through_revision: int = 0
     dropped_count: int = 0
     reasons: set[str] = field(default_factory=set)
+    forced_incomplete: bool = False
 
     @property
     def complete(self) -> bool:
@@ -51,6 +52,7 @@ class TradeDataIntegrityTracker:
         self._window_size_ms = window_size_ms
         self._issues: list[TradeIntegrityIssue] = []
         self._windows: dict[int, IntegrityWindowState] = {}
+        self._restored_windows: dict[tuple[int, int], IntegrityWindowState] = {}
         self._revision: int = 0
         self._dropped_count: int = 0
         self._repaired_ranges: dict[
@@ -102,6 +104,12 @@ class TradeDataIntegrityTracker:
                     wstate.repaired_through_revision,
                     through,
                 )
+        for (w_start, w_end), wstate in self._restored_windows.items():
+            if start <= w_start and w_end <= end:
+                wstate.repaired_through_revision = max(
+                    wstate.repaired_through_revision, through
+                )
+                wstate.forced_incomplete = False
         self._compact_repaired_details()
 
     def is_complete(self, window_start_ms: int, window_end_ms: int) -> bool:
@@ -134,7 +142,7 @@ class TradeDataIntegrityTracker:
                 and issue.revision > through_rev
             ]
             if not unmatched:
-                return None
+                return self._restored_invalid_reason(start, end, through_rev)
             return (
                 "trade_data_incomplete;repaired_through="
                 f"{through_rev};new_drop_after_repair="
@@ -149,7 +157,7 @@ class TradeDataIntegrityTracker:
                 matched_count += 1
                 matched_reasons[issue.reason] = None
         if matched_count == 0:
-            return None
+            return self._restored_invalid_reason(start, end)
         reason_str = ",".join(matched_reasons)
         return f"{reason_str};dropped_count={matched_count}"
 
@@ -202,6 +210,56 @@ class TradeDataIntegrityTracker:
         if value < 0:
             raise ValueError("revision must be non-negative")
         self._revision = max(self._revision, value)
+
+    def restore_window(
+        self,
+        start_ms: int,
+        end_ms: int,
+        *,
+        last_issue_revision: int,
+        repaired_through_revision: int,
+        reason: str | None,
+        complete: bool | None = None,
+    ) -> None:
+        """Restore durable aggregate integrity without inventing live drops."""
+        start, end = int(start_ms), int(end_ms)
+        issue, repaired = int(last_issue_revision), int(repaired_through_revision)
+        if end < start or issue < 0 or repaired < 0:
+            raise ValueError("invalid durable integrity window")
+        self.restore_revision(max(issue, repaired))
+        state = self._restored_windows.setdefault(
+            (start, end), IntegrityWindowState(start_ms=start, end_ms=end)
+        )
+        state.last_issue_revision = max(state.last_issue_revision, issue)
+        state.repaired_through_revision = max(
+            state.repaired_through_revision, repaired
+        )
+        if complete is not None:
+            state.forced_incomplete = not complete
+        if reason:
+            state.reasons.add(str(reason))
+        if repaired:
+            key = (start, end)
+            self._repaired_ranges[key] = max(
+                self._repaired_ranges.get(key, 0), repaired
+            )
+
+    def _restored_invalid_reason(
+        self, start_ms: int, end_ms: int, through_revision: int = 0
+    ) -> str | None:
+        for state in self._restored_windows.values():
+            if (
+                state.start_ms <= end_ms
+                and start_ms <= state.end_ms
+                and (
+                    state.forced_incomplete
+                    or state.last_issue_revision
+                    > max(state.repaired_through_revision, through_revision)
+                )
+            ):
+                reasons = ",".join(sorted(state.reasons)) or "trade_data_incomplete"
+                return f"{reasons};durable_window_incomplete"
+        return None
 
     @property
     def dropped_count(self) -> int:

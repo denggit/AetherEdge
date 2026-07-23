@@ -56,6 +56,7 @@ class ClosedBarComponent(RuntimeComponent):
             self._raise_on_unhealthy_market_data()
             self._raise_on_unhealthy_producer()
         now = int(time.time() * 1000) if now_ms is None else now_ms
+        self._arm_next_closed_bar_cutoff(now)
         due = await self._fetch_due_closed_kline(now)
         if due is None:
             return []
@@ -74,6 +75,21 @@ class ClosedBarComponent(RuntimeComponent):
             closed_kline,
             finalized_at_ms=now,
         )
+
+    def _arm_next_closed_bar_cutoff(self, now_ms: int) -> None:
+        processor = self.service_dependencies().market_event_processor
+        if not isinstance(processor, MarketEventProcessor):
+            return
+        interval = self._closed_bar_interval_ms
+        latest_closed = now_ms - (now_ms % interval) - interval
+        emitted = self._closed_bar_scheduler.last_emitted_open_time_ms
+        open_time_ms = latest_closed if emitted is None else emitted + interval
+        if open_time_ms < 0:
+            return
+        processor.arm_closed_bar_cutoff(
+            open_time_ms, open_time_ms + interval - 1
+        )
+        processor.activate_closed_bar_cutoff(now_ms)
 
     async def process_closed_bar(self, event: ClosedBarControlEvent) -> None:
         event.result = tuple(
@@ -150,19 +166,18 @@ class ClosedBarComponent(RuntimeComponent):
         if open_time_ms is None:
             return None
         processor = self.service_dependencies().market_event_processor
-        if isinstance(processor, MarketEventProcessor):
-            processor.begin_closed_bar_cutoff(
-                open_time_ms,
-                open_time_ms + self._closed_bar_interval_ms - 1,
+        rest_started = time.monotonic()
+        try:
+            rows = await self.context.data.fetch_klines(
+                interval=self._closed_bar_interval, limit=10,
+                start_time_ms=open_time_ms, end_time_ms=open_time_ms,
+                use_cache=False, oldest_first=True,
             )
-        rows = await self.context.data.fetch_klines(
-            interval=self._closed_bar_interval,
-            limit=10,
-            start_time_ms=open_time_ms,
-            end_time_ms=open_time_ms,
-            use_cache=False,
-            oldest_first=True,
-        )
+        finally:
+            if isinstance(processor, MarketEventProcessor):
+                processor.stats.rest_pending_time_ms = (
+                    time.monotonic() - rest_started
+                ) * 1000
         closed_rows = [
             row
             for row in rows
@@ -236,6 +251,7 @@ class ClosedBarComponent(RuntimeComponent):
         open_time_ms: int,
         closed_kline: MarketKline,
     ) -> list[MarketFeatureEvent]:
+        range_module = self._require_range_module()
         degraded = await self._degraded_range_context_feature(
             open_time_ms,
             closed_kline,
@@ -244,8 +260,8 @@ class ClosedBarComponent(RuntimeComponent):
             return [degraded]
         is_mid_bucket_restart = (
             self.requirements.trades.enabled
-            and self._rangebar_trust_start_bucket_ms is not None
-            and open_time_ms < self._rangebar_trust_start_bucket_ms
+            and range_module._trust_start_bucket_ms is not None
+            and open_time_ms < range_module._trust_start_bucket_ms
         )
         min_range_bars = self._get_min_range_bars()
         range_aggregates = self._load_range_aggregates_for_bucket(open_time_ms)
@@ -256,7 +272,7 @@ class ClosedBarComponent(RuntimeComponent):
         aggregates_usable = range_aggregates and (
             not is_mid_bucket_restart
             or (
-                self._initial_range_recovery is None
+                range_module._initial_recovery is None
                 and best_range_bar_count >= min_range_bars
             )
         )
@@ -295,7 +311,7 @@ class ClosedBarComponent(RuntimeComponent):
             open_time_ms,
             open_time_ms + self._closed_bar_interval_ms - 1,
             reason,
-            self._rangebar_trust_start_bucket_ms,
+            self._require_range_module()._trust_start_bucket_ms,
             self._market_queue.qsize(),
         )
         unavailable = range_aggregate_unavailable_feature(
@@ -324,7 +340,7 @@ class ClosedBarComponent(RuntimeComponent):
             self._closed_bar_interval,
             open_time_ms,
             open_time_ms + self._closed_bar_interval_ms - 1,
-            self._rangebar_trust_start_bucket_ms,
+            self._require_range_module()._trust_start_bucket_ms,
             best_range_bar_count,
             min_range_bars,
         )
@@ -346,7 +362,7 @@ class ClosedBarComponent(RuntimeComponent):
                 self._closed_bar_interval,
                 open_time_ms,
                 open_time_ms + self._closed_bar_interval_ms - 1,
-                self._rangebar_trust_start_bucket_ms,
+                self._require_range_module()._trust_start_bucket_ms,
                 best_range_bar_count,
                 min_range_bars,
             )
@@ -358,11 +374,11 @@ class ClosedBarComponent(RuntimeComponent):
                 open_time_ms,
                 open_time_ms + self._closed_bar_interval_ms - 1,
                 reason,
-                self._rangebar_trust_start_bucket_ms,
+                self._require_range_module()._trust_start_bucket_ms,
                 self._market_queue.qsize(),
             )
         elif (
-            self._initial_range_recovery is not None
+            self._require_range_module()._initial_recovery is not None
             and not has_range_aggregates
             and self.requirements.trades.enabled
         ):
@@ -519,10 +535,10 @@ class ClosedBarComponent(RuntimeComponent):
     def _range_store_fallback_allowed(self, bucket_start_ms: int) -> bool:
         module = self._require_range_module()
         return (
-            bucket_start_ms not in module.bars_by_bucket
+            bucket_start_ms not in module._bars_by_bucket
             or (
-                module.initial_bucket_ms == bucket_start_ms
-                and module.initial_recovery is not None
+                module._initial_bucket_ms == bucket_start_ms
+                and module._initial_recovery is not None
             )
         )
 

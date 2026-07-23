@@ -319,13 +319,13 @@ class StartupComponent(RuntimeComponent):
         module = self._require_range_module()
         now_ms = int(time.time() * 1000)
         recovery = (
-            module.initial_recovery
+            module._initial_recovery
             if getattr(self, "_market_modules_managed", False)
             else module.initialize_recovery()
         )
         if recovery is None:
             raise LiveRuntimeError("Range module recovery was not prepared")
-        current_bucket = module.initial_bucket_ms
+        current_bucket = module._initial_bucket_ms
         configure_coverage = getattr(
             self.context.strategy, "configure_range_coverage", None
         )
@@ -342,7 +342,7 @@ class StartupComponent(RuntimeComponent):
             self._closed_bar_interval,
             now_ms,
             current_bucket,
-            module.trust_start_bucket_ms,
+            module._trust_start_bucket_ms,
             recovery.coverage_status,
             recovery.checkpoint_age_ms,
             recovery.recovered_from_checkpoint,

@@ -1,16 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
-
-
-class ClosedBarOutcome(str, Enum):
-    COMPLETED = "completed"
-    SKIPPED_INCOMPLETE = "skipped_incomplete"
-    RETRYABLE_MISSING = "retryable_missing"
-    FATAL_PIPELINE_FAILURE = "fatal_pipeline_failure"
-
-
 def closed_bar_open_time_ms(now_ms: int, *, interval_ms: int, close_buffer_ms: int = 0) -> int:
     """Return the latest fully closed bar open time for ``now_ms``.
 

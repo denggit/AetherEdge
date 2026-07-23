@@ -337,9 +337,6 @@ def _minimal_runner(
     runner._request_sync_throttle = MagicMock()
     runner._recovery_service = "__default__"
     runner._reconciliation_service = "__default__"
-    runner._range_bar_store = None
-    runner._range_bar_builder = None
-    runner._range_bar_aggregator = None
     runner._intent_factory = MagicMock()
     runner.requirements = MagicMock()
     runner.requirements.closed_kline = MagicMock()

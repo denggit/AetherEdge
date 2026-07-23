@@ -7,7 +7,7 @@ import pytest
 
 from src.platform.data.models import MarketOrderBook, MarketTrade, TradeSide
 from src.platform.exchanges.models import ExchangeName
-from src.runtime.capabilities import MARKET_ORDER_BOOK
+from src.runtime.capabilities import FEATURE_RANGE_BARS, MARKET_ORDER_BOOK, MARKET_TRADES
 from src.runtime.market_data.catalog import build_market_data_registry
 from src.runtime.market_data.dispatcher import (
     BackpressurePolicy,
@@ -27,6 +27,9 @@ from src.runtime.market_data.integrity import (
     TradeDataIntegrityTracker,
 )
 from src.runtime.market_data.runtime import MarketDataRuntime, MarketDataRuntimeError
+from src.runtime.market_data.processor import MarketEventProcessor
+from src.runtime.market_data.pipeline_plan import ResolvedMarketPipelinePlan
+from src.runtime.module import ModuleHealth, ModuleState
 
 
 def _trade(trade_id: str, time_ms: int, *, price: str = "100") -> MarketTrade:
@@ -269,3 +272,82 @@ async def test_empty_market_runtime_creates_no_background_task() -> None:
     assert runtime.supervisor_task is None
     assert {task for task in asyncio.all_tasks() if task is not current} == before
     await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_trade_disconnect_fails_runtime_and_degrades_integrity() -> None:
+    integrity = TradeDataIntegrityTracker()
+
+    class RangeProbe:
+        module_id = "range-bars"
+        provides = frozenset({FEATURE_RANGE_BARS})
+        requires = frozenset({MARKET_TRADES})
+
+        def __init__(self) -> None:
+            self.degraded = []
+
+        async def process_trade(self, _trade) -> None:
+            return None
+
+        async def prepare(self) -> None:
+            return None
+
+        async def start(self) -> None:
+            return None
+
+        async def stop(self) -> None:
+            return None
+
+        def health(self):
+            return ModuleHealth(self.module_id, ModuleState.RUNNING, True)
+
+        def mark_trade_incomplete(self, event_ms, reason, revision) -> None:
+            self.degraded.append((event_ms, reason, revision))
+
+    class DisconnectingTradeStream:
+        async def stream_trades(self):
+            yield _trade("last-seen", 123)
+            raise OSError("transient websocket disconnect")
+
+    probe = RangeProbe()
+    processor = MarketEventProcessor(trade_modules=[probe], integrity=integrity)
+    runtime = MarketDataRuntime(
+        registry=build_market_data_registry(
+            create_trade_stream=DisconnectingTradeStream,
+            create_order_book_stream=lambda: None,
+            publish_feature=lambda _event: None,
+            create_range_module=lambda: probe,
+            trade_integrity=integrity,
+            trade_processor=processor,
+        ),
+        event_processor=processor,
+        pipeline_plan=ResolvedMarketPipelinePlan(
+            True, False, False, ("range-bars",)
+        ),
+    )
+    await runtime.start({FEATURE_RANGE_BARS})
+
+    with pytest.raises(MarketDataRuntimeError, match="websocket disconnect"):
+        await asyncio.wait_for(runtime.wait_failed(), timeout=1)
+    assert "trade_source_disconnected" in (integrity.invalid_reason(123, 123) or "")
+    assert probe.degraded[-1][1] == "trade_source_disconnected"
+    await runtime.stop()
+
+
+@pytest.mark.asyncio
+async def test_active_trade_source_shutdown_does_not_mark_disconnect() -> None:
+    integrity = TradeDataIntegrityTracker()
+    processor = MarketEventProcessor(integrity=integrity)
+    runtime = MarketDataRuntime(
+        registry=build_market_data_registry(
+            create_trade_stream=_IdleTradeStream,
+            create_order_book_stream=lambda: None,
+            publish_feature=lambda _event: None,
+            trade_integrity=integrity,
+            trade_processor=processor,
+        ),
+        event_processor=processor,
+    )
+    await runtime.start({MARKET_TRADES})
+    await runtime.stop()
+    assert integrity.dropped_count == 0

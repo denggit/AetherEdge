@@ -147,7 +147,7 @@ class PersistenceComponent(RuntimeComponent):
         range_bars_by_bucket = (
             {}
             if getattr(self, "_range_module", None) is None
-            else self._range_module.bars_by_bucket
+            else self._range_module._bars_by_bucket
         )
         current_bucket_count = (
             len(range_bars_by_bucket.get(current_bucket, ()))
