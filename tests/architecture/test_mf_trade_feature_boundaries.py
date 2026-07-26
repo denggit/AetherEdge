@@ -8,6 +8,9 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_RUNNER = PROJECT_ROOT / "src" / "runtime" / "runner.py"
 TRADE_FEATURE_PIPELINE = PROJECT_ROOT / "src" / "runtime" / "feature_pipeline.py"
+TRADE_FEATURE_MODULES = (
+    PROJECT_ROOT / "src" / "runtime" / "market_data" / "features.py"
+)
 
 # Files that must NOT contain strategy-specific vocabulary
 PUBLIC_MF_SOURCES = (
@@ -126,14 +129,15 @@ def test_bar_builder_has_no_runtime_or_strategy_imports() -> None:
             f"{builder_path.name} imports platform exchanges"
 
 
-def test_trade_builder_creation_and_one_time_config_resolution_live_only_in_pipeline() -> None:
+def test_trade_builder_creation_and_one_time_config_resolution_have_single_owners() -> None:
     builder_names = {
         "FixedTimeTradeBarBuilder",
         "TradeFootprintBuilder",
         "RangeFootprintBuilder",
     }
 
-    assert builder_names <= _constructed_names(TRADE_FEATURE_PIPELINE)
+    assert builder_names <= _constructed_names(TRADE_FEATURE_MODULES)
+    assert builder_names.isdisjoint(_constructed_names(TRADE_FEATURE_PIPELINE))
     assert builder_names.isdisjoint(_constructed_names(RUNTIME_RUNNER))
     assert "trade_feature_runtime_config" in _getattr_names(
         TRADE_FEATURE_PIPELINE
@@ -141,24 +145,26 @@ def test_trade_builder_creation_and_one_time_config_resolution_live_only_in_pipe
     assert "trade_feature_runtime_config" not in _getattr_names(RUNTIME_RUNNER)
 
     tree = ast.parse(
-        TRADE_FEATURE_PIPELINE.read_text(encoding="utf-8"),
-        filename=str(TRADE_FEATURE_PIPELINE),
+        TRADE_FEATURE_MODULES.read_text(encoding="utf-8"),
+        filename=str(TRADE_FEATURE_MODULES),
     )
-    process_trade = next(
+    process_trades = [
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.AsyncFunctionDef)
         and node.name == "process_trade"
-    )
-    assert "trade_feature_runtime_config" not in {
-        str(node.args[1].value)
-        for node in ast.walk(process_trade)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "getattr"
-        and len(node.args) >= 2
-        and isinstance(node.args[1], ast.Constant)
-    }
+    ]
+    assert process_trades
+    for process_trade in process_trades:
+        assert "trade_feature_runtime_config" not in {
+            str(node.args[1].value)
+            for node in ast.walk(process_trade)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+        }
 
 
 def test_range_bar_builders_are_owned_only_by_range_module() -> None:

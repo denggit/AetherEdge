@@ -36,10 +36,6 @@ class RuntimeServices:
     live_persistence_writer: object | None = None
     runtime_persistence_service: object | None = None
     market_data_persistence: object | None = None
-    fixed_time_trade_bar_builder: object | None = None
-    trade_footprint_builder: object | None = None
-    range_footprint_builder: object | None = None
-    trade_derived_feature_pipeline: object | None = None
     trade_feature_config: object | None = None
     producer_monitor: object | None = None
     producer_supervisor: object | None = None

@@ -20,6 +20,7 @@ from src.runtime.market_data.features import (
     TradeFootprintModuleConfig,
 )
 from src.runtime.market_data.integrity import (
+    IntegrityWindowState,
     OrderBookDataIntegrityTracker,
     TradeDataIntegrityTracker,
 )
@@ -80,10 +81,6 @@ def compose_live_runtime(
         defaults_path=defaults_path,
     )
     runtime_services = services or RuntimeServices()
-    trade_integrity = TradeDataIntegrityTracker()
-    order_book_integrity = OrderBookDataIntegrityTracker()
-    runtime_services.trade_data_integrity_tracker = trade_integrity
-    runtime_services.order_book_data_integrity_tracker = order_book_integrity
 
     runner = LiveRuntimeRunner(
         app_config=app_config,
@@ -102,6 +99,17 @@ def compose_live_runtime(
         runner.requirements,
         feature_config=feature_config,
     )
+    trade_integrity = TradeDataIntegrityTracker() if pipeline_plan.trades_enabled else None
+    order_book_integrity = OrderBookDataIntegrityTracker() if pipeline_plan.order_book_enabled else None
+    runtime_services.trade_data_integrity_tracker = trade_integrity
+    runtime_services.order_book_data_integrity_tracker = order_book_integrity
+    if trade_integrity is not None:
+        _bind_trade_integrity_persistence(
+            trade_integrity,
+            context.state_store,
+            exchange=app_config.data_exchange,
+            symbol=app_config.symbol,
+        )
 
     trade_processor = (
         MarketEventProcessor(
@@ -125,7 +133,7 @@ def compose_live_runtime(
 
     range_module = runtime_services.range_bar_module
     configure_integrity = getattr(range_module, "configure_integrity", None)
-    if callable(configure_integrity):
+    if trade_integrity is not None and callable(configure_integrity):
         configure_integrity(trade_integrity)
 
     module_config = _market_module_config(app_config, feature_config)
@@ -170,6 +178,10 @@ def compose_live_runtime(
         logger=logger,
         event_processor=trade_processor,
         pipeline_plan=pipeline_plan,
+        before_prepare=runner.closed_bar.prepare_startup_trade_integrity
+        if pipeline_plan.trades_enabled else None,
+        before_source_start=runner.closed_bar.prepare_initial_cutoff
+        if pipeline_plan.closed_kline_enabled else None,
     )
 
     request = capability_request_from_requirements(
@@ -183,6 +195,28 @@ def compose_live_runtime(
     )
     runner.attach_market_data_runtime(market_data, market_capabilities)
     return LiveRuntimeApplication(runner=runner, market_data=market_data)
+
+
+def _bind_trade_integrity_persistence(
+    tracker: TradeDataIntegrityTracker,
+    state_store: object,
+    *, exchange: object, symbol: str,
+) -> None:
+    load = getattr(state_store, "load_trade_integrity_windows", None)
+    save = getattr(state_store, "save_trade_integrity_window", None)
+    if not callable(load) or not callable(save):
+        return
+    for row in load(exchange=exchange, symbol=symbol):
+        tracker.restore_window(**row)
+
+    def persist(state: IntegrityWindowState) -> None:
+        save(exchange=exchange, symbol=symbol, start_ms=state.start_ms,
+             end_ms=state.end_ms, last_issue_revision=state.last_issue_revision,
+             repaired_through_revision=state.repaired_through_revision,
+             reason=",".join(sorted(state.reasons)) or None,
+             complete=state.complete and not state.forced_incomplete)
+
+    tracker.set_window_persister(persist)
 
 
 def _market_module_config(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +12,7 @@ from src.market_data.events import MarketFeatureEvent
 from src.market_data.models import RangeBar, RangeCoverageStatus, TimeRange
 from src.market_data.range_checkpoint import (
     CompletedRangeAggregate,
+    MICRO_REPAIR_SUCCESS,
     RangeCheckpointRecovery,
 )
 from src.platform import Balance, ExchangeName, LeverageInfo, PositionMode
@@ -25,6 +27,13 @@ from src.runtime import (
     StrategyRuntimeRequirements,
 )
 from src.runtime.market_data.processor import MarketEventProcessor
+from src.runtime.market_data.features import (
+    FixedTimeTradeBarModule,
+    FixedTimeTradeBarModuleConfig,
+    RangeFootprintModule,
+    RangeFootprintModuleConfig,
+)
+from src.runtime.market_data.integrity import TradeDataIntegrityTracker
 from src.runtime.market_data.sources import TradeStreamModule
 from src.signals import SignalAction, TradeSignal
 
@@ -208,6 +217,12 @@ class _CheckpointStore:
         self.aggregates.append(kwargs)
         return True
 
+    def load_micro_repair_job(self, **_kwargs):
+        return SimpleNamespace(
+            status=MICRO_REPAIR_SUCCESS,
+            last_error=None,
+        )
+
     def save_bucket_integrity(self, state):
         self.integrity = state
 
@@ -276,7 +291,9 @@ async def test_range_bar_save_failure_does_not_block_closed_feature_dispatch() -
         },
     )
 
-    await runner.process_market_event(_trade(time_ms=1_000, price="100"))
+    await runner._range_module.process_trade(
+        _trade(time_ms=1_000, price="100")
+    )
     assert [event.type_value for event in strategy.events] == [
         "range_bar_closed"
     ]
@@ -321,6 +338,36 @@ async def test_closed_kline_persist_failure_does_not_block_signal_execution() ->
 
 
 @pytest.mark.asyncio
+async def test_incomplete_trade_window_runs_maintenance_but_skips_strategy() -> None:
+    strategy = _FeatureStrategy()
+    tracker = TradeDataIntegrityTracker()
+    runner = _runner(
+        strategy,
+        requirements=_range_requirements(),
+        services={"trade_data_integrity_tracker": tracker},
+    )
+    maintained = []
+
+    async def maintain(bucket_start_ms, *, finalized_at_ms):
+        maintained.append((bucket_start_ms, finalized_at_ms))
+        return False
+
+    runner._range_module.maintain_closed_bucket = maintain
+    tracker.mark_dropped(1_000, "processor_queue_overflow")
+
+    events = await runner.closed_bar._process_confirmed_closed_bar(
+        0, _kline(0), finalized_at_ms=H4
+    )
+
+    assert maintained == [(0, H4)]
+    assert events == []
+    assert strategy.events == []
+    assert runner._closed_bar_scheduler.skipped_reason(0) == (
+        "trade_data_incomplete"
+    )
+
+
+@pytest.mark.asyncio
 async def test_mf_1m_feature_dispatch_only_updates_observer_buffer() -> None:
     observer = _MfObserver()
     range_store = _FailingRangeBarStore()
@@ -341,12 +388,40 @@ async def test_mf_1m_feature_dispatch_only_updates_observer_buffer() -> None:
     )
 
     base = 1_700_000_000_000
-    await runner.process_market_event(
+    feature_config = runner.runtime_services.trade_feature_config
+    integrity = TradeDataIntegrityTracker()
+    processor = MarketEventProcessor(
+        trade_modules=(
+            FixedTimeTradeBarModule(
+                config=FixedTimeTradeBarModuleConfig(
+                    contract_value=feature_config.contract_value,
+                    large_trade_threshold_notional=(
+                        feature_config.large_trade_threshold
+                    ),
+                ),
+                publish=runner.process_market_feature,
+                integrity=integrity,
+            ),
+            RangeFootprintModule(
+                config=RangeFootprintModuleConfig(
+                    contract_value=feature_config.contract_value,
+                    range_pct=feature_config.range_pct,
+                    price_step=feature_config.range_price_step,
+                ),
+                publish=runner.process_market_feature,
+                integrity=integrity,
+            ),
+        ),
+        integrity=integrity,
+    )
+    await processor.start()
+    processor.submit_trade(
         _trade(time_ms=base + 1_000, price="100", side=TradeSide.BUY)
     )
-    await runner.process_market_event(
+    processor.submit_trade(
         _trade(time_ms=base + 60_001, price="101", side=TradeSide.SELL)
     )
+    await processor.stop()
 
     assert observer.audit()["tradebar_count"] == 1
     assert observer.audit()["range_footprint_count"] == 1
@@ -575,6 +650,12 @@ class _RepairCheckpointStore:
         self.aggregates.append(kwargs)
         return True
 
+    def load_micro_repair_job(self, **_kwargs):
+        return SimpleNamespace(
+            status=MICRO_REPAIR_SUCCESS,
+            last_error=None,
+        )
+
 
 class _ControlledRangeBarStore(_MemoryRangeBarStore):
     """Range bar store where DB rows are configured separately from save() calls."""
@@ -653,14 +734,14 @@ async def test_micro_repair_complete_forces_db_rows_for_4h_aggregate() -> None:
 
     # Act: micro repair completes
     runner._range_module.begin_repair(0)
-    runner._refresh_range_micro_repair_coverage(0)
+    runner._range_module.refresh_repair_state(0)
 
     # Assert: bucket marked repaired, partial memory cleared
     assert runner._range_module.bucket_integrity(0).complete
     assert 0 not in runner._range_module._bars_by_bucket
 
     # Act: get rows for 4H aggregate
-    rows = runner._range_bar_rows_for_bucket(0)
+    rows = runner._range_module.rows_for_bucket(0)
 
     # Assert: 5 repaired DB rows returned, NOT 2 partial
     assert len(rows) == 5, f"Expected 5 repaired DB rows, got {len(rows)}"
@@ -708,7 +789,7 @@ async def test_micro_repair_complete_checkpoint_uses_repaired_db_rows() -> None:
 
     # Micro repair completes
     runner._range_module.begin_repair(0)
-    runner._refresh_range_micro_repair_coverage(0)
+    runner._range_module.refresh_repair_state(0)
     assert runner._range_module.bucket_integrity(0).complete
 
     # Force checkpoint due
@@ -725,7 +806,7 @@ async def test_micro_repair_complete_checkpoint_uses_repaired_db_rows() -> None:
     await runner._stop_live_persistence_writer()
 
     # The key assertion: partial rows (2) were replaced by repaired rows (5)
-    rows = runner._range_bar_rows_for_bucket(0)
+    rows = runner._range_module.rows_for_bucket(0)
     assert len(rows) == 5
 
 

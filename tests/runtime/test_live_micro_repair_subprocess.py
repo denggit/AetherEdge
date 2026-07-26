@@ -160,7 +160,7 @@ async def test_live_main_launches_subprocess_without_touching_trade_flow(
     )
 
     runner._initialize_rangebar_trust_window()
-    await runner._process_trade(
+    await runner._range_module.process_trade(
         MarketTrade(
             exchange=ExchangeName.OKX,
             symbol=app.symbol,
@@ -172,12 +172,11 @@ async def test_live_main_launches_subprocess_without_touching_trade_flow(
             trade_time_ms=NOW_MS + 88,
         )
     )
-    runner._finalize_range_repair_journal(
+    await runner._range_module.maintain_closed_bucket(
         bucket_start_ms=BUCKET_START,
         finalized_at_ms=BUCKET_START + H4,
     )
-    runner._get_range_checkpoint_writer().stop(flush=True)
-    runner._get_range_repair_journal_writer().stop(flush=True)
+    runner._range_module.checkpoint_writer.stop(flush=True)
 
     job = checkpoint_store.load_micro_repair_job(
         exchange="okx",
@@ -244,8 +243,16 @@ async def test_live_main_launches_subprocess_without_touching_trade_flow(
         missing_gap_ms=0,
         completed_at_ms=NOW_MS,
     )
-    runner._refresh_range_micro_repair_coverage(BUCKET_START)
-    coverage = runner._range_coverage_for_bucket(BUCKET_START)
+    checkpoint_store.mark_micro_repair_status(
+        exchange="okx",
+        symbol=app.symbol,
+        range_pct="0.002",
+        bucket_start_ms=BUCKET_START,
+        status="micro_repair_success",
+        updated_at_ms=NOW_MS,
+    )
+    runner._range_module.refresh_repair_state(BUCKET_START)
+    coverage = runner._range_module.coverage(BUCKET_START)
     assert coverage.coverage_status == RangeCoverageStatus.COMPLETE.value
     assert coverage.missing_gap_ms == 0
     assert runner._range_module.degraded_reason(BUCKET_START) is None

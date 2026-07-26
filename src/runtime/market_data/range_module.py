@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
@@ -17,7 +17,6 @@ from src.market_data.models import (
 )
 from src.market_data.range_checkpoint import (
     RangeBuilderCheckpoint,
-    RangeBucketIntegrityRecord,
     RangeCheckpointRecovery,
     RangeCheckpointWriter,
     SqliteRangeCheckpointStore,
@@ -32,8 +31,10 @@ from src.runtime.market_data.integrity import TradeDataIntegrityTracker
 from src.runtime.market_data.range_integrity import (
     RangeBucketIntegrityState,
     RangeBucketIntegrityStatus,
+    RangeIntegrityLifecycle,
 )
 from src.runtime.module import CapabilityId, ModuleHealth, ModuleState
+from src.runtime.range_repair_bootstrap import RepairStartStatus
 from src.utils.log import get_logger
 
 if TYPE_CHECKING:
@@ -81,7 +82,7 @@ class RangeBarModuleConfig:
             raise ValueError("minimum range bars cannot be negative")
 
 
-class RangeBarModule:
+class RangeBarModule(RangeIntegrityLifecycle):
     """Own Range building, recovery, checkpointing and aggregate state."""
 
     module_id = "range-bars"
@@ -197,6 +198,21 @@ class RangeBarModule:
                     missing_gap_ms=recovery.missing_gap_ms,
                     recovered_from_checkpoint=False,
                 )
+        if (
+            not self._bucket_is_degraded(bucket)
+            and self._integrity.invalid_reason(
+                bucket,
+                bucket + self.config.bucket_interval_ms - 1,
+            )
+            is not None
+        ):
+            recovery = RangeCheckpointRecovery(
+                coverage_status=RangeCoverageStatus.RECOVERED_INCOMPLETE.value,
+                checkpoint=recovery.checkpoint,
+                checkpoint_age_ms=recovery.checkpoint_age_ms,
+                missing_gap_ms=max(1, now_ms - bucket),
+                recovered_from_checkpoint=recovery.recovered_from_checkpoint,
+            )
         self._initial_recovery = recovery
         self._builder_reset_at_bucket_ms = bucket + self.config.bucket_interval_ms
         self._trust_start_bucket_ms = (
@@ -239,6 +255,7 @@ class RangeBarModule:
         self._speed_warmup = speed_warmup
         self._stop_event = stop_event
         self._repair_bootstrap = repair_bootstrap
+        background.set_repair_refresh(self.refresh_repair_state)
 
     def configure_integrity(
         self,
@@ -254,8 +271,6 @@ class RangeBarModule:
             or self._initial_recovery is None
         ):
             return
-        if self._initial_bucket_ms is not None:
-            self.begin_repair(self._initial_bucket_ms)
         result = self._repair_bootstrap().start_if_needed(
             self._initial_recovery,
             initial_bucket_ms=self._initial_bucket_ms,
@@ -264,6 +279,33 @@ class RangeBarModule:
         if self._background is not None:
             self._background.micro_repair_supervisor = (
                 result.micro_repair_supervisor
+            )
+        bucket = self._initial_bucket_ms
+        if bucket is None:
+            return
+        if result.status in {
+            RepairStartStatus.STARTED,
+            RepairStartStatus.ALREADY_RUNNING,
+        }:
+            state = self._bucket_states.get(bucket)
+            if (
+                state is None
+                or state.status is not RangeBucketIntegrityStatus.REPAIRING
+            ):
+                self.begin_repair(bucket)
+            self.refresh_repair_state(bucket)
+            return
+        if result.status in {
+            RepairStartStatus.NOT_REPAIRABLE,
+            RepairStartStatus.FAILED,
+        }:
+            state = self._bucket_states.get(bucket)
+            self.mark_degraded(
+                bucket_start_ms=bucket,
+                reason=result.reason or result.status.value,
+                revision=(
+                    None if state is None else state.last_issue_revision
+                ),
             )
 
     @property
@@ -277,6 +319,20 @@ class RangeBarModule:
         if self._repair_journal is None:
             raise RuntimeError("Range repair journal is not configured")
         return self._repair_journal
+
+    @property
+    def initial_recovery(self) -> RangeCheckpointRecovery | None:
+        return self._initial_recovery
+
+    @property
+    def trust_start_bucket_ms(self) -> int | None:
+        return self._trust_start_bucket_ms
+
+    def cached_rows_for_bucket(
+        self,
+        bucket_start_ms: int,
+    ) -> tuple[RangeBar, ...]:
+        return tuple(self._bars_by_bucket.get(int(bucket_start_ms), ()))
 
     @property
     def speed_warmup(self) -> RangeSpeedWarmup:
@@ -391,14 +447,6 @@ class RangeBarModule:
             self._persist_aggregate(aggregate)
         return events
 
-    async def emit_aggregate_for_bucket(
-        self,
-        bucket_start_ms: int,
-    ) -> list[MarketFeatureEvent]:
-        return await self.emit_aggregates(
-            self.aggregates_for_bucket(bucket_start_ms)
-        )
-
     async def emit_aggregates(
         self,
         aggregates: Sequence[RangeBarAggregate],
@@ -441,191 +489,30 @@ class RangeBarModule:
             self._prune(current_bucket=bucket_start_ms)
         return rows
 
-    def coverage(self, bucket_start_ms: int) -> RangeCheckpointRecovery:
-        state = self._bucket_states.get(bucket_start_ms)
-        if state is not None and not state.complete:
-            return _coverage(RangeCoverageStatus.RECOVERED_INCOMPLETE, gap_ms=1)
-        if state is not None and state.repair_started_revision is not None:
-            return _coverage(RangeCoverageStatus.COMPLETE, repaired=True)
-        if bucket_start_ms == self._initial_bucket_ms and self._initial_recovery is not None:
-            return self._initial_recovery
-        return _coverage(RangeCoverageStatus.COMPLETE)
-
-    def _bucket_state(self, bucket_start_ms: int) -> RangeBucketIntegrityState:
-        if bucket_start_ms not in self._bucket_states:
-            self._bucket_states[bucket_start_ms] = RangeBucketIntegrityState()
-        return self._bucket_states[bucket_start_ms]
-
-    def mark_degraded(
+    async def maintain_closed_bucket(
         self,
-        *,
         bucket_start_ms: int,
-        reason: str,
-        revision: int | None = None,
-    ) -> None:
-        state = self._bucket_state(bucket_start_ms)
-        state.status = RangeBucketIntegrityStatus.DEGRADED
-        state.reason = reason
-        if revision is None:
-            self._integrity.mark_dropped(bucket_start_ms, reason)
-            revision = self._integrity.revision
-        state.last_issue_revision = max(state.last_issue_revision, int(revision))
-        self._persist_bucket_state(bucket_start_ms, state)
-        try:
-            self.checkpoint_store.invalidate_completed_aggregate(
-                exchange=self.config.exchange.value, symbol=self.config.symbol,
-                range_pct=str(self.config.range_pct),
-                bucket_end_ms=bucket_start_ms + self.config.bucket_interval_ms - 1,
-                coverage_status=RangeCoverageStatus.RECOVERED_INCOMPLETE.value,
-                missing_gap_ms=1, completed_at_ms=self._clock_ms(),
+        *,
+        finalized_at_ms: int,
+    ) -> bool:
+        if self._repair_journal is not None:
+            await self._repair_journal.finalize(
+                bucket_start_ms=bucket_start_ms,
+                finalized_at_ms=finalized_at_ms,
             )
-        except BaseException as exc:
-            self.mark_failed(exc)
-            raise
-
-    def mark_trade_incomplete(self, event_time_ms: int, reason: str, revision: int) -> None:
-        self.mark_degraded(
-            bucket_start_ms=self._bucket_start(event_time_ms),
-            reason=reason,
-            revision=revision,
-        )
-
-    def degraded_reason(self, bucket_start_ms: int) -> str | None:
-        state = self._bucket_states.get(bucket_start_ms)
-        return None if state is None or state.complete else state.reason
-
-    def bucket_integrity(self, bucket_start_ms: int) -> RangeBucketIntegrityState | None:
-        state = self._bucket_states.get(bucket_start_ms)
-        return None if state is None else replace(state)
-
-    def begin_repair(self, bucket_start_ms: int) -> int:
-        state = self._bucket_state(bucket_start_ms)
-        state.status = RangeBucketIntegrityStatus.REPAIRING
-        state.repair_started_revision = self._integrity.revision
-        self._integrity.restore_window(
+        adopted = self.refresh_repair_state(bucket_start_ms)
+        invalid_reason = self._integrity.invalid_reason(
             bucket_start_ms,
             bucket_start_ms + self.config.bucket_interval_ms - 1,
-            last_issue_revision=state.last_issue_revision,
-            repaired_through_revision=state.repaired_through_revision,
-            reason=state.reason or "range_repair_in_progress",
-            complete=False,
         )
-        self._persist_bucket_state(bucket_start_ms, state)
-        return state.repair_started_revision
-
-    def mark_repaired(self, bucket_start_ms: int, *, through_revision: int) -> bool:
-        state = self._bucket_state(bucket_start_ms)
-        through = int(through_revision)
-        if through < 0 or through > self._integrity.revision:
-            raise ValueError("invalid Range repair revision")
-        if state.repair_started_revision is None:
-            logger.error("Range repair rejected: missing repair token | bucket_start_ms=%s", bucket_start_ms)
-            return False
-        if through != state.repair_started_revision or state.last_issue_revision > through:
-            return False
-        self._integrity.mark_repaired(
-            bucket_start_ms, bucket_start_ms + self.config.bucket_interval_ms - 1,
-            through_revision=through
-        )
-        state.repaired_through_revision = through
-        state.status = RangeBucketIntegrityStatus.REPAIRED
-        state.reason = None
-        self._persist_bucket_state(bucket_start_ms, state)
-        return state.complete
-
-    def adopt_repaired_coverage(self, bucket_start_ms: int) -> bool:
-        if (
-            self._initial_bucket_ms != bucket_start_ms
-            or self._initial_recovery is None
-            or self._initial_recovery.coverage_status
-            == RangeCoverageStatus.COMPLETE.value
-        ):
-            return False
-        completed = self.checkpoint_store.load_completed_aggregate(
-            exchange=self.config.exchange.value,
-            symbol=self.config.symbol,
-            range_pct=str(self.config.range_pct),
-            bucket_end_ms=(
-                bucket_start_ms + self.config.bucket_interval_ms - 1
-            ),
-        )
-        repaired_rows = self._load_store_rows(bucket_start_ms)
-        if (
-            completed is None
-            or completed.coverage_status
-            != RangeCoverageStatus.COMPLETE.value
-            or completed.bucket_start_ms != bucket_start_ms
-            or completed.bucket_end_ms
-            != bucket_start_ms + self.config.bucket_interval_ms - 1
-            or len(repaired_rows) != completed.rf_bar_count
-        ):
-            return False
-        state = self._bucket_state(bucket_start_ms)
-        through_rev = state.repair_started_revision
-        if through_rev is None:
-            logger.error("Range repair adoption rejected: missing repair token | bucket_start_ms=%s", bucket_start_ms)
-            return False
-        if state.last_issue_revision > through_rev:
-            return False
-        if not self.mark_repaired(
-            bucket_start_ms,
-            through_revision=through_rev,
-        ):
-            return False
-        self._initial_recovery = _coverage(
-            RangeCoverageStatus.COMPLETE, repaired=True
-        )
-        self._trust_start_bucket_ms = bucket_start_ms
-        self._bars_by_bucket.pop(bucket_start_ms, None)
-        return True
-
-    def _restore_bucket_integrity(self) -> None:
-        self._bucket_states = {
-            row.bucket_start_ms: RangeBucketIntegrityState(
-                status=(
-                    RangeBucketIntegrityStatus.REPAIRED
-                    if row.status == "complete" and row.repair_started_revision is not None
-                    else RangeBucketIntegrityStatus.CLEAN
-                    if row.status == "complete"
-                    else RangeBucketIntegrityStatus(row.status)
-                ),
-                last_issue_revision=row.last_issue_revision,
-                repaired_through_revision=row.repaired_through_revision,
-                repair_started_revision=row.repair_started_revision,
-                reason=row.reason,
+        state = self._bucket_states.get(bucket_start_ms)
+        if invalid_reason is not None and (state is None or state.complete):
+            self.mark_degraded(
+                bucket_start_ms=bucket_start_ms,
+                reason=invalid_reason,
+                revision=self._integrity.revision,
             )
-            for row in self.checkpoint_store.load_bucket_integrity(
-                exchange=self.config.exchange.value, symbol=self.config.symbol,
-                range_pct=str(self.config.range_pct),
-            )
-        }
-        for bucket_start_ms, state in self._bucket_states.items():
-            self._integrity.restore_window(
-                bucket_start_ms,
-                bucket_start_ms + self.config.bucket_interval_ms - 1,
-                last_issue_revision=state.last_issue_revision,
-                repaired_through_revision=state.repaired_through_revision,
-                reason=state.reason,
-                complete=state.complete,
-            )
-            self._integrity.restore_revision(state.repair_started_revision or 0)
-        self._integrity_revision = self._integrity.revision
-
-    def _persist_bucket_state(self, bucket_start_ms: int, state: RangeBucketIntegrityState) -> None:
-        try:
-            self.checkpoint_store.save_bucket_integrity(
-                RangeBucketIntegrityRecord(
-                    self.config.exchange.value, self.config.symbol,
-                    str(self.config.range_pct), bucket_start_ms,
-                    state.last_issue_revision, state.repaired_through_revision,
-                    state.repair_started_revision, state.status.value,
-                    state.reason, self._clock_ms(),
-                )
-            )
-        except BaseException as exc:
-            self.mark_failed(exc)
-            self._report("range bucket integrity write failed", exc)
-            raise
+        return adopted
 
     def submit_checkpoint_if_due(self, trade: MarketTrade) -> bool:
         now_ms = self._clock_ms()
@@ -677,28 +564,17 @@ class RangeBarModule:
         self._prune(current_bucket=bucket)
         return accepted
 
-    def prune(self, *, current_bucket: int) -> None:
-        self._prune(current_bucket=current_bucket)
-
     @property
     def builder(self) -> Any:
         self._ensure_resources()
         assert self._builder is not None
         return self._builder
 
-    @builder.setter
-    def builder(self, value: Any | None) -> None:
-        self._builder = value
-
     @property
     def aggregator(self) -> RangeBarAggregator:
         self._ensure_resources()
         assert self._aggregator is not None
         return self._aggregator
-
-    @aggregator.setter
-    def aggregator(self, value: RangeBarAggregator | None) -> None:
-        self._aggregator = value
 
     @property
     def checkpoint_store(self) -> SqliteRangeCheckpointStore:
@@ -718,9 +594,6 @@ class RangeBarModule:
         assert self._bar_store is not None
         return self._bar_store
 
-    @bar_store.setter
-    def bar_store(self, value: Any | None) -> None:
-        self._bar_store = value
     def _ensure_resources(self) -> None:
         if self._builder is None:
             self._builder = RangeBarBuilder(
@@ -821,10 +694,6 @@ class RangeBarModule:
 
 def _trade_time_ms(trade: MarketTrade) -> int | None:
     return trade.trade_time_ms or trade.event_time_ms
-
-
-def _coverage(status: RangeCoverageStatus, *, repaired: bool = False, gap_ms: int = 0) -> RangeCheckpointRecovery:
-    return RangeCheckpointRecovery(status.value, None, None, gap_ms, repaired)
 
 
 __all__ = [

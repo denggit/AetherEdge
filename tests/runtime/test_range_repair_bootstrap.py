@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from src.market_data.models import RangeCoverageStatus
 from src.market_data.range_checkpoint import (
+    MICRO_REPAIR_RUNNING,
     RangeBuilderCheckpoint,
     RangeCheckpointRecovery,
 )
 from src.runtime.range_repair_bootstrap import (
     RangeRepairBootstrapService,
+    RepairStartStatus,
 )
 from src.runtime.market_data.range_config import RangeRuntimeConfig
 
@@ -23,9 +27,16 @@ CHECKPOINT_TS = BUCKET_START + 1_000
 class _CheckpointStore:
     def __init__(self) -> None:
         self.jobs = []
+        self.existing = None
 
     def enqueue_micro_repair(self, job) -> None:
         self.jobs.append(job)
+
+    def load_micro_repair_job(self, **_kwargs):
+        return self.existing
+
+    def mark_micro_repair_status(self, **_kwargs) -> bool:
+        return True
 
 
 class _JournalStore:
@@ -99,9 +110,12 @@ def _checkpoint() -> RangeBuilderCheckpoint:
     )
 
 
-def _service(tmp_path, checkpoint_store, clock_ms):
+def _service(
+    tmp_path, checkpoint_store, clock_ms, *, config=None,
+    supervisor_factory=_Supervisor,
+):
     return RangeRepairBootstrapService(
-        range_config=_config(tmp_path),
+        range_config=config or _config(tmp_path),
         exchange="okx",
         symbol="ETH-USDT-PERP",
         range_pct="0.002",
@@ -110,7 +124,7 @@ def _service(tmp_path, checkpoint_store, clock_ms):
         emit_alert=lambda alert: None,
         journal_store_factory=lambda path: _JournalStore(),
         journal_writer_factory=_Writer,
-        micro_repair_supervisor_factory=_Supervisor,
+        micro_repair_supervisor_factory=supervisor_factory,
         clock_ms=clock_ms,
         repo_root=tmp_path,
     )
@@ -139,6 +153,7 @@ async def test_bootstrap_does_not_start_without_degraded_bucket(
     assert result.journal_writer is None
     assert result.micro_repair_supervisor is None
     assert result.micro_repair_started is False
+    assert result.status is RepairStartStatus.NOT_NEEDED
     assert checkpoint_store.jobs == []
 
 
@@ -173,6 +188,7 @@ async def test_bootstrap_starts_journal_and_supervisor_with_runtime_config(
     assert isinstance(result.journal_writer, _Writer)
     assert isinstance(result.micro_repair_supervisor, _Supervisor)
     assert result.micro_repair_started is True
+    assert result.status is RepairStartStatus.STARTED
     assert result.journal_bucket_start_ms == BUCKET_START
     assert result.checkpoint_last_trade_ts_ms == CHECKPOINT_TS
     assert result.journal_writer.started == 1
@@ -218,6 +234,70 @@ async def test_bootstrap_starts_journal_and_supervisor_with_runtime_config(
             "missing_gap_ms": 500,
         }
     ]
+
+
+def test_bootstrap_reports_not_repairable_without_journal(tmp_path) -> None:
+    store = _CheckpointStore()
+    service = _service(
+        tmp_path,
+        store,
+        lambda: 1,
+        config=replace(_config(tmp_path), repair_journal_enabled=False),
+    )
+    result = service.start_if_needed(
+        RangeCheckpointRecovery(
+            RangeCoverageStatus.RECOVERED_INCOMPLETE.value,
+            _checkpoint(), 100, 500, True,
+        ),
+        initial_bucket_ms=BUCKET_START,
+    )
+
+    assert result.status is RepairStartStatus.NOT_REPAIRABLE
+    assert result.reason == "repair_journal_disabled"
+    assert store.jobs == []
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_reports_failed_when_worker_does_not_start(tmp_path) -> None:
+    class FailedSupervisor(_Supervisor):
+        def start_startup_recovery(self, **kwargs) -> bool:
+            super().start_startup_recovery(**kwargs)
+            return False
+
+    store = _CheckpointStore()
+    result = _service(
+        tmp_path, store, lambda: 1, supervisor_factory=FailedSupervisor
+    ).start_if_needed(
+        RangeCheckpointRecovery(
+            RangeCoverageStatus.RECOVERED_INCOMPLETE.value,
+            _checkpoint(), 100, 500, True,
+        ),
+        initial_bucket_ms=BUCKET_START,
+    )
+
+    assert result.status is RepairStartStatus.FAILED
+    assert result.reason == "worker_start_failed"
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_recovers_existing_durable_job(tmp_path) -> None:
+    store = _CheckpointStore()
+    store.existing = SimpleNamespace(
+        status=MICRO_REPAIR_RUNNING,
+        bucket_start_ms=BUCKET_START,
+        checkpoint_last_trade_ts_ms=CHECKPOINT_TS,
+        last_error=None,
+    )
+    result = _service(tmp_path, store, lambda: 1).start_if_needed(
+        RangeCheckpointRecovery(
+            RangeCoverageStatus.RECOVERED_INCOMPLETE.value,
+            _checkpoint(), 100, 500, True,
+        ),
+        initial_bucket_ms=BUCKET_START,
+    )
+
+    assert result.status is RepairStartStatus.ALREADY_RUNNING
+    assert store.jobs == []
 
 
 def test_bootstrap_module_has_no_exchange_adapter_dependency() -> None:

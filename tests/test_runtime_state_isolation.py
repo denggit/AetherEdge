@@ -218,7 +218,7 @@ def test_fake_repository_sentinel_and_real_runtime_manifest_remain_unchanged(
     paths = (
         runner._get_position_plan_store().path,
         runner._get_order_journal().path,
-        runner._get_range_checkpoint_store().path,
+        runner._range_module.checkpoint_store.path,
         runner._range_repair_journal.store.path,
         runner._range_module.bar_store.path,
         runner._heartbeat_service.store.db_path,

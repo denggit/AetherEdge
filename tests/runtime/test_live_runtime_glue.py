@@ -830,8 +830,8 @@ async def test_range_bar_pipeline_saves_bar_and_emits_aggregate_feature():
     trade1 = MarketTrade(exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP", raw_symbol="ETH-USDT-SWAP", price=Decimal("100"), quantity=Decimal("1"), side=TradeSide.BUY, trade_time_ms=1_000)
     trade2 = MarketTrade(exchange=ExchangeName.OKX, symbol="ETH-USDT-PERP", raw_symbol="ETH-USDT-SWAP", price=Decimal("100.2"), quantity=Decimal("1"), side=TradeSide.SELL, trade_time_ms=2_000)
 
-    await runner.process_market_event(trade1)
-    await runner.process_market_event(trade2)
+    await runner._range_module.process_trade(trade1)
+    await runner._range_module.process_trade(trade2)
     await runner.emit_range_aggregate_for_bucket(0)
     await runner._stop_live_persistence_writer()
 
@@ -3294,37 +3294,29 @@ async def test_runtime_start_logs_market_queue_settings(caplog, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_explicit_range_only_trade_skips_on_trade_callback(monkeypatch):
+async def test_explicit_range_only_trade_skips_on_trade_callback():
     strategy = CountingTradeStrategy(strategy_id="eth_lf_portfolio_v9c_reclaim_priority")
     strategy.raw_trade_callbacks_enabled = False
     runner = _runner(strategy, dry_run=True)
-    processed_trades = []
+    processor = MarketEventProcessor(
+        trade_modules=(runner._range_module,),
+        raw_trade_callback=None,
+    )
 
-    async def fake_process_trade(event):
-        processed_trades.append(event)
+    await processor.start()
+    processor.submit_trade(_trade())
+    await processor.stop()
 
-    monkeypatch.setattr(runner, "_process_trade", fake_process_trade)
-
-    await runner.process_market_event(_trade())
-
-    assert len(processed_trades) == 1
     assert strategy.trade_calls == 0
 
 
 @pytest.mark.asyncio
-async def test_non_v9c_trade_event_still_calls_on_trade_callback(monkeypatch):
+async def test_non_v9c_trade_event_still_calls_on_trade_callback():
     strategy = CountingTradeStrategy(strategy_id="other_strategy")
     runner = _runner(strategy, dry_run=True)
-    processed_trades = []
-
-    async def fake_process_trade(event):
-        processed_trades.append(event)
-
-    monkeypatch.setattr(runner, "_process_trade", fake_process_trade)
 
     await runner.process_market_event(_trade())
 
-    assert len(processed_trades) == 1
     assert strategy.trade_calls == 1
 
 

@@ -134,7 +134,6 @@ def test_all_final_service_keys_preserve_injected_identity_and_are_lazy() -> Non
     recovery_coordinator = SimpleNamespace(execute=AsyncMock())
     reconciliation_coordinator = SimpleNamespace(execute=AsyncMock())
     persistence_service = SimpleNamespace()
-    trade_pipeline = SimpleNamespace()
     market_persistence = SimpleNamespace()
     health = object()
     health_state = SimpleNamespace(current=health, update=Mock())
@@ -157,7 +156,6 @@ def test_all_final_service_keys_preserve_injected_identity_and_are_lazy() -> Non
         "recovery_coordinator": recovery_coordinator,
         "reconciliation_coordinator": reconciliation_coordinator,
         "runtime_persistence_service": persistence_service,
-        "trade_derived_feature_pipeline": trade_pipeline,
         "market_data_persistence": market_persistence,
         "runtime_health_state": health_state,
         "heartbeat_service": heartbeat,
@@ -179,7 +177,6 @@ def test_all_final_service_keys_preserve_injected_identity_and_are_lazy() -> Non
         "recovery_coordinator": runner._recovery_coordinator,
         "reconciliation_coordinator": runner._reconciliation_coordinator,
         "runtime_persistence_service": runner._runtime_persistence_service,
-        "trade_derived_feature_pipeline": runner._trade_derived_feature_pipeline,
         "market_data_persistence": runner._market_data_persistence,
         "runtime_health_state": runner._runtime_health_state,
         "heartbeat_service": runner._heartbeat_service,

@@ -351,18 +351,6 @@ async def _process_market_event_with_order(
         "_maybe_log_live_data_path_stats",
         lambda: calls.append("data_path"),
     )
-    if isinstance(event, MarketTrade):
-        monkeypatch.setattr(
-            runner,
-            "_process_trade",
-            _async_stage(calls, "trade"),
-        )
-        monkeypatch.setattr(
-            runner,
-            "_trade_events_are_range_only",
-            lambda: False,
-        )
-
     await runner.process_market_event(event)
     return heartbeat, calls
 

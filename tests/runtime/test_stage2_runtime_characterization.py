@@ -413,8 +413,6 @@ async def test_trade_processing_precedes_strategy_callback_and_execution(monkeyp
     executed = []
     monkeypatch.setattr(runner, "_set_health", lambda *args, **kwargs: None)
     monkeypatch.setattr(runner, "_maybe_log_live_data_path_stats", lambda: None)
-    monkeypatch.setattr(runner, "_process_trade", _async_stage(calls, "_process_trade"))
-
     async def execute(signals, **kwargs):
         calls.append("_execute_signals")
         executed.append((signals, kwargs))
@@ -424,49 +422,10 @@ async def test_trade_processing_precedes_strategy_callback_and_execution(monkeyp
 
     await runner.process_market_event(trade)
 
-    assert calls == ["_process_trade", "strategy.on_trade", "_execute_signals"]
+    assert calls == ["strategy.on_trade", "_execute_signals"]
     assert executed == [
         ((signal,), {"source": "trade", "event_time_ms": trade.trade_time_ms})
     ]
-
-
-@pytest.mark.asyncio
-async def test_range_only_trade_skips_raw_strategy_callback_and_execution(monkeypatch) -> None:
-    calls: list[str] = []
-    strategy = FakeStrategy(calls)
-    strategy.raw_trade_callbacks_enabled = False
-    runner = _runner(strategy, calls=calls)
-    runner._heartbeat_service = None
-    monkeypatch.setattr(runner, "_set_health", lambda *args, **kwargs: None)
-    monkeypatch.setattr(runner, "_maybe_log_live_data_path_stats", lambda: None)
-    monkeypatch.setattr(runner, "_process_trade", _async_stage(calls, "_process_trade"))
-    monkeypatch.setattr(
-        runner, "_execute_signals", _async_stage(calls, "_execute_signals")
-    )
-
-    await runner.process_market_event(_trade())
-
-    assert calls == ["_process_trade"]
-
-
-@pytest.mark.asyncio
-async def test_injected_trade_derived_feature_pipeline_owns_runner_dispatch() -> None:
-    calls: list[str] = []
-    trade = _trade()
-
-    class InjectedPipeline:
-        async def process_trade(self, value):
-            calls.append("pipeline.process_trade")
-            assert value is trade
-
-    runner = _runner(
-        calls=calls,
-        services={"trade_derived_feature_pipeline": InjectedPipeline()},
-    )
-
-    await runner._dispatch_trade_derived_features(trade)
-
-    assert calls == ["pipeline.process_trade"]
 
 
 @pytest.mark.asyncio

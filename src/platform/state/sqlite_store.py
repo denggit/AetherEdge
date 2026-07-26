@@ -222,6 +222,66 @@ class SqliteStateStore:
             ).fetchone()
         return _row_to_account_snapshot(row) if row is not None else None
 
+    def save_trade_integrity_window(
+        self,
+        *,
+        exchange: ExchangeName,
+        symbol: str,
+        start_ms: int, end_ms: int,
+        last_issue_revision: int, repaired_through_revision: int,
+        reason: str | None, complete: bool,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO trade_integrity_windows (
+                    exchange, symbol, start_ms, end_ms,
+                    last_issue_revision, repaired_through_revision,
+                    reason, complete, updated_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(exchange, symbol, start_ms) DO UPDATE SET
+                    end_ms=MAX(trade_integrity_windows.end_ms, excluded.end_ms),
+                    last_issue_revision=MAX(
+                        trade_integrity_windows.last_issue_revision,
+                        excluded.last_issue_revision
+                    ),
+                    repaired_through_revision=MAX(
+                        trade_integrity_windows.repaired_through_revision,
+                        excluded.repaired_through_revision
+                    ),
+                    reason=excluded.reason,
+                    complete=excluded.complete,
+                    updated_at_ms=excluded.updated_at_ms
+                """,
+                (exchange.value, symbol, int(start_ms), int(end_ms),
+                 int(last_issue_revision), int(repaired_through_revision),
+                 reason, int(bool(complete)), int(time.time() * 1000)),
+            )
+
+    def load_trade_integrity_windows(
+        self, *, exchange: ExchangeName, symbol: str,
+    ) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT start_ms, end_ms, last_issue_revision,
+                       repaired_through_revision, reason, complete
+                FROM trade_integrity_windows
+                WHERE exchange=? AND symbol=?
+                ORDER BY start_ms
+                """,
+                (exchange.value, symbol),
+            ).fetchall()
+        return [
+            {
+                "start_ms": int(row[0]), "end_ms": int(row[1]),
+                "last_issue_revision": int(row[2]),
+                "repaired_through_revision": int(row[3]), "reason": row[4],
+                "complete": bool(row[5])
+            }
+            for row in rows
+        ]
+
     def _upsert_order(self, order: StoredOrder) -> None:
         key_order_id = order.order_id or ""
         key_client_order_id = order.client_order_id or ""
@@ -385,6 +445,19 @@ class SqliteStateStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_events_lookup
                     ON events (exchange, symbol, id);
+
+                CREATE TABLE IF NOT EXISTS trade_integrity_windows (
+                    exchange TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    start_ms INTEGER NOT NULL,
+                    end_ms INTEGER NOT NULL,
+                    last_issue_revision INTEGER NOT NULL,
+                    repaired_through_revision INTEGER NOT NULL,
+                    reason TEXT,
+                    complete INTEGER NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (exchange, symbol, start_ms)
+                );
                 """
             )
 

@@ -30,6 +30,7 @@ from src.runtime.market_data.runtime import MarketDataRuntime, MarketDataRuntime
 from src.runtime.market_data.processor import MarketEventProcessor
 from src.runtime.market_data.pipeline_plan import ResolvedMarketPipelinePlan
 from src.runtime.module import ModuleHealth, ModuleState
+from src.runtime.registry import ModuleDefinition, ModuleRegistry
 
 
 def _trade(trade_id: str, time_ms: int, *, price: str = "100") -> MarketTrade:
@@ -189,6 +190,91 @@ class _IdleTradeStream:
         await asyncio.Event().wait()
         if False:
             yield None
+
+
+class _StartupTradeSource:
+    module_id = "trade-stream"
+    provides = frozenset({MARKET_TRADES})
+    requires = frozenset()
+
+    def __init__(self, processor, trace) -> None:
+        self.processor = processor
+        self.trace = trace
+        self.started = False
+
+    async def prepare(self) -> None:
+        self.trace.append("source.prepare")
+
+    async def start(self) -> None:
+        self.started = True
+        self.trace.append(("source.start", self.processor.pending_cutoff))
+        self.processor.submit_trade(_trade("first", 500))
+
+    async def stop(self) -> None:
+        self.trace.append("source.stop")
+
+    def health(self):
+        return ModuleHealth(self.module_id, ModuleState.RUNNING, True)
+
+
+@pytest.mark.asyncio
+async def test_initial_cutoff_is_armed_before_trade_source_starts() -> None:
+    trace = []
+
+    async def raw_trade(trade) -> None:
+        trace.append(("trade", trade.trade_time_ms))
+
+    processor = MarketEventProcessor(raw_trade_callback=raw_trade)
+    source = _StartupTradeSource(processor, trace)
+    registry = ModuleRegistry()
+    registry.register(ModuleDefinition(
+        module_id=source.module_id,
+        provides=source.provides,
+        requires=source.requires,
+        factory=lambda: source,
+    ))
+
+    def arm() -> None:
+        trace.append("cutoff.arm")
+        processor.arm_closed_bar_cutoff(0, 999)
+
+    runtime = MarketDataRuntime(
+        registry=registry,
+        event_processor=processor,
+        before_source_start=arm,
+    )
+    await runtime.start({MARKET_TRADES})
+    await runtime.stop()
+
+    assert trace.index("cutoff.arm") < trace.index(("source.start", (0, 999)))
+    assert ("trade", 500) in trace
+
+
+@pytest.mark.asyncio
+async def test_initial_cutoff_failure_prevents_trade_source_start() -> None:
+    processor = MarketEventProcessor()
+    source = _StartupTradeSource(processor, [])
+    registry = ModuleRegistry()
+    registry.register(ModuleDefinition(
+        module_id=source.module_id,
+        provides=source.provides,
+        requires=source.requires,
+        factory=lambda: source,
+    ))
+
+    def fail_arm() -> None:
+        raise RuntimeError("cutoff arm failed")
+
+    runtime = MarketDataRuntime(
+        registry=registry,
+        event_processor=processor,
+        before_source_start=fail_arm,
+    )
+    await runtime.prepare({MARKET_TRADES})
+    with pytest.raises(RuntimeError, match="cutoff arm failed"):
+        await runtime.start_prepared()
+
+    assert not source.started
 
 
 @pytest.mark.asyncio

@@ -21,10 +21,7 @@ from src.runtime.account_config import (
 )
 from src.runtime.account_sync import AccountStateSyncService, OrderStateSyncService, RequestThrottle, SyncExchangeContext
 from src.runtime.config import LiveRuntimeConfig, live_runtime_config_from_app
-from src.runtime.feature_pipeline import (
-    TradeDerivedFeaturePipeline,
-    TradeFeatureRuntimeConfig,
-)
+from src.runtime.feature_pipeline import TradeFeatureRuntimeConfig
 from src.runtime.health_state import RuntimeHealthState
 from src.runtime.heartbeat import RuntimeHeartbeatService
 from src.runtime.market_data.range_module import RangeBarModule
@@ -251,37 +248,10 @@ class WiringComponent(RuntimeComponent):
             self._runtime_persistence_service
         )
         self._persistence_alert_loop: asyncio.AbstractEventLoop | None = None
-        self._fixed_time_trade_bar_builder_compat = (
-            self.runtime_services.fixed_time_trade_bar_builder
-        )
-        self._trade_footprint_builder_compat = (
-            self.runtime_services.trade_footprint_builder
-        )
-        self._range_footprint_builder_compat = (
-            self.runtime_services.range_footprint_builder
-        )
-        injected_trade_pipeline = (
-            self.runtime_services.trade_derived_feature_pipeline
-        )
         self._trade_feature_config = TradeFeatureRuntimeConfig.from_strategy(
             self.context.strategy
         )
         self.runtime_services.trade_feature_config = self._trade_feature_config
-        self._trade_derived_feature_pipeline = (
-            injected_trade_pipeline
-            if injected_trade_pipeline is not None
-            else TradeDerivedFeaturePipeline(
-                config=(
-                    TradeFeatureRuntimeConfig()
-                    if self._market_modules_managed
-                    else self._trade_feature_config
-                ),
-                emit_feature=self.process_market_feature,
-                fixed_time_trade_bar_builder=self._fixed_time_trade_bar_builder_compat,
-                trade_footprint_builder=self._trade_footprint_builder_compat,
-                range_footprint_builder=self._range_footprint_builder_compat,
-            )
-        )
         self._market_data_persistence = (
             self.runtime_services.market_data_persistence
         )

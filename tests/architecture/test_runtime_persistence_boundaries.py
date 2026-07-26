@@ -544,7 +544,6 @@ def test_gateway_excludes_error_handlers_checkpoint_and_repair_writers() -> None
         "RangeRepairJournalWriter",
         "_get_range_checkpoint_writer",
         "_append_range_repair_trade",
-        "_finalize_range_repair_journal",
     }
     gateway_names = {
         node.id for node in ast.walk(gateway_tree) if isinstance(node, ast.Name)
@@ -615,13 +614,17 @@ def test_independent_range_writers_were_not_moved() -> None:
     persistence_names = {
         node.id for node in ast.walk(_tree(PERSISTENCE)) if isinstance(node, ast.Name)
     }
-    runner_names = {
-        node.id
-        for node in ast.walk(runtime_surface_class(SOURCE_ROOT))
-        if isinstance(node, ast.Name)
-    }
-
     assert "RangeCheckpointWriter" not in persistence_names
     assert "RangeRepairJournalWriter" not in persistence_names
-    assert "RangeCheckpointWriter" in runner_names
-    assert "RangeRepairJournalWriter" in runner_names
+    range_tree = _tree(
+        SOURCE_ROOT / "runtime" / "market_data" / "range_module.py"
+    )
+    assert "RangeCheckpointWriter" in {
+        node.id for node in ast.walk(range_tree) if isinstance(node, ast.Name)
+    }
+    journal_tree = _tree(
+        SOURCE_ROOT / "runtime" / "market_data" / "range_repair_journal.py"
+    )
+    assert "RangeRepairJournalWriter" in {
+        node.id for node in ast.walk(journal_tree) if isinstance(node, ast.Name)
+    }

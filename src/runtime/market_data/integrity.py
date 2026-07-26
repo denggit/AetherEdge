@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 
@@ -55,9 +55,15 @@ class TradeDataIntegrityTracker:
         self._restored_windows: dict[tuple[int, int], IntegrityWindowState] = {}
         self._revision: int = 0
         self._dropped_count: int = 0
+        self._persist_window: Callable[[IntegrityWindowState], None] | None = None
         self._repaired_ranges: dict[
             tuple[int, int], int
         ] = {}  # (start_ms,end_ms) → through_revision
+
+    def set_window_persister(
+        self, callback: Callable[[IntegrityWindowState], None] | None
+    ) -> None:
+        self._persist_window = callback
 
     def mark_dropped(self, event_time_ms: int, reason: str) -> None:
         normalized_reason = str(reason).strip() or "trade_data_incomplete"
@@ -80,6 +86,37 @@ class TradeDataIntegrityTracker:
         wstate.dropped_count += 1
         wstate.reasons.add(normalized_reason)
         wstate.last_issue_revision = self._revision
+        self._persist(wstate)
+
+    def mark_window_incomplete(
+        self,
+        window_start_ms: int,
+        window_end_ms: int,
+        reason: str,
+    ) -> int:
+        """Record a known aggregate gap without inventing a dropped Trade."""
+
+        start, end = int(window_start_ms), int(window_end_ms)
+        if end < start:
+            raise ValueError("window end must not precede window start")
+        normalized_reason = str(reason).strip() or "trade_data_incomplete"
+        self._revision += 1
+        matching_key = next((
+            key for key, state in self._restored_windows.items()
+            if state.start_ms == start and normalized_reason in state.reasons
+        ), None)
+        state = (
+            self._restored_windows.pop(matching_key)
+            if matching_key is not None
+            else IntegrityWindowState(start_ms=start, end_ms=end)
+        )
+        state.end_ms = max(state.end_ms, end)
+        state.last_issue_revision = self._revision
+        state.reasons.add(normalized_reason)
+        state.forced_incomplete = True
+        self._restored_windows[(state.start_ms, state.end_ms)] = state
+        self._persist(state)
+        return self._revision
 
     def mark_repaired(
         self,
@@ -104,12 +141,14 @@ class TradeDataIntegrityTracker:
                     wstate.repaired_through_revision,
                     through,
                 )
+                self._persist(wstate)
         for (w_start, w_end), wstate in self._restored_windows.items():
             if start <= w_start and w_end <= end:
                 wstate.repaired_through_revision = max(
                     wstate.repaired_through_revision, through
                 )
                 wstate.forced_incomplete = False
+                self._persist(wstate)
         self._compact_repaired_details()
 
     def is_complete(self, window_start_ms: int, window_end_ms: int) -> bool:
@@ -280,6 +319,10 @@ class TradeDataIntegrityTracker:
                 continue
             retained.append(issue)
         self._issues = retained
+
+    def _persist(self, state: IntegrityWindowState) -> None:
+        if self._persist_window is not None:
+            self._persist_window(state)
 
 
 @dataclass(frozen=True)

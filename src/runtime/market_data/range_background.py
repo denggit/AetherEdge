@@ -57,13 +57,17 @@ class RangeBackgroundServices:
         self.backfill_supervisor = backfill_supervisor
         self.micro_repair_supervisor = micro_repair_supervisor
         self.speed_refresher = speed_refresher
+        self._repair_refresh: Callable[[], object] | None = None
+
+    def set_repair_refresh(self, callback: Callable[[], object]) -> None:
+        self._repair_refresh = callback
 
     def start(self, stop_event: asyncio.Event) -> None:
         if self.config.micro_repair_enabled:
             try:
-                self.get_micro_repair_supervisor().start_monitor(
-                    stop_event=stop_event
-                )
+                supervisor = self.get_micro_repair_supervisor()
+                supervisor.set_refresh_callback(self._repair_refresh)
+                supervisor.start_monitor(stop_event=stop_event)
             except Exception as exc:
                 logger.warning(
                     "Range micro repair supervisor initialization failed | error=%s",

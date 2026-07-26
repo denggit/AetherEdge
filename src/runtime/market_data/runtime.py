@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,12 +34,16 @@ class MarketDataRuntime:
         logger: Any | None = None,
         event_processor: MarketEventProcessor | None = None,
         pipeline_plan: ResolvedMarketPipelinePlan | None = None,
+        before_prepare: Callable[[], None] | None = None,
+        before_source_start: Callable[[], None] | None = None,
     ) -> None:
         self._registry = registry
         self._resolver = DependencyResolver(registry)
         self._logger = logger
         self._event_processor = event_processor
         self._pipeline_plan = pipeline_plan
+        self._before_prepare = before_prepare
+        self._before_source_start = before_source_start
         self._plan: RuntimePlan | None = None
         self._host: ModuleHost | None = None
         self._consumer_modules = ()
@@ -102,6 +107,8 @@ class MarketDataRuntime:
         )
         self._log_plan(plan)
         try:
+            if self._before_prepare is not None:
+                self._before_prepare()
             await host.prepare()
         except BaseException as exc:
             self._error = exc
@@ -120,6 +127,8 @@ class MarketDataRuntime:
             await host.start(self._consumer_modules)
             if self._event_processor is not None:
                 await self._event_processor.start()
+            if self._before_source_start is not None:
+                self._before_source_start()
             await host.start(self._source_modules)
         except BaseException as exc:
             self._error = exc

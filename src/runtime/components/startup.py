@@ -314,12 +314,12 @@ class StartupComponent(RuntimeComponent):
             )
 
     def _initialize_rangebar_trust_window(self) -> None:
-        if not self.requirements.range_bars.enabled or not self.requirements.trades.enabled:
+        if not self.requirements.range_bars.enabled:
             return
         module = self._require_range_module()
         now_ms = int(time.time() * 1000)
         recovery = (
-            module._initial_recovery
+            module.initial_recovery
             if getattr(self, "_market_modules_managed", False)
             else module.initialize_recovery()
         )
@@ -342,7 +342,7 @@ class StartupComponent(RuntimeComponent):
             self._closed_bar_interval,
             now_ms,
             current_bucket,
-            module._trust_start_bucket_ms,
+            module.trust_start_bucket_ms,
             recovery.coverage_status,
             recovery.checkpoint_age_ms,
             recovery.recovered_from_checkpoint,

@@ -11,6 +11,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 STRATEGY_PORT = PROJECT_ROOT / "src" / "strategy" / "market_features.py"
 RUNTIME_DISPATCHER = PROJECT_ROOT / "src" / "runtime" / "market_features.py"
 TRADE_FEATURE_PIPELINE = PROJECT_ROOT / "src" / "runtime" / "feature_pipeline.py"
+MARKET_EVENT_PROCESSOR = (
+    PROJECT_ROOT / "src" / "runtime" / "market_data" / "processor.py"
+)
 RUNNER = PROJECT_ROOT / "src" / "runtime" / "runner.py"
 WIRING = PROJECT_ROOT / "src" / "runtime" / "components" / "wiring.py"
 NEW_SOURCE_FILES = (
@@ -142,7 +145,7 @@ def test_runner_uses_only_market_feature_pipeline_boundary() -> None:
     )
 
 
-def test_runner_owns_feature_bookkeeping_and_trade_pipeline_emitter() -> None:
+def test_runner_owns_feature_bookkeeping_without_legacy_trade_pipeline() -> None:
     runner_class = runtime_surface_class(PROJECT_ROOT / "src")
     assert any(
         isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -150,27 +153,19 @@ def test_runner_owns_feature_bookkeeping_and_trade_pipeline_emitter() -> None:
         for node in runner_class.body
     )
 
-    trade_pipeline_calls = [
-        node
-        for node in ast.walk(runner_class)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "TradeDerivedFeaturePipeline"
-    ]
-    assert len(trade_pipeline_calls) == 1
-    emit_keywords = [
-        keyword.value
-        for keyword in trade_pipeline_calls[0].keywords
-        if keyword.arg == "emit_feature"
-    ]
-    assert len(emit_keywords) == 1
-    assert isinstance(emit_keywords[0], ast.Attribute)
-    assert isinstance(emit_keywords[0].value, ast.Name)
-    assert emit_keywords[0].value.id == "self"
-    assert emit_keywords[0].attr == "process_market_feature"
+    legacy_definitions = []
+    for path in sorted((PROJECT_ROOT / "src").rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        if any(
+            isinstance(node, ast.ClassDef)
+            and node.name == "TradeDerivedFeaturePipeline"
+            for node in ast.walk(tree)
+        ):
+            legacy_definitions.append(path.relative_to(PROJECT_ROOT).as_posix())
+    assert legacy_definitions == []
 
 
-def test_trade_feature_pipeline_has_no_business_or_execution_dependencies() -> None:
+def test_trade_feature_config_has_no_business_or_execution_dependencies() -> None:
     imports = _imports(TRADE_FEATURE_PIPELINE)
 
     assert not any(module.startswith("strategies") for module in imports)
@@ -192,55 +187,46 @@ def test_trade_feature_pipeline_has_no_business_or_execution_dependencies() -> N
     assert forbidden_calls == set()
 
 
-def test_trade_feature_pipeline_has_one_static_builder_on_trade_boundary() -> None:
+def test_market_event_processor_serially_owns_trade_modules() -> None:
     tree = ast.parse(
-        TRADE_FEATURE_PIPELINE.read_text(encoding="utf-8"),
-        filename=str(TRADE_FEATURE_PIPELINE),
+        MARKET_EVENT_PROCESSOR.read_text(encoding="utf-8"),
+        filename=str(MARKET_EVENT_PROCESSOR),
     )
-    helper = next(
+    processor = next(
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_feed_trade"
+        if isinstance(node, ast.ClassDef) and node.name == "MarketEventProcessor"
     )
-    direct_on_trade = [
+    process_trade = next(
         node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Attribute) and node.attr == "on_trade"
-    ]
-    helper_on_trade = [
+        for node in processor.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_process_trade"
+    )
+    module_loop = next(
         node
-        for node in ast.walk(helper)
-        if isinstance(node, ast.Attribute) and node.attr == "on_trade"
-    ]
+        for node in ast.walk(process_trade)
+        if isinstance(node, ast.For)
+        and isinstance(node.iter, ast.Attribute)
+        and node.iter.attr == "_modules"
+    )
+    module_dispatch = next(
+        node
+        for node in ast.walk(module_loop)
+        if isinstance(node, ast.Await)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "process_trade"
+    )
+    raw_callback = next(
+        node
+        for node in ast.walk(process_trade)
+        if isinstance(node, ast.Await)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "_raw_trade_callback"
+    )
 
-    assert len(direct_on_trade) == 1
-    assert helper_on_trade == direct_on_trade
-    assert any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func is direct_on_trade[0]
-        for node in ast.walk(helper)
-    )
-    assert not any(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "getattr"
-        for node in ast.walk(helper)
-    )
-    assert not any(isinstance(node, ast.BinOp) for node in ast.walk(helper))
-
-    forbidden_names = {"eval", "exec", "__getattribute__", "methodcaller"}
-    bypasses = {
-        node.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Name) and node.id in forbidden_names
-    }
-    bypasses.update(
-        node.attr
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Attribute) and node.attr in forbidden_names
-    )
-    assert bypasses == set()
+    assert module_dispatch.lineno < raw_callback.lineno
 
 
 def test_new_public_boundary_sources_have_no_strategy_specific_vocabulary() -> None:

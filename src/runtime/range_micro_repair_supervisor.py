@@ -65,6 +65,13 @@ class RangeMicroRepairSupervisor:
         self._stdout_handle = None
         self._monitor_task: asyncio.Task | None = None
         self._retried_job_keys: set[tuple] = set()
+        self._refresh_callback: Callable[[], object] | None = None
+
+    def set_refresh_callback(
+        self,
+        callback: Callable[[], object] | None,
+    ) -> None:
+        self._refresh_callback = callback
 
     def start_monitor(self, *, stop_event: asyncio.Event) -> None:
         if not self.config.enabled:
@@ -89,6 +96,8 @@ class RangeMicroRepairSupervisor:
         while not stop_event.is_set():
             try:
                 self._refresh_finished_process()
+                if self._refresh_callback is not None:
+                    self._refresh_callback()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

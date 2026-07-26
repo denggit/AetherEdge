@@ -51,9 +51,11 @@ class PersistenceComponent(RuntimeComponent):
                 persistence = RuntimeMarketDataPersistence(
                     persistence_service=self._get_runtime_persistence_service(),
                     kline_store_provider=self._get_live_kline_store,
-                    range_bar_store_provider=self._get_range_bar_store,
+                    range_bar_store_provider=(
+                        lambda: self._require_range_module().bar_store
+                    ),
                     completed_aggregate_store_provider=(
-                        self._get_range_checkpoint_store
+                        lambda: self._require_range_module().checkpoint_store
                     ),
                     exchange=self.app_config.data_exchange.value,
                     clock_ms=lambda: int(time.time() * 1000),
@@ -144,14 +146,10 @@ class PersistenceComponent(RuntimeComponent):
             if interval_ms > 0
             else None
         )
-        range_bars_by_bucket = (
-            {}
-            if getattr(self, "_range_module", None) is None
-            else self._range_module._bars_by_bucket
-        )
         current_bucket_count = (
-            len(range_bars_by_bucket.get(current_bucket, ()))
+            len(self._range_module.cached_rows_for_bucket(current_bucket))
             if current_bucket is not None
+            and getattr(self, "_range_module", None) is not None
             else None
         )
         mf_audit = self._mf_observer_audit()

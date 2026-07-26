@@ -173,18 +173,29 @@ class RangeRepairJournalSession:
             dropped_trades=dropped_trades,
         )
 
-    def finalize(self, *, bucket_start_ms: int, finalized_at_ms: int) -> None:
+    async def finalize(
+        self,
+        *,
+        bucket_start_ms: int,
+        finalized_at_ms: int,
+    ) -> None:
         writer = self.writer
-        if writer is None or self.bucket_start_ms != bucket_start_ms:
+        if (
+            writer is None
+            or self.bucket_start_ms != bucket_start_ms
+            or self.finalize_submitted
+        ):
             return
-        writer.submit_finalize(
+        accepted = writer.submit_finalize(
             exchange=self.config.exchange.value,
             symbol=self.config.symbol,
             range_pct=str(self.config.range_pct),
             bucket_start_ms=bucket_start_ms,
             finalized_at_ms=finalized_at_ms,
         )
-        self.finalize_submitted = True
+        if accepted:
+            self.finalize_submitted = True
+            await asyncio.to_thread(writer.stop, flush=True)
 
     async def stop(self) -> None:
         writer = self.writer

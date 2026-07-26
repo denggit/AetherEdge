@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
 from src.market_data.models import RangeBar, RangeCoverageStatus
-from src.market_data.range_checkpoint import SqliteRangeCheckpointStore
+from src.market_data.range_checkpoint import (
+    MICRO_REPAIR_SUCCESS,
+    RangeCheckpointRecovery,
+    SqliteRangeCheckpointStore,
+)
 from src.platform.data.models import MarketTrade, TradeSide
 from src.platform.exchanges.models import ExchangeName
 from src.runtime.market_data import (
@@ -187,7 +192,7 @@ async def test_range_module_owns_builder_persistence_and_shutdown() -> None:
     assert module.health().state is ModuleState.RUNNING
     assert module.health().metadata[0] == ("bars_closed", "1")
 
-    events = await module.emit_aggregate_for_bucket(0)
+    events = await module.emit_aggregates(module.aggregates_for_bucket(0))
     assert len(events) == 1
     assert persistence.aggregates[0].bar_count == 1
 
@@ -220,10 +225,10 @@ async def test_range_aggregate_publish_failure_is_retryable_and_commits_once() -
     await module.process_trade(_trade())
 
     with pytest.raises(RuntimeError, match="first publish failed"):
-        await module.emit_aggregate_for_bucket(0)
+        await module.emit_aggregates(module.aggregates_for_bucket(0))
 
-    retried = await module.emit_aggregate_for_bucket(0)
-    duplicate = await module.emit_aggregate_for_bucket(0)
+    retried = await module.emit_aggregates(module.aggregates_for_bucket(0))
+    duplicate = await module.emit_aggregates(module.aggregates_for_bucket(0))
 
     assert attempts == 2
     assert len(retried) == 1
@@ -365,3 +370,61 @@ def test_repairing_clean_revision_still_fails_closed() -> None:
     assert module.begin_repair(0) == 0
     assert tracker.invalid_reason(0, 99) is not None
     assert module.coverage(0).coverage_status != RangeCoverageStatus.COMPLETE.value
+
+
+@pytest.mark.parametrize(
+    ("job", "completed", "reason"),
+    [
+        (None, None, "orphan_repairing_state"),
+        (
+            SimpleNamespace(status=MICRO_REPAIR_SUCCESS),
+            SimpleNamespace(
+                coverage_status=RangeCoverageStatus.COMPLETE.value,
+                bucket_start_ms=0,
+                bucket_end_ms=99,
+                rf_bar_count=1,
+            ),
+            "repair_result_validation_failed",
+        ),
+    ],
+)
+def test_repair_refresh_fails_closed_for_orphan_or_invalid_result(
+    job, completed, reason
+) -> None:
+    class RepairStore(FakeCheckpointStore):
+        def load_micro_repair_job(self, **_kwargs):
+            return job
+
+        def load_completed_aggregate(self, **_kwargs):
+            return completed
+
+        def invalidate_completed_aggregate(self, **_kwargs):
+            return False
+
+    module = RangeBarModule(
+        config=RangeBarModuleConfig(
+            symbol="ETH-USDT-PERP",
+            exchange=ExchangeName.OKX,
+            range_pct=Decimal("0.002"),
+            contract_value=Decimal("0.01"),
+            bucket_interval_ms=100,
+            aggregate_interval="100ms",
+        ),
+        builder=FakeBuilder(),
+        bar_store=FakeBarStore(),
+        checkpoint_store=RepairStore(),
+        checkpoint_writer=FakeCheckpointWriter(),
+        integrity=TradeDataIntegrityTracker(),
+        clock_ms=lambda: 50,
+    )
+    module._initial_bucket_ms = 0
+    module._initial_recovery = RangeCheckpointRecovery(
+        RangeCoverageStatus.RECOVERED_INCOMPLETE.value,
+        None, None, 1, False,
+    )
+    module.mark_degraded(bucket_start_ms=0, reason="source_drop")
+    module.begin_repair(0)
+
+    assert not module.refresh_repair_state(0)
+    assert module.bucket_integrity(0).status is RangeBucketIntegrityStatus.DEGRADED
+    assert module.degraded_reason(0) == reason

@@ -10,6 +10,7 @@ from src.app import AppConfig, AppContext
 from src.platform import ExchangeName
 from src.platform.data.models import MarketTrade, TradeSide
 from src.platform.markets import get_market_profile
+from src.platform.state.sqlite_store import SqliteStateStore
 from src.runtime import LiveRuntimeConfig, RuntimeMode
 from src.runtime.composition import compose_live_runtime
 from src.runtime.market_data.runtime import MarketDataRuntimeError
@@ -80,13 +81,13 @@ def _app_config(tmp_path) -> AppConfig:
     )
 
 
-def _context(strategy: _Strategy) -> AppContext:
+def _context(strategy: _Strategy, state_store=None) -> AppContext:
     return AppContext(
         data=SimpleNamespace(
             market_profile=get_market_profile("ETH-USDT-PERP")
         ),
         execution=object(),
-        state_store=object(),
+        state_store=state_store or object(),
         strategy=strategy,
         planner=object(),
         alerts=_Alerts(),
@@ -125,17 +126,120 @@ def _requirements(
     )
 
 
-def _compose(tmp_path, requirements, strategy):
+def _compose(tmp_path, requirements, strategy, *, state_store=None):
     app_config = _app_config(tmp_path)
     return compose_live_runtime(
         app_config,
-        app_context=_context(strategy),
+        app_context=_context(strategy, state_store),
         runtime_config=LiveRuntimeConfig(
             app=app_config,
             mode=RuntimeMode.LIVE_RUNTIME,
         ),
         services=RuntimeServices(runtime_requirements=requirements),
     )
+
+
+@pytest.mark.parametrize(
+    ("requirements", "trade_features", "uses_trade"),
+    [
+        (_requirements(closed_kline=True), False, False),
+        (_requirements(trades=True, closed_kline=True), False, True),
+        (
+            _requirements(closed_kline=True),
+            {
+                "fixed_time_trade_bars_enabled": True,
+                "trade_footprint_enabled": False,
+                "range_footprint_enabled": False,
+            },
+            True,
+        ),
+        (
+            _requirements(closed_kline=True),
+            {
+                "fixed_time_trade_bars_enabled": False,
+                "trade_footprint_enabled": True,
+                "range_footprint_enabled": False,
+            },
+            True,
+        ),
+        (
+            _requirements(closed_kline=True),
+            {
+                "fixed_time_trade_bars_enabled": False,
+                "trade_footprint_enabled": False,
+                "range_footprint_enabled": True,
+            },
+            True,
+        ),
+        (_requirements(range_bars=True, closed_kline=True), False, True),
+    ],
+)
+def test_closed_bar_integrity_follows_resolved_trade_pipeline(
+    tmp_path, requirements, trade_features, uses_trade
+) -> None:
+    application = _compose(
+        tmp_path, requirements, _Strategy(trade_features=trade_features)
+    )
+
+    assert (
+        application.runner.runtime_services.trade_data_integrity_tracker
+        is not None
+    ) is uses_trade
+    assert (
+        application.runner.runtime_services.market_event_processor is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_feature_only_startup_partial_survives_repeated_restart(
+    tmp_path, monkeypatch
+) -> None:
+    bucket_start = 1_800_000_000_000
+    state_path = tmp_path / "state.sqlite3"
+    monkeypatch.setattr(
+        "src.runtime.composition.create_trade_stream",
+        lambda *_args, **_kwargs: _IdleTradeStream(),
+    )
+    monkeypatch.setattr(
+        "src.runtime.composition.create_order_book_stream",
+        lambda *_args, **_kwargs: _IdleOrderBookStream(),
+    )
+    requirements = _requirements(closed_kline=True)
+
+    first = _compose(
+        tmp_path,
+        requirements,
+        _Strategy(trade_features=True),
+        state_store=SqliteStateStore(state_path),
+    )
+    monkeypatch.setattr(
+        "src.runtime.components.closed_bar.time.time",
+        lambda: (bucket_start + 60_000) / 1000,
+    )
+    await first.market_data.prepare(first.runner._market_data_capabilities)
+    await first.market_data.stop()
+
+    restarted = _compose(
+        tmp_path,
+        requirements,
+        _Strategy(trade_features=True),
+        state_store=SqliteStateStore(state_path),
+    )
+    monkeypatch.setattr(
+        "src.runtime.components.closed_bar.time.time",
+        lambda: (bucket_start + 120_000) / 1000,
+    )
+    await restarted.market_data.prepare(
+        restarted.runner._market_data_capabilities
+    )
+    tracker = restarted.runner.runtime_services.trade_data_integrity_tracker
+
+    assert tracker.dropped_count == 0
+    assert "startup_partial_trade_window" in (
+        tracker.invalid_reason(bucket_start, bucket_start + 14_400_000 - 1)
+        or ""
+    )
+    await restarted.market_data.stop()
 
 
 @pytest.mark.parametrize(
@@ -364,7 +468,11 @@ async def test_closed_kline_only_creates_control_processor_without_trade_source(
     assert application.market_data._event_processor is not None
     assert application.market_data._event_processor.trade_module_ids == ()
     assert created == {"trades": 0, "books": 0}
-    await application.market_data.stop()
+    with pytest.raises(
+        MarketDataRuntimeError,
+        match="unresolved closed-bar cutoff",
+    ):
+        await application.market_data.stop()
 
 
 @pytest.mark.asyncio

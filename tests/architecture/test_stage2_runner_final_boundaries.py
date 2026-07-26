@@ -39,7 +39,6 @@ SERVICE_FIELDS = {
     "recovery_coordinator": "_recovery_coordinator",
     "reconciliation_coordinator": "_reconciliation_coordinator",
     "runtime_persistence_service": "_runtime_persistence_service",
-    "trade_derived_feature_pipeline": "_trade_derived_feature_pipeline",
     "market_data_persistence": "_market_data_persistence",
     "runtime_health_state": "_runtime_health_state",
     "heartbeat_service": "_heartbeat_service",
@@ -62,7 +61,6 @@ def test_generic_runtime_config_contains_no_market_module_configuration() -> Non
 
 UNIQUE_CLASSES = {
     "StrategyHost": "src/runtime/strategy_host.py",
-    "TradeDerivedFeaturePipeline": "src/runtime/feature_pipeline.py",
     "MarketFeaturePipeline": "src/runtime/market_features.py",
     "RuntimePersistenceService": "src/runtime/persistence_service.py",
     "RuntimeMarketDataPersistence": "src/runtime/market_data_persistence.py",

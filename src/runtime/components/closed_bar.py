@@ -56,7 +56,7 @@ class ClosedBarComponent(RuntimeComponent):
             self._raise_on_unhealthy_market_data()
             self._raise_on_unhealthy_producer()
         now = int(time.time() * 1000) if now_ms is None else now_ms
-        self._arm_next_closed_bar_cutoff(now)
+        self.sync_next_closed_bar_cutoff(now)
         due = await self._fetch_due_closed_kline(now)
         if due is None:
             return []
@@ -76,7 +76,29 @@ class ClosedBarComponent(RuntimeComponent):
             finalized_at_ms=now,
         )
 
-    def _arm_next_closed_bar_cutoff(self, now_ms: int) -> None:
+    def prepare_startup_trade_integrity(
+        self,
+        now_ms: int | None = None,
+    ) -> None:
+        tracker = self._trade_integrity_tracker()
+        if tracker is None:
+            return
+        now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        interval = self._closed_bar_interval_ms
+        bucket_start_ms = now_ms - (now_ms % interval)
+        if now_ms > bucket_start_ms:
+            tracker.mark_window_incomplete(
+                bucket_start_ms,
+                now_ms,
+                "startup_partial_trade_window",
+            )
+
+    def prepare_initial_cutoff(self, now_ms: int | None = None) -> None:
+        self.sync_next_closed_bar_cutoff(
+            int(time.time() * 1000) if now_ms is None else int(now_ms)
+        )
+
+    def sync_next_closed_bar_cutoff(self, now_ms: int) -> None:
         processor = self.service_dependencies().market_event_processor
         if not isinstance(processor, MarketEventProcessor):
             return
@@ -107,27 +129,31 @@ class ClosedBarComponent(RuntimeComponent):
         *,
         finalized_at_ms: int,
     ) -> list[MarketFeatureEvent]:
+        maintenance_started = time.monotonic()
+        if self.requirements.range_bars.enabled:
+            await self._require_range_module().maintain_closed_bucket(
+                open_time_ms,
+                finalized_at_ms=finalized_at_ms,
+            )
+        processor = self.service_dependencies().market_event_processor
+        if isinstance(processor, MarketEventProcessor):
+            processor.stats.module_timings["repair-maintenance"] = (
+                processor.stats.module_timings.get("repair-maintenance", 0.0)
+                + (time.monotonic() - maintenance_started) * 1000
+            )
         tracker = self._trade_integrity_tracker()
         invalid_reason = (
             None
-            if tracker is None or not self.requirements.trades.enabled
+            if tracker is None
             else tracker.invalid_reason(
                 open_time_ms,
                 closed_kline.close_time_ms,
             )
         )
         if invalid_reason is not None:
-            self._mark_range_context_degraded_bucket(
-                bucket_start_ms=open_time_ms,
-                reason="trade_data_incomplete_before_closed_bar",
-                event_time_ms=closed_kline.close_time_ms,
-            )
             scheduler = self._closed_bar_scheduler
-            mark = getattr(scheduler, "mark_skipped", None)
-            if callable(mark):
-                mark(open_time_ms, "trade_data_incomplete")
-            should_alert = getattr(scheduler, "should_alert_skipped", None)
-            if callable(should_alert) and should_alert(open_time_ms):
+            scheduler.mark_skipped(open_time_ms, "trade_data_incomplete")
+            if scheduler.should_alert_skipped(open_time_ms):
                 logger.error(
                     "Closed-bar permanently skipped | open_time_ms=%s "
                     "close_time_ms=%s reason=trade_data_incomplete",
@@ -138,7 +164,6 @@ class ClosedBarComponent(RuntimeComponent):
         features = await self._emit_closed_kline_feature(
             open_time_ms,
             closed_kline,
-            finalized_at_ms=finalized_at_ms,
         )
         if not self.requirements.range_bars.enabled:
             return self._finish_closed_bar_decision(
@@ -228,22 +253,11 @@ class ClosedBarComponent(RuntimeComponent):
         self,
         open_time_ms: int,
         closed_kline: MarketKline,
-        *,
-        finalized_at_ms: int,
     ) -> list[MarketFeatureEvent]:
-        self._finalize_range_repair_journal(
-            bucket_start_ms=open_time_ms,
-            finalized_at_ms=finalized_at_ms,
-        )
         event = closed_kline_feature(closed_kline)
         self.stats.closed_klines_seen += 1
         await self.process_market_feature(event)
-        mark_emitted = getattr(self._closed_bar_scheduler, "mark_emitted", None)
-        if callable(mark_emitted):
-            mark_emitted(open_time_ms)
-        else:
-            self._closed_bar_scheduler.last_emitted_open_time_ms = open_time_ms
-        self._refresh_range_micro_repair_coverage(open_time_ms)
+        self._closed_bar_scheduler.mark_emitted(open_time_ms)
         return [event]
 
     async def _closed_bar_range_features(
@@ -259,9 +273,8 @@ class ClosedBarComponent(RuntimeComponent):
         if degraded is not None:
             return [degraded]
         is_mid_bucket_restart = (
-            self.requirements.trades.enabled
-            and range_module._trust_start_bucket_ms is not None
-            and open_time_ms < range_module._trust_start_bucket_ms
+            range_module.trust_start_bucket_ms is not None
+            and open_time_ms < range_module.trust_start_bucket_ms
         )
         min_range_bars = self._get_min_range_bars()
         range_aggregates = self._load_range_aggregates_for_bucket(open_time_ms)
@@ -272,7 +285,7 @@ class ClosedBarComponent(RuntimeComponent):
         aggregates_usable = range_aggregates and (
             not is_mid_bucket_restart
             or (
-                range_module._initial_recovery is None
+                range_module.initial_recovery is None
                 and best_range_bar_count >= min_range_bars
             )
         )
@@ -299,8 +312,6 @@ class ClosedBarComponent(RuntimeComponent):
         open_time_ms: int,
         closed_kline: MarketKline,
     ) -> MarketFeatureEvent | None:
-        if not self.requirements.trades.enabled:
-            return None
         reason = self._require_range_module().degraded_reason(open_time_ms)
         if reason is None:
             return None
@@ -311,7 +322,7 @@ class ClosedBarComponent(RuntimeComponent):
             open_time_ms,
             open_time_ms + self._closed_bar_interval_ms - 1,
             reason,
-            self._require_range_module()._trust_start_bucket_ms,
+            self._require_range_module().trust_start_bucket_ms,
             self._market_queue.qsize(),
         )
         unavailable = range_aggregate_unavailable_feature(
@@ -340,7 +351,7 @@ class ClosedBarComponent(RuntimeComponent):
             self._closed_bar_interval,
             open_time_ms,
             open_time_ms + self._closed_bar_interval_ms - 1,
-            self._require_range_module()._trust_start_bucket_ms,
+            self._require_range_module().trust_start_bucket_ms,
             best_range_bar_count,
             min_range_bars,
         )
@@ -362,7 +373,7 @@ class ClosedBarComponent(RuntimeComponent):
                 self._closed_bar_interval,
                 open_time_ms,
                 open_time_ms + self._closed_bar_interval_ms - 1,
-                self._require_range_module()._trust_start_bucket_ms,
+                self._require_range_module().trust_start_bucket_ms,
                 best_range_bar_count,
                 min_range_bars,
             )
@@ -374,18 +385,17 @@ class ClosedBarComponent(RuntimeComponent):
                 open_time_ms,
                 open_time_ms + self._closed_bar_interval_ms - 1,
                 reason,
-                self._require_range_module()._trust_start_bucket_ms,
+                self._require_range_module().trust_start_bucket_ms,
                 self._market_queue.qsize(),
             )
         elif (
-            self._require_range_module()._initial_recovery is not None
+            self._require_range_module().initial_recovery is not None
             and not has_range_aggregates
-            and self.requirements.trades.enabled
         ):
             reason = "no_completed_range_bars"
         else:
             return None
-        coverage = self._range_coverage_for_bucket(open_time_ms)
+        coverage = self._require_range_module().coverage(open_time_ms)
         unavailable = range_aggregate_unavailable_feature(
             symbol=self.app_config.symbol,
             exchange=self.app_config.data_exchange,
@@ -531,16 +541,6 @@ class ClosedBarComponent(RuntimeComponent):
         self, bucket_start_ms: int
     ) -> list[RangeBar]:
         return self._require_range_module().rows_for_bucket(bucket_start_ms)
-
-    def _range_store_fallback_allowed(self, bucket_start_ms: int) -> bool:
-        module = self._require_range_module()
-        return (
-            bucket_start_ms not in module._bars_by_bucket
-            or (
-                module._initial_bucket_ms == bucket_start_ms
-                and module._initial_recovery is not None
-            )
-        )
 
     async def _emit_range_aggregates(self, aggregates: Sequence[RangeBarAggregate]) -> list[MarketFeatureEvent]:
         module = self._require_range_module()

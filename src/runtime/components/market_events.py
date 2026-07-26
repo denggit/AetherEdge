@@ -14,10 +14,6 @@ from src.market_data.range_repair import (
     RangeRepairJournalWriter,
 )
 from src.platform.data.models import MarketEvent, MarketEventType, MarketKline, MarketOrderBook, MarketTicker, MarketTrade
-from src.runtime.feature_pipeline import (
-    TradeDerivedFeaturePipeline,
-    TradeFeatureRuntimeConfig,
-)
 from src.runtime.models import RuntimePhase
 from src.runtime.market_data.integrity import (
     OrderBookDataIntegrityTracker,
@@ -76,11 +72,6 @@ class MarketEventsComponent(RuntimeComponent):
                 },
             )
 
-        if is_trade:
-            await self._process_trade(event)  # type: ignore[arg-type]
-            if self._trade_events_are_range_only():
-                self._maybe_log_live_data_path_stats()
-                return
         signals = await self._call_strategy_market_event(event)
         await self._execute_signals(
             signals,
@@ -193,17 +184,16 @@ class MarketEventsComponent(RuntimeComponent):
             "producer_failed": JOURNAL_INVALID_PRODUCER_FAILED,
         }.get(reason)
         if journal_status is not None:
-            self._invalidate_range_repair_journal(
-                bucket_start_ms=bucket_start_ms,
-                status=journal_status,
-                reason=reason,
-                dropped_trades=(
-                    1
-                    if reason
-                    in {"market_queue_dropped_trade", "trade_dispatcher_drop"}
-                    else 0
-                ),
-            )
+            journal = self._range_repair_journal
+            if journal is not None:
+                journal.invalidate(
+                    bucket_start_ms=bucket_start_ms,
+                    status=journal_status,
+                    reason=reason,
+                    dropped_trades=int(reason in {
+                        "market_queue_dropped_trade", "trade_dispatcher_drop"
+                    }),
+                )
         module = self._range_module
         if module is not None and module.degraded_reason(bucket_start_ms) is None:
             module.mark_degraded(
@@ -303,73 +293,6 @@ class MarketEventsComponent(RuntimeComponent):
             else None
         )
 
-    async def _process_trade(self, trade: MarketTrade) -> None:
-        if self.market_state.modules_managed:
-            module = self._range_module
-            if module is not None:
-                self.stats.range_bars_closed = module.bars_closed
-            return
-        await self._dispatch_trade_derived_features(trade)
-        if not self.requirements.range_bars.enabled:
-            return
-        module = self._require_range_module()
-        before = module.bars_closed
-        await module.process_trade(trade)
-        self.stats.range_bars_closed += module.bars_closed - before
-
-    async def _dispatch_trade_derived_features(
-        self, trade: MarketTrade
-    ) -> None:
-        await self._trade_derived_feature_pipeline.process_trade(trade)
-
-    @property
-    def _fixed_time_trade_bar_builder(self):
-        pipeline = getattr(self, "_trade_derived_feature_pipeline", None)
-        if isinstance(pipeline, TradeDerivedFeaturePipeline):
-            return pipeline.fixed_time_trade_bar_builder
-        return getattr(self, "_fixed_time_trade_bar_builder_compat", None)
-
-    @_fixed_time_trade_bar_builder.setter
-    def _fixed_time_trade_bar_builder(self, value) -> None:
-        self._fixed_time_trade_bar_builder_compat = value
-        pipeline = getattr(self, "_trade_derived_feature_pipeline", None)
-        if isinstance(pipeline, TradeDerivedFeaturePipeline):
-            pipeline.fixed_time_trade_bar_builder = value
-
-    @property
-    def _trade_footprint_builder(self):
-        pipeline = getattr(self, "_trade_derived_feature_pipeline", None)
-        if isinstance(pipeline, TradeDerivedFeaturePipeline):
-            return pipeline.trade_footprint_builder
-        return getattr(self, "_trade_footprint_builder_compat", None)
-
-    @_trade_footprint_builder.setter
-    def _trade_footprint_builder(self, value) -> None:
-        self._trade_footprint_builder_compat = value
-        pipeline = getattr(self, "_trade_derived_feature_pipeline", None)
-        if isinstance(pipeline, TradeDerivedFeaturePipeline):
-            pipeline.trade_footprint_builder = value
-
-    @property
-    def _range_footprint_builder(self):
-        pipeline = getattr(self, "_trade_derived_feature_pipeline", None)
-        if isinstance(pipeline, TradeDerivedFeaturePipeline):
-            return pipeline.range_footprint_builder
-        return getattr(self, "_range_footprint_builder_compat", None)
-
-    @_range_footprint_builder.setter
-    def _range_footprint_builder(self, value) -> None:
-        self._range_footprint_builder_compat = value
-        pipeline = getattr(self, "_trade_derived_feature_pipeline", None)
-        if isinstance(pipeline, TradeDerivedFeaturePipeline):
-            pipeline.range_footprint_builder = value
-
     async def _call_strategy_market_event(self, event: MarketEvent) -> Sequence[TradeSignal]:
         return await self._strategy_host.on_market_event(event)
 
-    def _trade_events_are_range_only(self) -> bool:
-        return getattr(
-            self.context.strategy,
-            "raw_trade_callbacks_enabled",
-            None,
-        ) is False

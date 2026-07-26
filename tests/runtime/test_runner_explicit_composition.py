@@ -37,11 +37,11 @@ def test_instance_compatibility_patch_does_not_mutate_component_class() -> None:
         "_runtime_components",
         {MarketEventsComponent: second_component},
     )
-    original = MarketEventsComponent._process_trade
+    original = MarketEventsComponent._process_market_event
 
     replacement = object()
-    first._process_trade = replacement
+    first._process_market_event = replacement
 
-    assert first.__dict__["_process_trade"] is replacement
-    assert MarketEventsComponent._process_trade is original
-    assert second._process_trade.__self__ is second_component
+    assert first.__dict__["_process_market_event"] is replacement
+    assert MarketEventsComponent._process_market_event is original
+    assert second._process_market_event.__self__ is second_component

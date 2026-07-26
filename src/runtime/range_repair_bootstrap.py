@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 import time
 from typing import Callable
@@ -10,7 +11,12 @@ from src.app.alerts import AppAlert
 from src.market_data.models import RangeCoverageStatus
 from src.market_data.range_checkpoint import (
     MICRO_REPAIR_FAILED,
+    MICRO_REPAIR_PARTIAL,
+    MICRO_REPAIR_PENDING,
     MICRO_REPAIR_QUEUED,
+    MICRO_REPAIR_RUNNING,
+    MICRO_REPAIR_SKIPPED,
+    MICRO_REPAIR_SUCCESS,
     RangeBuilderCheckpoint,
     RangeCheckpointRecovery,
     RangeMicroRepairJob,
@@ -31,12 +37,22 @@ from src.utils.log import get_logger
 logger = get_logger(__name__)
 
 
+class RepairStartStatus(str, Enum):
+    NOT_NEEDED = "not_needed"
+    NOT_REPAIRABLE = "not_repairable"
+    STARTED = "started"
+    ALREADY_RUNNING = "already_running"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True)
 class RangeRepairBootstrapResult:
     journal_store: SqliteRangeRepairJournalStore | None
     journal_writer: RangeRepairJournalWriter | None
     micro_repair_supervisor: RangeMicroRepairSupervisor | None
     micro_repair_started: bool
+    status: RepairStartStatus = RepairStartStatus.NOT_NEEDED
+    reason: str | None = None
     journal_bucket_start_ms: int | None = None
     checkpoint_last_trade_ts_ms: int | None = None
 
@@ -86,14 +102,49 @@ class RangeRepairBootstrapService:
         )
 
     def start_if_needed(
-        self,
-        recovery: RangeCheckpointRecovery,
-        *,
-        initial_bucket_ms: int | None,
+        self, recovery: RangeCheckpointRecovery, *, initial_bucket_ms: int | None,
     ) -> RangeRepairBootstrapResult:
+        if recovery.coverage_status == RangeCoverageStatus.COMPLETE.value or recovery.missing_gap_ms <= 0:
+            return self._result(status=RepairStartStatus.NOT_NEEDED)
         if not self.range_config.micro_repair_enabled:
-            return self._result()
+            return self._result(
+                status=RepairStartStatus.NOT_REPAIRABLE,
+                reason="micro_repair_disabled",
+            )
+
         checkpoint = recovery.checkpoint
+        bucket_start_ms = checkpoint.bucket_start_ms if checkpoint else initial_bucket_ms
+        existing = (
+            None
+            if bucket_start_ms is None
+            else self.checkpoint_store.load_micro_repair_job(
+                exchange=self.exchange,
+                symbol=self.symbol,
+                range_pct=self.range_pct,
+                bucket_start_ms=bucket_start_ms,
+            )
+        )
+        if existing is not None:
+            if existing.status in {
+                MICRO_REPAIR_QUEUED,
+                MICRO_REPAIR_RUNNING,
+                MICRO_REPAIR_PENDING,
+                MICRO_REPAIR_PARTIAL,
+                MICRO_REPAIR_SUCCESS,
+            }:
+                self.get_micro_repair_supervisor()
+                if existing.status != MICRO_REPAIR_SUCCESS:
+                    self.get_journal_writer().start()
+                return self._result(
+                    status=RepairStartStatus.ALREADY_RUNNING,
+                    journal_bucket_start_ms=existing.bucket_start_ms,
+                    checkpoint_last_trade_ts_ms=existing.checkpoint_last_trade_ts_ms,
+                )
+            return self._result(
+                status=RepairStartStatus.FAILED,
+                reason=existing.last_error or f"repair_job_{existing.status}",
+            )
+
         repairable = (
             recovery.recovered_from_checkpoint
             and checkpoint is not None
@@ -104,60 +155,27 @@ class RangeRepairBootstrapService:
             and self.range_config.repair_journal_enabled
         )
         if not repairable:
-            if recovery.missing_gap_ms > 0:
-                bucket_start_ms = int(initial_bucket_ms or 0)
-                bucket_end_ms = bucket_start_ms + self.closed_bar_interval_ms - 1
-                # Diagnose the specific reason micro repair is not possible.
-                reasons: list[str] = []
-                if not recovery.recovered_from_checkpoint:
-                    reasons.append("no_checkpoint_recovered")
-                else:
-                    checkpoint = recovery.checkpoint
-                    if checkpoint is None:
-                        reasons.append("checkpoint_is_none")
-                    elif checkpoint.last_trade_ts_ms is None:
-                        reasons.append("checkpoint_last_trade_ts_ms_is_none")
-                if recovery.coverage_status == RangeCoverageStatus.COMPLETE.value:
-                    reasons.append("bucket_already_complete")
-                if not self.range_config.repair_journal_enabled:
-                    reasons.append("repair_journal_disabled")
-                failure_reason = (
-                    "+".join(reasons)
-                    if reasons
-                    else "missing_checkpoint_or_repair_journal_disabled"
-                )
-                logger.warning(
-                    "range_micro_repair_skipped | symbol=%s "
-                    "exchange=%s range_pct=%s bucket_start_ms=%s "
-                    "bucket_end_ms=%s checkpoint_last_trade_ts_ms=%s "
-                    "checkpoint_last_trade_id=%s missing_gap_ms=%s "
-                    "coverage_before=%s coverage_after=%s failure_reason=%s "
-                    "needs_archive_backfill=%s is_current_day=%s",
-                    self.symbol,
-                    self.exchange,
-                    self.range_pct,
-                    bucket_start_ms,
-                    bucket_end_ms,
-                    (
-                        recovery.checkpoint.last_trade_ts_ms
-                        if recovery.checkpoint is not None
-                        else None
-                    ),
-                    (
-                        recovery.checkpoint.last_trade_id
-                        if recovery.checkpoint is not None
-                        else None
-                    ),
-                    recovery.missing_gap_ms,
-                    recovery.coverage_status,
-                    recovery.coverage_status,
-                    failure_reason,
-                    not recovery.recovered_from_checkpoint
-                    or recovery.checkpoint is None
-                    or recovery.checkpoint.last_trade_ts_ms is None,
-                    True,  # startup recovery always targets the current/in-progress day bucket
-                )
-            return self._result()
+            reasons = []
+            if not recovery.recovered_from_checkpoint:
+                reasons.append("no_checkpoint_recovered")
+            if checkpoint is None:
+                reasons.append("checkpoint_is_none")
+            elif checkpoint.last_trade_ts_ms is None:
+                reasons.append("checkpoint_last_trade_ts_ms_is_none")
+            if not self.range_config.repair_journal_enabled:
+                reasons.append("repair_journal_disabled")
+            reason = "+".join(reasons) or "repair_not_possible"
+            logger.warning(
+                "range_micro_repair_not_repairable | symbol=%s "
+                "bucket_start_ms=%s reason=%s",
+                self.symbol,
+                bucket_start_ms,
+                reason,
+            )
+            return self._result(
+                status=RepairStartStatus.NOT_REPAIRABLE,
+                reason=reason,
+            )
 
         timestamp_ms = self._clock_ms()
         job = RangeMicroRepairJob(
@@ -179,13 +197,17 @@ class RangeRepairBootstrapService:
         )
         self.checkpoint_store.enqueue_micro_repair(job)
         if not self._start_journal(checkpoint):
+            self._mark_start_failed(checkpoint.bucket_start_ms, "journal_start_failed")
             logger.warning(
                 "startup_recovery_micro_repair skipped | symbol=%s "
                 "bucket_start_ms=%s failure_reason=journal_writer_start_failed",
                 checkpoint.symbol,
                 checkpoint.bucket_start_ms,
             )
-            return self._result()
+            return self._result(
+                status=RepairStartStatus.FAILED,
+                reason="journal_start_failed",
+            )
 
         supervisor = self.get_micro_repair_supervisor()
         started = supervisor.start_startup_recovery(
@@ -197,30 +219,24 @@ class RangeRepairBootstrapService:
             coverage_status=recovery.coverage_status,
             missing_gap_ms=recovery.missing_gap_ms,
         )
-        logger.warning(
-            "startup_recovery_micro_repair_subprocess_launch | "
-            "symbol=%s exchange=%s "
-            "range_pct=%s bucket_start_ms=%s bucket_end_ms=%s "
-            "checkpoint_last_trade_ts_ms=%s checkpoint_last_trade_id=%s "
-            "missing_gap_ms=%s repair_gap_start_ms=%s "
-            "repair_gap_end_ms=pending_first_live_trade "
-            "coverage_before=%s started=%s",
-            self.symbol,
-            self.exchange,
-            self.range_pct,
-            checkpoint.bucket_start_ms,
-            checkpoint.bucket_end_ms,
-            checkpoint.last_trade_ts_ms,
-            checkpoint.last_trade_id,
-            recovery.missing_gap_ms,
-            int(checkpoint.last_trade_ts_ms) + 1,
-            recovery.coverage_status,
-            started,
-        )
+        if not started:
+            self._mark_start_failed(checkpoint.bucket_start_ms, "worker_start_failed")
         return self._result(
-            micro_repair_started=bool(started),
+            status=RepairStartStatus.STARTED if started else RepairStartStatus.FAILED,
+            reason=None if started else "worker_start_failed",
             journal_bucket_start_ms=checkpoint.bucket_start_ms,
             checkpoint_last_trade_ts_ms=checkpoint.last_trade_ts_ms,
+        )
+
+    def _mark_start_failed(self, bucket_start_ms: int, reason: str) -> None:
+        self.checkpoint_store.mark_micro_repair_status(
+            exchange=self.exchange,
+            symbol=self.symbol,
+            range_pct=self.range_pct,
+            bucket_start_ms=bucket_start_ms,
+            status=MICRO_REPAIR_FAILED,
+            updated_at_ms=self._clock_ms(),
+            last_error=reason,
         )
 
     def get_journal_store(self) -> SqliteRangeRepairJournalStore:
@@ -391,7 +407,8 @@ class RangeRepairBootstrapService:
     def _result(
         self,
         *,
-        micro_repair_started: bool = False,
+        status: RepairStartStatus,
+        reason: str | None = None,
         journal_bucket_start_ms: int | None = None,
         checkpoint_last_trade_ts_ms: int | None = None,
     ) -> RangeRepairBootstrapResult:
@@ -399,7 +416,9 @@ class RangeRepairBootstrapService:
             journal_store=self._journal_store,
             journal_writer=self._journal_writer,
             micro_repair_supervisor=self._micro_repair_supervisor,
-            micro_repair_started=micro_repair_started,
+            micro_repair_started=status is RepairStartStatus.STARTED,
+            status=status,
+            reason=reason,
             journal_bucket_start_ms=journal_bucket_start_ms,
             checkpoint_last_trade_ts_ms=checkpoint_last_trade_ts_ms,
         )
@@ -407,3 +426,10 @@ class RangeRepairBootstrapService:
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+__all__ = [
+    "RangeRepairBootstrapResult",
+    "RangeRepairBootstrapService",
+    "RepairStartStatus",
+]
