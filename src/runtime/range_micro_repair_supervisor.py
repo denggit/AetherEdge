@@ -389,6 +389,7 @@ class RangeMicroRepairSupervisor:
                 )
                 continue
 
+            retry_error = f"{RETRY_MARKER} {job.last_error or ''}".strip()
             checkpoint_store.mark_micro_repair_status(
                 exchange=job.exchange,
                 symbol=job.symbol,
@@ -396,7 +397,7 @@ class RangeMicroRepairSupervisor:
                 bucket_start_ms=job.bucket_start_ms,
                 status=MICRO_REPAIR_PENDING,
                 updated_at_ms=now_ms(),
-                last_error=job.last_error,
+                last_error=retry_error,
             )
             logger.warning(
                 "Range micro repair resuming recoverable failed job | "
@@ -433,16 +434,6 @@ class RangeMicroRepairSupervisor:
                 )
                 self._notify_failure(failure_reason)
                 return
-            retry_error = f"{RETRY_MARKER} {job.last_error or ''}".strip()
-            checkpoint_store.mark_micro_repair_status(
-                exchange=job.exchange,
-                symbol=job.symbol,
-                range_pct=job.range_pct,
-                bucket_start_ms=job.bucket_start_ms,
-                status=MICRO_REPAIR_PENDING,
-                updated_at_ms=now_ms(),
-                last_error=retry_error,
-            )
             self._retried_job_keys.add(job.key)
             return
 

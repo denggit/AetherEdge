@@ -29,6 +29,7 @@ from src.runtime.components.base import RuntimeComponent
 class _StartupTradeGapSession:
     interval_ms: int
     first_bucket_start_ms: int
+    initial_end_ms: int
     initial_revision: int
     closed: bool = False
 
@@ -104,6 +105,7 @@ class ClosedBarComponent(RuntimeComponent):
         self._startup_trade_gap = _StartupTradeGapSession(
             interval_ms=interval,
             first_bucket_start_ms=bucket_start_ms,
+            initial_end_ms=now_ms,
             initial_revision=revision,
         )
         self._notify_range_startup_gap(bucket_start_ms, revision)
@@ -119,12 +121,12 @@ class ClosedBarComponent(RuntimeComponent):
             return
         end_ms = int(first_trade_time_ms)
         if end_ms < session.first_bucket_start_ms:
-            raise ValueError("first live Trade precedes startup gap")
+            raise ValueError("first live Trade precedes startup bucket")
         interval = session.interval_ms
         first_bucket_end_ms = session.first_bucket_start_ms + interval - 1
         tracker.extend_incomplete_window(
             session.first_bucket_start_ms,
-            min(end_ms, first_bucket_end_ms),
+            min(max(end_ms, session.initial_end_ms), first_bucket_end_ms),
             "startup_partial_trade_window",
             session.initial_revision,
         )

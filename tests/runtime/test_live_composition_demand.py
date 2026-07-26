@@ -7,8 +7,9 @@ from types import SimpleNamespace
 import pytest
 
 from src.app import AppConfig, AppContext
+from src.market_data.models import RangeCoverageStatus
 from src.platform import ExchangeName
-from src.platform.data.models import MarketTrade, TradeSide
+from src.platform.data.models import MarketKline, MarketTrade, TradeSide
 from src.platform.markets import get_market_profile
 from src.platform.state.sqlite_store import SqliteStateStore
 from src.runtime import LiveRuntimeConfig, RuntimeMode
@@ -51,12 +52,17 @@ class _ControlledTradeStream:
             yield await self.queue.get()
 
 
-def _trade(trade_id: str, event_ms: int) -> MarketTrade:
+def _trade(
+    trade_id: str,
+    event_ms: int,
+    *,
+    price: str = "100",
+) -> MarketTrade:
     return MarketTrade(
         exchange=ExchangeName.OKX,
         symbol="ETH-USDT-PERP",
         raw_symbol="ETH-USDT-SWAP",
-        price=Decimal("100"),
+        price=Decimal(price),
         quantity=Decimal("1"),
         side=TradeSide.BUY,
         trade_id=trade_id,
@@ -624,6 +630,97 @@ async def test_delayed_first_trade_seals_startup_gap_and_recovers_features(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("first_trade_offset_ms", [420, 500])
+async def test_startup_gap_tolerates_same_bucket_trade_clock_skew(
+    tmp_path, monkeypatch, first_trade_offset_ms
+) -> None:
+    bucket_start = 1_800_000_000_000
+    prepare_offset_ms = 500
+    stream = _ControlledTradeStream()
+    monkeypatch.setattr(
+        "src.runtime.composition.create_trade_stream",
+        lambda *_args, **_kwargs: stream,
+    )
+    monkeypatch.setattr(
+        "src.runtime.composition.create_order_book_stream",
+        lambda *_args, **_kwargs: _IdleOrderBookStream(),
+    )
+    store = SqliteStateStore(tmp_path / "state.sqlite3")
+    application = _compose(
+        tmp_path,
+        _requirements(),
+        _FeatureObserverStrategy(),
+        state_store=store,
+    )
+    monkeypatch.setattr(
+        "src.runtime.components.closed_bar.time.time",
+        lambda: (bucket_start + prepare_offset_ms) / 1000,
+    )
+    await application.market_data.start(
+        application.runner._market_data_capabilities
+    )
+
+    first_trade_ms = bucket_start + first_trade_offset_ms
+    await stream.queue.put(_trade("first-live", first_trade_ms))
+    processor = application.market_data._event_processor
+    await asyncio.wait_for(
+        _wait_until(lambda: processor.stats.trades_processed == 1),
+        timeout=1,
+    )
+    tracker = application.runner.runtime_services.trade_data_integrity_tracker
+    rows = store.load_trade_integrity_windows(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+    )
+
+    assert rows == [{
+        "start_ms": bucket_start,
+        "end_ms": bucket_start + prepare_offset_ms,
+        "last_issue_revision": 1,
+        "repaired_through_revision": 0,
+        "reason": "startup_partial_trade_window",
+        "complete": False,
+    }]
+    assert tracker.revision == 1
+    assert application.runner.closed_bar._startup_trade_gap.closed
+    assert processor.stats.trades_processed == 1
+    assert (
+        application.runner._heartbeat_service.build().last_market_event_ms
+        == first_trade_ms
+    )
+    assert tracker.invalid_reason(
+        bucket_start,
+        bucket_start + 4 * 60 * 60_000 - 1,
+    ) is not None
+    await application.market_data.stop()
+
+
+def test_startup_gap_rejects_trade_before_startup_bucket(
+    tmp_path, monkeypatch
+) -> None:
+    bucket_start = 1_800_000_000_000
+    application = _compose(
+        tmp_path,
+        _requirements(),
+        _FeatureObserverStrategy(),
+        state_store=SqliteStateStore(tmp_path / "state.sqlite3"),
+    )
+    monkeypatch.setattr(
+        "src.runtime.components.closed_bar.time.time",
+        lambda: (bucket_start + 500) / 1000,
+    )
+    application.runner.closed_bar.begin_startup_trade_gap()
+
+    with pytest.raises(
+        ValueError,
+        match="^first live Trade precedes startup bucket$",
+    ):
+        application.runner.closed_bar.close_startup_trade_gap(
+            bucket_start - 1
+        )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("boundaries_crossed", [1, 2])
 async def test_startup_gap_is_split_into_one_durable_row_per_4h_bucket(
     tmp_path, monkeypatch, boundaries_crossed
@@ -769,6 +866,133 @@ async def test_cross_bucket_startup_keeps_old_range_repair_token_independent(
         new_bucket,
         new_bucket + interval_ms - 1,
     ) is not None
+    await application.market_data.stop()
+
+
+@pytest.mark.asyncio
+async def test_cross_bucket_startup_recovers_on_next_complete_4h_bucket(
+    tmp_path, monkeypatch
+) -> None:
+    bucket_start = 1_800_000_000_000
+    interval_ms = 4 * 60 * 60_000
+    stream = _ControlledTradeStream()
+    monkeypatch.setattr(
+        "src.runtime.composition.create_trade_stream",
+        lambda *_args, **_kwargs: stream,
+    )
+    monkeypatch.setattr(
+        "src.runtime.composition.create_order_book_stream",
+        lambda *_args, **_kwargs: _IdleOrderBookStream(),
+    )
+    now_seconds = (bucket_start + interval_ms - 10_000) / 1000
+    monkeypatch.setattr(
+        "src.runtime.components.closed_bar.time.time",
+        lambda: now_seconds,
+    )
+    monkeypatch.setattr(
+        "src.runtime.market_data.range_module.time.time",
+        lambda: now_seconds,
+    )
+    range_config = RangeRuntimeConfig(
+        checkpoint_db_path=str(tmp_path / "range.sqlite3"),
+        micro_repair_enabled=False,
+        repair_journal_enabled=False,
+        repair_journal_db=str(tmp_path / "repair.sqlite3"),
+        speed_refresh_enabled=False,
+        backfill_enabled=False,
+        market_data_db_path=str(tmp_path / "market.sqlite3"),
+    )
+
+    class RangeStore:
+        def load(self, **_kwargs):
+            return []
+
+        def save(self, rows):
+            return len(rows)
+
+    strategy = _FeatureObserverStrategy()
+    application = _compose(
+        tmp_path,
+        _requirements(range_bars=True),
+        strategy,
+        state_store=SqliteStateStore(tmp_path / "state.sqlite3"),
+        range_config=range_config,
+        services=RuntimeServices(range_bar_store=RangeStore()),
+    )
+    await application.market_data.prepare(
+        application.runner._market_data_capabilities
+    )
+    await application.market_data.start_prepared()
+
+    affected_new_bucket = bucket_start + interval_ms
+    clean_bucket = bucket_start + 2 * interval_ms
+    trades = (
+        _trade("first-live", affected_new_bucket + 10_000),
+        _trade("affected-close", affected_new_bucket + 10_001, price="101"),
+        _trade("clean-open", clean_bucket + 1),
+        _trade("clean-close", clean_bucket + 2, price="101"),
+    )
+    for count, trade in enumerate(trades, start=1):
+        await stream.queue.put(trade)
+        processor = application.market_data._event_processor
+        await asyncio.wait_for(
+            _wait_until(
+                lambda count=count: processor.stats.trades_processed == count
+            ),
+            timeout=1,
+        )
+
+    def kline(open_time_ms):
+        return MarketKline(
+            exchange=ExchangeName.OKX,
+            symbol="ETH-USDT-PERP",
+            raw_symbol="ETH-USDT-SWAP",
+            interval="4h",
+            open_time_ms=open_time_ms,
+            close_time_ms=open_time_ms + interval_ms - 1,
+            open=Decimal("100"),
+            high=Decimal("101"),
+            low=Decimal("100"),
+            close=Decimal("101"),
+            volume=Decimal("1"),
+        )
+
+    closed_bar = application.runner.closed_bar
+    assert await closed_bar._process_confirmed_closed_bar(
+        bucket_start,
+        kline(bucket_start),
+        finalized_at_ms=clean_bucket,
+    ) == []
+    assert await closed_bar._process_confirmed_closed_bar(
+        affected_new_bucket,
+        kline(affected_new_bucket),
+        finalized_at_ms=clean_bucket,
+    ) == []
+    clean_features = await closed_bar._process_confirmed_closed_bar(
+        clean_bucket,
+        kline(clean_bucket),
+        finalized_at_ms=clean_bucket + interval_ms,
+    )
+
+    range_module = application.runner.runtime_services.range_bar_module
+    assert range_module.bucket_integrity(bucket_start).status is (
+        RangeBucketIntegrityStatus.DEGRADED
+    )
+    assert range_module.bucket_integrity(affected_new_bucket).status is (
+        RangeBucketIntegrityStatus.DEGRADED
+    )
+    assert range_module.coverage(clean_bucket).coverage_status == (
+        RangeCoverageStatus.COMPLETE.value
+    )
+    assert [event.type_value for event in clean_features] == [
+        "closed_kline",
+        "range_aggregate",
+    ]
+    assert [
+        event.data["open_time_ms"]
+        for event in strategy.events
+        if event.type_value == "closed_kline"
+    ] == [clean_bucket]
     await application.market_data.stop()
 
 

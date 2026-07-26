@@ -132,6 +132,8 @@ from src.market_data.range_checkpoint import (
     MICRO_REPAIR_FAILED,
     MICRO_REPAIR_PARTIAL,
     MICRO_REPAIR_PENDING,
+    MICRO_REPAIR_RUNNING,
+    MICRO_REPAIR_SUCCESS,
     MIN_VALID_COMPLETED_AGGREGATE_MS,
     RETRY_MARKER,
     RangeMicroRepairJob,
@@ -315,6 +317,67 @@ def test_recoverable_failed_job_is_retried_by_supervisor(
     assert job is not None
     assert job.status == MICRO_REPAIR_PENDING
     assert RETRY_MARKER in (job.last_error or "")
+
+
+@pytest.mark.parametrize(
+    "worker_status",
+    [MICRO_REPAIR_RUNNING, MICRO_REPAIR_SUCCESS],
+)
+def test_recoverable_retry_does_not_overwrite_worker_status_before_popen_return(
+    tmp_path, monkeypatch, worker_status
+) -> None:
+    checkpoint_db = tmp_path / "checkpoint.sqlite3"
+    journal_db = tmp_path / "journal.sqlite3"
+    start = MIN_VALID_COMPLETED_AGGREGATE_MS + 500_000
+    _seed_failed_job(
+        checkpoint_db,
+        last_error="REST pagination limit reached",
+        bucket_start_ms=start,
+    )
+    _seed_journal_for_failed_job(journal_db, bucket_start_ms=start)
+    processes = []
+
+    def fake_popen(command, **kwargs):
+        SqliteRangeCheckpointStore(checkpoint_db).mark_micro_repair_status(
+            exchange="okx",
+            symbol="ETH-USDT-PERP",
+            range_pct="0.002",
+            bucket_start_ms=start,
+            status=worker_status,
+            updated_at_ms=start + 20_000,
+            last_error=None,
+        )
+        processes.append(_Process(command, **kwargs))
+        return processes[-1]
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    failures = []
+    supervisor = RangeMicroRepairSupervisor(
+        RangeMicroRepairSupervisorConfig(
+            status_path=tmp_path / "status.json",
+            lock_path=tmp_path / "repair.lock",
+            checkpoint_db_path=checkpoint_db,
+            market_db_path=tmp_path / "market.sqlite3",
+            journal_db_path=journal_db,
+            repo_root=tmp_path,
+        ),
+        on_failure=failures.append,
+    )
+
+    supervisor._retry_recoverable_failed_jobs()
+
+    job = SqliteRangeCheckpointStore(checkpoint_db).load_micro_repair_job(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+        bucket_start_ms=start,
+    )
+    assert job is not None
+    assert job.status == worker_status
+    assert job.key in supervisor._retried_job_keys
+    assert failures == []
+    supervisor._retry_recoverable_failed_jobs()
+    assert len(processes) == 1
 
 
 def test_recoverable_retry_worker_start_failure_rolls_back_atomically(
