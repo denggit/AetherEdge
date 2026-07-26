@@ -17,6 +17,8 @@ from src.utils.log import get_logger
 
 logger = get_logger(__name__)
 
+SMTP_TIMEOUT_SECONDS = 10.0
+
 
 class EmailSender:
     """邮件发送器"""
@@ -91,7 +93,7 @@ class EmailSender:
             smtp_server = 'smtp.qq.com'
             smtp_port = 587  # 使用 TLS
 
-            with smtplib.SMTP(smtp_server, smtp_port) as server:
+            with smtplib.SMTP(smtp_server, smtp_port, timeout=SMTP_TIMEOUT_SECONDS) as server:
                 server.starttls()  # 启用 TLS 加密
                 server.login(self.sender, self.password)
                 server.send_message(msg)
@@ -184,7 +186,7 @@ class EmailSender:
             smtp_server = 'smtp.qq.com'
             smtp_port = 587
 
-            with smtplib.SMTP(smtp_server, smtp_port) as server:
+            with smtplib.SMTP(smtp_server, smtp_port, timeout=SMTP_TIMEOUT_SECONDS) as server:
                 server.starttls()
                 server.login(self.sender, self.password)
                 server.send_message(msg)

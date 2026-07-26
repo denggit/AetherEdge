@@ -46,6 +46,20 @@ from src.runtime.live_types import (
 _FATAL_ALERT_FLUSH_TIMEOUT_SECONDS = 2.0
 
 
+async def _flush_fatal_runtime_alert(alerts) -> None:
+    flush = getattr(alerts, "flush", None)
+    if not callable(flush):
+        return
+    try:
+        if not await flush(timeout_seconds=_FATAL_ALERT_FLUSH_TIMEOUT_SECONDS):
+            logger.warning(
+                "Fatal runtime alert flush timed out | timeout_seconds=%s",
+                _FATAL_ALERT_FLUSH_TIMEOUT_SECONDS,
+            )
+    except Exception:
+        logger.exception("Fatal runtime alert flush failed")
+
+
 def _compatibility_component_methods() -> dict[str, type]:
     methods: dict[str, type] = {}
     for component_type in COMPONENT_TYPES:
@@ -287,21 +301,28 @@ class LiveRuntimeRunner(_RunnerCompatibilityFacade):
                 self.lifecycle._set_health,
             )(RuntimePhase.ERROR, healthy=False, error=str(exc))
             logger.exception("Live runtime error")
-            self.context.alerts.emit(AppAlert(subject="AetherEdge live runtime error", content=str(exc), severity="error"))
-            flush = getattr(self.context.alerts, "flush", None)
-            if callable(flush):
-                try:
-                    flushed = await flush(
-                        timeout_seconds=_FATAL_ALERT_FLUSH_TIMEOUT_SECONDS,
+            fatal_alert = AppAlert(
+                subject="AetherEdge live runtime error",
+                content=str(exc),
+                severity="error",
+            )
+            queued = self.context.alerts.emit(fatal_alert)
+            await _flush_fatal_runtime_alert(self.context.alerts)
+            if not queued:
+                if self.context.alerts.emit(fatal_alert):
+                    await _flush_fatal_runtime_alert(self.context.alerts)
+                else:
+                    queue = getattr(self.context.alerts, "_queue", None)
+                    logger.critical(
+                        "Fatal runtime alert could not be queued after bounded drain | "
+                        "subject=%s queue_size=%s maxsize=%s sent=%s failed=%s dropped=%s",
+                        fatal_alert.subject,
+                        queue.qsize() if queue is not None else "unknown",
+                        getattr(queue, "maxsize", "unknown"),
+                        getattr(self.context.alerts, "sent", "unknown"),
+                        getattr(self.context.alerts, "failed", "unknown"),
+                        getattr(self.context.alerts, "dropped", "unknown"),
                     )
-                    if not flushed:
-                        logger.warning(
-                            "Fatal runtime alert flush timed out | "
-                            "timeout_seconds=%s",
-                            _FATAL_ALERT_FLUSH_TIMEOUT_SECONDS,
-                        )
-                except Exception:
-                    logger.exception("Fatal runtime alert flush failed")
             raise
         finally:
             await self._run_finally_shutdown()

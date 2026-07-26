@@ -26,6 +26,9 @@ from src.signals import SignalAction, TradeSignal
 from src.strategy import StrategyCapabilityError
 
 
+_REAL_EMAIL_ALERT_SINK_SEND = EmailAlertSink.send
+
+
 class FakeStrategy:
     async def on_start(self, snapshot):
         return []
@@ -248,6 +251,131 @@ async def test_capability_error_survives_alert_flush_timeout(
     assert alerts._worker is not None and alerts._worker.done()
     assert alerts.sent == 0
     assert alerts.failed == 0
+
+
+@pytest.mark.asyncio
+async def test_capability_error_retries_fatal_alert_after_bounded_queue_drain() -> None:
+    app_config = _app_config()
+    release = asyncio.Event()
+    entered = asyncio.Event()
+    fatal_rejected = asyncio.Event()
+    recorded: list[AppAlert] = []
+
+    class BlockingSink:
+        async def send(self, alert: AppAlert) -> None:
+            if not recorded:
+                entered.set()
+                await release.wait()
+            recorded.append(alert)
+
+    class ObservedDispatcher(AsyncAlertDispatcher):
+        def emit(self, alert: AppAlert) -> bool:
+            dropped_before = self.dropped
+            queued = super().emit(alert)
+            if alert.severity == "error" and self.dropped > dropped_before:
+                fatal_rejected.set()
+            return queued
+
+    alerts = ObservedDispatcher(BlockingSink(), maxsize=1)
+    alerts.start()
+    assert alerts.emit(AppAlert("existing warning", "queued")) is True
+    await entered.wait()
+    assert alerts.emit(AppAlert("queued warning", "fills queue")) is True
+    runner = _capability_failure_runner(app_config, alerts)
+    running = asyncio.create_task(runner.run(max_market_events=0))
+
+    await fatal_rejected.wait()
+    release.set()
+    with pytest.raises(StrategyCapabilityError) as raised:
+        await running
+
+    assert "strategy capability validation failed" in str(raised.value)
+    assert [alert.subject for alert in recorded] == [
+        "existing warning",
+        "queued warning",
+        "AetherEdge live runtime error",
+    ]
+    assert alerts.dropped == 1
+    assert alerts._worker is not None and alerts._worker.done()
+
+
+@pytest.mark.asyncio
+async def test_capability_error_logs_when_fatal_alert_retry_stays_full(
+    caplog,
+    monkeypatch,
+) -> None:
+    app_config = _app_config()
+    alerts = AsyncAlertDispatcher(maxsize=1)
+    assert alerts.emit(AppAlert("existing warning", "fills queue")) is True
+    monkeypatch.setattr(alerts, "start", lambda: None)
+    monkeypatch.setattr(
+        "src.runtime.runner._FATAL_ALERT_FLUSH_TIMEOUT_SECONDS",
+        0,
+    )
+    runner = _capability_failure_runner(app_config, alerts)
+
+    with pytest.raises(StrategyCapabilityError) as raised:
+        await runner.run(max_market_events=0)
+
+    assert "strategy capability validation failed" in str(raised.value)
+    assert alerts.dropped == 2
+    assert alerts.sent == 0
+    assert "Fatal runtime alert could not be queued after bounded drain" in caplog.text
+    assert "subject=AetherEdge live runtime error" in caplog.text
+    assert "queue_size=1" in caplog.text
+    assert "maxsize=1" in caplog.text
+    assert "sent=0" in caplog.text
+    assert "failed=0" in caplog.text
+    assert "dropped=2" in caplog.text
+    assert alerts._worker is None
+
+
+@pytest.mark.asyncio
+async def test_capability_error_survives_email_sink_failure(monkeypatch) -> None:
+    async def failed_send_email(**_kwargs):
+        return False
+
+    monkeypatch.setattr(
+        EmailAlertSink,
+        "send",
+        _REAL_EMAIL_ALERT_SINK_SEND,
+    )
+    monkeypatch.setattr(
+        "src.utils.email_sender.send_email",
+        failed_send_email,
+    )
+    app_config = _app_config()
+    alerts = AsyncAlertDispatcher(EmailAlertSink())
+    runner = _capability_failure_runner(app_config, alerts)
+
+    with pytest.raises(StrategyCapabilityError) as raised:
+        await runner.run(max_market_events=0)
+
+    assert "strategy capability validation failed" in str(raised.value)
+    assert alerts.failed == 1
+    assert alerts.sent == 0
+    assert alerts._worker is not None and alerts._worker.done()
+
+
+def _capability_failure_runner(
+    app_config: AppConfig,
+    alerts: AsyncAlertDispatcher,
+) -> LiveRuntimeRunner:
+    return LiveRuntimeRunner(
+        app_config=app_config,
+        app_context=AppContext(
+            data=FakeData(),
+            execution=FakeExecution(),
+            state_store=FakeStateStore(),
+            strategy=FakeStrategy(),
+            planner=ExecutionPlanner(),
+            alerts=alerts,
+        ),
+        runtime_config=LiveRuntimeConfig(
+            app=app_config,
+            mode=RuntimeMode.LIVE_RUNTIME,
+        ),
+    )
 
 
 def _ticker_event(ts: int) -> MarketTicker:

@@ -68,6 +68,8 @@ class AsyncAlertDispatcher:
             pass
 
     async def flush(self, *, timeout_seconds: float) -> bool:
+        if self._queue.empty() and self._queue._unfinished_tasks == 0:
+            return True
         try:
             await asyncio.wait_for(
                 self._queue.join(),
@@ -77,11 +79,13 @@ class AsyncAlertDispatcher:
             return False
         return True
 
-    def emit(self, alert: AppAlert) -> None:
+    def emit(self, alert: AppAlert) -> bool:
         try:
             self._queue.put_nowait(alert)
         except asyncio.QueueFull:
             self.dropped += 1
+            return False
+        return True
 
     async def _run(self) -> None:
         while True:

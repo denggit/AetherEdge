@@ -33,10 +33,11 @@ class _Alerts:
     async def stop(self) -> None:
         self.calls.append("alerts.stop")
 
-    def emit(self, alert) -> None:
+    def emit(self, alert) -> bool:
         self.emitted.append(alert)
         if alert.subject == "AetherEdge live runtime error":
             self.calls.append("error.alert")
+        return True
 
 
 def _runner(
