@@ -66,6 +66,7 @@ class RangeMicroRepairSupervisor:
         self._monitor_task: asyncio.Task | None = None
         self._retried_job_keys: set[tuple] = set()
         self._refresh_callback: Callable[[], object] | None = None
+        self._last_start_error: str | None = None
 
     def set_refresh_callback(
         self,
@@ -94,18 +95,19 @@ class RangeMicroRepairSupervisor:
 
     async def _monitor_loop(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
-            try:
-                self._refresh_finished_process()
-                self._retry_partial_jobs()
-                self._retry_recoverable_failed_jobs()
-                if self._refresh_callback is not None:
-                    self._refresh_callback()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning(
-                    "Range micro repair supervisor monitor failed | error=%s",
-                    exc,
+            self._run_monitor_step(
+                "refresh_finished",
+                self._refresh_finished_process,
+            )
+            self._run_monitor_step("retry_partial", self._retry_partial_jobs)
+            self._run_monitor_step(
+                "retry_recoverable",
+                self._retry_recoverable_failed_jobs,
+            )
+            if self._refresh_callback is not None:
+                self._run_monitor_step(
+                    "refresh_callback",
+                    self._refresh_callback,
                 )
             try:
                 await asyncio.wait_for(
@@ -114,6 +116,20 @@ class RangeMicroRepairSupervisor:
                 )
             except asyncio.TimeoutError:
                 pass
+
+    @staticmethod
+    def _run_monitor_step(name: str, callback: Callable[[], object]) -> None:
+        try:
+            callback()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Range micro repair supervisor monitor step failed | "
+                "step=%s error=%s",
+                name,
+                exc,
+            )
 
     def start_startup_recovery(
         self,
@@ -125,9 +141,11 @@ class RangeMicroRepairSupervisor:
         bucket_end_ms: int,
         coverage_status: str,
         missing_gap_ms: int,
+        notify_failure: bool = True,
     ) -> bool:
         if not self.config.enabled or self.running:
             return False
+        self._last_start_error = None
         try:
             log_path = (
                 self.config.repo_root
@@ -169,10 +187,14 @@ class RangeMicroRepairSupervisor:
             )
             return True
         except Exception as exc:
+            self._last_start_error = str(exc)
             logger.warning(
                 "Range micro repair worker failed to start | error=%s", exc
             )
-            self._notify_failure(f"worker_start_failed:{exc}")
+            if notify_failure:
+                self._notify_failure(
+                    f"worker_start_failed:{self._last_start_error}"
+                )
             self.process = None
             self._close_stdout()
             return False
@@ -317,96 +339,112 @@ class RangeMicroRepairSupervisor:
         """Retry each eligible durable failure at most once."""
         if self.running:
             return
-        try:
-            checkpoint_store = SqliteRangeCheckpointStore(
-                self.config.checkpoint_db_path
+        checkpoint_store = SqliteRangeCheckpointStore(
+            self.config.checkpoint_db_path
+        )
+        journal_store = SqliteRangeRepairJournalStore(
+            self.config.journal_db_path
+        )
+        jobs = checkpoint_store.load_resumable_failed_micro_repair_jobs()
+        for job in jobs:
+            if job.key in self._retried_job_keys:
+                continue
+
+            completed = checkpoint_store.load_completed_aggregate(
+                exchange=job.exchange,
+                symbol=job.symbol,
+                range_pct=job.range_pct,
+                bucket_end_ms=job.bucket_end_ms,
             )
-            journal_store = SqliteRangeRepairJournalStore(
-                self.config.journal_db_path
+            if (
+                completed is not None
+                and completed.coverage_status == "COMPLETE"
+            ):
+                logger.info(
+                    "Range micro repair recoverable failed job skipped: "
+                    "bucket already COMPLETE | symbol=%s exchange=%s "
+                    "bucket_start_ms=%s",
+                    job.symbol,
+                    job.exchange,
+                    job.bucket_start_ms,
+                )
+                continue
+
+            journal_state = journal_store.load_state(
+                exchange=job.exchange,
+                symbol=job.symbol,
+                range_pct=job.range_pct,
+                bucket_start_ms=job.bucket_start_ms,
             )
-            jobs = checkpoint_store.load_resumable_failed_micro_repair_jobs()
-            for job in jobs:
-                if job.key in self._retried_job_keys:
-                    continue
-
-                completed = checkpoint_store.load_completed_aggregate(
-                    exchange=job.exchange,
-                    symbol=job.symbol,
-                    range_pct=job.range_pct,
-                    bucket_end_ms=job.bucket_end_ms,
+            if journal_state is None or not journal_state.valid_for_repair:
+                logger.info(
+                    "Range micro repair recoverable failed job skipped: "
+                    "journal not valid_for_repair | symbol=%s exchange=%s "
+                    "bucket_start_ms=%s finalized=%s status=%s",
+                    job.symbol,
+                    job.exchange,
+                    job.bucket_start_ms,
+                    getattr(journal_state, "finalized", None),
+                    getattr(journal_state, "status", None),
                 )
-                if (
-                    completed is not None
-                    and completed.coverage_status == "COMPLETE"
-                ):
-                    logger.info(
-                        "Range micro repair recoverable failed job skipped: "
-                        "bucket already COMPLETE | symbol=%s exchange=%s "
-                        "bucket_start_ms=%s",
-                        job.symbol,
-                        job.exchange,
-                        job.bucket_start_ms,
-                    )
-                    continue
+                continue
 
-                journal_state = journal_store.load_state(
-                    exchange=job.exchange,
-                    symbol=job.symbol,
-                    range_pct=job.range_pct,
-                    bucket_start_ms=job.bucket_start_ms,
-                )
-                if journal_state is None or not journal_state.valid_for_repair:
-                    logger.info(
-                        "Range micro repair recoverable failed job skipped: "
-                        "journal not valid_for_repair | symbol=%s exchange=%s "
-                        "bucket_start_ms=%s finalized=%s status=%s",
-                        job.symbol,
-                        job.exchange,
-                        job.bucket_start_ms,
-                        getattr(journal_state, "finalized", None),
-                        getattr(journal_state, "status", None),
-                    )
-                    continue
-
-                timestamp = now_ms()
-                retry_error = (
-                    f"{RETRY_MARKER} {job.last_error or ''}".strip()
+            checkpoint_store.mark_micro_repair_status(
+                exchange=job.exchange,
+                symbol=job.symbol,
+                range_pct=job.range_pct,
+                bucket_start_ms=job.bucket_start_ms,
+                status=MICRO_REPAIR_PENDING,
+                updated_at_ms=now_ms(),
+                last_error=job.last_error,
+            )
+            logger.warning(
+                "Range micro repair resuming recoverable failed job | "
+                "symbol=%s exchange=%s bucket_start_ms=%s "
+                "last_error=%s",
+                job.symbol,
+                job.exchange,
+                job.bucket_start_ms,
+                job.last_error,
+            )
+            started = self.start_startup_recovery(
+                exchange=job.exchange,
+                symbol=job.symbol,
+                range_pct=job.range_pct,
+                bucket_start_ms=job.bucket_start_ms,
+                bucket_end_ms=job.bucket_end_ms,
+                coverage_status=job.coverage_status,
+                missing_gap_ms=job.missing_gap_ms,
+                notify_failure=False,
+            )
+            if not started:
+                failure_reason = (
+                    "worker_retry_start_failed:"
+                    + (self._last_start_error or "unknown")
                 )
                 checkpoint_store.mark_micro_repair_status(
                     exchange=job.exchange,
                     symbol=job.symbol,
                     range_pct=job.range_pct,
                     bucket_start_ms=job.bucket_start_ms,
-                    status=MICRO_REPAIR_PENDING,
-                    updated_at_ms=timestamp,
-                    last_error=retry_error,
+                    status=MICRO_REPAIR_FAILED,
+                    updated_at_ms=now_ms(),
+                    last_error=failure_reason,
                 )
-                self._retried_job_keys.add(job.key)
-
-                logger.warning(
-                    "Range micro repair resuming recoverable failed job | "
-                    "symbol=%s exchange=%s bucket_start_ms=%s "
-                    "last_error=%s",
-                    job.symbol,
-                    job.exchange,
-                    job.bucket_start_ms,
-                    job.last_error,
-                )
-                self.start_startup_recovery(
-                    exchange=job.exchange,
-                    symbol=job.symbol,
-                    range_pct=job.range_pct,
-                    bucket_start_ms=job.bucket_start_ms,
-                    bucket_end_ms=job.bucket_end_ms,
-                    coverage_status=job.coverage_status,
-                    missing_gap_ms=job.missing_gap_ms,
-                )
+                self._notify_failure(failure_reason)
                 return
-        except Exception as exc:
-            logger.warning(
-                "Range micro repair recoverable failed check failed | error=%s",
-                exc,
+            retry_error = f"{RETRY_MARKER} {job.last_error or ''}".strip()
+            checkpoint_store.mark_micro_repair_status(
+                exchange=job.exchange,
+                symbol=job.symbol,
+                range_pct=job.range_pct,
+                bucket_start_ms=job.bucket_start_ms,
+                status=MICRO_REPAIR_PENDING,
+                updated_at_ms=now_ms(),
+                last_error=retry_error,
             )
+            self._retried_job_keys.add(job.key)
+            return
 
     def _close_stdout(self) -> None:
         handle = self._stdout_handle

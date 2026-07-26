@@ -3445,6 +3445,13 @@ async def test_incomplete_trade_window_suppresses_entire_closed_bar_decision():
     assert runner._closed_bar_scheduler.is_skipped(2 * H4)
     assert runner._market_queue.empty()
 
+    recovered = await runner.poll_closed_bar_once(
+        now_ms=4 * H4 + 60_000
+    )
+
+    assert [event.type_value for event in recovered] == ["closed_kline"]
+    assert runner.stats.closed_klines_seen == 1
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Stop order post-check via coordinator post_result_validator + retry

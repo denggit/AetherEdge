@@ -174,6 +174,11 @@ def compose_live_runtime(
         trade_integrity=trade_integrity,
         order_book_integrity=order_book_integrity,
         trade_processor=trade_processor,
+        on_first_live_trade=(
+            runner.closed_bar.close_startup_trade_gap
+            if pipeline_plan.trades_enabled
+            else None
+        ),
     )
 
     market_data = MarketDataRuntime(
@@ -181,9 +186,9 @@ def compose_live_runtime(
         logger=logger,
         event_processor=trade_processor,
         pipeline_plan=pipeline_plan,
-        before_prepare=runner.closed_bar.prepare_startup_trade_integrity
+        before_prepare=runner.closed_bar.begin_startup_trade_gap
         if pipeline_plan.trades_enabled else None,
-        before_source_start=runner.closed_bar.prepare_market_source_start
+        before_source_start=runner.closed_bar.arm_initial_closed_bar_cutoff
         if pipeline_plan.trades_enabled else None,
     )
 

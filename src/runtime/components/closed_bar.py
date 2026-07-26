@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Sequence
 from src.app.alerts import AppAlert
 from src.market_data.events import MarketFeatureEvent
@@ -22,6 +23,14 @@ from src.strategy.ports import (
 
 from src.runtime.live_types import LiveRuntimeStats, StartupPreviewState, logger
 from src.runtime.components.base import RuntimeComponent
+
+
+@dataclass
+class _StartupTradeGapSession:
+    interval_ms: int
+    first_bucket_start_ms: int
+    initial_revision: int
+    closed: bool = False
 
 
 class ClosedBarComponent(RuntimeComponent):
@@ -76,38 +85,80 @@ class ClosedBarComponent(RuntimeComponent):
             finalized_at_ms=now,
         )
 
-    def prepare_startup_trade_integrity(
+    def begin_startup_trade_gap(
         self,
         now_ms: int | None = None,
     ) -> None:
-        self._startup_trade_integrity = None
+        self._startup_trade_gap = None
         tracker = self._trade_integrity_tracker()
         if tracker is None:
             return
         now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
         interval = self._closed_bar_interval_ms
         bucket_start_ms = now_ms - (now_ms % interval)
-        if now_ms > bucket_start_ms:
+        revision = tracker.mark_window_incomplete(
+            bucket_start_ms,
+            now_ms,
+            "startup_partial_trade_window",
+        )
+        self._startup_trade_gap = _StartupTradeGapSession(
+            interval_ms=interval,
+            first_bucket_start_ms=bucket_start_ms,
+            initial_revision=revision,
+        )
+        self._notify_range_startup_gap(bucket_start_ms, revision)
+
+    def close_startup_trade_gap(self, first_trade_time_ms: int) -> None:
+        session = getattr(self, "_startup_trade_gap", None)
+        tracker = self._trade_integrity_tracker()
+        if (
+            tracker is None
+            or not isinstance(session, _StartupTradeGapSession)
+            or session.closed
+        ):
+            return
+        end_ms = int(first_trade_time_ms)
+        if end_ms < session.first_bucket_start_ms:
+            raise ValueError("first live Trade precedes startup gap")
+        interval = session.interval_ms
+        first_bucket_end_ms = session.first_bucket_start_ms + interval - 1
+        tracker.extend_incomplete_window(
+            session.first_bucket_start_ms,
+            min(end_ms, first_bucket_end_ms),
+            "startup_partial_trade_window",
+            session.initial_revision,
+        )
+        bucket_start_ms = session.first_bucket_start_ms + interval
+        while bucket_start_ms <= end_ms:
             revision = tracker.mark_window_incomplete(
                 bucket_start_ms,
-                now_ms,
+                min(end_ms, bucket_start_ms + interval - 1),
                 "startup_partial_trade_window",
             )
-            self._startup_trade_integrity = (bucket_start_ms, revision)
+            self._notify_range_startup_gap(bucket_start_ms, revision)
+            bucket_start_ms += interval
+        session.closed = True
 
-    def prepare_market_source_start(self, now_ms: int | None = None) -> None:
+    def arm_initial_closed_bar_cutoff(self, now_ms: int | None = None) -> None:
         now = int(time.time() * 1000) if now_ms is None else int(now_ms)
-        startup_window = self._startup_trade_integrity
-        tracker = self._trade_integrity_tracker()
-        if tracker is not None and startup_window is not None:
-            tracker.extend_incomplete_window(
-                startup_window[0],
-                now,
-                "startup_partial_trade_window",
-                startup_window[1],
-            )
         if self.requirements.closed_kline.enabled:
             self.sync_next_closed_bar_cutoff(now)
+
+    def _notify_range_startup_gap(
+        self,
+        bucket_start_ms: int,
+        revision: int,
+    ) -> None:
+        if not self.requirements.range_bars.enabled:
+            return
+        module = self.service_dependencies().range_bar_module
+        mark = getattr(module, "mark_trade_incomplete", None)
+        if callable(mark):
+            mark(
+                bucket_start_ms,
+                "startup_partial_trade_window",
+                revision,
+            )
 
     def sync_next_closed_bar_cutoff(self, now_ms: int) -> None:
         processor = self.service_dependencies().market_event_processor

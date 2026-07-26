@@ -120,13 +120,25 @@ def _configure_real_strategy(strategy: Strategy) -> None:
     )
 
 
-async def _replay(*, ordered: bool, root) -> dict[str, object]:
+async def _replay(
+    *,
+    ordered: bool,
+    root,
+    startup_gap: bool = False,
+    require_signal: bool = True,
+) -> dict[str, object]:
     root.mkdir(parents=True, exist_ok=True)
     strategy = Strategy(mf_store_path=root / "features.sqlite3")
     _configure_real_strategy(strategy)
     strategy_host = StrategyHost(strategy)
     feature_pipeline = MarketFeaturePipeline(strategy)
     integrity = TradeDataIntegrityTracker()
+    if startup_gap:
+        integrity.mark_window_incomplete(
+            BASE_MS,
+            BASE_MS + 30_000,
+            "startup_partial_trade_window",
+        )
     feature_trace: list[tuple[str, dict[str, object]]] = []
     callback_trace: list[tuple[str, int]] = []
     closed_bar_observations: list[dict[str, int]] = []
@@ -278,7 +290,22 @@ async def _replay(*, ordered: bool, root) -> dict[str, object]:
     account_signals = await strategy_host.on_account_event(account)
     signals.extend(account_signals or ())
 
-    assert signals, "real Portfolio V1 fixture must produce its own TradeSignal"
+    if not signals:
+        assert not require_signal
+        return {
+            "feature_trace": feature_trace,
+            "callback_trace": callback_trace,
+            "closed_bar_observations": closed_bar_observations,
+            "signal": None,
+            "signal_metadata": None,
+            "intent": None,
+            "position": None,
+            "legs": (),
+            "strategy_state": asdict(strategy.mf_sleeve),
+            "observer_audit": dict(strategy.last_mf_signal_audit),
+            "order_result_followups": (),
+        }
+    assert require_signal
     signal = signals[0]
     factory = LiveOrderIntentFactory(
         strategy_id="strategies.eth_portfolio_v1:Strategy",
@@ -362,3 +389,48 @@ async def test_real_portfolio_v1_parent_and_runtime_replay_parity(tmp_path) -> N
     assert runtime["signal_metadata"]["engine"] == "MF_LOW_SWEEP_TIME48"
     assert runtime["position"] is not None
     assert runtime["legs"]
+
+
+@pytest.mark.asyncio
+async def test_real_portfolio_v1_suppresses_startup_partial_mf_then_recovers(
+    tmp_path,
+) -> None:
+    clean = _normalize_replay(
+        await _replay(
+            ordered=True,
+            root=tmp_path / "clean",
+        )
+    )
+    gapped = _normalize_replay(
+        await _replay(
+            ordered=True,
+            root=tmp_path / "gapped",
+            startup_gap=True,
+            require_signal=False,
+        )
+    )
+
+    def fixed_features(replay):
+        return [
+            payload
+            for event_type, payload in replay["feature_trace"]
+            if event_type == "fixed_time_trade_bar"
+        ]
+
+    clean_fixed = fixed_features(clean)
+    gapped_fixed = fixed_features(gapped)
+    assert clean_fixed[0]["open_time_ms"] == BASE_MS
+    assert gapped_fixed[0]["open_time_ms"] == BASE_MS + MINUTE_MS
+    assert gapped_fixed[0] == clean_fixed[1]
+    assert gapped["signal"] is None
+    assert all(
+        max(observation.values()) <= close_time
+        for observation, close_time in zip(
+            gapped["closed_bar_observations"],
+            (
+                time_ms
+                for callback, time_ms in gapped["callback_trace"]
+                if callback == "strategy:closed_kline"
+            ),
+        )
+    )

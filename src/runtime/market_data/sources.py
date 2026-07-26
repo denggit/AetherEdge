@@ -25,6 +25,7 @@ EventT = TypeVar("EventT")
 StreamFactory = Callable[[], AsyncIterator[EventT]]
 ModuleErrorHandler = Callable[[str, BaseException], None]
 DroppedEventHandler = Callable[[EventT], Awaitable[None] | None]
+FirstLiveTradeHandler = Callable[[int], None]
 
 
 class OrderBookResyncRequired(RuntimeError):
@@ -154,10 +155,13 @@ class TradeStreamModule(_StreamModule[MarketTrade]):
         processor: MarketEventProcessor | None,
         on_error: ModuleErrorHandler | None = None,
         on_dropped: DroppedEventHandler[MarketTrade] | None = None,
+        on_first_live_trade: FirstLiveTradeHandler | None = None,
     ) -> None:
         if processor is None:
             raise ValueError("trade stream requires MarketEventProcessor")
         self._processor = processor
+        self._on_first_live_trade = on_first_live_trade
+        self._first_live_trade_seen = False
         super().__init__(
             module_id="trade-stream",
             capability=MARKET_TRADES,
@@ -174,6 +178,10 @@ class TradeStreamModule(_StreamModule[MarketTrade]):
                 self.events_seen += 1
                 last_event_time_ms = event.trade_time_ms or event.event_time_ms or 0
                 try:
+                    if not self._first_live_trade_seen:
+                        if self._on_first_live_trade is not None:
+                            self._on_first_live_trade(last_event_time_ms)
+                        self._first_live_trade_seen = True
                     self._processor.submit_trade(event)
                 except Exception:
                     self.events_dropped += 1

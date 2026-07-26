@@ -317,6 +317,212 @@ def test_recoverable_failed_job_is_retried_by_supervisor(
     assert RETRY_MARKER in (job.last_error or "")
 
 
+def test_recoverable_retry_worker_start_failure_rolls_back_atomically(
+    tmp_path, monkeypatch
+) -> None:
+    checkpoint_db = tmp_path / "checkpoint.sqlite3"
+    journal_db = tmp_path / "journal.sqlite3"
+    start = MIN_VALID_COMPLETED_AGGREGATE_MS + 500_000
+    _seed_failed_job(
+        checkpoint_db,
+        last_error="REST pagination limit reached",
+        bucket_start_ms=start,
+    )
+    _seed_journal_for_failed_job(journal_db, bucket_start_ms=start)
+    monkeypatch.setattr(
+        "subprocess.Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("injected retry spawn failure")
+        ),
+    )
+    failures = []
+    supervisor = RangeMicroRepairSupervisor(
+        RangeMicroRepairSupervisorConfig(
+            status_path=tmp_path / "status.json",
+            lock_path=tmp_path / "repair.lock",
+            checkpoint_db_path=checkpoint_db,
+            market_db_path=tmp_path / "market.sqlite3",
+            journal_db_path=journal_db,
+            repo_root=tmp_path,
+        ),
+        on_failure=failures.append,
+    )
+
+    supervisor._retry_recoverable_failed_jobs()
+
+    job = SqliteRangeCheckpointStore(checkpoint_db).load_micro_repair_job(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+        bucket_start_ms=start,
+    )
+    assert job is not None
+    assert job.status == MICRO_REPAIR_FAILED
+    assert job.last_error == (
+        "worker_retry_start_failed:injected retry spawn failure"
+    )
+    assert job.key not in supervisor._retried_job_keys
+    assert supervisor.process is None
+    assert failures == [
+        "worker_retry_start_failed:injected retry spawn failure"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_retry_spawn_failure_monitor_refreshes_range_to_degraded(
+    tmp_path, monkeypatch
+) -> None:
+    checkpoint_db = tmp_path / "checkpoint.sqlite3"
+    journal_db = tmp_path / "journal.sqlite3"
+    start = MIN_VALID_COMPLETED_AGGREGATE_MS + 500_000
+    store = _seed_failed_job(
+        checkpoint_db,
+        last_error="REST pagination limit reached",
+        bucket_start_ms=start,
+    )
+    _seed_journal_for_failed_job(journal_db, bucket_start_ms=start)
+
+    class BarStore:
+        def load(self, **_kwargs):
+            return []
+
+    first = RangeBarModule(
+        config=RangeBarModuleConfig(
+            symbol="ETH-USDT-PERP",
+            exchange=ExchangeName.OKX,
+            range_pct=Decimal("0.002"),
+            contract_value=Decimal("0.01"),
+            bucket_interval_ms=10_000,
+            aggregate_interval="10s",
+        ),
+        bar_store=BarStore(),
+        checkpoint_store=store,
+        integrity=TradeDataIntegrityTracker(),
+        clock_ms=lambda: start + 500,
+    )
+    first.mark_degraded(bucket_start_ms=start, reason="startup_gap")
+    first.begin_repair(start)
+    module = RangeBarModule(
+        config=first.config,
+        bar_store=BarStore(),
+        checkpoint_store=store,
+        integrity=TradeDataIntegrityTracker(),
+        clock_ms=lambda: start + 500,
+    )
+    module.initialize_recovery()
+    assert module.bucket_integrity(start).status is (
+        RangeBucketIntegrityStatus.REPAIRING
+    )
+
+    monkeypatch.setattr(
+        "subprocess.Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            OSError("injected retry spawn failure")
+        ),
+    )
+    stop = asyncio.Event()
+    refreshed = asyncio.Event()
+    failures = []
+    supervisor = RangeMicroRepairSupervisor(
+        RangeMicroRepairSupervisorConfig(
+            monitor_seconds=60,
+            status_path=tmp_path / "status.json",
+            lock_path=tmp_path / "repair.lock",
+            checkpoint_db_path=checkpoint_db,
+            market_db_path=tmp_path / "market.sqlite3",
+            journal_db_path=journal_db,
+            repo_root=tmp_path,
+        ),
+        on_failure=failures.append,
+    )
+
+    def refresh():
+        module.refresh_repair_state()
+        refreshed.set()
+        stop.set()
+
+    supervisor.set_refresh_callback(refresh)
+    supervisor.start_monitor(stop_event=stop)
+    await asyncio.wait_for(refreshed.wait(), timeout=1)
+    await supervisor.stop_async()
+
+    state = module.bucket_integrity(start)
+    assert state.status is RangeBucketIntegrityStatus.DEGRADED
+    assert module._integrity.invalid_reason(start, start + 9_999) is not None
+    assert failures == [
+        "worker_retry_start_failed:injected retry spawn failure"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failed_step",
+    ["refresh_finished", "retry_partial", "retry_recoverable", "refresh_callback"],
+)
+async def test_monitor_isolates_each_step_failure(
+    tmp_path, monkeypatch, failed_step
+) -> None:
+    supervisor = RangeMicroRepairSupervisor(
+        RangeMicroRepairSupervisorConfig(
+            monitor_seconds=60,
+            status_path=tmp_path / "status.json",
+            checkpoint_db_path=tmp_path / "checkpoint.sqlite3",
+            market_db_path=tmp_path / "market.sqlite3",
+            journal_db_path=tmp_path / "journal.sqlite3",
+            repo_root=tmp_path,
+        )
+    )
+    stop = asyncio.Event()
+    trace = []
+
+    def step(name):
+        def run():
+            trace.append(name)
+            if name == failed_step:
+                raise RuntimeError(f"injected {name} failure")
+        return run
+
+    monkeypatch.setattr(
+        supervisor, "_refresh_finished_process", step("refresh_finished")
+    )
+    monkeypatch.setattr(
+        supervisor, "_retry_partial_jobs", step("retry_partial")
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_retry_recoverable_failed_jobs",
+        step("retry_recoverable"),
+    )
+
+    def refresh():
+        step("refresh_callback")()
+        stop.set()
+
+    supervisor.set_refresh_callback(refresh)
+    supervisor.start_monitor(stop_event=stop)
+    if failed_step != "refresh_callback":
+        await asyncio.wait_for(stop.wait(), timeout=1)
+    else:
+        await asyncio.wait_for(
+            _wait_for_trace(trace, "refresh_callback"),
+            timeout=1,
+        )
+        stop.set()
+    await supervisor.stop_async()
+
+    assert trace == [
+        "refresh_finished",
+        "retry_partial",
+        "retry_recoverable",
+        "refresh_callback",
+    ]
+
+
+async def _wait_for_trace(trace, value) -> None:
+    while value not in trace:
+        await asyncio.sleep(0)
+
+
 @pytest.mark.asyncio
 async def test_monitor_retries_before_refresh_and_adopts_success(
     tmp_path, monkeypatch

@@ -70,6 +70,7 @@ def build_market_data_registry(
     trade_integrity: TradeDataIntegrityTracker | None = None,
     order_book_integrity: OrderBookDataIntegrityTracker | None = None,
     trade_processor: MarketEventProcessor | None = None,
+    on_first_live_trade: Callable[[int], None] | None = None,
 ) -> ModuleRegistry:
     """Build lazy module definitions without opening streams or stores."""
 
@@ -95,6 +96,7 @@ def build_market_data_registry(
                 stream=create_trade_stream(),
                 processor=trade_processor,
                 on_dropped=consume_dropped_trade,
+                on_first_live_trade=on_first_live_trade,
             ),
         )
     )
