@@ -124,9 +124,12 @@ def compose_live_runtime(
                 else None
             ),
             integrity=trade_integrity,
+            trade_processed_callback=(
+                runner._heartbeat_service.note_market_event
+            ),
             maxsize=max(1, app_config.market_queue_maxsize),
         )
-        if pipeline_plan.trades_enabled or pipeline_plan.closed_kline_enabled
+        if pipeline_plan.trades_enabled
         else None
     )
     runtime_services.market_event_processor = trade_processor
@@ -180,8 +183,8 @@ def compose_live_runtime(
         pipeline_plan=pipeline_plan,
         before_prepare=runner.closed_bar.prepare_startup_trade_integrity
         if pipeline_plan.trades_enabled else None,
-        before_source_start=runner.closed_bar.prepare_initial_cutoff
-        if pipeline_plan.closed_kline_enabled else None,
+        before_source_start=runner.closed_bar.prepare_market_source_start
+        if pipeline_plan.trades_enabled else None,
     )
 
     request = capability_request_from_requirements(

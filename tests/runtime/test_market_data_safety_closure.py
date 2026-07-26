@@ -207,7 +207,8 @@ class _StartupTradeSource:
 
     async def start(self) -> None:
         self.started = True
-        self.trace.append(("source.start", self.processor.pending_cutoff))
+        pending = self.processor._pending_cutoff
+        self.trace.append(("source.start", None if pending is None else pending[:2]))
         self.processor.submit_trade(_trade("first", 500))
 
     async def stop(self) -> None:
@@ -355,7 +356,7 @@ async def test_empty_market_runtime_creates_no_background_task() -> None:
     before = {task for task in asyncio.all_tasks() if task is not current}
     await runtime.start(())
 
-    assert runtime.supervisor_task is None
+    assert runtime._supervisor_task is None
     assert {task for task in asyncio.all_tasks() if task is not current} == before
     await runtime.stop()
 

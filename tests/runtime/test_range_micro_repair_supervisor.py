@@ -145,6 +145,13 @@ from src.market_data.range_repair import (
 )
 from src.market_data.models import RangeBarAggregate
 from decimal import Decimal
+from src.runtime.market_data.range_module import (
+    RangeBarModule,
+    RangeBarModuleConfig,
+)
+from src.runtime.market_data.integrity import TradeDataIntegrityTracker
+from src.runtime.market_data.range_integrity import RangeBucketIntegrityStatus
+from src.platform.exchanges.models import ExchangeName
 
 
 def _seed_failed_job(
@@ -308,6 +315,143 @@ def test_recoverable_failed_job_is_retried_by_supervisor(
     assert job is not None
     assert job.status == MICRO_REPAIR_PENDING
     assert RETRY_MARKER in (job.last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_monitor_retries_before_refresh_and_adopts_success(
+    tmp_path, monkeypatch
+) -> None:
+    checkpoint_db = tmp_path / "checkpoint.sqlite3"
+    journal_db = tmp_path / "journal.sqlite3"
+    start = MIN_VALID_COMPLETED_AGGREGATE_MS + 500_000
+    store = _seed_failed_job(
+        checkpoint_db,
+        last_error="REST pagination limit reached",
+        bucket_start_ms=start,
+    )
+    _seed_journal_for_failed_job(
+        journal_db,
+        bucket_start_ms=start,
+    )
+    worker_started = asyncio.Event()
+    adopted = asyncio.Event()
+    processes = []
+
+    def fake_popen(command, **kwargs):
+        process = _Process(command, **kwargs)
+        processes.append(process)
+        worker_started.set()
+        return process
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    class BarStore:
+        def load(self, **_kwargs):
+            return [object()]
+
+    first = RangeBarModule(
+        config=RangeBarModuleConfig(
+            symbol="ETH-USDT-PERP",
+            exchange=ExchangeName.OKX,
+            range_pct=Decimal("0.002"),
+            contract_value=Decimal("0.01"),
+            bucket_interval_ms=10_000,
+            aggregate_interval="10s",
+        ),
+        bar_store=BarStore(),
+        checkpoint_store=store,
+        integrity=TradeDataIntegrityTracker(),
+        clock_ms=lambda: start + 500,
+    )
+    first.mark_degraded(bucket_start_ms=start, reason="startup_gap")
+    token = first.begin_repair(start)
+    module = RangeBarModule(
+        config=first.config,
+        bar_store=BarStore(),
+        checkpoint_store=store,
+        integrity=TradeDataIntegrityTracker(),
+        clock_ms=lambda: start + 500,
+    )
+    module.initialize_recovery()
+    assert module.bucket_integrity(start).status is (
+        RangeBucketIntegrityStatus.REPAIRING
+    )
+
+    supervisor = RangeMicroRepairSupervisor(
+        RangeMicroRepairSupervisorConfig(
+            monitor_seconds=1,
+            status_path=tmp_path / "status.json",
+            lock_path=tmp_path / "repair.lock",
+            checkpoint_db_path=checkpoint_db,
+            market_db_path=tmp_path / "market.sqlite3",
+            journal_db_path=journal_db,
+            repo_root=tmp_path,
+        )
+    )
+
+    def refresh():
+        if module.refresh_repair_state():
+            adopted.set()
+
+    supervisor.set_refresh_callback(refresh)
+    stop = asyncio.Event()
+    supervisor.start_monitor(stop_event=stop)
+    await asyncio.wait_for(worker_started.wait(), timeout=1)
+
+    pending = store.load_micro_repair_job(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+        bucket_start_ms=start,
+    )
+    assert pending.status == MICRO_REPAIR_PENDING
+    assert module.bucket_integrity(start).status is (
+        RangeBucketIntegrityStatus.REPAIRING
+    )
+    assert module.bucket_integrity(start).repair_started_revision == token
+
+    store.save_completed_aggregate(
+        exchange="okx",
+        aggregate=RangeBarAggregate(
+            symbol="ETH-USDT-PERP",
+            range_pct=Decimal("0.002"),
+            bucket_start_ms=start,
+            bucket_end_ms=start + 9_999,
+            bar_count=1,
+            first_open=Decimal("100"),
+            last_close=Decimal("100"),
+            high=Decimal("100"),
+            low=Decimal("100"),
+            buy_notional_sum=Decimal("1"),
+            sell_notional_sum=Decimal("0"),
+            delta_notional_sum=Decimal("1"),
+            notional_sum=Decimal("1"),
+        ),
+        coverage_status="COMPLETE",
+        completed_at_ms=start + 10_000,
+    )
+    store.mark_micro_repair_status(
+        exchange="okx",
+        symbol="ETH-USDT-PERP",
+        range_pct="0.002",
+        bucket_start_ms=start,
+        status="micro_repair_success",
+        updated_at_ms=start + 10_000,
+    )
+    processes[0].returncode = 0
+    supervisor.status_store.write({
+        "running": False,
+        "repair_status": "micro_repair_success",
+    })
+
+    await asyncio.wait_for(adopted.wait(), timeout=2)
+    stop.set()
+    await supervisor.stop_async()
+
+    assert module.bucket_integrity(start).status is (
+        RangeBucketIntegrityStatus.REPAIRED
+    )
+    assert module._integrity.invalid_reason(start, start + 9_999) is None
 
 
 def test_non_pagination_failed_job_not_retried(

@@ -20,7 +20,6 @@ class IntegrityWindowState:
     end_ms: int
     last_issue_revision: int = 0
     repaired_through_revision: int = 0
-    dropped_count: int = 0
     reasons: set[str] = field(default_factory=set)
     forced_incomplete: bool = False
 
@@ -83,7 +82,6 @@ class TradeDataIntegrityTracker:
                 end_ms=wkey + self._window_size_ms - 1,
             )
         wstate = self._windows[wkey]
-        wstate.dropped_count += 1
         wstate.reasons.add(normalized_reason)
         wstate.last_issue_revision = self._revision
         self._persist(wstate)
@@ -118,6 +116,35 @@ class TradeDataIntegrityTracker:
         self._persist(state)
         return self._revision
 
+    def extend_incomplete_window(
+        self,
+        window_start_ms: int,
+        window_end_ms: int,
+        reason: str,
+        revision: int,
+    ) -> None:
+        """Extend one existing issue without changing its repair revision."""
+
+        start, end = int(window_start_ms), int(window_end_ms)
+        normalized_reason = str(reason).strip() or "trade_data_incomplete"
+        match = next((
+            (key, state)
+            for key, state in self._restored_windows.items()
+            if state.start_ms == start
+            and state.last_issue_revision == int(revision)
+            and normalized_reason in state.reasons
+            and state.forced_incomplete
+        ), None)
+        if match is None:
+            raise RuntimeError("incomplete Trade window to extend was not found")
+        key, state = match
+        if end < state.end_ms:
+            raise ValueError("extended window end must not move backwards")
+        self._restored_windows.pop(key)
+        state.end_ms = end
+        self._restored_windows[(start, end)] = state
+        self._persist(state)
+
     def mark_repaired(
         self,
         window_start_ms: int,
@@ -150,9 +177,6 @@ class TradeDataIntegrityTracker:
                 wstate.forced_incomplete = False
                 self._persist(wstate)
         self._compact_repaired_details()
-
-    def is_complete(self, window_start_ms: int, window_end_ms: int) -> bool:
-        return self.invalid_reason(window_start_ms, window_end_ms) is None
 
     def invalid_reason(
         self,

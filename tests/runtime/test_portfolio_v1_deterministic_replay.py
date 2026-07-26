@@ -249,7 +249,7 @@ async def _replay(*, ordered: bool, root) -> dict[str, object]:
         await processor.start()
         for trade in period_a:
             processor.submit_trade(trade)
-        processor.begin_closed_bar_cutoff(
+        processor.arm_closed_bar_cutoff(
             kline.open_time_ms,
             kline.close_time_ms,
         )

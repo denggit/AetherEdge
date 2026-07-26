@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +21,7 @@ from src.runtime.market_data import (
 from src.runtime.market_data.integrity import TradeDataIntegrityTracker
 from src.runtime.market_data.range_integrity import RangeBucketIntegrityStatus
 from src.runtime.module import ModuleState
+from src.runtime.range_repair_bootstrap import RepairStartStatus
 
 
 class FakeBuilder:
@@ -184,13 +186,17 @@ async def test_range_module_owns_builder_persistence_and_shutdown() -> None:
 
     await module.prepare()
     await module.start()
+    started = time.monotonic()
     await module.process_trade(_trade())
+    range_processing_ms = (time.monotonic() - started) * 1000
 
     assert builder.calls == 1
     assert persistence.bars == [_bar()]
     assert emitted[0].type_value == "range_bar_closed"
     assert module.health().state is ModuleState.RUNNING
     assert module.health().metadata[0] == ("bars_closed", "1")
+    print(f"range_processing_smoke duration_ms={range_processing_ms:.6f}")
+    assert range_processing_ms >= 0
 
     events = await module.emit_aggregates(module.aggregates_for_bucket(0))
     assert len(events) == 1
@@ -340,6 +346,64 @@ def test_repairing_and_durable_trade_window_remain_incomplete_after_restart(
     assert restarted_tracker.invalid_reason(0, 99) is not None
     assert restarted_tracker.dropped_count == 0
     assert restarted_tracker.issues_since(0) == ()
+
+
+def test_repaired_bucket_new_failure_creates_revision_then_reuses_active_issue(
+    tmp_path,
+) -> None:
+    tracker = TradeDataIntegrityTracker()
+    tracker.restore_revision(6)
+    module = RangeBarModule(
+        config=RangeBarModuleConfig(
+            symbol="ETH-USDT-PERP",
+            exchange=ExchangeName.OKX,
+            range_pct=Decimal("0.002"),
+            contract_value=Decimal("0.01"),
+            bucket_interval_ms=100,
+            aggregate_interval="100ms",
+        ),
+        builder=FakeBuilder(),
+        bar_store=FakeBarStore(),
+        checkpoint_store=SqliteRangeCheckpointStore(
+            tmp_path / "checkpoint.sqlite3"
+        ),
+        checkpoint_writer=FakeCheckpointWriter(),
+        integrity=tracker,
+        clock_ms=lambda: 50,
+    )
+    module._initial_bucket_ms = 0
+    module._initial_recovery = RangeCheckpointRecovery(
+        RangeCoverageStatus.RECOVERED_INCOMPLETE.value,
+        None,
+        None,
+        1,
+        False,
+    )
+    module.mark_degraded(bucket_start_ms=0, reason="old_issue")
+    token = module.begin_repair(0)
+    assert token == 7
+    assert module.mark_repaired(0, through_revision=token)
+
+    result = SimpleNamespace(
+        status=RepairStartStatus.NOT_REPAIRABLE,
+        reason="new_startup_failure",
+        micro_repair_supervisor=None,
+    )
+    module._repair_bootstrap = lambda: SimpleNamespace(
+        start_if_needed=lambda *_args, **_kwargs: result
+    )
+    module._repair_journal = SimpleNamespace(activate=lambda _result: None)
+
+    module.repair_now()
+
+    state = module.bucket_integrity(0)
+    assert tracker.revision == 8
+    assert state.status is RangeBucketIntegrityStatus.DEGRADED
+    assert state.last_issue_revision == 8
+    assert tracker.invalid_reason(0, 99) is not None
+
+    module.repair_now()
+    assert tracker.revision == 8
 
 
 @pytest.mark.asyncio

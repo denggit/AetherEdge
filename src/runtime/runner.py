@@ -163,12 +163,6 @@ class _RunnerCompatibilityFacade:
     _build_signal_feedback_request = _ComponentMethod(
         SignalExecutionComponent, "_build_signal_feedback_request"
     )
-    _bootstrap_account_config_if_enabled = _ComponentMethod(
-        StartupComponent, "_bootstrap_account_config_if_enabled"
-    )
-    _get_recovery_service = _ComponentMethod(
-        RecoveryComponent, "_get_recovery_service"
-    )
     _get_sync_contexts = _ComponentMethod(
         AccountComponent, "_get_sync_contexts"
     )

@@ -341,10 +341,14 @@ async def test_closed_kline_persist_failure_does_not_block_signal_execution() ->
 async def test_incomplete_trade_window_runs_maintenance_but_skips_strategy() -> None:
     strategy = _FeatureStrategy()
     tracker = TradeDataIntegrityTracker()
+    processor = MarketEventProcessor()
     runner = _runner(
         strategy,
         requirements=_range_requirements(),
-        services={"trade_data_integrity_tracker": tracker},
+        services={
+            "trade_data_integrity_tracker": tracker,
+            "market_event_processor": processor,
+        },
     )
     maintained = []
 
@@ -365,6 +369,9 @@ async def test_incomplete_trade_window_runs_maintenance_but_skips_strategy() -> 
     assert runner._closed_bar_scheduler.skipped_reason(0) == (
         "trade_data_incomplete"
     )
+    maintenance_ms = processor.stats.module_timings["repair-maintenance"]
+    print(f"repair_maintenance_smoke duration_ms={maintenance_ms:.6f}")
+    assert maintenance_ms >= 0
 
 
 @pytest.mark.asyncio
@@ -1102,16 +1109,16 @@ async def test_scheduler_registers_cutoff_before_blocked_rest_and_future_trade_r
     await source.start()
     runner._closed_bar_scheduler.mark_emitted(H4)
     assert await runner.poll_closed_bar_once(now_ms=cutoff - 1_000) == []
-    assert processor.pending_cutoff == (2 * H4, cutoff)
+    assert processor._pending_cutoff[:2] == (2 * H4, cutoff)
     await stream.send(_trade(time_ms=cutoff, price="100"))
     await stream.send(_trade(time_ms=cutoff + 1, price="101"))
-    assert processor.future_buffer_size == 1
+    assert len(processor._future_trades) == 1
     assert all(value <= cutoff for value in latest.values())
     poll = asyncio.create_task(
         runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
     )
     await data.fetch_started.wait()
-    assert processor.pending_cutoff == (2 * H4, cutoff)
+    assert processor._pending_cutoff[:2] == (2 * H4, cutoff)
 
     data.release.set()
     await poll

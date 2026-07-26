@@ -33,7 +33,6 @@ class LiveRuntimeStats:
     submitted_intents: int = 0
     partial_failures: int = 0
     failed_intents: int = 0
-    range_bars_closed: int = 0
     range_aggregates_created: int = 0
     closed_klines_seen: int = 0
     warmup_runs: int = 0

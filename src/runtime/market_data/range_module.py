@@ -138,7 +138,7 @@ class RangeBarModule(RangeIntegrityLifecycle):
         self._speed_warmup: RangeSpeedWarmup | None = None
         self._stop_event: asyncio.Event | None = None
         self._repair_bootstrap: Callable[[], RangeRepairBootstrapService] | None = None
-        self.bars_closed = self.builder_bars_closed = 0
+        self.bars_closed = 0
         self.aggregates_created = 0
         self.bars_suppressed = 0
 
@@ -300,12 +300,22 @@ class RangeBarModule(RangeIntegrityLifecycle):
             RepairStartStatus.FAILED,
         }:
             state = self._bucket_states.get(bucket)
+            reuse_revision = (
+                state is not None
+                and state.status in {
+                    RangeBucketIntegrityStatus.DEGRADED,
+                    RangeBucketIntegrityStatus.REPAIRING,
+                }
+                and state.last_issue_revision > state.repaired_through_revision
+                and self._integrity.invalid_reason(
+                    bucket,
+                    bucket + self.config.bucket_interval_ms - 1,
+                ) is not None
+            )
             self.mark_degraded(
                 bucket_start_ms=bucket,
                 reason=result.reason or result.status.value,
-                revision=(
-                    None if state is None else state.last_issue_revision
-                ),
+                revision=state.last_issue_revision if reuse_revision else None,
             )
 
     @property
@@ -388,7 +398,6 @@ class RangeBarModule(RangeIntegrityLifecycle):
             builder.discard_active_bar()
             self._builder_reset_at_bucket_ms = None
         for bar in builder.on_trade(trade):
-            self.builder_bars_closed += 1
             bucket = self._bucket_start(bar.end_time_ms)
             invalid_reason = self._integrity.invalid_reason(
                 int(bar.start_time_ms),

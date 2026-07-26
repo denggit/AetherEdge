@@ -243,22 +243,22 @@ class TestIntegrityRepair:
         tracker.mark_dropped(1000, "a")  # revision 1
         tracker.mark_dropped(2000, "b")  # revision 2
         tracker.mark_repaired(0, 3000, through_revision=2)
-        assert tracker.is_complete(0, 3000)
+        assert tracker.invalid_reason(0, 3000) is None
 
     def test_new_drop_after_repair_incomplete(self):
         tracker = TradeDataIntegrityTracker()
         tracker.mark_dropped(1000, "a")  # revision 1
         tracker.mark_repaired(0, 3000, through_revision=1)
-        assert tracker.is_complete(0, 3000)
+        assert tracker.invalid_reason(0, 3000) is None
         tracker.mark_dropped(1500, "c")  # revision 2 — new drop after repair
-        assert not tracker.is_complete(0, 3000)
+        assert tracker.invalid_reason(0, 3000) is not None
 
     def test_partial_repair_not_enough(self):
         tracker = TradeDataIntegrityTracker()
         tracker.mark_dropped(1000, "a")  # revision 1
         tracker.mark_dropped(2000, "b")  # revision 2
         tracker.mark_repaired(0, 3000, through_revision=1)
-        assert not tracker.is_complete(0, 3000)  # revision 2 not covered
+        assert tracker.invalid_reason(0, 3000) is not None
 
     def test_invalid_reason_returns_detail(self):
         tracker = TradeDataIntegrityTracker()
@@ -269,7 +269,7 @@ class TestIntegrityRepair:
 
     def test_complete_window_no_issues(self):
         tracker = TradeDataIntegrityTracker()
-        assert tracker.is_complete(0, 10000)
+        assert tracker.invalid_reason(0, 10000) is None
 
     def test_durable_window_restores_without_fabricating_live_drop(self):
         tracker = TradeDataIntegrityTracker()
@@ -294,7 +294,24 @@ class TestIntegrityRepair:
             repaired_through_revision=7,
             reason=None,
         )
-        assert tracker.is_complete(0, 999)
+        assert tracker.invalid_reason(0, 999) is None
+
+    def test_incomplete_window_extension_preserves_revision_and_drop_count(self):
+        tracker = TradeDataIntegrityTracker()
+        revision = tracker.mark_window_incomplete(0, 20, "startup")
+
+        tracker.extend_incomplete_window(0, 130, "startup", revision)
+
+        assert tracker.revision == revision
+        assert tracker.dropped_count == 0
+        assert tracker.invalid_reason(100, 130) is not None
+
+    def test_incomplete_window_extension_fails_fast_on_wrong_revision(self):
+        tracker = TradeDataIntegrityTracker()
+        tracker.mark_window_incomplete(0, 20, "startup")
+
+        with pytest.raises(RuntimeError, match="was not found"):
+            tracker.extend_incomplete_window(0, 130, "startup", 2)
 
 
 class TestIntegrityPrune:
@@ -302,16 +319,16 @@ class TestIntegrityPrune:
         tracker = TradeDataIntegrityTracker(window_size_ms=1000)
         tracker.mark_dropped(500, "a")  # in window [0, 999]
         tracker.mark_repaired(0, 999, through_revision=1)
-        assert tracker.is_complete(0, 999)
+        assert tracker.invalid_reason(0, 999) is None
         tracker.prune_before(1000)
-        assert tracker.is_complete(0, 999)  # still answers (no issues left)
+        assert tracker.invalid_reason(0, 999) is None
 
     def test_prune_preserves_incomplete_windows(self):
         tracker = TradeDataIntegrityTracker(window_size_ms=1000)
         tracker.mark_dropped(500, "a")
         tracker.prune_before(1000)
         # the issue should remain because window is incomplete
-        assert not tracker.is_complete(0, 999)
+        assert tracker.invalid_reason(0, 999) is not None
 
 
 class TestIntegrityWindowState:
@@ -602,10 +619,10 @@ class TestProcessorClosedBar:
         )
         await processor.start()
         processor.submit_trade(_trade("period-a", 900))
-        processor.begin_closed_bar_cutoff(0, 1000)
+        processor.arm_closed_bar_cutoff(0, 1000)
         processor.submit_trade(_trade("period-b-1", 1001))
         processor.submit_trade(_trade("period-b-2", 1002))
-        assert processor.future_buffer_size == 2
+        assert len(processor._future_trades) == 2
 
         event = ClosedBarControlEvent(open_time_ms=0, kline=_kline())
         processor.submit_closed_bar(event)
@@ -624,7 +641,7 @@ class TestProcessorClosedBar:
             future_buffer_maxsize=1,
         )
         await processor.start()
-        processor.begin_closed_bar_cutoff(0, 1000)
+        processor.arm_closed_bar_cutoff(0, 1000)
         processor.submit_trade(_trade("first", 1001))
         with pytest.raises(ProcessorOverflowError, match="future Trade buffer"):
             processor.submit_trade(_trade("overflow", 1002))
@@ -654,7 +671,7 @@ class TestProcessorClosedBar:
         await processor.start()
         kline = _kline(open_time_ms=1000, close_time_ms=2000)
         event = ClosedBarControlEvent(open_time_ms=1000, kline=kline)
-        processor.begin_closed_bar_cutoff(1000, 2000)
+        processor.arm_closed_bar_cutoff(1000, 2000)
         processor.submit_closed_bar(event)
         await asyncio.wait_for(event.completion, timeout=2.0)
         await processor.stop()
@@ -693,7 +710,7 @@ class TestProcessorClosedBar:
         processor.submit_trade(_trade("t2"))
         kline = _kline(open_time_ms=1000, close_time_ms=2000)
         cb_event = ClosedBarControlEvent(open_time_ms=1000, kline=kline)
-        processor.begin_closed_bar_cutoff(1000, 2000)
+        processor.arm_closed_bar_cutoff(1000, 2000)
         processor.submit_closed_bar(cb_event)
         processor.submit_trade(_trade("t3", 2001))
         processor.submit_trade(_trade("t4", 2002))
@@ -716,7 +733,7 @@ class TestProcessorClosedBar:
         )
         await processor.start()
         event = ClosedBarControlEvent(open_time_ms=0, kline=_kline())
-        processor.begin_closed_bar_cutoff(0, 1000)
+        processor.arm_closed_bar_cutoff(0, 1000)
         processor.submit_closed_bar(event)
         await event.completion
         with pytest.raises(CausalIntegrityError, match="completed closed-bar boundary"):
@@ -737,7 +754,7 @@ class TestProcessorClosedBar:
 
         processor = MarketEventProcessor(closed_bar_handler=Handler())
         event = ClosedBarControlEvent(open_time_ms=0, kline=_kline())
-        processor.begin_closed_bar_cutoff(0, 1000)
+        processor.arm_closed_bar_cutoff(0, 1000)
         processor.submit_closed_bar(event)
         processor.submit_trade(_trade("late", 1000))
         await processor.start()
@@ -760,7 +777,7 @@ class TestProcessorClosedBar:
         processor = MarketEventProcessor(closed_bar_handler=Handler())
         await processor.start()
         event = ClosedBarControlEvent(open_time_ms=0, kline=_kline())
-        processor.begin_closed_bar_cutoff(0, 1000)
+        processor.arm_closed_bar_cutoff(0, 1000)
         processor.submit_closed_bar(event)
         await started.wait()
 
@@ -792,7 +809,7 @@ class TestProcessorClosedBar:
         await processor.start()
         kline = _kline()
         cb_event = ClosedBarControlEvent(open_time_ms=0, kline=kline)
-        processor.begin_closed_bar_cutoff(0, 1000)
+        processor.arm_closed_bar_cutoff(0, 1000)
         processor.submit_closed_bar(cb_event)
         # Should eventually fail
         with pytest.raises(RuntimeError):

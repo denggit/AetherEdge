@@ -260,10 +260,6 @@ class MarketDataRuntime:
             health=(() if host is None else host.health()),
         )
 
-    @property
-    def supervisor_task(self) -> asyncio.Task[None] | None:
-        return self._supervisor_task
-
     def _log_plan(self, plan: RuntimePlan) -> None:
         self._log(
             "Requested capabilities | capabilities=%s",

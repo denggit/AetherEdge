@@ -40,6 +40,15 @@ class _IdleOrderBookStream:
             yield None
 
 
+class _ControlledTradeStream:
+    def __init__(self) -> None:
+        self.queue = asyncio.Queue()
+
+    async def stream_trades(self):
+        while True:
+            yield await self.queue.get()
+
+
 class _Strategy:
     def __init__(self, *, trade_features=False) -> None:
         self.trade_features = trade_features
@@ -52,6 +61,24 @@ class _Strategy:
             if isinstance(self.trade_features, dict)
             else {"enabled": self.trade_features}
         )
+
+
+class _FeatureObserverStrategy(_Strategy):
+    observer_id = "startup-feature-observer"
+    enabled = True
+
+    def __init__(self) -> None:
+        super().__init__(
+            trade_features={"fixed_time_trade_bars_enabled": True}
+        )
+        self.events = []
+
+    def market_feature_observers(self):
+        return (self,)
+
+    async def on_market_feature(self, event):
+        self.events.append(event)
+        return ()
 
 
 class _Alerts:
@@ -187,7 +214,7 @@ def test_closed_bar_integrity_follows_resolved_trade_pipeline(
     ) is uses_trade
     assert (
         application.runner.runtime_services.market_event_processor is not None
-    )
+    ) is uses_trade
 
 
 @pytest.mark.asyncio
@@ -433,13 +460,15 @@ async def test_formal_composition_instantiates_only_selected_trade_feature(
     assert plan.module_ids == ("trade-stream", expected_module)
     processor = application.market_data._event_processor
     assert processor is not None
-    assert processor.trade_module_ids == (expected_module,)
+    assert tuple(module.module_id for module in processor._modules) == (
+        expected_module,
+    )
     assert created == {"trades": 1, "books": 0}
     await application.market_data.stop()
 
 
 @pytest.mark.asyncio
-async def test_closed_kline_only_creates_control_processor_without_trade_source(
+async def test_closed_kline_only_creates_no_trade_processor_or_source(
     tmp_path,
     monkeypatch,
 ) -> None:
@@ -465,14 +494,128 @@ async def test_closed_kline_only_creates_control_processor_without_trade_source(
     )
 
     assert plan.module_ids == ()
-    assert application.market_data._event_processor is not None
-    assert application.market_data._event_processor.trade_module_ids == ()
+    assert application.market_data._event_processor is None
     assert created == {"trades": 0, "books": 0}
-    with pytest.raises(
-        MarketDataRuntimeError,
-        match="unresolved closed-bar cutoff",
+    await application.market_data.stop()
+
+
+@pytest.mark.asyncio
+async def test_long_startup_extends_one_durable_revision_and_recovers_features(
+    tmp_path, monkeypatch
+) -> None:
+    bucket_start = 1_800_000_000_000
+    stream = _ControlledTradeStream()
+    monkeypatch.setattr(
+        "src.runtime.composition.create_trade_stream",
+        lambda *_args, **_kwargs: stream,
+    )
+    monkeypatch.setattr(
+        "src.runtime.composition.create_order_book_stream",
+        lambda *_args, **_kwargs: _IdleOrderBookStream(),
+    )
+    store = SqliteStateStore(tmp_path / "state.sqlite3")
+    strategy = _FeatureObserverStrategy()
+    application = _compose(
+        tmp_path,
+        _requirements(),
+        strategy,
+        state_store=store,
+    )
+    monkeypatch.setattr(
+        "src.runtime.components.closed_bar.time.time",
+        lambda: (bucket_start + 20_000) / 1000,
+    )
+    await application.market_data.prepare(
+        application.runner._market_data_capabilities
+    )
+    tracker = application.runner.runtime_services.trade_data_integrity_tracker
+    repair_token = tracker.revision
+
+    monkeypatch.setattr(
+        "src.runtime.components.closed_bar.time.time",
+        lambda: (bucket_start + 130_000) / 1000,
+    )
+    startup_started = asyncio.get_running_loop().time()
+    await application.market_data.start_prepared()
+    startup_duration_ms = (
+        asyncio.get_running_loop().time() - startup_started
+    ) * 1000
+
+    for index, event_ms in enumerate(
+        (
+            bucket_start + 130_000,
+            bucket_start + 170_000,
+            bucket_start + 180_000,
+            bucket_start + 240_000,
+        ),
+        start=1,
     ):
-        await application.market_data.stop()
+        await stream.queue.put(
+            MarketTrade(
+                exchange=ExchangeName.OKX,
+                symbol="ETH-USDT-PERP",
+                raw_symbol="ETH-USDT-SWAP",
+                price=Decimal("100"),
+                quantity=Decimal("1"),
+                side=TradeSide.BUY,
+                trade_id=f"startup-{index}",
+                trade_time_ms=event_ms,
+                event_time_ms=event_ms,
+            )
+        )
+        processor = application.market_data._event_processor
+        await asyncio.wait_for(
+            _wait_until(lambda: processor.stats.trades_processed >= index),
+            timeout=1,
+        )
+
+    fixed_time = next(
+        module
+        for module in application.market_data._host.modules
+        if module.module_id == "fixed-time-trade-bars"
+    )
+    durable = store.load_trade_integrity_windows(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+    )
+
+    assert tracker.revision == repair_token == 1
+    assert tracker.dropped_count == 0
+    assert durable == [{
+        "start_ms": bucket_start,
+        "end_ms": bucket_start + 130_000,
+        "last_issue_revision": 1,
+        "repaired_through_revision": 0,
+        "reason": "startup_partial_trade_window",
+        "complete": False,
+    }]
+    assert fixed_time.features_suppressed == 1
+    assert fixed_time.features_emitted == 1
+    assert [event.data["open_time_ms"] for event in strategy.events] == [
+        bucket_start + 180_000
+    ]
+    assert tracker.invalid_reason(
+        bucket_start, bucket_start + 14_400_000 - 1
+    ) is not None
+    assert (
+        application.runner._heartbeat_service.build().last_market_event_ms
+        == bucket_start + 240_000
+    )
+    print(
+        "startup_integrity_smoke "
+        f"startup_duration_ms={startup_duration_ms:.6f} "
+        "startup_partial_duration_ms=110000 "
+        "range_processing_ms=0 "
+        "repair_maintenance_ms=0 "
+        f"feature_processing_ms="
+        f"{processor.stats.module_timings['fixed-time-trade-bars']:.6f}"
+    )
+    await application.market_data.stop()
+
+
+async def _wait_until(predicate) -> None:
+    while not predicate():
+        await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio

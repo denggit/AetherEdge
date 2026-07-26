@@ -54,6 +54,7 @@ class MarketEventProcessor:
         trade_modules: Sequence[Any] = (),
         closed_bar_handler: Any | None = None,
         raw_trade_callback: Callable[[MarketTrade], Awaitable[None]] | None = None,
+        trade_processed_callback: Callable[[int], None] | None = None,
         integrity: TradeDataIntegrityTracker | None = None,
         maxsize: int = 4096,
         future_buffer_maxsize: int | None = None,
@@ -73,6 +74,7 @@ class MarketEventProcessor:
         self._modules = list(trade_modules)
         self._closed_bar_handler = closed_bar_handler
         self._raw_trade_callback = raw_trade_callback
+        self._trade_processed_callback = trade_processed_callback
         self._integrity = integrity
         self._cutoff_timeout = float(cutoff_timeout_seconds)
         self._drain_timeout = float(drain_timeout_seconds)
@@ -93,25 +95,8 @@ class MarketEventProcessor:
         self._modules = list(modules)
 
     @property
-    def trade_module_ids(self) -> tuple[str, ...]:
-        return tuple(module.module_id for module in self._modules)
-
-    @property
-    def queue_size(self) -> int:
-        return self._queue.qsize()
-
-    @property
     def is_accepting(self) -> bool:
         return self._accepting
-
-    @property
-    def future_buffer_size(self) -> int:
-        return len(self._future_trades)
-
-    @property
-    def pending_cutoff(self) -> tuple[int, int] | None:
-        pending = self._pending_cutoff
-        return None if pending is None else pending[:2]
 
     def arm_closed_bar_cutoff(self, open_time_ms: int, close_time_ms: int) -> None:
         if not self._accepting_controls:
@@ -128,9 +113,6 @@ class MarketEventProcessor:
             self._fail(error)
             raise error
         self._pending_cutoff = (*boundary, 0.0)
-
-    def begin_closed_bar_cutoff(self, open_time_ms: int, close_time_ms: int) -> None:
-        self.arm_closed_bar_cutoff(open_time_ms, close_time_ms)
 
     def activate_closed_bar_cutoff(self, now_ms: int) -> None:
         pending = self._pending_cutoff
@@ -395,6 +377,8 @@ class MarketEventProcessor:
             )
         if self._raw_trade_callback is not None:
             await self._raw_trade_callback(trade)
+        if self._trade_processed_callback is not None:
+            self._trade_processed_callback(self.stats.last_event_time_ms)
 
     async def _process_closed_bar(self, event: ClosedBarControlEvent) -> None:
         event.started = True

@@ -80,6 +80,7 @@ class ClosedBarComponent(RuntimeComponent):
         self,
         now_ms: int | None = None,
     ) -> None:
+        self._startup_trade_integrity = None
         tracker = self._trade_integrity_tracker()
         if tracker is None:
             return
@@ -87,16 +88,26 @@ class ClosedBarComponent(RuntimeComponent):
         interval = self._closed_bar_interval_ms
         bucket_start_ms = now_ms - (now_ms % interval)
         if now_ms > bucket_start_ms:
-            tracker.mark_window_incomplete(
+            revision = tracker.mark_window_incomplete(
                 bucket_start_ms,
                 now_ms,
                 "startup_partial_trade_window",
             )
+            self._startup_trade_integrity = (bucket_start_ms, revision)
 
-    def prepare_initial_cutoff(self, now_ms: int | None = None) -> None:
-        self.sync_next_closed_bar_cutoff(
-            int(time.time() * 1000) if now_ms is None else int(now_ms)
-        )
+    def prepare_market_source_start(self, now_ms: int | None = None) -> None:
+        now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        startup_window = self._startup_trade_integrity
+        tracker = self._trade_integrity_tracker()
+        if tracker is not None and startup_window is not None:
+            tracker.extend_incomplete_window(
+                startup_window[0],
+                now,
+                "startup_partial_trade_window",
+                startup_window[1],
+            )
+        if self.requirements.closed_kline.enabled:
+            self.sync_next_closed_bar_cutoff(now)
 
     def sync_next_closed_bar_cutoff(self, now_ms: int) -> None:
         processor = self.service_dependencies().market_event_processor

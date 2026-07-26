@@ -96,6 +96,8 @@ class RangeMicroRepairSupervisor:
         while not stop_event.is_set():
             try:
                 self._refresh_finished_process()
+                self._retry_partial_jobs()
+                self._retry_recoverable_failed_jobs()
                 if self._refresh_callback is not None:
                     self._refresh_callback()
             except asyncio.CancelledError:
@@ -103,25 +105,6 @@ class RangeMicroRepairSupervisor:
             except Exception as exc:
                 logger.warning(
                     "Range micro repair supervisor monitor failed | error=%s",
-                    exc,
-                )
-            try:
-                self._retry_partial_jobs()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning(
-                    "Range micro repair supervisor retry check failed | error=%s",
-                    exc,
-                )
-            try:
-                self._retry_recoverable_failed_jobs()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning(
-                    "Range micro repair supervisor recoverable "
-                    "failed retry check failed | error=%s",
                     exc,
                 )
             try:
@@ -331,17 +314,7 @@ class RangeMicroRepairSupervisor:
         )
 
     def _retry_recoverable_failed_jobs(self) -> None:
-        """Scan the database for FAILED jobs with recoverable errors and retry.
-
-        Conditions (all must be met):
-        * Job status is MICRO_REPAIR_FAILED with a recoverable *last_error*.
-        * The completed aggregate is not already COMPLETE.
-        * The repair journal is finalized and ``valid_for_repair``.
-        * The job has not already been retried this session.
-
-        On match the job is marked MICRO_REPAIR_PENDING (with RETRY_MARKER
-        in *last_error* to prevent re-retry loops) and a worker is launched.
-        """
+        """Retry each eligible durable failure at most once."""
         if self.running:
             return
         try:
