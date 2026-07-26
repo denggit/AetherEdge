@@ -5,6 +5,11 @@ import inspect
 from dataclasses import dataclass
 from typing import Protocol
 
+from src.utils.log import get_logger
+
+
+logger = get_logger(__name__)
+
 
 @dataclass(frozen=True)
 class AppAlert:
@@ -14,7 +19,7 @@ class AppAlert:
 
 
 class AlertSink(Protocol):
-    async def send(self, alert: AppAlert) -> None:
+    async def send(self, alert: AppAlert) -> bool | None:
         ...
 
 
@@ -24,12 +29,15 @@ class NoopAlertSink:
 
 
 class EmailAlertSink:
-    async def send(self, alert: AppAlert) -> None:
+    async def send(self, alert: AppAlert) -> bool | None:
         from src.utils.email_sender import send_email
 
         result = send_email(subject=alert.subject, content=alert.content, content_type="plain")
         if inspect.isawaitable(result):
-            await result
+            result = await result
+        if result is False:
+            raise RuntimeError("email alert sink returned failure")
+        return result
 
 
 class AsyncAlertDispatcher:
@@ -43,6 +51,7 @@ class AsyncAlertDispatcher:
         self._queue: asyncio.Queue[AppAlert] = asyncio.Queue(maxsize=maxsize)
         self._worker: asyncio.Task | None = None
         self.sent = 0
+        self.failed = 0
         self.dropped = 0
 
     def start(self) -> None:
@@ -58,6 +67,16 @@ class AsyncAlertDispatcher:
         except asyncio.CancelledError:
             pass
 
+    async def flush(self, *, timeout_seconds: float) -> bool:
+        try:
+            await asyncio.wait_for(
+                self._queue.join(),
+                timeout=max(0.0, float(timeout_seconds)),
+            )
+        except TimeoutError:
+            return False
+        return True
+
     def emit(self, alert: AppAlert) -> None:
         try:
             self._queue.put_nowait(alert)
@@ -68,7 +87,17 @@ class AsyncAlertDispatcher:
         while True:
             alert = await self._queue.get()
             try:
-                await self._sink.send(alert)
-                self.sent += 1
+                result = await self._sink.send(alert)
+                if result is False:
+                    self.failed += 1
+                else:
+                    self.sent += 1
+            except Exception:
+                self.failed += 1
+                logger.exception(
+                    "Alert sink failed | subject=%s severity=%s",
+                    alert.subject,
+                    alert.severity,
+                )
             finally:
                 self._queue.task_done()

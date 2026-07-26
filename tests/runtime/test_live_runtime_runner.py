@@ -3,10 +3,14 @@ from __future__ import annotations
 import asyncio
 from decimal import Decimal
 
+import pytest
+
 from src.app import (
+    AppAlert,
     AppConfig,
     AppContext,
     AsyncAlertDispatcher,
+    EmailAlertSink,
     NoopAlertSink,
 )
 from src.platform import ExchangeName
@@ -19,6 +23,7 @@ from src.runtime import (
     RuntimePhase,
 )
 from src.signals import SignalAction, TradeSignal
+from src.strategy import StrategyCapabilityError
 
 
 class FakeStrategy:
@@ -152,6 +157,97 @@ def test_non_trade_market_queue_full_records_drop_and_emits_alert():
 
     assert runner.stats.market_events_dropped == 1
     assert alerts._queue.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_capability_error_is_flushed_to_recording_sink(
+    monkeypatch,
+) -> None:
+    app_config = _app_config()
+    recorded: list[AppAlert] = []
+
+    class RecordingSink:
+        async def send(self, alert: AppAlert) -> None:
+            recorded.append(alert)
+
+    alerts = AsyncAlertDispatcher(RecordingSink())
+    context = AppContext(
+        data=FakeData(),
+        execution=FakeExecution(),
+        state_store=FakeStateStore(),
+        strategy=FakeStrategy(),
+        planner=ExecutionPlanner(),
+        alerts=alerts,
+    )
+    runner = LiveRuntimeRunner(
+        app_config=app_config,
+        app_context=context,
+        runtime_config=LiveRuntimeConfig(
+            app=app_config,
+            mode=RuntimeMode.LIVE_RUNTIME,
+        ),
+    )
+    monkeypatch.setenv("AETHER_ENABLE_EMAIL_ALERT", "true")
+    monkeypatch.setenv("EMAIL_SENDER", "real-looking@example.com")
+    monkeypatch.setenv("EMAIL_PASSWORD", "not-a-real-password")
+    monkeypatch.setenv("EMAIL_RECEIVER", "receiver@example.com")
+
+    with pytest.raises(
+        StrategyCapabilityError,
+        match="strategy capability validation failed",
+    ):
+        await runner.run(max_market_events=0)
+
+    assert (await runner.health()).phase is RuntimePhase.ERROR
+    assert len(recorded) == 1
+    assert recorded[0].subject == "AetherEdge live runtime error"
+    assert recorded[0].severity == "error"
+    assert "strategy capability validation failed" in recorded[0].content
+    assert not isinstance(alerts._sink, EmailAlertSink)
+    assert alerts._worker is not None and alerts._worker.done()
+    assert alerts.sent == 1
+    assert alerts.failed == 0
+
+
+@pytest.mark.asyncio
+async def test_capability_error_survives_alert_flush_timeout(
+    monkeypatch,
+) -> None:
+    app_config = _app_config()
+    release = asyncio.Event()
+
+    class BlockingSink:
+        async def send(self, _alert: AppAlert) -> None:
+            await release.wait()
+
+    alerts = AsyncAlertDispatcher(BlockingSink())
+    runner = LiveRuntimeRunner(
+        app_config=app_config,
+        app_context=AppContext(
+            data=FakeData(),
+            execution=FakeExecution(),
+            state_store=FakeStateStore(),
+            strategy=FakeStrategy(),
+            planner=ExecutionPlanner(),
+            alerts=alerts,
+        ),
+        runtime_config=LiveRuntimeConfig(
+            app=app_config,
+            mode=RuntimeMode.LIVE_RUNTIME,
+        ),
+    )
+    monkeypatch.setattr(
+        "src.runtime.runner._FATAL_ALERT_FLUSH_TIMEOUT_SECONDS",
+        0,
+    )
+
+    with pytest.raises(StrategyCapabilityError) as raised:
+        await runner.run(max_market_events=0)
+
+    assert "strategy capability validation failed" in str(raised.value)
+    assert alerts._worker is not None and alerts._worker.done()
+    assert alerts.sent == 0
+    assert alerts.failed == 0
 
 
 def _ticker_event(ts: int) -> MarketTicker:

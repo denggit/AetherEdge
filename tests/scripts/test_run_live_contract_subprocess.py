@@ -131,6 +131,7 @@ def _run_live(
             ),
             "AETHER_REQUIRED_LIVE_STRATEGY": "",
             "AETHER_REQUIRE_LIVE_GATE_REPORTS": "false",
+            "AETHER_ENABLE_EMAIL_ALERT": "0",
             "AETHER_STATE_DB": str(tmp_path / "state.sqlite3"),
             "AETHER_ORDER_JOURNAL_DB": str(tmp_path / "order-journal.sqlite3"),
             "AETHER_POSITION_PLAN_DB": str(tmp_path / "position-plan.sqlite3"),

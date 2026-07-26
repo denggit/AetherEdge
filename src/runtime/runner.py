@@ -43,6 +43,9 @@ from src.runtime.live_types import (
 )
 
 
+_FATAL_ALERT_FLUSH_TIMEOUT_SECONDS = 2.0
+
+
 def _compatibility_component_methods() -> dict[str, type]:
     methods: dict[str, type] = {}
     for component_type in COMPONENT_TYPES:
@@ -285,6 +288,20 @@ class LiveRuntimeRunner(_RunnerCompatibilityFacade):
             )(RuntimePhase.ERROR, healthy=False, error=str(exc))
             logger.exception("Live runtime error")
             self.context.alerts.emit(AppAlert(subject="AetherEdge live runtime error", content=str(exc), severity="error"))
+            flush = getattr(self.context.alerts, "flush", None)
+            if callable(flush):
+                try:
+                    flushed = await flush(
+                        timeout_seconds=_FATAL_ALERT_FLUSH_TIMEOUT_SECONDS,
+                    )
+                    if not flushed:
+                        logger.warning(
+                            "Fatal runtime alert flush timed out | "
+                            "timeout_seconds=%s",
+                            _FATAL_ALERT_FLUSH_TIMEOUT_SECONDS,
+                        )
+                except Exception:
+                    logger.exception("Fatal runtime alert flush failed")
             raise
         finally:
             await self._run_finally_shutdown()

@@ -47,6 +47,7 @@ def pytest_configure(config: pytest.Config) -> None:
     allowed_temp_root = factory.getbasetemp().resolve()
     _session_root = factory.mktemp("aether-runtime-state", numbered=True)
     keys = tuple(_PATH_ENV) + (
+        "AETHER_ENABLE_EMAIL_ALERT",
         "AETHER_PYTEST_SQLITE_GUARD",
         "AETHER_PYTEST_REPO_ROOT",
         "AETHER_PYTEST_STATE_ROOT",
@@ -90,6 +91,7 @@ def _isolate_runtime_state_per_test(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     from strategies.eth_portfolio_v1.domain.mf_data import MfDataBuffer, MfDataReadiness
 
     reset_project_env_config_for_tests()
+    os.environ["AETHER_ENABLE_EMAIL_ALERT"] = "0"
 
     def isolated_heartbeat_service(*, store=None, interval_seconds: float = 15.0):
         resolved = store or RuntimeHeartbeatStore(
@@ -126,6 +128,63 @@ def _isolate_runtime_state_per_test(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         _apply_isolated_environment(_session_root)
 
 
+@pytest.fixture(autouse=True)
+def _forbid_external_email(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+):
+    from src.app.alerts import EmailAlertSink
+    import src.utils.email_sender as email_sender
+
+    attempted_alerts: list[dict[str, str]] = []
+    smtp_attempts: list[str] = []
+    node_id = request.node.nodeid
+
+    def record_alert(subject, content, severity="unknown") -> AssertionError:
+        attempted_alerts.append({
+            "subject": str(subject),
+            "severity": str(severity),
+            "content": str(content),
+        })
+        return AssertionError(
+            _external_email_failure(node_id, attempted_alerts, smtp_attempts)
+        )
+
+    async def forbidden_sink_send(_sink, alert):
+        raise record_alert(alert.subject, alert.content, alert.severity)
+
+    async def forbidden_send_email(
+        subject, content, content_type="plain"
+    ):
+        raise record_alert(subject, content, content_type)
+
+    async def forbidden_sender_send(
+        _sender, subject, content, content_type="plain"
+    ):
+        raise record_alert(subject, content, content_type)
+
+    def forbidden_smtp(*args, **kwargs):
+        smtp_attempts.append(f"args={args!r} kwargs={kwargs!r}")
+        raise AssertionError(
+            _external_email_failure(node_id, attempted_alerts, smtp_attempts)
+        )
+
+    monkeypatch.setattr(EmailAlertSink, "send", forbidden_sink_send)
+    monkeypatch.setattr(email_sender, "send_email", forbidden_send_email)
+    monkeypatch.setattr(
+        email_sender.EmailSender,
+        "send_email_async",
+        forbidden_sender_send,
+    )
+    monkeypatch.setattr(email_sender.smtplib, "SMTP", forbidden_smtp)
+
+    yield
+
+    assert not attempted_alerts and not smtp_attempts, (
+        _external_email_failure(node_id, attempted_alerts, smtp_attempts)
+    )
+
+
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     global _saved_tempdir
     after = build_manifest(repo_root=REPO_ROOT, roots=RUNTIME_ROOTS)
@@ -160,7 +219,23 @@ def _apply_isolated_environment(root: Path) -> None:
     os.environ["AETHER_PYTEST_SQLITE_GUARD"] = "1"
     os.environ["AETHER_PYTEST_REPO_ROOT"] = str(REPO_ROOT)
     os.environ["AETHER_PYTEST_STATE_ROOT"] = str(root)
+    os.environ["AETHER_ENABLE_EMAIL_ALERT"] = "0"
     support = str(REPO_ROOT / "tests" / "_support" / "sqlite_guard")
     current = os.environ.get("PYTHONPATH", "")
     parts = [part for part in current.split(os.pathsep) if part and part != support]
     os.environ["PYTHONPATH"] = os.pathsep.join((support, *parts))
+
+
+def _external_email_failure(
+    node_id: str,
+    attempted_alerts: list[dict[str, str]],
+    smtp_attempts: list[str],
+) -> str:
+    return (
+        "pytest attempted external email | "
+        f"node_id={node_id} "
+        f"alert_count={len(attempted_alerts)} "
+        f"alerts={attempted_alerts!r} "
+        f"smtp_connection_count={len(smtp_attempts)} "
+        f"smtp_attempts={smtp_attempts!r}"
+    )
