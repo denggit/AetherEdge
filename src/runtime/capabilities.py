@@ -9,6 +9,9 @@ from src.runtime.requirements import StrategyRuntimeRequirements
 
 MARKET_TRADES = CapabilityId("market.trades")
 MARKET_ORDER_BOOK = CapabilityId("market.order_book")
+MARKET_ORDER_BOOK_L2 = CapabilityId("market.order_book_l2")
+MARKET_FULL_ORDER_BOOK = CapabilityId("market.full_order_book")
+MARKET_OPEN_INTEREST = CapabilityId("market.open_interest")
 MARKET_CLOSED_KLINES = CapabilityId("market.closed_klines")
 ACCOUNT_PRIVATE_EVENTS = CapabilityId("account.private_events")
 ACCOUNT_SNAPSHOT = CapabilityId("account.snapshot")
@@ -43,6 +46,21 @@ def capability_request_from_requirements(
         and requirements.order_book.stream_enabled
     ):
         requested.add(MARKET_ORDER_BOOK)
+    if (
+        requirements.order_book_l2.enabled
+        and requirements.order_book_l2.stream_enabled
+    ):
+        requested.add(MARKET_ORDER_BOOK_L2)
+    if (
+        requirements.full_order_book.enabled
+        and requirements.full_order_book.polling_enabled
+    ):
+        requested.add(MARKET_FULL_ORDER_BOOK)
+    if (
+        requirements.open_interest.enabled
+        and requirements.open_interest.stream_enabled
+    ):
+        requested.add(MARKET_OPEN_INTEREST)
     if requirements.closed_kline.enabled:
         requested.add(MARKET_CLOSED_KLINES)
     if requirements.range_bars.enabled:
@@ -80,7 +98,10 @@ __all__ = [
     "FEATURE_RANGE_FOOTPRINT",
     "FEATURE_TRADE_FOOTPRINT",
     "MARKET_CLOSED_KLINES",
+    "MARKET_FULL_ORDER_BOOK",
+    "MARKET_OPEN_INTEREST",
     "MARKET_ORDER_BOOK",
+    "MARKET_ORDER_BOOK_L2",
     "MARKET_TRADES",
     "ORDER_POLL",
     "capability_request_from_requirements",

@@ -6,9 +6,27 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Generic, TypeVar
 
-from src.platform.data.models import MarketOrderBook, MarketTrade
-from src.platform.data.websocket.ports import OrderBookStream, TradeStream
-from src.runtime.capabilities import MARKET_ORDER_BOOK, MARKET_TRADES
+from src.platform.data.models import (
+    MarketFullOrderBook,
+    MarketOpenInterest,
+    MarketOrderBook,
+    MarketOrderBookL2,
+    MarketTrade,
+)
+from src.platform.data.polling import FullOrderBookStream
+from src.platform.data.websocket.ports import (
+    OpenInterestStream,
+    OrderBookL2Stream,
+    OrderBookStream,
+    TradeStream,
+)
+from src.runtime.capabilities import (
+    MARKET_FULL_ORDER_BOOK,
+    MARKET_OPEN_INTEREST,
+    MARKET_ORDER_BOOK,
+    MARKET_ORDER_BOOK_L2,
+    MARKET_TRADES,
+)
 from src.runtime.market_data.dispatcher import EventDispatcher
 from src.runtime.market_data.integrity import (
     OrderBookDataIntegrityTracker,
@@ -253,7 +271,119 @@ class OrderBookStreamModule(_StreamModule[MarketOrderBook]):
         )
 
 
+class _LatestStateStreamModule(_StreamModule[EventT]):
+    def __init__(
+        self,
+        *,
+        owner: object,
+        module_id: str,
+        capability: CapabilityId,
+        stream: StreamFactory[EventT],
+        dispatcher: EventDispatcher[EventT],
+        on_error: ModuleErrorHandler | None = None,
+        on_dropped: DroppedEventHandler[EventT] | None = None,
+    ) -> None:
+        self._owner = owner
+        super().__init__(
+            module_id=module_id,
+            capability=capability,
+            stream=stream,
+            dispatcher=dispatcher,
+            on_error=on_error,
+            on_dropped=on_dropped,
+        )
+
+    async def stop(self) -> None:
+        error: BaseException | None = None
+        try:
+            await super().stop()
+        except BaseException as exc:
+            error = exc
+        close = getattr(self._owner, "close", None)
+        if not callable(close):
+            close = getattr(self._owner, "stop", None)
+        if callable(close):
+            try:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+            except BaseException as exc:
+                if error is None:
+                    error = exc
+        if error is not None:
+            raise error
+
+
+class OrderBookL2StreamModule(
+    _LatestStateStreamModule[MarketOrderBookL2]
+):
+    def __init__(
+        self,
+        *,
+        stream: OrderBookL2Stream,
+        dispatcher: EventDispatcher[MarketOrderBookL2],
+        on_error: ModuleErrorHandler | None = None,
+        on_dropped: DroppedEventHandler[MarketOrderBookL2] | None = None,
+    ) -> None:
+        super().__init__(
+            owner=stream,
+            module_id="order-book-l2-stream",
+            capability=MARKET_ORDER_BOOK_L2,
+            stream=stream.stream_order_book_l2,
+            dispatcher=dispatcher,
+            on_error=on_error,
+            on_dropped=on_dropped,
+        )
+
+
+class FullOrderBookPollingModule(
+    _LatestStateStreamModule[MarketFullOrderBook]
+):
+    def __init__(
+        self,
+        *,
+        stream: FullOrderBookStream,
+        dispatcher: EventDispatcher[MarketFullOrderBook],
+        on_error: ModuleErrorHandler | None = None,
+        on_dropped: DroppedEventHandler[MarketFullOrderBook] | None = None,
+    ) -> None:
+        super().__init__(
+            owner=stream,
+            module_id="full-order-book-poller",
+            capability=MARKET_FULL_ORDER_BOOK,
+            stream=stream.stream_full_order_book,
+            dispatcher=dispatcher,
+            on_error=on_error,
+            on_dropped=on_dropped,
+        )
+
+
+class OpenInterestStreamModule(
+    _LatestStateStreamModule[MarketOpenInterest]
+):
+    def __init__(
+        self,
+        *,
+        stream: OpenInterestStream,
+        dispatcher: EventDispatcher[MarketOpenInterest],
+        on_error: ModuleErrorHandler | None = None,
+        on_dropped: DroppedEventHandler[MarketOpenInterest] | None = None,
+    ) -> None:
+        super().__init__(
+            owner=stream,
+            module_id="open-interest-stream",
+            capability=MARKET_OPEN_INTEREST,
+            stream=stream.stream_open_interest,
+            dispatcher=dispatcher,
+            on_error=on_error,
+            on_dropped=on_dropped,
+        )
+
+
 __all__ = [
+    "FullOrderBookPollingModule",
+    "OpenInterestStreamModule",
+    "OrderBookL2StreamModule",
     "OrderBookResyncRequired",
     "OrderBookStreamModule",
     "TradeStreamModule",

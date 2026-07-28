@@ -43,10 +43,14 @@ from src.platform.exchanges.models import (
     TriggerPriceType,
 )
 from src.platform.exchanges.ports import HttpClient
+from src.platform.exchanges.okx.public_rest import (
+    OKX_DEMO_REST_URL,
+    OKX_PROD_REST_URL,
+    OkxPublicRestRequester,
+)
 from src.platform.exchanges.symbols import to_exchange_symbol
 
-OKX_PROD_REST_URL = "https://www.okx.com"
-OKX_DEMO_REST_URL = "https://www.okx.com"
+OKX_BOOKS_FULL_ENDPOINT = "/api/v5/market/books-full"
 
 _OKX_ORDER_STATUS = {
     "live": OrderStatus.NEW,
@@ -54,10 +58,6 @@ _OKX_ORDER_STATUS = {
     "filled": OrderStatus.FILLED,
     "canceled": OrderStatus.CANCELED,
 }
-
-_OKX_TOO_MANY_REQUESTS_CODE = "50011"
-_RETRYABLE_PUBLIC_HTTP_STATUS = {429, 500, 502, 503, 504}
-
 
 class _OkxPrivateWriteRateLimiter:
     """Conservative async limiter for OKX private write calls.
@@ -100,6 +100,10 @@ class OkxExchangeClient:
         self._config = config
         self._http = http_client
         self._base_url = OKX_DEMO_REST_URL if config.sandbox else OKX_PROD_REST_URL
+        self._public_rest = OkxPublicRestRequester(
+            config=config,
+            http_client=http_client,
+        )
         self._private_write_rate_limiter = _OkxPrivateWriteRateLimiter.from_env()
         self.last_historical_trade_pages = 0
 
@@ -809,25 +813,11 @@ class OkxExchangeClient:
         *,
         params: Mapping[str, Any] | None = None,
     ) -> Any:
-        attempts = max(1, int(os.getenv("OKX_PUBLIC_REST_RETRY_ATTEMPTS", "5")))
-        base_sleep = max(0.0, float(os.getenv("OKX_PUBLIC_REST_RETRY_BACKOFF_SECONDS", "2")))
-        max_sleep = max(base_sleep, float(os.getenv("OKX_PUBLIC_REST_RETRY_MAX_SLEEP_SECONDS", "30")))
-        last_error: ExchangeApiError | None = None
-        for attempt in range(1, attempts + 1):
-            try:
-                return await self._http.request(
-                    method,
-                    f"{self._base_url}{path}",
-                    params=params,
-                    timeout_seconds=self._config.timeout_seconds,
-                )
-            except ExchangeApiError as exc:
-                last_error = exc
-                if attempt >= attempts or not _is_retryable_public_error(exc):
-                    raise
-                await asyncio.sleep(_retry_sleep_seconds(attempt, base_sleep=base_sleep, max_sleep=max_sleep))
-        assert last_error is not None
-        raise last_error
+        return await self._public_rest.request(
+            method,
+            path,
+            params=params,
+        )
 
     async def _request_private(
         self,
@@ -875,21 +865,6 @@ class OkxExchangeClient:
 
     def _require_credentials(self) -> None:
         validate_private_credentials(ExchangeName.OKX, self._config)
-
-
-def _is_retryable_public_error(exc: ExchangeApiError) -> bool:
-    if exc.status_code in _RETRYABLE_PUBLIC_HTTP_STATUS:
-        return True
-    payload = exc.payload
-    if isinstance(payload, Mapping) and str(payload.get("code")) == _OKX_TOO_MANY_REQUESTS_CODE:
-        return True
-    return False
-
-
-def _retry_sleep_seconds(attempt: int, *, base_sleep: float, max_sleep: float) -> float:
-    if base_sleep <= 0:
-        return 0.0
-    return min(base_sleep * (2 ** max(0, attempt - 1)), max_sleep)
 
 
 def _okx_timestamp() -> str:

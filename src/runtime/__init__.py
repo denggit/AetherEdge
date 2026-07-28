@@ -4,6 +4,9 @@ from src.runtime.ports import BackgroundTaskQueue, RuntimeServicePort
 from src.runtime.requirements import (
     ClosedKlineRequirement,
     AccountStateRequirement,
+    FullOrderBookRequirement,
+    OpenInterestRequirement,
+    OrderBookL2Requirement,
     OrderBookRequirement,
     OrderStateRequirement,
     PrivateAccountStreamRequirement,
@@ -35,6 +38,9 @@ from src.runtime.registry import (
 )
 from src.runtime.capabilities import (
     CapabilityRequest,
+    MARKET_FULL_ORDER_BOOK,
+    MARKET_OPEN_INTEREST,
+    MARKET_ORDER_BOOK_L2,
     capability_request_from_requirements,
 )
 from src.runtime.strategy_capabilities import (
@@ -54,6 +60,9 @@ __all__ = [
     "CapabilityRegistry",
     "CapabilityResolutionError",
     "CapabilityRequest",
+    "MARKET_FULL_ORDER_BOOK",
+    "MARKET_OPEN_INTEREST",
+    "MARKET_ORDER_BOOK_L2",
     "DependencyResolver",
     "ModuleDefinition",
     "ModuleHealth",
@@ -73,6 +82,9 @@ __all__ = [
     "RuntimeServicePort",
     "ClosedKlineRequirement",
     "AccountStateRequirement",
+    "FullOrderBookRequirement",
+    "OpenInterestRequirement",
+    "OrderBookL2Requirement",
     "OrderBookRequirement",
     "OrderStateRequirement",
     "PrivateAccountStreamRequirement",

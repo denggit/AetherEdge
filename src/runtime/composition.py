@@ -4,7 +4,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from src.app import AppConfig, AppContext, build_app_context
-from src.platform.data.factory import create_order_book_stream, create_trade_stream
+from src.platform.data.factory import (
+    create_full_order_book_stream,
+    create_open_interest_stream,
+    create_order_book_l2_stream,
+    create_order_book_stream,
+    create_trade_stream,
+)
 from src.platform.data.websocket import WebsocketsConnector
 from src.platform.exchanges.models import ExchangeConfig
 from src.runtime.capabilities import capability_request_from_requirements
@@ -162,6 +168,33 @@ def compose_live_runtime(
             reconnect_delay_seconds=1.0,
             max_reconnects=None,
         ),
+        create_order_book_l2_stream=lambda: create_order_book_l2_stream(
+            app_config.data_exchange,
+            symbol=app_config.symbol,
+            config=exchange_config,
+            connector=connector,
+            reconnect=True,
+            reconnect_delay_seconds=1.0,
+            max_reconnects=None,
+        ),
+        create_full_order_book_stream=lambda: create_full_order_book_stream(
+            app_config.data_exchange,
+            symbol=app_config.symbol,
+            config=exchange_config,
+            depth=runner.requirements.full_order_book.depth,
+            poll_interval_seconds=(
+                runner.requirements.full_order_book.poll_interval_seconds
+            ),
+        ),
+        create_open_interest_stream=lambda: create_open_interest_stream(
+            app_config.data_exchange,
+            symbol=app_config.symbol,
+            config=exchange_config,
+            connector=connector,
+            reconnect=True,
+            reconnect_delay_seconds=1.0,
+            max_reconnects=None,
+        ),
         publish_feature=runner.process_market_feature,
         config=module_config,
         create_range_module=(
@@ -171,6 +204,9 @@ def compose_live_runtime(
         ),
         consume_dropped_trade=runner.handle_dropped_trade,
         consume_order_book=runner.enqueue_market_event,
+        consume_order_book_l2=runner.enqueue_market_event,
+        consume_full_order_book=runner.enqueue_market_event,
+        consume_open_interest=runner.enqueue_market_event,
         trade_integrity=trade_integrity,
         order_book_integrity=order_book_integrity,
         trade_processor=trade_processor,
@@ -233,6 +269,9 @@ def _market_module_config(
 ) -> MarketDataModuleConfig:
     return MarketDataModuleConfig(
         order_book_queue_maxsize=max(1, app_config.market_queue_maxsize),
+        order_book_l2_queue_maxsize=1,
+        full_order_book_queue_maxsize=1,
+        open_interest_queue_maxsize=1,
         fixed_time_trade_bars=FixedTimeTradeBarModuleConfig(
             contract_value=config.contract_value,
             large_trade_threshold_notional=config.large_trade_threshold,

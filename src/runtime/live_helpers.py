@@ -6,7 +6,17 @@ from decimal import Decimal
 from typing import Any, Callable, Mapping, Sequence
 from src.order_management.quantity import NativeQuantityConverter
 from src.platform.config import ProjectEnvConfig, get_project_env_config
-from src.platform.data.models import MarketEvent, MarketEventType, MarketKline, MarketOrderBook, MarketTicker, MarketTrade
+from src.platform.data.models import (
+    MarketEvent,
+    MarketEventType,
+    MarketFullOrderBook,
+    MarketKline,
+    MarketOpenInterest,
+    MarketOrderBook,
+    MarketOrderBookL2,
+    MarketTicker,
+    MarketTrade,
+)
 from src.platform.exchanges.models import ExchangeConfig, ExchangeName, InstrumentRule, Order, OrderStatus, Position, PositionMode, PositionSide
 from src.platform.execution.ports import ExecutionClient
 from src.runtime.strategy_positions import (
@@ -40,6 +50,11 @@ def _event_time_ms(event: MarketEvent) -> int | None:
     if isinstance(event, MarketTrade):
         return event.trade_time_ms if event.trade_time_ms is not None else event.event_time_ms
     if isinstance(event, MarketOrderBook):
+        return event.event_time_ms
+    if isinstance(
+        event,
+        (MarketOrderBookL2, MarketFullOrderBook, MarketOpenInterest),
+    ):
         return event.event_time_ms
     if isinstance(event, MarketKline):
         return event.close_time_ms

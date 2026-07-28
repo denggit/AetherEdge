@@ -47,6 +47,26 @@ class OrderBookRequirement:
     stream_enabled: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class OrderBookL2Requirement:
+    enabled: bool = False
+    stream_enabled: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class FullOrderBookRequirement:
+    enabled: bool = False
+    polling_enabled: bool = False
+    depth: int = 5000
+    poll_interval_seconds: float = 3.0
+
+
+@dataclass(frozen=True, slots=True)
+class OpenInterestRequirement:
+    enabled: bool = False
+    stream_enabled: bool = False
+
+
 @dataclass(frozen=True)
 class RangeBarRequirement:
     enabled: bool = False
@@ -106,6 +126,15 @@ class StrategyRuntimeRequirements:
     closed_kline: ClosedKlineRequirement = field(default_factory=ClosedKlineRequirement)
     trades: TradeStreamRequirement = field(default_factory=TradeStreamRequirement)
     order_book: OrderBookRequirement = field(default_factory=OrderBookRequirement)
+    order_book_l2: OrderBookL2Requirement = field(
+        default_factory=OrderBookL2Requirement
+    )
+    full_order_book: FullOrderBookRequirement = field(
+        default_factory=FullOrderBookRequirement
+    )
+    open_interest: OpenInterestRequirement = field(
+        default_factory=OpenInterestRequirement
+    )
     range_bars: RangeBarRequirement = field(default_factory=RangeBarRequirement)
     private_account_stream: PrivateAccountStreamRequirement = field(default_factory=PrivateAccountStreamRequirement)
     account_state: AccountStateRequirement = field(default_factory=AccountStateRequirement)
@@ -126,6 +155,9 @@ class StrategyRuntimeRequirements:
             closed_kline=_closed_kline(raw.get("closed_kline")),
             trades=_trades(raw.get("trades")),
             order_book=_order_book(raw.get("order_book")),
+            order_book_l2=_order_book_l2(raw.get("order_book_l2")),
+            full_order_book=_full_order_book(raw.get("full_order_book")),
+            open_interest=_open_interest(raw.get("open_interest")),
             range_bars=_range_bars(raw.get("range_bars")),
             private_account_stream=_private_account(raw.get("private_account_stream")),
             account_state=_account_state(raw.get("account_state")),
@@ -146,9 +178,30 @@ class StrategyRuntimeRequirements:
     @classmethod
     def from_data_streams(cls, data_streams: tuple[str, ...]) -> "StrategyRuntimeRequirements":
         streams = {item.strip().lower() for item in data_streams}
+        order_book_l2 = bool(
+            streams.intersection({"order_book_l2", "books400"})
+        )
+        full_order_book = bool(
+            streams.intersection({"full_order_book", "books5000"})
+        )
+        open_interest = bool(
+            streams.intersection({"open_interest", "oi"})
+        )
         return cls(
             trades=TradeStreamRequirement(enabled="trades" in streams, stream_enabled="trades" in streams),
             order_book=OrderBookRequirement(enabled=("order_book" in streams or "books" in streams), stream_enabled=("order_book" in streams or "books" in streams)),
+            order_book_l2=OrderBookL2Requirement(
+                enabled=order_book_l2,
+                stream_enabled=order_book_l2,
+            ),
+            full_order_book=FullOrderBookRequirement(
+                enabled=full_order_book,
+                polling_enabled=full_order_book,
+            ),
+            open_interest=OpenInterestRequirement(
+                enabled=open_interest,
+                stream_enabled=open_interest,
+            ),
         )
 
 
@@ -164,6 +217,25 @@ def validate_strategy_runtime_requirements(
     if type(requirements.capability_manifest_declared) is not bool:
         raise StrategyCapabilityError(
             "strategy capability_manifest_declared must be bool"
+        )
+    full_order_book = requirements.full_order_book
+    if (
+        type(full_order_book.depth) is not int
+        or not 1 <= full_order_book.depth <= 5000
+    ):
+        raise StrategyCapabilityError(
+            "full order book depth must be an integer between 1 and 5000"
+        )
+    if (
+        isinstance(full_order_book.poll_interval_seconds, bool)
+        or not isinstance(
+            full_order_book.poll_interval_seconds,
+            (int, float),
+        )
+        or float(full_order_book.poll_interval_seconds) < 1.0
+    ):
+        raise StrategyCapabilityError(
+            "full order book poll_interval_seconds must be at least 1.0"
         )
 
     capabilities = requirements.capabilities
@@ -287,6 +359,44 @@ def _order_book(value: Any) -> OrderBookRequirement:
     raw = _mapping(value)
     enabled = _bool(raw.get("enabled"), False)
     return OrderBookRequirement(enabled=enabled, stream_enabled=_bool(raw.get("stream_enabled"), enabled))
+
+
+def _order_book_l2(value: Any) -> OrderBookL2Requirement:
+    raw = _mapping(value)
+    enabled = _bool(raw.get("enabled"), False)
+    return OrderBookL2Requirement(
+        enabled=enabled,
+        stream_enabled=_bool(raw.get("stream_enabled"), enabled),
+    )
+
+
+def _full_order_book(value: Any) -> FullOrderBookRequirement:
+    raw = _mapping(value)
+    enabled = _bool(raw.get("enabled"), False)
+    try:
+        depth = int(raw.get("depth", 5000))
+        poll_interval_seconds = float(
+            raw.get("poll_interval_seconds", 3.0)
+        )
+    except (TypeError, ValueError) as exc:
+        raise StrategyCapabilityError(
+            "full order book depth and poll interval must be numeric"
+        ) from exc
+    return FullOrderBookRequirement(
+        enabled=enabled,
+        polling_enabled=_bool(raw.get("polling_enabled"), enabled),
+        depth=depth,
+        poll_interval_seconds=poll_interval_seconds,
+    )
+
+
+def _open_interest(value: Any) -> OpenInterestRequirement:
+    raw = _mapping(value)
+    enabled = _bool(raw.get("enabled"), False)
+    return OpenInterestRequirement(
+        enabled=enabled,
+        stream_enabled=_bool(raw.get("stream_enabled"), enabled),
+    )
 
 
 def _range_bars(value: Any) -> RangeBarRequirement:

@@ -13,13 +13,22 @@ class ResolvedMarketPipelinePlan:
     closed_kline_enabled: bool
     order_book_enabled: bool
     enabled_module_ids: tuple[str, ...]
+    order_book_l2_enabled: bool = False
+    full_order_book_enabled: bool = False
+    open_interest_enabled: bool = False
 
     @property
     def ordered_trade_module_ids(self) -> tuple[str, ...]:
         return tuple(
             module_id
             for module_id in self.enabled_module_ids
-            if module_id != "trade-stream"
+            if module_id not in {
+                "trade-stream",
+                "order-book-stream",
+                "order-book-l2-stream",
+                "full-order-book-poller",
+                "open-interest-stream",
+            }
         )
 
 
@@ -68,6 +77,22 @@ def resolve_market_pipeline(
         enabled.append("range-bars")
     if raw_trades:
         enabled.append("raw-trade-callback")
+    order_book_enabled = (
+        requirements.order_book.enabled
+        and requirements.order_book.stream_enabled
+    )
+    order_book_l2_enabled = (
+        requirements.order_book_l2.enabled
+        and requirements.order_book_l2.stream_enabled
+    )
+    full_order_book_enabled = (
+        requirements.full_order_book.enabled
+        and requirements.full_order_book.polling_enabled
+    )
+    open_interest_enabled = (
+        requirements.open_interest.enabled
+        and requirements.open_interest.stream_enabled
+    )
     enabled_set = frozenset(enabled)
     ordered = tuple(
         module_id for module_id in _DEFAULT_ORDER if module_id in enabled_set
@@ -75,13 +100,30 @@ def resolve_market_pipeline(
     return ResolvedMarketPipelinePlan(
         trades_enabled=trades_enabled,
         closed_kline_enabled=requirements.closed_kline.enabled,
-        order_book_enabled=(
-            requirements.order_book.enabled
-            and requirements.order_book.stream_enabled
-        ),
+        order_book_enabled=order_book_enabled,
         enabled_module_ids=(
-            (("trade-stream",) if trades_enabled else ()) + ordered
+            (("trade-stream",) if trades_enabled else ())
+            + ordered
+            + (("order-book-stream",) if order_book_enabled else ())
+            + (
+                ("order-book-l2-stream",)
+                if order_book_l2_enabled
+                else ()
+            )
+            + (
+                ("full-order-book-poller",)
+                if full_order_book_enabled
+                else ()
+            )
+            + (
+                ("open-interest-stream",)
+                if open_interest_enabled
+                else ()
+            )
         ),
+        order_book_l2_enabled=order_book_l2_enabled,
+        full_order_book_enabled=full_order_book_enabled,
+        open_interest_enabled=open_interest_enabled,
     )
 
 

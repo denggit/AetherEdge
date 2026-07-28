@@ -7,8 +7,11 @@ from src.platform.account.events import AccountEvent
 from src.platform.data.models import (
     MarketEvent,
     MarketEventType,
+    MarketFullOrderBook,
     MarketKline,
+    MarketOpenInterest,
     MarketOrderBook,
+    MarketOrderBookL2,
     MarketTicker,
     MarketTrade,
 )
@@ -42,6 +45,21 @@ class StrategyHost:
             handler = getattr(self._strategy, "on_trade", None)
         elif isinstance(event, MarketOrderBook) or event.event_type is MarketEventType.ORDER_BOOK:
             handler = getattr(self._strategy, "on_order_book", None)
+        elif (
+            isinstance(event, MarketOrderBookL2)
+            or event.event_type is MarketEventType.ORDER_BOOK_L2
+        ):
+            handler = getattr(self._strategy, "on_order_book_l2", None)
+        elif (
+            isinstance(event, MarketFullOrderBook)
+            or event.event_type is MarketEventType.FULL_ORDER_BOOK
+        ):
+            handler = getattr(self._strategy, "on_full_order_book", None)
+        elif (
+            isinstance(event, MarketOpenInterest)
+            or event.event_type is MarketEventType.OPEN_INTEREST
+        ):
+            handler = getattr(self._strategy, "on_open_interest", None)
         else:
             handler = None
         if not callable(handler):

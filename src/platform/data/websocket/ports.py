@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from typing import AsyncIterator, Protocol
 
-from src.platform.data.models import MarketOrderBook, MarketTrade
+from src.platform.data.models import (
+    MarketOpenInterest,
+    MarketOrderBook,
+    MarketOrderBookL2,
+    MarketTrade,
+)
 
 
 class WebSocketConnection(Protocol):
@@ -28,4 +33,14 @@ class TradeStream(Protocol):
 
 class OrderBookStream(Protocol):
     async def stream_order_book(self) -> AsyncIterator[MarketOrderBook]:
+        ...
+
+
+class OrderBookL2Stream(Protocol):
+    async def stream_order_book_l2(self) -> AsyncIterator[MarketOrderBookL2]:
+        ...
+
+
+class OpenInterestStream(Protocol):
+    async def stream_open_interest(self) -> AsyncIterator[MarketOpenInterest]:
         ...

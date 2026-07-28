@@ -99,7 +99,13 @@ class MarketDataRuntime:
         source_by_id = {module.module_id: module for module in modules}
         self._source_modules = tuple(
             source_by_id[module_id]
-            for module_id in ("trade-stream", "order-book-stream")
+            for module_id in (
+                "trade-stream",
+                "order-book-stream",
+                "order-book-l2-stream",
+                "full-order-book-poller",
+                "open-interest-stream",
+            )
             if module_id in source_by_id
         )
         self._consumer_modules = tuple(

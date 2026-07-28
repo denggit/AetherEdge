@@ -11,7 +11,20 @@ from src.platform.data.websocket.okx import (
     OkxOrderBookWebSocketFeed,
     OkxTradeWebSocketFeed,
 )
-from src.platform.data.websocket.ports import OrderBookStream, TradeStream, WebSocketConnection, WebSocketConnector
+from src.platform.data.websocket.okx_open_interest import (
+    OkxOpenInterestWebSocketFeed,
+)
+from src.platform.data.websocket.okx_order_book_l2 import (
+    OkxOrderBookL2WebSocketFeed,
+)
+from src.platform.data.websocket.ports import (
+    OpenInterestStream,
+    OrderBookL2Stream,
+    OrderBookStream,
+    TradeStream,
+    WebSocketConnection,
+    WebSocketConnector,
+)
 
 __all__ = [
     "BINANCE_USDM_TESTNET_WS_URL",
@@ -21,7 +34,11 @@ __all__ = [
     "OKX_DEMO_PUBLIC_WS_URL",
     "OKX_PUBLIC_WS_URL",
     "OkxOrderBookWebSocketFeed",
+    "OkxOrderBookL2WebSocketFeed",
+    "OkxOpenInterestWebSocketFeed",
     "OkxTradeWebSocketFeed",
+    "OpenInterestStream",
+    "OrderBookL2Stream",
     "OrderBookStream",
     "TradeStream",
     "WebSocketConnection",

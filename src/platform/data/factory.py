@@ -4,19 +4,32 @@ from pathlib import Path
 
 from src.platform.data.ports import MarketDataFeed
 from src.platform.data.rest_feed import RestMarketDataFeed
+from src.platform.data.polling import (
+    FullOrderBookPollingStream,
+    FullOrderBookStream,
+)
+from src.platform.data.rest import (
+    OkxFullOrderBookRestClient,
+)
 from src.platform.data.storage import MarketDataStore, SqliteMarketDataStore
 from src.platform.data.websocket import (
     BinanceOrderBookWebSocketFeed,
     BinanceTradeWebSocketFeed,
+    OkxOpenInterestWebSocketFeed,
+    OkxOrderBookL2WebSocketFeed,
     OkxOrderBookWebSocketFeed,
     OkxTradeWebSocketFeed,
+    OpenInterestStream,
+    OrderBookL2Stream,
     OrderBookStream,
     TradeStream,
     WebSocketConnector,
     WebsocketsConnector,
 )
 from src.platform.exchanges.factory import create_exchange_client, normalize_exchange_name
+from src.platform.exchanges.http import RequestsHttpClient
 from src.platform.exchanges.models import ExchangeConfig, ExchangeName
+from src.platform.exchanges.okx.public_rest import OkxPublicRestRequester
 from src.platform.markets import MarketProfile, get_market_profile
 from src.platform.exchanges.ports import ExchangeMarketDataClient, HttpClient
 
@@ -150,8 +163,93 @@ def create_order_book_stream(
     raise ValueError(f"Unsupported exchange for order book stream: {exchange.value}")
 
 
+def create_order_book_l2_stream(
+    exchange: ExchangeName | str,
+    *,
+    symbol: str,
+    config: ExchangeConfig | None = None,
+    connector: WebSocketConnector | None = None,
+    reconnect: bool = True,
+    reconnect_delay_seconds: float = 1.0,
+    max_reconnects: int | None = None,
+) -> OrderBookL2Stream:
+    exchange_name = normalize_exchange_name(exchange)
+    if exchange_name != ExchangeName.OKX:
+        raise ValueError(
+            "Unsupported exchange for L2 order book stream: "
+            f"{exchange_name.value}"
+        )
+    cfg = config or ExchangeConfig()
+    return OkxOrderBookL2WebSocketFeed(
+        symbol=symbol,
+        connector=connector or WebsocketsConnector(),
+        sandbox=cfg.sandbox,
+        reconnect=reconnect,
+        reconnect_delay_seconds=reconnect_delay_seconds,
+        max_reconnects=max_reconnects,
+    )
+
+
+def create_full_order_book_stream(
+    exchange: ExchangeName | str,
+    *,
+    symbol: str,
+    config: ExchangeConfig | None = None,
+    http_client: HttpClient | None = None,
+    depth: int = 5000,
+    poll_interval_seconds: float = 3.0,
+) -> FullOrderBookStream:
+    exchange_name = normalize_exchange_name(exchange)
+    if exchange_name != ExchangeName.OKX:
+        raise ValueError(
+            "Unsupported exchange for full order book stream: "
+            f"{exchange_name.value}"
+        )
+    cfg = config or ExchangeConfig()
+    requester = OkxPublicRestRequester(
+        config=cfg,
+        http_client=http_client or RequestsHttpClient(),
+    )
+    return FullOrderBookPollingStream(
+        fetcher=OkxFullOrderBookRestClient(requester=requester),
+        symbol=symbol,
+        depth=depth,
+        poll_interval_seconds=poll_interval_seconds,
+    )
+
+
+def create_open_interest_stream(
+    exchange: ExchangeName | str,
+    *,
+    symbol: str,
+    config: ExchangeConfig | None = None,
+    connector: WebSocketConnector | None = None,
+    reconnect: bool = True,
+    reconnect_delay_seconds: float = 1.0,
+    max_reconnects: int | None = None,
+) -> OpenInterestStream:
+    exchange_name = normalize_exchange_name(exchange)
+    if exchange_name != ExchangeName.OKX:
+        raise ValueError(
+            "Unsupported exchange for open interest stream: "
+            f"{exchange_name.value}"
+        )
+    cfg = config or ExchangeConfig()
+    return OkxOpenInterestWebSocketFeed(
+        symbol=symbol,
+        connector=connector or WebsocketsConnector(),
+        sandbox=cfg.sandbox,
+        reconnect=reconnect,
+        reconnect_delay_seconds=reconnect_delay_seconds,
+        max_reconnects=max_reconnects,
+    )
+
+
 __all__ = [
+    "create_full_order_book_stream",
     "create_market_data_feed",
+    "create_open_interest_stream",
+    "create_order_book_l2_stream",
     "create_order_book_stream",
     "create_trade_stream",
 ]

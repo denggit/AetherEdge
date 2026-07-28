@@ -13,6 +13,9 @@ class MarketEventType(str, Enum):
     TICKER = "ticker"
     TRADE = "trade"
     ORDER_BOOK = "order_book"
+    ORDER_BOOK_L2 = "order_book_l2"
+    FULL_ORDER_BOOK = "full_order_book"
+    OPEN_INTEREST = "open_interest"
 
 
 class MarketDataSource(str, Enum):
@@ -83,10 +86,11 @@ class MarketTrade:
         return MarketEventType.TRADE
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class OrderBookLevel:
     price: Decimal
     quantity: Decimal
+    order_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -105,7 +109,69 @@ class MarketOrderBook:
         return MarketEventType.ORDER_BOOK
 
 
-MarketEvent = MarketKline | MarketTicker | MarketTrade | MarketOrderBook
+@dataclass(frozen=True, slots=True)
+class MarketOrderBookL2:
+    exchange: ExchangeName
+    symbol: str
+    raw_symbol: str
+    bids: tuple[OrderBookLevel, ...]
+    asks: tuple[OrderBookLevel, ...]
+    event_time_ms: int
+    sequence_id: int
+    previous_sequence_id: int
+    depth: int = 400
+    source: MarketDataSource = MarketDataSource.WEBSOCKET
+    raw: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def event_type(self) -> MarketEventType:
+        return MarketEventType.ORDER_BOOK_L2
+
+
+@dataclass(frozen=True, slots=True)
+class MarketFullOrderBook:
+    exchange: ExchangeName
+    symbol: str
+    raw_symbol: str
+    bids: tuple[OrderBookLevel, ...]
+    asks: tuple[OrderBookLevel, ...]
+    event_time_ms: int
+    requested_depth: int
+    source: MarketDataSource = MarketDataSource.REST
+    raw: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def event_type(self) -> MarketEventType:
+        return MarketEventType.FULL_ORDER_BOOK
+
+
+@dataclass(frozen=True, slots=True)
+class MarketOpenInterest:
+    exchange: ExchangeName
+    symbol: str
+    raw_symbol: str
+    instrument_type: str
+    open_interest_contracts: Decimal
+    open_interest_base: Decimal | None
+    open_interest_usd: Decimal | None
+    event_time_ms: int
+    source: MarketDataSource = MarketDataSource.WEBSOCKET
+    raw: Mapping[str, Any] = field(default_factory=dict)
+
+    @property
+    def event_type(self) -> MarketEventType:
+        return MarketEventType.OPEN_INTEREST
+
+
+MarketEvent = (
+    MarketKline
+    | MarketTicker
+    | MarketTrade
+    | MarketOrderBook
+    | MarketOrderBookL2
+    | MarketFullOrderBook
+    | MarketOpenInterest
+)
 
 
 def market_kline_from_exchange(kline: Kline) -> MarketKline:

@@ -1,3 +1,6 @@
-from src.platform.exchanges.okx.client import OkxExchangeClient
+from src.platform.exchanges.okx.client import (
+    OKX_BOOKS_FULL_ENDPOINT,
+    OkxExchangeClient,
+)
 
-__all__ = ["OkxExchangeClient"]
+__all__ = ["OKX_BOOKS_FULL_ENDPOINT", "OkxExchangeClient"]

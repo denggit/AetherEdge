@@ -5,6 +5,9 @@ from src.runtime.market_data.dispatcher import (
     SubscriptionHealth,
 )
 from src.runtime.market_data.sources import (
+    FullOrderBookPollingModule,
+    OpenInterestStreamModule,
+    OrderBookL2StreamModule,
     OrderBookStreamModule,
     TradeStreamModule,
 )
@@ -35,9 +38,12 @@ __all__ = [
     "DispatchResult",
     "FixedTimeTradeBarModule",
     "FixedTimeTradeBarModuleConfig",
+    "FullOrderBookPollingModule",
     "MarketDataRuntime",
     "MarketDataRuntimeState",
     "MarketDataModuleConfig",
+    "OpenInterestStreamModule",
+    "OrderBookL2StreamModule",
     "OrderBookStreamModule",
     "RangeFootprintModule",
     "RangeBarModule",

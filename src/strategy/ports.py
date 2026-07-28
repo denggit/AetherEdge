@@ -4,7 +4,15 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from src.platform.account.events import AccountEvent
-from src.platform.data.models import MarketKline, MarketOrderBook, MarketTicker, MarketTrade
+from src.platform.data.models import (
+    MarketFullOrderBook,
+    MarketKline,
+    MarketOpenInterest,
+    MarketOrderBook,
+    MarketOrderBookL2,
+    MarketTicker,
+    MarketTrade,
+)
 from src.platform.snapshot import PlatformSnapshot
 from src.reconcile.models import ReconcileReport
 from src.signals import TradeSignal
@@ -61,6 +69,30 @@ class RecoverableStrategyPort(Protocol):
     """Optional strategy extension used by runtime recovery."""
 
     async def recover(self, context: StrategyRecoveryContext) -> Sequence[TradeSignal]:
+        ...
+
+
+class OrderBookL2StrategyPort(Protocol):
+    async def on_order_book_l2(
+        self,
+        order_book: MarketOrderBookL2,
+    ) -> Sequence[TradeSignal]:
+        ...
+
+
+class FullOrderBookStrategyPort(Protocol):
+    async def on_full_order_book(
+        self,
+        order_book: MarketFullOrderBook,
+    ) -> Sequence[TradeSignal]:
+        ...
+
+
+class OpenInterestStrategyPort(Protocol):
+    async def on_open_interest(
+        self,
+        open_interest: MarketOpenInterest,
+    ) -> Sequence[TradeSignal]:
         ...
 
 
