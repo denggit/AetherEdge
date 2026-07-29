@@ -35,7 +35,7 @@ class PersistenceComponent(RuntimeComponent):
                 writer_name="live-persistence-writer",
             )
             self._runtime_persistence_service = service
-            self.service_dependencies().runtime_persistence_service = service
+            self._runtime_service_bundle().persistence.runtime = service
         return service
 
     def _get_market_data_persistence(self) -> RuntimeMarketDataPersistence:
@@ -45,8 +45,8 @@ class PersistenceComponent(RuntimeComponent):
             pass
         persistence = getattr(self, "_market_data_persistence", None)
         if persistence is None:
-            services = self.service_dependencies()
-            persistence = services.market_data_persistence
+            services = self._runtime_service_bundle().persistence
+            persistence = services.market_data
             if persistence is None:
                 persistence = RuntimeMarketDataPersistence(
                     persistence_service=self._get_runtime_persistence_service(),
@@ -60,14 +60,14 @@ class PersistenceComponent(RuntimeComponent):
                     exchange=self.app_config.data_exchange.value,
                     clock_ms=lambda: int(time.time() * 1000),
                 )
-                services.market_data_persistence = persistence
+                services.market_data = persistence
             self._market_data_persistence = persistence
         return persistence
 
     def _get_live_persistence_writer(self) -> _BackgroundWriteQueue:
         writer = self._get_runtime_persistence_service().get_writer()
         self._live_persistence_writer = writer
-        self.service_dependencies().live_persistence_writer = writer
+        self._runtime_service_bundle().persistence.writer = writer
         return writer  # type: ignore[return-value]
 
     def _on_live_persistence_write_rejected(self, description: str) -> None:

@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Any, Mapping
 from urllib.parse import urlencode
 
+from src.platform.data.models import MarketKline, MarketTicker
 from src.platform.exchanges.errors import ExchangeApiError, ExchangeConfigError, ExchangeMappingError
 from src.platform.exchanges.credentials import validate_private_credentials
 from src.platform.exchanges.models import (
@@ -18,7 +19,6 @@ from src.platform.exchanges.models import (
     ExchangeConfig,
     ExchangeName,
     InstrumentRule,
-    Kline,
     LeverageInfo,
     LeverageRequest,
     MarginMode,
@@ -33,7 +33,6 @@ from src.platform.exchanges.models import (
     PositionSide,
     StopMarketOrderRequest,
     StopOrderQuery,
-    Ticker,
     TimeInForce,
     TriggerPriceType,
 )
@@ -80,7 +79,7 @@ class BinanceExchangeClient:
         start_time_ms: int | None = None,
         end_time_ms: int | None = None,
         oldest_first: bool = False,
-    ) -> list[Kline]:
+    ) -> list[MarketKline]:
         raw_symbol = to_exchange_symbol(self.exchange, symbol)
         params = {
             "symbol": raw_symbol,
@@ -92,10 +91,10 @@ class BinanceExchangeClient:
         payload = await self._request_public("GET", "/fapi/v1/klines", params=params)
         return [_map_binance_kline(row, symbol=symbol, raw_symbol=raw_symbol, interval=interval) for row in payload]
 
-    async def fetch_ticker(self, symbol: str) -> Ticker:
+    async def fetch_ticker(self, symbol: str) -> MarketTicker:
         raw_symbol = to_exchange_symbol(self.exchange, symbol)
         payload = await self._request_public("GET", "/fapi/v1/ticker/price", params={"symbol": raw_symbol})
-        return Ticker(
+        return MarketTicker(
             exchange=self.exchange,
             symbol=symbol,
             raw_symbol=raw_symbol,
@@ -514,10 +513,12 @@ class BinanceExchangeClient:
         validate_private_credentials(ExchangeName.BINANCE, self._config)
 
 
-def _map_binance_kline(row: list[Any], *, symbol: str, raw_symbol: str, interval: str) -> Kline:
+def _map_binance_kline(
+    row: list[Any], *, symbol: str, raw_symbol: str, interval: str
+) -> MarketKline:
     if len(row) < 8:
         raise ExchangeMappingError("Binance kline row is too short", payload=row)
-    return Kline(
+    return MarketKline(
         exchange=ExchangeName.BINANCE,
         symbol=symbol,
         raw_symbol=raw_symbol,

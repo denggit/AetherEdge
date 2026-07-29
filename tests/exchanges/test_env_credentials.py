@@ -8,6 +8,7 @@ from src.platform.config import (
 )
 from src.platform.exchanges import ExchangeConfig, ExchangeName
 from src.platform.exchanges.binance.credentials import resolve_binance_credentials
+from src.platform.exchanges.config_loader import load_exchange_config
 from src.platform.exchanges.credentials import validate_private_credentials
 from src.platform.exchanges.errors import PrivateCredentialValidationError
 from src.platform.exchanges.okx.credentials import resolve_okx_credentials
@@ -91,7 +92,7 @@ def test_binance_credentials_use_only_maintained_key_names():
     assert resolve_binance_credentials(cfg, env) == ("binance_key", "binance_secret")
 
 
-def test_exchange_config_from_env_resolves_okx_strict_keys(tmp_path):
+def test_load_exchange_config_resolves_okx_strict_keys(tmp_path):
     env_file = tmp_path / "okx.env"
     env_file.write_text(
         "OKX_API_KEY=fake_okx_file_key\n"
@@ -112,14 +113,14 @@ def test_exchange_config_from_env_resolves_okx_strict_keys(tmp_path):
         )
     )
 
-    cfg = ExchangeConfig.from_env(ExchangeName.OKX)
+    cfg = load_exchange_config(ExchangeName.OKX)
 
     assert cfg.api_key == "fake_okx_process_key"
     assert cfg.api_secret == "fake_okx_process_secret"
     assert cfg.passphrase == "fake_okx_process_pass"
 
 
-def test_exchange_config_from_env_resolves_binance_strict_keys(tmp_path):
+def test_load_exchange_config_resolves_binance_strict_keys(tmp_path):
     env_file = tmp_path / "binance.env"
     env_file.write_text(
         "BINANCE_API_KEY=fake_binance_file_key\n"
@@ -137,7 +138,7 @@ def test_exchange_config_from_env_resolves_binance_strict_keys(tmp_path):
         )
     )
 
-    cfg = ExchangeConfig.from_env(ExchangeName.BINANCE)
+    cfg = load_exchange_config(ExchangeName.BINANCE)
 
     assert cfg.api_key == "fake_binance_process_key"
     assert cfg.api_secret == "fake_binance_process_secret"
@@ -165,8 +166,8 @@ def test_exchange_config_uses_process_keys_from_global_project_snapshot(tmp_path
     )
     set_project_env_config(project_env)
 
-    okx = ExchangeConfig.from_env(ExchangeName.OKX)
-    binance = ExchangeConfig.from_env(ExchangeName.BINANCE)
+    okx = load_exchange_config(ExchangeName.OKX)
+    binance = load_exchange_config(ExchangeName.BINANCE)
 
     assert (okx.api_key, okx.api_secret, okx.passphrase) == (
         "okx_process_key",

@@ -13,8 +13,6 @@ from src.platform.data.rest import (
 )
 from src.platform.data.storage import MarketDataStore, SqliteMarketDataStore
 from src.platform.data.websocket import (
-    BinanceOrderBookWebSocketFeed,
-    BinanceTradeWebSocketFeed,
     OkxOpenInterestWebSocketFeed,
     OkxOrderBookL2WebSocketFeed,
     OkxOrderBookWebSocketFeed,
@@ -59,6 +57,7 @@ def create_market_data_feed(
     """
 
     exchange_name = normalize_exchange_name(exchange)
+    _require_okx_market_data(exchange_name)
     profile = market_profile or get_market_profile(symbol)
     symbol = profile.symbol
     cfg = config or ExchangeConfig()
@@ -98,6 +97,8 @@ def create_market_data_feed(
         trade_stream=trade_stream,
         order_book_stream=order_book_stream,
         store=data_store,
+        supports_trade_max_pages=True,
+        supports_partial_trade_pagination=True,
     )
 
 
@@ -120,16 +121,9 @@ def create_trade_stream(
             reconnect_delay_seconds=reconnect_delay_seconds,
             max_reconnects=max_reconnects,
         )
-    if exchange == ExchangeName.BINANCE:
-        return BinanceTradeWebSocketFeed(
-            symbol=symbol,
-            connector=connector,
-            sandbox=config.sandbox,
-            reconnect=reconnect,
-            reconnect_delay_seconds=reconnect_delay_seconds,
-            max_reconnects=max_reconnects,
-        )
-    raise ValueError(f"Unsupported exchange for trade stream: {exchange.value}")
+    raise ValueError(
+        f"OKX is the only supported market-data exchange; got {exchange.value}"
+    )
 
 
 def create_order_book_stream(
@@ -151,16 +145,9 @@ def create_order_book_stream(
             reconnect_delay_seconds=reconnect_delay_seconds,
             max_reconnects=max_reconnects,
         )
-    if exchange == ExchangeName.BINANCE:
-        return BinanceOrderBookWebSocketFeed(
-            symbol=symbol,
-            connector=connector,
-            sandbox=config.sandbox,
-            reconnect=reconnect,
-            reconnect_delay_seconds=reconnect_delay_seconds,
-            max_reconnects=max_reconnects,
-        )
-    raise ValueError(f"Unsupported exchange for order book stream: {exchange.value}")
+    raise ValueError(
+        f"OKX is the only supported market-data exchange; got {exchange.value}"
+    )
 
 
 def create_order_book_l2_stream(
@@ -174,11 +161,7 @@ def create_order_book_l2_stream(
     max_reconnects: int | None = None,
 ) -> OrderBookL2Stream:
     exchange_name = normalize_exchange_name(exchange)
-    if exchange_name != ExchangeName.OKX:
-        raise ValueError(
-            "Unsupported exchange for L2 order book stream: "
-            f"{exchange_name.value}"
-        )
+    _require_okx_market_data(exchange_name)
     cfg = config or ExchangeConfig()
     return OkxOrderBookL2WebSocketFeed(
         symbol=symbol,
@@ -200,11 +183,7 @@ def create_full_order_book_stream(
     poll_interval_seconds: float = 3.0,
 ) -> FullOrderBookStream:
     exchange_name = normalize_exchange_name(exchange)
-    if exchange_name != ExchangeName.OKX:
-        raise ValueError(
-            "Unsupported exchange for full order book stream: "
-            f"{exchange_name.value}"
-        )
+    _require_okx_market_data(exchange_name)
     cfg = config or ExchangeConfig()
     requester = OkxPublicRestRequester(
         config=cfg,
@@ -229,11 +208,7 @@ def create_open_interest_stream(
     max_reconnects: int | None = None,
 ) -> OpenInterestStream:
     exchange_name = normalize_exchange_name(exchange)
-    if exchange_name != ExchangeName.OKX:
-        raise ValueError(
-            "Unsupported exchange for open interest stream: "
-            f"{exchange_name.value}"
-        )
+    _require_okx_market_data(exchange_name)
     cfg = config or ExchangeConfig()
     return OkxOpenInterestWebSocketFeed(
         symbol=symbol,
@@ -243,6 +218,14 @@ def create_open_interest_stream(
         reconnect_delay_seconds=reconnect_delay_seconds,
         max_reconnects=max_reconnects,
     )
+
+
+def _require_okx_market_data(exchange: ExchangeName) -> None:
+    if exchange != ExchangeName.OKX:
+        raise ValueError(
+            "OKX is the only supported market-data exchange; "
+            f"got {exchange.value}"
+        )
 
 
 __all__ = [

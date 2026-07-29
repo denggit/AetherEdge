@@ -2,6 +2,8 @@ import asyncio
 import json
 from decimal import Decimal
 
+import pytest
+
 from src.platform.data import create_market_data_feed
 from src.platform.exchanges import ExchangeConfig, ExchangeName
 from tests.data_feed.test_rest_feed import FakeExchangeClient
@@ -87,7 +89,7 @@ def test_okx_orderbook_websocket_stream_maps_books5():
     assert order_book.asks[0].quantity == Decimal("2")
 
 
-def test_binance_orderbook_websocket_stream_maps_depth5():
+def test_binance_orderbook_websocket_stream_is_rejected():
     connector = FakeWebSocketConnector(
         [
             json.dumps(
@@ -101,18 +103,12 @@ def test_binance_orderbook_websocket_stream_maps_depth5():
             )
         ]
     )
-    feed = create_market_data_feed(
-        "binance",
-        symbol="ETH-USDT-PERP",
-        config=ExchangeConfig(),
-        exchange_client=FakeExchangeClient(),
-        websocket_connector=connector,
-    )
-
-    order_book = asyncio.run(_first_order_book(feed))
-
-    assert connector.urls == ["wss://fstream.binance.com/ws/ethusdt@depth5@100ms"]
-    assert order_book.exchange is ExchangeName.BINANCE
-    assert order_book.raw_symbol == "ETHUSDT"
-    assert order_book.bids[0].price == Decimal("3000")
-    assert order_book.asks[0].quantity == Decimal("2")
+    with pytest.raises(ValueError, match="OKX is the only"):
+        create_market_data_feed(
+            "binance",
+            symbol="ETH-USDT-PERP",
+            config=ExchangeConfig(),
+            exchange_client=FakeExchangeClient(),
+            websocket_connector=connector,
+        )
+    assert connector.urls == []

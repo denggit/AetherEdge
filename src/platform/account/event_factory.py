@@ -5,6 +5,7 @@ from src.platform.account.websocket import BinanceAccountEventStream, OkxAccount
 from src.platform.data.websocket.connector import WebsocketsConnector
 from src.platform.data.websocket.ports import WebSocketConnector
 from src.platform.exchanges import ExchangeClient, ExchangeConfig, ExchangeName, create_exchange_client
+from src.platform.exchanges.config_loader import load_exchange_config
 from src.platform.markets import get_market_profile
 
 
@@ -22,7 +23,7 @@ def create_account_event_stream(
     exchange_name = exchange if isinstance(exchange, ExchangeName) else ExchangeName(str(exchange).strip().lower())
     profile = get_market_profile(symbol)
     resolved_symbol = profile.symbol
-    resolved_config = config or ExchangeConfig.from_env(exchange_name)
+    resolved_config = config or load_exchange_config(exchange_name)
     resolved_connector = connector or WebsocketsConnector()
     if exchange_name == ExchangeName.OKX:
         return OkxAccountEventStream(

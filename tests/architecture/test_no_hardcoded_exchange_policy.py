@@ -19,6 +19,8 @@ FORBIDDEN_POLICY_DEFAULTS = (
     "ExchangeName.BINANCE",
 )
 
+MARKET_DATA_POLICY_BOUNDARY = Path("src/runtime/composition.py")
+
 
 def test_business_modules_do_not_hardcode_okx_binance_exchange_policy() -> None:
     offenders: list[str] = []
@@ -28,7 +30,14 @@ def test_business_modules_do_not_hardcode_okx_binance_exchange_policy() -> None:
                 continue
             text = path.read_text(encoding="utf-8")
             for token in FORBIDDEN_POLICY_DEFAULTS:
-                if token in text:
+                allowed_market_data_policy = (
+                    path == MARKET_DATA_POLICY_BOUNDARY
+                    and token == "ExchangeName.OKX"
+                )
+                if token in text and not allowed_market_data_policy:
                     offenders.append(f"{path}:{token}")
 
     assert offenders == []
+    composition = MARKET_DATA_POLICY_BOUNDARY.read_text(encoding="utf-8")
+    assert "app_config.data_exchange != ExchangeName.OKX" in composition
+    assert "only supported market-data exchange" in composition

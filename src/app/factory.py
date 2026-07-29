@@ -5,6 +5,7 @@ from src.app.config import AppConfig
 from src.app.context import AppContext
 from src.platform import create_execution_client, create_market_data_feed
 from src.platform.execution import MultiExchangeExecutionClient
+from src.platform.exchanges.config_loader import load_exchange_config
 from src.platform.exchanges.models import ExchangeConfig
 from src.platform.state import SqliteStateStore
 from src.planner import ExecutionPlanner
@@ -16,7 +17,7 @@ def build_app_context(
     *,
     enable_market_streams: bool = True,
 ) -> AppContext:
-    data_exchange_config = ExchangeConfig.from_env(config.data_exchange)
+    data_exchange_config = load_exchange_config(config.data_exchange)
     data = create_market_data_feed(
         config.data_exchange,
         symbol=config.symbol,

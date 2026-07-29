@@ -344,21 +344,22 @@ async def test_runner_builds_complete_plan_and_delegates_once() -> None:
     assert returned is snapshots
     assert len(captured) == 1
     plan = captured[0]
+    component = runner.recovery
     expected = {
-        "resolve_service": runner._get_recovery_service,
-        "fallback_snapshots": runner._recovery_fallback_snapshots,
-        "invoke_service": runner._invoke_recovery_service,
-        "record_run": runner._record_recovery_run,
-        "validate_report": runner._validate_runtime_recovery_report,
-        "partition_signals": runner._partition_recovery_signals,
-        "capture_failure_counts": runner._capture_recovery_failure_counts,
-        "execute_stop_signals": runner._execute_recovery_stop_signals,
-        "validate_stop_execution": runner._validate_recovery_stop_execution,
+        "resolve_service": component._get_recovery_service,
+        "fallback_snapshots": component._recovery_fallback_snapshots,
+        "invoke_service": component._invoke_recovery_service,
+        "record_run": component._record_recovery_run,
+        "validate_report": component._validate_runtime_recovery_report,
+        "partition_signals": component._partition_recovery_signals,
+        "capture_failure_counts": component._capture_recovery_failure_counts,
+        "execute_stop_signals": component._execute_recovery_stop_signals,
+        "validate_stop_execution": component._validate_recovery_stop_execution,
         "validate_post_execution_protection": (
-            runner._validate_post_execution_stop_protection
+            component._validate_post_execution_stop_protection
         ),
-        "execute_other_signals": runner._execute_recovery_other_signals,
-        "finalize_report": runner._finalize_recovery_report,
+        "execute_other_signals": component._execute_recovery_other_signals,
+        "finalize_report": component._finalize_recovery_report,
     }
     assert all(getattr(plan, name) == callback for name, callback in expected.items())
 

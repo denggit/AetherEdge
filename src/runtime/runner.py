@@ -18,12 +18,14 @@ from src.runtime.components import (
     MarketEventsComponent,
     OrderResultsComponent,
     PersistenceComponent,
+    RangeRuntimeComponent,
     RecoveryComponent,
     SignalExecutionComponent,
     StartupComponent,
     WiringComponent,
 )
-from src.runtime.components.base import RuntimeSharedState
+from src.runtime.context import RuntimeContext
+from src.runtime.services import RuntimeServiceBundle, RuntimeServices
 from src.runtime.persistence import (
     BackgroundWriteItem as _BackgroundWriteItem,
     BackgroundWriteQueue as _BackgroundWriteQueue,
@@ -60,164 +62,227 @@ async def _flush_fatal_runtime_alert(alerts) -> None:
         logger.exception("Fatal runtime alert flush failed")
 
 
-def _compatibility_component_methods() -> dict[str, type]:
-    methods: dict[str, type] = {}
-    for component_type in COMPONENT_TYPES:
-        for name, value in component_type.__dict__.items():
-            if name == "initialize" or not (
-                callable(value) or isinstance(value, property)
-            ):
-                continue
-            existing = methods.get(name)
-            if existing is not None:
-                raise RuntimeError(
-                    "runtime component method conflict | "
-                    f"method={name} components="
-                    f"{existing.__name__},{component_type.__name__}"
-                )
-            methods[name] = component_type
-    return methods
+class _RunnerCompatibilityFacade(
+    AccountComponent,
+    CatchupComponent,
+    ClosedBarComponent,
+    LifecycleComponent,
+    MarketEventsComponent,
+    OrderResultsComponent,
+    PersistenceComponent,
+    RecoveryComponent,
+    RangeRuntimeComponent,
+    SignalExecutionComponent,
+    StartupComponent,
+    WiringComponent,
+):
+    """Static compatibility surface for legacy tests and integrations."""
 
-
-_COMPATIBILITY_COMPONENT_METHODS = _compatibility_component_methods()
-
-
-class _ComponentMethod:
-    """Explicit class/instance descriptor for a small legacy surface."""
-
-    def __init__(self, component_type: type, name: str) -> None:
-        self.component_type = component_type
-        self.name = name
-
-    def __get__(self, instance, owner=None):
-        if instance is None:
-            return getattr(self.component_type, self.name)
-        components = instance._ensure_runtime_components()
-        return getattr(components[self.component_type], self.name)
-
-
-class _RunnerCompatibilityFacade:
-    """Legacy test/integration surface; formal orchestration uses named parts."""
-
-    def _ensure_runtime_state(self) -> RuntimeSharedState:
-        state = self.__dict__.get("_runtime_state")
-        if state is None:
-            state = RuntimeSharedState()
-            object.__setattr__(self, "_runtime_state", state)
-        return state
-
-    def _ensure_runtime_components(self):
+    def _named_component(self, name: str, component_type: type):
         components = self.__dict__.get("_runtime_components")
         if components is None:
-            components = {
-                component_type: component_type(self)
-                for component_type in COMPONENT_TYPES
-            }
-            object.__setattr__(self, "_runtime_components", components)
-        return components
+            return self
+        return components[component_type]
 
     def _compat_override(self, name: str, default):
         return self.__dict__.get(name, default)
 
-    def _runtime_component_override(self, name: str):
-        if name in self.__dict__:
-            return True, self.__dict__[name]
-        return False, None
-
-    def _named_component(self, name: str, component_type: type):
-        component = self.__dict__.get(name)
-        if component is not None:
-            return component
-        return self._ensure_runtime_components()[component_type]
-
-    def __getattr__(self, name: str):
-        state_values = self._ensure_runtime_state().__dict__
-        if name in state_values:
-            return state_values[name]
-        component_type = _COMPATIBILITY_COMPONENT_METHODS.get(name)
-        if component_type is None:
-            raise AttributeError(name)
-        return getattr(self._ensure_runtime_components()[component_type], name)
-
-    def __setattr__(self, name: str, value: object) -> None:
-        state = self._ensure_runtime_state()
-        if name == "_market_data_runtime":
-            state.market.runtime = value  # type: ignore[assignment]
-        elif name == "_market_data_capabilities":
-            state.market.capabilities = value  # type: ignore[assignment]
-        elif name == "_market_modules_managed":
-            state.market.modules_managed = bool(value)
-        elif name == "_pipeline_integrity_error":
-            state.market.integrity_error = value  # type: ignore[assignment]
-        component_type = _COMPATIBILITY_COMPONENT_METHODS.get(name)
-        descriptor = (
-            None if component_type is None else component_type.__dict__.get(name)
-        )
-        if isinstance(descriptor, property) and descriptor.fset is not None:
-            setattr(self._ensure_runtime_components()[component_type], name, value)
-            return
-        if (
-            component_type is not None
-            or name in type(self).__dict__
-            or name in {"_runtime_state", "_runtime_components"}
-        ):
-            object.__setattr__(self, name, value)
-            return
-        setattr(self._ensure_runtime_state(), name, value)
-
-    _log_4h_decision_summary = _ComponentMethod(
-        ClosedBarComponent, "_log_4h_decision_summary"
-    )
-    _check_startup_feature_backfills = _ComponentMethod(
-        LifecycleComponent, "_check_startup_feature_backfills"
-    )
-    _check_strategy_position_mode_requirements = _ComponentMethod(
-        StartupComponent, "_check_strategy_position_mode_requirements"
-    )
-    _execute_signals = _ComponentMethod(
-        SignalExecutionComponent, "_execute_signals"
-    )
-    _build_signal_feedback_request = _ComponentMethod(
-        SignalExecutionComponent, "_build_signal_feedback_request"
-    )
-    _get_sync_contexts = _ComponentMethod(
-        AccountComponent, "_get_sync_contexts"
-    )
-    _get_position_plan_store = _ComponentMethod(
-        PersistenceComponent, "_get_position_plan_store"
-    )
-
+    def _runtime_service_bundle(self) -> RuntimeServiceBundle:
+        bundle = self.__dict__.get("service_bundle")
+        if isinstance(bundle, RuntimeServiceBundle):
+            return bundle
+        legacy = RuntimeServices.coerce(self.__dict__.get("services"))
+        bundle = RuntimeServiceBundle.from_legacy_boundary(legacy)
+        self.runtime_services = legacy
+        self.service_bundle = bundle
+        return bundle
 
 class LiveRuntimeRunner(_RunnerCompatibilityFacade):
     """Thin lifecycle orchestrator over typed domain runtime components."""
 
     def __init__(self, *args, **kwargs) -> None:
-        object.__setattr__(self, "_runtime_state", RuntimeSharedState())
+        runtime_context = RuntimeContext()
+        self.__dict__ = runtime_context.__dict__
         components = {
-            component_type: component_type(self)
+            component_type: component_type(runtime_context)
             for component_type in COMPONENT_TYPES
         }
-        object.__setattr__(self, "_runtime_components", components)
-        object.__setattr__(self, "wiring", components[WiringComponent])
-        object.__setattr__(self, "lifecycle", components[LifecycleComponent])
-        object.__setattr__(self, "market_events", components[MarketEventsComponent])
-        object.__setattr__(self, "closed_bar", components[ClosedBarComponent])
-        object.__setattr__(self, "signal_execution", components[SignalExecutionComponent])
-        object.__setattr__(self, "account_runtime", components[AccountComponent])
-        object.__setattr__(self, "recovery", components[RecoveryComponent])
-        object.__setattr__(self, "startup", components[StartupComponent])
-        object.__setattr__(self, "catchup", components[CatchupComponent])
-        object.__setattr__(self, "order_results", components[OrderResultsComponent])
-        object.__setattr__(self, "persistence", components[PersistenceComponent])
-        object.__setattr__(self, "market_data_lifecycle", components[COMPONENT_TYPES[-1]])
+        self._runtime_components = components
+        self.wiring = components[WiringComponent]
+        self.lifecycle = components[LifecycleComponent]
+        self.market_events = components[MarketEventsComponent]
+        self.closed_bar = components[ClosedBarComponent]
+        self.signal_execution = components[SignalExecutionComponent]
+        self.account_runtime = components[AccountComponent]
+        self.recovery = components[RecoveryComponent]
+        self.startup = components[StartupComponent]
+        self.catchup = components[CatchupComponent]
+        self.order_results = components[OrderResultsComponent]
+        self.persistence = components[PersistenceComponent]
+        self.market_data_lifecycle = components[RangeRuntimeComponent]
+        self._bind_component_ports(components)
         self.wiring.initialize(*args, **kwargs)
+
+    def _bind_component_ports(self, components: dict[type, object]) -> None:
+        """Bind the explicit callable ports used across domain components."""
+
+        self._runtime_service_bundle = (
+            _RunnerCompatibilityFacade._runtime_service_bundle.__get__(
+                self,
+                LiveRuntimeRunner,
+            )
+        )
+        account = components[AccountComponent]
+        catchup = components[CatchupComponent]
+        lifecycle = components[LifecycleComponent]
+        market = components[MarketEventsComponent]
+        orders = components[OrderResultsComponent]
+        persistence = components[PersistenceComponent]
+        range_runtime = components[RangeRuntimeComponent]
+        recovery = components[RecoveryComponent]
+        signals = components[SignalExecutionComponent]
+        startup = components[StartupComponent]
+
+        self._execute_signals = signals._execute_signals
+        self._get_account_clients = account._get_account_clients
+        self._get_account_sync_service = account._get_account_sync_service
+        self._get_order_sync_service = account._get_order_sync_service
+        self._get_sync_contexts = account._get_sync_contexts
+        self._has_account_config_entry_block = (
+            account._has_account_config_entry_block
+        )
+        self._has_unresolved_follower_close = (
+            account._has_unresolved_follower_close
+        )
+        self._periodic_follower_close_check = (
+            account._periodic_follower_close_check
+        )
+        self._recheck_account_config_after_recovery = (
+            startup._recheck_account_config_after_recovery
+        )
+        self._resolved_account_config_env = (
+            account._resolved_account_config_env
+        )
+        self._run_reconciliation = account._run_reconciliation
+        self._strategy_position_index = account._strategy_position_index
+
+        self._get_min_range_bars = catchup._get_min_range_bars
+        self._call_on_start = catchup._call_on_start
+        self._evaluate_startup_catchup_once = (
+            catchup._evaluate_startup_catchup_once
+        )
+
+        self._all_producers_done = lifecycle._all_producers_done
+        self._raise_on_unhealthy_producer = (
+            lifecycle._raise_on_unhealthy_producer
+        )
+        self._set_health = lifecycle._set_health
+
+        self._enqueue_market_event = market._enqueue_market_event
+        self._mark_range_context_degraded_bucket = (
+            market._mark_range_context_degraded_bucket
+        )
+        self._raise_on_unhealthy_market_data = (
+            market._raise_on_unhealthy_market_data
+        )
+        self._trade_integrity_tracker = market._trade_integrity_tracker
+        self._order_book_integrity_tracker = (
+            market._order_book_integrity_tracker
+        )
+
+        self._get_execution_clients = orders._get_execution_clients
+        self._get_order_coordinator = orders._get_order_coordinator
+        self._get_order_journal = orders._get_order_journal
+        self._validate_order_results_before_journal = (
+            signals._validate_order_results_before_journal
+        )
+        self._process_order_result_feedback = (
+            orders._process_order_result_feedback
+        )
+        self._save_order_results = orders._save_order_results
+        self._verify_stop_order_results = orders._verify_stop_order_results
+
+        self._emit_alert_threadsafe = persistence._emit_alert_threadsafe
+        self._get_market_data_persistence = (
+            persistence._get_market_data_persistence
+        )
+        self._get_market_feature_pipeline = (
+            persistence._get_market_feature_pipeline
+        )
+        self._get_position_plan_store = (
+            persistence._get_position_plan_store
+        )
+        self._maybe_log_live_data_path_stats = (
+            persistence._maybe_log_live_data_path_stats
+        )
+        self._on_live_persistence_write_rejected = (
+            persistence._on_live_persistence_write_rejected
+        )
+
+        self._get_live_kline_store = range_runtime._get_live_kline_store
+        self._get_range_repair_bootstrap_service = (
+            range_runtime._get_range_repair_bootstrap_service
+        )
+        self._require_range_module = range_runtime._require_range_module
+        self._start_range_speed_background_services = (
+            range_runtime._start_range_speed_background_services
+        )
+
+        self._run_recovery = recovery._run_recovery
+        self._strategy_range_speed_history_provider = (
+            recovery._strategy_range_speed_history_provider
+        )
+        self._strategy_capabilities = recovery._strategy_capabilities
+        self._strategy_pending_work_provider = (
+            recovery._strategy_pending_work_provider
+        )
+        self._strategy_startup_preview_provider = (
+            recovery._strategy_startup_preview_provider
+        )
+
+        self._bootstrap_account_config_if_enabled = (
+            startup._bootstrap_account_config_if_enabled
+        )
+        self._check_strategy_position_mode_requirements = (
+            startup._check_strategy_position_mode_requirements
+        )
+        self._finish_range_speed_warmup_after_catchup = (
+            startup._finish_range_speed_warmup_after_catchup
+        )
+        self._initialize_rangebar_trust_window = (
+            startup._initialize_rangebar_trust_window
+        )
+        self._run_warmup = startup._run_warmup
+        self._warmup_range_speed_history = (
+            startup._warmup_range_speed_history
+        )
+
+        self._on_range_bar_persist_error = (
+            components[ClosedBarComponent]._on_range_bar_persist_error
+        )
+        self._on_completed_range_aggregate_persist_error = (
+            components[
+                ClosedBarComponent
+            ]._on_completed_range_aggregate_persist_error
+        )
+
+        self.process_market_event = LiveRuntimeRunner.process_market_event.__get__(
+            self,
+            LiveRuntimeRunner,
+        )
+        self.process_market_feature = (
+            LiveRuntimeRunner.process_market_feature.__get__(
+                self,
+                LiveRuntimeRunner,
+            )
+        )
 
     def attach_market_data_runtime(
         self,
         runtime: MarketDataRuntime,
         capabilities: frozenset[CapabilityId],
     ) -> None:
-        market_state = self._ensure_runtime_state().market
+        market_state = self.runtime_state.market
         if market_state.runtime is not None:
             raise RuntimeError("market data runtime is already attached")
         market_state.runtime = runtime
@@ -241,13 +306,13 @@ class LiveRuntimeRunner(_RunnerCompatibilityFacade):
         )._handle_market_data_trade_drop(event)
 
     async def _prepare_market_data_modules(self) -> None:
-        market_state = self._ensure_runtime_state().market
+        market_state = self.runtime_state.market
         runtime = market_state.runtime
         if runtime is not None:
             await runtime.prepare(market_state.capabilities)
 
     async def _start_market_data_modules(self) -> None:
-        runtime = self._ensure_runtime_state().market.runtime
+        runtime = self.runtime_state.market.runtime
         if runtime is not None:
             await runtime.start_prepared()
 

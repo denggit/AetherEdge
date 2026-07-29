@@ -12,6 +12,13 @@ from decimal import Decimal
 from typing import Any, Mapping
 from urllib.parse import urlencode
 
+from src.platform.data.models import (
+    MarketDataSource,
+    MarketKline,
+    MarketTicker,
+    MarketTrade,
+    TradeSide,
+)
 from src.platform.exchanges.errors import ExchangeApiError, ExchangeConfigError, ExchangeMappingError
 from src.platform.exchanges.credentials import validate_private_credentials
 from src.platform.exchanges.models import (
@@ -22,7 +29,6 @@ from src.platform.exchanges.models import (
     ExchangeConfig,
     ExchangeName,
     InstrumentRule,
-    Kline,
     LeverageInfo,
     LeverageRequest,
     MarginMode,
@@ -37,8 +43,6 @@ from src.platform.exchanges.models import (
     PositionSide,
     StopMarketOrderRequest,
     StopOrderQuery,
-    Ticker,
-    Trade,
     TimeInForce,
     TriggerPriceType,
 )
@@ -125,7 +129,7 @@ class OkxExchangeClient:
         start_time_ms: int | None = None,
         end_time_ms: int | None = None,
         oldest_first: bool = False,
-    ) -> list[Kline]:
+    ) -> list[MarketKline]:
         raw_symbol = to_exchange_symbol(self.exchange, symbol)
         page_limit = min(max(int(limit or 100), 1), 100)
         if start_time_ms is not None and end_time_ms is not None:
@@ -160,7 +164,7 @@ class OkxExchangeClient:
         start_time_ms: int,
         end_time_ms: int,
         oldest_first: bool,
-    ) -> list[Kline]:
+    ) -> list[MarketKline]:
         params: dict[str, Any] = {
             "instId": raw_symbol,
             "bar": _map_okx_interval(interval),
@@ -179,11 +183,11 @@ class OkxExchangeClient:
         klines.sort(key=lambda row: row.open_time_ms, reverse=not oldest_first)
         return klines
 
-    async def fetch_ticker(self, symbol: str) -> Ticker:
+    async def fetch_ticker(self, symbol: str) -> MarketTicker:
         raw_symbol = to_exchange_symbol(self.exchange, symbol)
         payload = await self._request_public("GET", "/api/v5/market/ticker", params={"instId": raw_symbol})
         data = _first_data(payload, "OKX ticker")
-        return Ticker(
+        return MarketTicker(
             exchange=self.exchange,
             symbol=symbol,
             raw_symbol=raw_symbol,
@@ -201,7 +205,7 @@ class OkxExchangeClient:
         limit: int = 1000,
         oldest_first: bool = True,
         max_pages: int | None = None,
-    ) -> list[Trade]:
+    ) -> list[MarketTrade]:
         raw_symbol = to_exchange_symbol(self.exchange, symbol)
         page_limit = min(max(int(limit or 100), 1), 100)
         configured_max_pages = int(
@@ -282,7 +286,7 @@ class OkxExchangeClient:
         max_pages: int = 20,
         oldest_first: bool = True,
         partial_on_pagination: bool = False,
-    ) -> list[Trade]:
+    ) -> list[MarketTrade]:
         """Fetch trades strictly between two OKX trade IDs.
 
         OKX ``history-trades`` interprets ``after`` as "older than this trade
@@ -884,11 +888,19 @@ def _map_okx_interval(interval: str) -> str:
     return value
 
 
-def _map_okx_trade(row: Mapping[str, Any], *, symbol: str, raw_symbol: str) -> Trade:
+def _map_okx_trade(
+    row: Mapping[str, Any], *, symbol: str, raw_symbol: str
+) -> MarketTrade:
     side_value = str(row.get("side") or "").lower()
-    side = OrderSide.BUY if side_value == "buy" else OrderSide.SELL if side_value == "sell" else None
+    side = (
+        OrderSide.BUY
+        if side_value == "buy"
+        else OrderSide.SELL
+        if side_value == "sell"
+        else TradeSide.UNKNOWN
+    )
     ts = _optional_int(row.get("ts"))
-    return Trade(
+    return MarketTrade(
         exchange=ExchangeName.OKX,
         symbol=symbol,
         raw_symbol=raw_symbol,
@@ -898,15 +910,18 @@ def _map_okx_trade(row: Mapping[str, Any], *, symbol: str, raw_symbol: str) -> T
         trade_id=str(row.get("tradeId")) if row.get("tradeId") is not None else None,
         event_time_ms=ts,
         trade_time_ms=ts,
+        source=MarketDataSource.REST,
         raw=row,
     )
 
-def _map_okx_kline(row: list[Any], *, symbol: str, raw_symbol: str, interval: str) -> Kline:
+def _map_okx_kline(
+    row: list[Any], *, symbol: str, raw_symbol: str, interval: str
+) -> MarketKline:
     if len(row) < 6:
         raise ExchangeMappingError("OKX kline row is too short", payload=row)
     open_time_ms = int(row[0])
     interval_ms = _okx_interval_to_ms(interval)
-    return Kline(
+    return MarketKline(
         exchange=ExchangeName.OKX,
         symbol=symbol,
         raw_symbol=raw_symbol,

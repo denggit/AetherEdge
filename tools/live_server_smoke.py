@@ -19,6 +19,12 @@ from src.runtime.live_smoke import (
     strategy_plugin_path,
     write_live_smoke_report,
 )
+from src.runtime.legacy_config import (
+    legacy_live_runtime_config_from_app,
+)
+from src.runtime.config import (
+    live_runtime_config_from_app as core_live_runtime_config_from_app,
+)
 from src.runtime.market_data.range_config import (
     range_runtime_config_from_env,
 )
@@ -27,9 +33,9 @@ from src.platform.config import (
     set_project_env_config,
 )
 from src.app import AppConfig
+from src.platform.exchanges.config_loader import load_exchange_config
 from src.platform.exchanges.credentials import validate_private_credentials
 from src.platform.exchanges.errors import ExchangeConfigError
-from src.platform.exchanges.models import ExchangeConfig
 from src.strategy import load_strategy
 from src.utils.log import get_logger
 from tools._sqlite_readonly_snapshot import (
@@ -76,7 +82,7 @@ async def run_server_smoke(
             for exchange in app_config.exchanges:
                 validate_private_credentials(
                     exchange,
-                    ExchangeConfig.from_env(exchange, env=project_env.values),
+                    load_exchange_config(exchange, env=project_env.values),
                 )
         except ExchangeConfigError as exc:
             return BootstrapFailureReport(
@@ -138,7 +144,28 @@ async def run_server_smoke(
             ),
             **resolved_provider_kwargs,
         )
-        return await FiniteLiveSmokeRunner(provider).run()
+        provider_module_name = type(provider).__module__
+        provider_module = sys.modules[provider_module_name]
+        original_loader = vars(provider_module).get(
+            "live_runtime_config_from_app"
+        )
+        if original_loader is not core_live_runtime_config_from_app:
+            return await FiniteLiveSmokeRunner(provider).run()
+
+        strategy_module = sys.modules[type(strategy).__module__]
+        strategy_source = vars(strategy_module).get("__file__")
+        if strategy_source is not None and "repo_root" in vars(provider):
+            # Strategy-owned legacy gates search for lock tokens. Keep that
+            # audit on the plugin source tree instead of traversing runtime
+            # data, Git objects, and pytest snapshots under the repository.
+            provider.repo_root = Path(strategy_source).resolve().parent
+        provider_module.live_runtime_config_from_app = (
+            legacy_live_runtime_config_from_app
+        )
+        try:
+            return await FiniteLiveSmokeRunner(provider).run()
+        finally:
+            provider_module.live_runtime_config_from_app = original_loader
 
     try:
         if read_only_state:

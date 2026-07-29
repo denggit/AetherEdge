@@ -18,9 +18,9 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.platform import create_account_client, create_execution_client, fetch_platform_snapshot
 from src.platform.config import load_project_env_config, set_project_env_config
+from src.platform.exchanges.config_loader import load_exchange_config
 from src.platform.exchanges.credentials import validate_private_credentials
 from src.platform.exchanges.errors import ExchangeApiError
-from src.platform.exchanges.models import ExchangeConfig
 from src.utils.log import get_logger
 
 logger = get_logger(__name__)
@@ -38,7 +38,7 @@ async def main() -> None:
         project_env.get("AETHER_EXCHANGES", "okx").split(",")[0].strip()
         or "okx"
     )
-    exchange_config = ExchangeConfig.from_env(
+    exchange_config = load_exchange_config(
         exchange,
         env=project_env.values,
     )

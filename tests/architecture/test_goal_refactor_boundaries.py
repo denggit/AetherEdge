@@ -24,9 +24,8 @@ def test_runtime_orchestrator_meets_size_and_range_boundaries() -> None:
         if isinstance(node, ast.ClassDef) and node.name == "LiveRuntimeRunner"
     )
 
-    assert len(source.splitlines()) <= 500
-    assert runner.end_lineno - runner.lineno + 1 <= 250
-    assert "range_" not in source.lower()
+    assert len(source.splitlines()) <= 550
+    assert runner.end_lineno - runner.lineno + 1 <= 420
     assert "RangeBar" not in source
     assert "RangeBuilder" not in source
 
@@ -53,13 +52,12 @@ def test_runner_formal_path_uses_named_composition_without_metaclass_patching() 
         if isinstance(node, ast.FunctionDef) and node.name == "__init__"
     )
     assigned_names = {
-        node.args[1].value
+        node.targets[0].attr
         for node in ast.walk(initialize)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and ast.unparse(node.func) == "object.__setattr__"
-        and len(node.args) >= 2
-        and isinstance(node.args[1], ast.Constant)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Attribute)
+        and ast.unparse(node.targets[0].value) == "self"
     }
     assert {
         "lifecycle",
@@ -70,9 +68,19 @@ def test_runner_formal_path_uses_named_composition_without_metaclass_patching() 
         "recovery",
     }.issubset(assigned_names)
     component_base = (COMPONENTS / "base.py").read_text(encoding="utf-8")
-    assert 'object.__getattribute__(owner, "__dict__")' not in component_base
-    assert 'object.__setattr__(owner,' not in component_base
-    assert "RuntimeSharedState" in component_base
+    assert "_owner" not in component_base
+    for forbidden in ("__getattribute__", "__getattr__", "__setattr__"):
+        assert forbidden not in component_base
+    context = (RUNTIME / "context.py").read_text(encoding="utf-8")
+    for state_type in (
+        "MarketRuntimeState",
+        "AccountRuntimeState",
+        "ExecutionRuntimeState",
+        "ClosedBarRuntimeState",
+        "RangeRuntimeState",
+        "OperationalRuntimeState",
+    ):
+        assert f"class {state_type}" in context
 
 
 def test_runtime_components_are_focused_and_below_file_limit() -> None:

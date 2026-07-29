@@ -10,7 +10,8 @@ from src.order_management.reconciliation.service import LiveStateReconciliationS
 from src.platform import create_account_client, create_execution_client
 from src.platform.account.events import AccountEvent
 from src.platform.account.ports import AccountClient
-from src.platform.exchanges.models import ExchangeConfig, ExchangeName, InstrumentRule, Order, OrderStatus, Position, PositionMode, PositionSide
+from src.platform.exchanges.config_loader import load_exchange_config
+from src.platform.exchanges.models import ExchangeName, InstrumentRule, Order, OrderStatus, Position, PositionMode, PositionSide
 from src.platform.snapshot import PlatformSnapshot
 from src.runtime.account_config import (
     AccountConfigBootstrapResult,
@@ -230,12 +231,16 @@ class AccountComponent(RuntimeComponent):
 
     def _get_account_clients(self) -> tuple[AccountClient, ...]:
         if self._account_clients is None:
-            injected = self.service_dependencies().account_clients
+            injected = self._runtime_service_bundle().account.clients
             if injected is not None:
                 self._account_clients = tuple(injected)
             else:
                 self._account_clients = tuple(
-                    create_account_client(exchange, symbol=self.app_config.symbol, config=ExchangeConfig.from_env(exchange))
+                    create_account_client(
+                        exchange,
+                        symbol=self.app_config.symbol,
+                        config=load_exchange_config(exchange),
+                    )
                     for exchange in self.app_config.exchanges
                 )
         return self._account_clients
@@ -447,7 +452,10 @@ class AccountComponent(RuntimeComponent):
             )
 
     def _get_sync_contexts(self) -> tuple[SyncExchangeContext, ...]:
-        if ("execution_clients" in self.services) != ("account_clients" in self.services):
+        bundle = self._runtime_service_bundle()
+        injected_execution = bundle.execution.clients
+        injected_accounts = bundle.account.clients
+        if (injected_execution is not None) != (injected_accounts is not None):
             raise LiveRuntimeError("request sync requires account_clients and execution_clients to be injected together")
         clients = self._get_execution_clients()
         accounts = self._get_account_clients()

@@ -12,7 +12,8 @@ from src.platform.data.factory import (
     create_trade_stream,
 )
 from src.platform.data.websocket import WebsocketsConnector
-from src.platform.exchanges.models import ExchangeConfig
+from src.platform.exchanges.config_loader import load_exchange_config
+from src.platform.exchanges.models import ExchangeConfig, ExchangeName
 from src.runtime.capabilities import capability_request_from_requirements
 from src.runtime.config import LiveRuntimeConfig, live_runtime_config_from_app
 from src.runtime.feature_pipeline import TradeFeatureRuntimeConfig
@@ -75,6 +76,11 @@ def compose_live_runtime(
 ) -> LiveRuntimeApplication:
     """Build every formal live dependency without opening market streams."""
 
+    if app_config.data_exchange != ExchangeName.OKX:
+        raise ValueError(
+            "OKX is the only supported market-data exchange; "
+            f"got {app_config.data_exchange.value}"
+        )
     context = app_context or build_app_context(
         app_config,
         enable_market_streams=False,
@@ -146,7 +152,7 @@ def compose_live_runtime(
         configure_integrity(trade_integrity)
 
     module_config = _market_module_config(app_config, feature_config)
-    exchange_config = ExchangeConfig.from_env(app_config.data_exchange)
+    exchange_config = load_exchange_config(app_config.data_exchange)
     connector = WebsocketsConnector()
 
     registry = build_market_data_registry(

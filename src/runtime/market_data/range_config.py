@@ -5,7 +5,10 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Mapping, TypeVar
 
-from src.runtime.config import _load_defaults, _load_runtime_env
+from src.runtime.config_loader import (
+    load_runtime_defaults,
+    load_runtime_env,
+)
 
 
 T = TypeVar("T")
@@ -72,8 +75,8 @@ def range_runtime_config_from_env(
     env_file: str | Path | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> RangeRuntimeConfig:
-    defaults = _load_defaults(defaults_path)
-    env = _load_runtime_env(env_file=env_file, environ=environ)
+    defaults = load_runtime_defaults(defaults_path)
+    env = load_runtime_env(env_file=env_file, environ=environ)
 
     def value(
         env_key: str,

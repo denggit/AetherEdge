@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 from typing import AsyncIterator
 
 from src.platform.data.models import (
@@ -9,9 +8,6 @@ from src.platform.data.models import (
     MarketOrderBook,
     MarketTicker,
     MarketTrade,
-    market_kline_from_exchange,
-    market_ticker_from_exchange,
-    market_trade_from_exchange,
 )
 from src.platform.data.storage import MarketDataStore
 from src.platform.data.websocket.ports import OrderBookStream, TradeStream
@@ -32,6 +28,8 @@ class RestMarketDataFeed:
         trade_stream: TradeStream | None = None,
         order_book_stream: OrderBookStream | None = None,
         store: MarketDataStore | None = None,
+        supports_trade_max_pages: bool = False,
+        supports_partial_trade_pagination: bool = False,
     ) -> None:
         self._exchange_client = exchange_client
         self._symbol = symbol
@@ -39,6 +37,10 @@ class RestMarketDataFeed:
         self._trade_stream = trade_stream
         self._order_book_stream = order_book_stream
         self._store = store
+        self._supports_trade_max_pages = supports_trade_max_pages
+        self._supports_partial_trade_pagination = (
+            supports_partial_trade_pagination
+        )
         self.last_historical_trade_pages = 0
 
     @property
@@ -83,14 +85,12 @@ class RestMarketDataFeed:
             end_time_ms=end_time_ms,
             oldest_first=oldest_first,
         )
-        klines = [market_kline_from_exchange(row) for row in rows]
         if self._store is not None:
-            self._store.save_klines(klines)
-        return klines
+            self._store.save_klines(rows)
+        return rows
 
     async def fetch_ticker(self) -> MarketTicker:
-        ticker = await self._exchange_client.fetch_ticker(self._symbol)
-        return market_ticker_from_exchange(ticker)
+        return await self._exchange_client.fetch_ticker(self._symbol)
 
     async def fetch_trades(
         self,
@@ -104,24 +104,18 @@ class RestMarketDataFeed:
     ) -> list[MarketTrade]:
         if symbol is not None and symbol != self._symbol:
             raise ValueError(f"data feed is bound to {self._symbol}, got {symbol}")
-        fetch = getattr(self._exchange_client, "fetch_trades", None)
-        if not callable(fetch):
-            raise NotImplementedError(f"Historical trades are not supported for {self.exchange.value}")
         kwargs = {
             "start_time_ms": start_time_ms,
             "end_time_ms": end_time_ms,
             "limit": limit,
             "oldest_first": oldest_first,
         }
-        try:
-            accepts_max_pages = (
-                "max_pages" in inspect.signature(fetch).parameters
-            )
-        except (TypeError, ValueError):
-            accepts_max_pages = False
-        if max_pages is not None and accepts_max_pages:
+        if self._supports_trade_max_pages and max_pages is not None:
             kwargs["max_pages"] = int(max_pages)
-        rows = await fetch(self._symbol, **kwargs)
+        rows = await self._exchange_client.fetch_trades(
+            self._symbol,
+            **kwargs,
+        )
         self.last_historical_trade_pages = max(
             1,
             int(
@@ -133,7 +127,7 @@ class RestMarketDataFeed:
                 or 1
             ),
         )
-        return [market_trade_from_exchange(row) for row in rows]
+        return rows
 
     async def fetch_trades_between_ids(
         self,
@@ -152,23 +146,7 @@ class RestMarketDataFeed:
             raise ValueError(
                 f"data feed is bound to {self._symbol}, got {symbol}"
             )
-        fetch = getattr(
-            self._exchange_client,
-            "fetch_trades_between_ids",
-            None,
-        )
-        if not callable(fetch):
-            raise NotImplementedError(
-                f"Trade-id anchored history is not supported for {self.exchange.value}"
-            )
-        try:
-            accepts_partial = (
-                "partial_on_pagination"
-                in inspect.signature(fetch).parameters
-            )
-        except (TypeError, ValueError):
-            accepts_partial = False
-        fetch_kwargs: dict[str, object] = {
+        kwargs: dict[str, object] = {
             "newer_trade_id": str(newer_trade_id),
             "older_trade_id": str(older_trade_id),
             "start_time_ms": start_time_ms,
@@ -177,9 +155,12 @@ class RestMarketDataFeed:
             "max_pages": int(max_pages),
             "oldest_first": bool(oldest_first),
         }
-        if accepts_partial:
-            fetch_kwargs["partial_on_pagination"] = partial_on_pagination
-        rows = await fetch(self._symbol, **fetch_kwargs)
+        if self._supports_partial_trade_pagination:
+            kwargs["partial_on_pagination"] = partial_on_pagination
+        rows = await self._exchange_client.fetch_trades_between_ids(
+            self._symbol,
+            **kwargs,
+        )
         self.last_historical_trade_pages = max(
             1,
             int(
@@ -191,7 +172,7 @@ class RestMarketDataFeed:
                 or 1
             ),
         )
-        return [market_trade_from_exchange(row) for row in rows]
+        return rows
 
     async def stream_trades(self) -> AsyncIterator[MarketTrade]:
         if self._trade_stream is None:

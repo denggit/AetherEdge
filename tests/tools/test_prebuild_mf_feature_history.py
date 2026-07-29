@@ -644,7 +644,7 @@ def test_run_prebuild_reaches_ready_with_real_sqlite_feature_coverage(
     monkeypatch,
 ) -> None:
     from decimal import Decimal
-    import src.market_data.trade_features.coverage as coverage_module
+    import src.market_data.trade_features.coverage_service as coverage_service
     from src.market_data.models import (
         FixedTimeTradeBar,
         RangeFootprintFeature,
@@ -667,7 +667,7 @@ def test_run_prebuild_reaches_ready_with_real_sqlite_feature_coverage(
         lambda args: (required_minutes, required_minutes),
     )
     monkeypatch.setattr(
-        coverage_module,
+        coverage_service,
         "safe_okx_archive_end_ms",
         lambda now_ms=None, **kwargs: safe_end_ms,
     )

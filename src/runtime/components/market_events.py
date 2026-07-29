@@ -380,18 +380,22 @@ class MarketEventsComponent(RuntimeComponent):
         integrity_error = self.market_state.integrity_error
         if integrity_error is not None:
             raise LiveRuntimeError(str(integrity_error)) from integrity_error
-        runtime = self.market_state.runtime
+        runtime = self.market_state.runtime or getattr(
+            self,
+            "_market_data_runtime",
+            None,
+        )
         if runtime is not None:
             runtime.raise_if_failed()
 
     def _trade_integrity_tracker(self) -> TradeDataIntegrityTracker | None:
-        value = self.service_dependencies().trade_data_integrity_tracker
+        value = self.service_bundle.market.trade_data_integrity_tracker
         return value if isinstance(value, TradeDataIntegrityTracker) else None
 
     def _order_book_integrity_tracker(
         self,
     ) -> OrderBookDataIntegrityTracker | None:
-        value = self.service_dependencies().order_book_data_integrity_tracker
+        value = self.service_bundle.market.order_book_data_integrity_tracker
         return (
             value
             if isinstance(value, OrderBookDataIntegrityTracker)

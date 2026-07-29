@@ -54,7 +54,7 @@ from src.platform.config import (
 )
 from src.platform.exchanges.credentials import validate_private_credentials
 from src.platform.exchanges.errors import ExchangeConfigError
-from src.platform.exchanges.models import ExchangeConfig
+from src.platform.exchanges.config_loader import load_exchange_config
 from src.platform.execution.factory import create_execution_client
 from src.platform.snapshot import PlatformSnapshot, fetch_platform_snapshot
 from src.runtime import (
@@ -294,7 +294,7 @@ async def main() -> int:
             for exchange in app_config.exchanges:
                 validate_private_credentials(
                     exchange,
-                    ExchangeConfig.from_env(
+                    load_exchange_config(
                         exchange,
                         env=project_env.values,
                     ),
@@ -710,7 +710,7 @@ async def _fetch_snapshots(
     snapshots: list[PlatformSnapshot] = []
     for exchange in app_config.exchanges:
         try:
-            config = ExchangeConfig.from_env(exchange)
+            config = load_exchange_config(exchange)
             validate_private_credentials(exchange, config)
             account = create_account_client(exchange, symbol=app_config.symbol, config=config)
             execution = create_execution_client(exchange, symbol=app_config.symbol, config=config)

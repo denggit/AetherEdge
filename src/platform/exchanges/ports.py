@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Protocol
 
+from src.platform.data.models import MarketKline, MarketTicker, MarketTrade
 from src.platform.exchanges.models import (
     AmendOrderRequest,
     Balance,
@@ -9,7 +10,6 @@ from src.platform.exchanges.models import (
     CancelStopOrderRequest,
     ExchangeName,
     InstrumentRule,
-    Kline,
     LeverageInfo,
     LeverageRequest,
     MarginMode,
@@ -20,8 +20,6 @@ from src.platform.exchanges.models import (
     PositionMode,
     StopMarketOrderRequest,
     StopOrderQuery,
-    Ticker,
-    Trade,
 )
 
 
@@ -60,10 +58,10 @@ class ExchangeMarketDataClient(ExchangeIdentity, Protocol):
         start_time_ms: int | None = None,
         end_time_ms: int | None = None,
         oldest_first: bool = False,
-    ) -> list[Kline]:
+    ) -> list[MarketKline]:
         ...
 
-    async def fetch_ticker(self, symbol: str) -> Ticker:
+    async def fetch_ticker(self, symbol: str) -> MarketTicker:
         ...
 
     async def fetch_trades(
@@ -75,7 +73,7 @@ class ExchangeMarketDataClient(ExchangeIdentity, Protocol):
         limit: int = 1000,
         oldest_first: bool = True,
         max_pages: int | None = None,
-    ) -> list[Trade]:
+    ) -> list[MarketTrade]:
         ...
 
     async def fetch_trades_between_ids(
@@ -89,7 +87,8 @@ class ExchangeMarketDataClient(ExchangeIdentity, Protocol):
         limit: int = 100,
         max_pages: int = 20,
         oldest_first: bool = True,
-    ) -> list[Trade]:
+        partial_on_pagination: bool = False,
+    ) -> list[MarketTrade]:
         ...
 
     async def fetch_instrument_rule(self, symbol: str) -> InstrumentRule:

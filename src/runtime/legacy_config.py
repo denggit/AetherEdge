@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping
 
+from src.app import AppConfig
 from src.runtime.config import LiveRuntimeConfig
+from src.runtime.config import live_runtime_config_from_app
 from src.runtime.market_data.range_config import RangeRuntimeConfig
+from src.runtime.market_data.range_config import range_runtime_config_from_env
 
 
 @dataclass(frozen=True)
@@ -52,4 +57,33 @@ class LegacyLiveRuntimeConfig(LiveRuntimeConfig):
         return self._compat_range_config.market_data_db_path
 
 
-__all__ = ["LegacyLiveRuntimeConfig"]
+def legacy_live_runtime_config_from_app(
+    app_config: AppConfig,
+    *,
+    defaults_path: str | Path = "config/aether_defaults.json",
+    env_file: str | Path | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> LegacyLiveRuntimeConfig:
+    """Outer preflight adapter for strategy-owned legacy Range aliases."""
+
+    runtime = live_runtime_config_from_app(
+        app_config,
+        defaults_path=defaults_path,
+        env_file=env_file,
+        environ=environ,
+    )
+    range_config = range_runtime_config_from_env(
+        defaults_path=defaults_path,
+        env_file=env_file,
+        environ=environ,
+    )
+    return LegacyLiveRuntimeConfig.wrap(
+        runtime,
+        range_config=range_config,
+    )
+
+
+__all__ = [
+    "LegacyLiveRuntimeConfig",
+    "legacy_live_runtime_config_from_app",
+]

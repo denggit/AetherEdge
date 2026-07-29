@@ -685,9 +685,10 @@ async def _check_api_position_safety(
         from src.order_management.quantity import NativeQuantityConverter
         from src.order_management.safety import RecoveryExitOrderValidator
         from src.platform.account.factory import create_account_client
+        from src.platform.exchanges.config_loader import load_exchange_config
         from src.platform.exchanges.credentials import validate_private_credentials
         from src.platform.exchanges.errors import ExchangeConfigError
-        from src.platform.exchanges.models import ExchangeConfig, ExchangeName, PositionSide
+        from src.platform.exchanges.models import ExchangeName, PositionSide
         from src.platform.execution.factory import create_execution_client
         from src.platform.markets import get_market_profile
         from src.platform.snapshot import fetch_platform_snapshot
@@ -717,7 +718,7 @@ async def _check_api_position_safety(
     exchange_configs = {}
     try:
         for exchange in app.exchanges:
-            exchange_config = ExchangeConfig.from_env(exchange, env)
+            exchange_config = load_exchange_config(exchange, env)
             validate_private_credentials(exchange, exchange_config)
             exchange_configs[exchange] = exchange_config
     except ExchangeConfigError as exc:

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 from src.app import AppConfig
 from src.order_management import MasterFollowerPolicyConfig
-from src.platform.config import get_project_env_config, load_env_config
+from src.platform.config import load_env_config
+from src.runtime.config_loader import (
+    load_runtime_defaults,
+    load_runtime_env,
+)
 from src.runtime.models import RuntimeMode
 from src.runtime.startup_catchup import StartupCatchupConfig
 
@@ -56,8 +59,8 @@ def runtime_mode_from_env(
     env_file: str | Path | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> RuntimeMode:
-    defaults = _load_defaults(defaults_path)
-    env = _load_runtime_env(env_file=env_file, environ=environ)
+    defaults = load_runtime_defaults(defaults_path)
+    env = load_runtime_env(env_file=env_file, environ=environ)
     value = env.get("AETHER_RUNTIME_MODE", str(defaults.get("runtime_mode", RuntimeMode.LIVE_RUNTIME.value)))
     return RuntimeMode(str(value).strip().lower())
 
@@ -69,10 +72,10 @@ def live_runtime_config_from_app(
     env_file: str | Path | None = None,
     environ: Mapping[str, str] | None = None,
 ) -> LiveRuntimeConfig:
-    defaults = _load_defaults(defaults_path)
-    env = _load_runtime_env(env_file=env_file, environ=environ)
+    defaults = load_runtime_defaults(defaults_path)
+    env = load_runtime_env(env_file=env_file, environ=environ)
     master_follower_env = _master_follower_env(env, env_file=env_file, environ=environ)
-    runtime = LiveRuntimeConfig(
+    return LiveRuntimeConfig(
         app=app_config,
         mode=RuntimeMode(str(env.get("AETHER_RUNTIME_MODE", defaults.get("runtime_mode", RuntimeMode.LIVE_RUNTIME.value))).strip().lower()),
         warmup_enabled=_bool(env.get("AETHER_WARMUP_ENABLED", defaults.get("warmup_enabled", True))),
@@ -90,38 +93,6 @@ def live_runtime_config_from_app(
         ),
         startup_catchup=StartupCatchupConfig.from_mapping(defaults.get("startup_catchup")),
     )
-    # Existing strategy-owned preflight providers still consume two legacy
-    # Range path aliases.  Keep those aliases outside the core Runtime config.
-    from src.runtime.legacy_config import LegacyLiveRuntimeConfig
-    from src.runtime.market_data.range_config import (
-        range_runtime_config_from_env,
-    )
-
-    return LegacyLiveRuntimeConfig.wrap(
-        runtime,
-        range_config=range_runtime_config_from_env(
-            defaults_path=defaults_path,
-            env_file=env_file,
-            environ=environ,
-        ),
-    )
-
-
-def _load_runtime_env(*, env_file: str | Path | None, environ: Mapping[str, str] | None) -> dict[str, str]:
-    if environ is None and env_file is None:
-        return dict(get_project_env_config().values)
-    if environ is not None and env_file is None:
-        # Synthetic environ mappings used by tests should be hermetic: do not
-        # inherit the developer's project config.
-        return {str(key): str(value) for key, value in environ.items()}
-    return dict(load_env_config(env_file, environ=environ))
-
-
-def _load_defaults(path: str | Path) -> dict[str, Any]:
-    p = Path(path)
-    if not p.exists():
-        return {}
-    return json.loads(p.read_text(encoding="utf-8"))
 
 
 def _bool(value: Any) -> bool:

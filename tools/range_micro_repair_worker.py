@@ -46,7 +46,8 @@ from src.platform.data.models import (
     MarketTrade,
     TradeSide,
 )
-from src.platform.exchanges.models import ExchangeConfig, ExchangeName
+from src.platform.exchanges.config_loader import load_exchange_config
+from src.platform.exchanges.models import ExchangeName
 from src.platform.markets import get_market_profile
 
 
@@ -210,7 +211,7 @@ def main(argv: list[str] | None = None) -> int:
         provider = create_market_data_feed(
             exchange,
             symbol=args.symbol,
-            config=ExchangeConfig.from_env(exchange),
+            config=load_exchange_config(exchange),
             enable_trade_stream=False,
             enable_order_book_stream=False,
         )

@@ -274,7 +274,7 @@ class CatchupComponent(RuntimeComponent):
         window: _CatchupWindow,
     ) -> MarketKline | None:
         repository = (
-            self.service_dependencies().kline_store or SqliteKlineStore()
+            self.service_bundle.market.kline_store or SqliteKlineStore()
         )
         rows = repository.load(
             symbol=self.app_config.symbol,
@@ -533,4 +533,3 @@ class CatchupComponent(RuntimeComponent):
             if list_open(exchange=exchange, symbol=self.app_config.symbol, include_stop_orders=True):
                 return True
         return False
-

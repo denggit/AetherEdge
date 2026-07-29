@@ -413,15 +413,16 @@ async def test_runner_builds_exact_request_plan_and_delegates_once() -> None:
     assert request.event_time_ms == 88
     assert request.metadata is metadata
     assert request.feedback_depth == 3
+    component = runner.signal_execution
     expected = {
-        "prepare_signal": runner._prepare_signal_execution,
-        "create_intent": runner._create_signal_execution_intent,
-        "execute_intent": runner._execute_signal_execution_intent,
-        "post_submit_sync": runner._run_post_submit_order_sync,
-        "handle_results": runner._handle_signal_execution_results,
-        "post_order_sync": runner._run_post_order_account_sync,
-        "process_feedback": runner._process_signal_execution_feedback,
-        "build_feedback_request": runner._build_signal_feedback_request,
+        "prepare_signal": component._prepare_signal_execution,
+        "create_intent": component._create_signal_execution_intent,
+        "execute_intent": component._execute_signal_execution_intent,
+        "post_submit_sync": component._run_post_submit_order_sync,
+        "handle_results": component._handle_signal_execution_results,
+        "post_order_sync": component._run_post_order_account_sync,
+        "process_feedback": component._process_signal_execution_feedback,
+        "build_feedback_request": component._build_signal_feedback_request,
     }
     assert all(getattr(plan, name) == callback for name, callback in expected.items())
 

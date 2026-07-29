@@ -2,9 +2,59 @@ from __future__ import annotations
 
 from typing import AsyncIterator, Protocol
 
-from src.platform.exchanges.models import ExchangeName
+from src.platform.exchanges.names import ExchangeName
 from src.platform.markets import MarketProfile
 from src.platform.data.models import MarketEvent, MarketKline, MarketOrderBook, MarketTicker, MarketTrade
+
+
+class KlineFetcher(Protocol):
+    async def fetch_klines(
+        self,
+        symbol: str,
+        *,
+        interval: str,
+        limit: int = 100,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        oldest_first: bool = False,
+    ) -> list[MarketKline]:
+        ...
+
+
+class TickerFetcher(Protocol):
+    async def fetch_ticker(self, symbol: str) -> MarketTicker:
+        ...
+
+
+class HistoricalTradeFetcher(Protocol):
+    async def fetch_trades(
+        self,
+        symbol: str,
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 1000,
+        oldest_first: bool = True,
+        max_pages: int | None = None,
+    ) -> list[MarketTrade]:
+        ...
+
+
+class TradeIdAnchoredHistoryFetcher(Protocol):
+    async def fetch_trades_between_ids(
+        self,
+        symbol: str,
+        *,
+        newer_trade_id: str,
+        older_trade_id: str,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 100,
+        max_pages: int = 20,
+        oldest_first: bool = True,
+        partial_on_pagination: bool = False,
+    ) -> list[MarketTrade]:
+        ...
 
 
 class MarketDataFeed(Protocol):
@@ -60,6 +110,7 @@ class MarketDataFeed(Protocol):
         limit: int = 100,
         max_pages: int = 20,
         oldest_first: bool = True,
+        partial_on_pagination: bool = False,
     ) -> list[MarketTrade]:
         ...
 

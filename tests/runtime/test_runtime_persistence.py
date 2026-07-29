@@ -251,7 +251,7 @@ def test_runner_default_writer_uses_config_and_is_cached() -> None:
     assert isinstance(writer, BackgroundWriteQueue)
     assert writer.name == "live-persistence-writer"
     assert writer.max_pending == 7
-    assert runner.services["live_persistence_writer"] is writer
+    assert runner._runtime_service_bundle().persistence.writer is writer
     assert runner._get_live_persistence_writer() is writer
     writer.stop()
 

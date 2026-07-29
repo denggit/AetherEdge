@@ -1,111 +1,31 @@
 from __future__ import annotations
 
-import time
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
-from pathlib import Path
 from typing import Any, Mapping
 
 from src.market_data.models import (
     TradeDerivedFeatureCoverage,
     TradeFeatureBackfillTarget,
 )
-from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
+from src.market_data.trade_features.coverage_repository import (
+    TradeFeatureCoverageRepository,
+)
+from src.market_data.trade_features.coverage_service import (
+    TradeFeatureCoverageService,
+    TradeFeatureReadiness,
+)
+from src.market_data.trade_features.okx_archive_calendar import (
+    safe_okx_archive_end_ms,
+)
 
 _ONE_MINUTE_MS = 60_000
-_OKX_ARCHIVE_TIMEZONE = timezone(timedelta(hours=8))
-
-
-@dataclass(frozen=True)
-class TradeFeatureReadiness:
-    """Aggregated readiness status for the trade-derived feature pipeline."""
-
-    tradebar_ready: bool = False
-    fixed_time_footprint_ready: bool = False
-    range_footprint_ready: bool = False
-    price_ready: bool = False
-    orderflow_ready: bool = False
-    footprint_ready: bool = False
-    coverage_ready: bool = False
-
-    coverage: TradeDerivedFeatureCoverage | None = None
-    worker_running: bool = False
-    waiting_for_global_lock: bool = False
-    degraded_footprint: bool = False
-    current_day_archive_not_ready: bool = False
-
-    def audit(self) -> Mapping[str, Any]:
-        coverage_extra = (
-            dict(self.coverage.extra or {})
-            if self.coverage is not None
-            else {}
-        )
-        return {
-            "tradebar_ready": self.tradebar_ready,
-            "fixed_time_footprint_ready": self.fixed_time_footprint_ready,
-            "range_footprint_ready": self.range_footprint_ready,
-            "price_ready": self.price_ready,
-            "orderflow_ready": self.orderflow_ready,
-            "footprint_ready": self.footprint_ready,
-            "coverage_ready": self.coverage_ready,
-            "coverage": _coverage_audit(self.coverage),
-            "worker_running": self.worker_running,
-            "waiting_for_global_lock": self.waiting_for_global_lock,
-            "degraded_footprint": self.degraded_footprint,
-            "current_day_archive_not_ready": self.current_day_archive_not_ready,
-            "archive_publish_lag_hours": coverage_extra.get(
-                "archive_publish_lag_hours"
-            ),
-            "calendar_safe_archive_end_ms": coverage_extra.get(
-                "calendar_safe_archive_end_ms"
-            ),
-            "safe_archive_end_ms": coverage_extra.get(
-                "safe_archive_end_ms"
-            ),
-            "safe_archive_end_okx": coverage_extra.get(
-                "safe_archive_end_okx"
-            ),
-            "calendar_safe_archive_end_okx": coverage_extra.get(
-                "calendar_safe_archive_end_okx"
-            ),
-            "latest_archive_day_deferred": coverage_extra.get(
-                "latest_archive_day_deferred", False
-            ),
-            "latest_archive_day_deferred_reason": coverage_extra.get(
-                "latest_archive_day_deferred_reason"
-            ),
-        }
-
-
-def safe_okx_archive_end_ms(
-    now_ms: int | None = None,
-    *,
-    archive_publish_lag_hours: float = 8.0,
-) -> int:
-    """Return the last published-safe millisecond of an OKX UTC+8 day."""
-    now = (
-        datetime.now(UTC)
-        if now_ms is None
-        else datetime.fromtimestamp(int(now_ms) / 1000, tz=UTC)
-    )
-    lag_hours = max(0.0, float(archive_publish_lag_hours))
-    effective_now = now - timedelta(hours=lag_hours)
-    okx_now = effective_now.astimezone(_OKX_ARCHIVE_TIMEZONE)
-    current_day_start = datetime(
-        okx_now.year,
-        okx_now.month,
-        okx_now.day,
-        tzinfo=_OKX_ARCHIVE_TIMEZONE,
-    )
-    return int(current_day_start.timestamp() * 1000) - 1
 
 
 def trade_feature_coverage_scan(
     *,
     symbol: str,
     exchange: str,
-    store: SqliteTradeFeatureStore,
+    store: TradeFeatureCoverageRepository,
     required_minutes: int = 4320,
     worker_status_path: str | None = None,
     global_lock_path: str | None = None,
@@ -116,47 +36,17 @@ def trade_feature_coverage_scan(
     archive_publish_lag_hours: float = 8.0,
 ) -> TradeDerivedFeatureCoverage:
     """Scan 1m and range-footprint coverage at a safe archive edge."""
-    lag_hours = max(0.0, float(archive_publish_lag_hours))
-    calendar_safe_end = safe_okx_archive_end_ms(
-        now_ms,
-        archive_publish_lag_hours=0.0,
-    )
-    safe_end = safe_okx_archive_end_ms(
-        now_ms,
-        archive_publish_lag_hours=lag_hours,
-    )
-    latest_archive_day_deferred = calendar_safe_end > safe_end
-    extra: dict[str, Any] = {
-        "current_day_archive_ready": False,
-        "archive_publish_lag_hours": lag_hours,
-        "calendar_safe_archive_end_ms": calendar_safe_end,
-        "safe_archive_end_ms": safe_end,
-        "safe_archive_end_okx": _format_okx_time(safe_end),
-        "calendar_safe_archive_end_okx": _format_okx_time(
-            calendar_safe_end
-        ),
-        "latest_archive_day_deferred": latest_archive_day_deferred,
-        "latest_archive_day_deferred_reason": (
-            "archive_publish_lag"
-            if latest_archive_day_deferred
-            else None
-        ),
-    }
-    if worker_status_path:
-        extra["worker_status_path"] = worker_status_path
-    if global_lock_path:
-        extra["global_lock_path"] = global_lock_path
-
-    return store.coverage_scan(
+    return TradeFeatureCoverageService(store).scan(
         symbol=symbol,
         exchange=exchange,
         required_minutes=required_minutes,
-        current_day_archive_ready=False,
+        worker_status_path=worker_status_path,
+        global_lock_path=global_lock_path,
         reference_end_ms=reference_end_ms,
-        safe_archive_end_ms=safe_end,
+        now_ms=now_ms,
         range_pct=range_pct,
         price_step=price_step,
-        extra=extra,
+        archive_publish_lag_hours=archive_publish_lag_hours,
     )
 
 
@@ -164,7 +54,7 @@ def resolve_trade_feature_readiness(
     *,
     symbol: str,
     exchange: str,
-    store: SqliteTradeFeatureStore,
+    store: TradeFeatureCoverageRepository,
     required_minutes: int = 4320,
     worker_status_path: str | None = None,
     global_lock_path: str | None = None,
@@ -175,10 +65,9 @@ def resolve_trade_feature_readiness(
     archive_publish_lag_hours: float = 8.0,
 ) -> TradeFeatureReadiness:
     """Resolve independent price, order-flow, and footprint readiness gates."""
-    coverage = trade_feature_coverage_scan(
+    return TradeFeatureCoverageService(store).readiness(
         symbol=symbol,
         exchange=exchange,
-        store=store,
         required_minutes=required_minutes,
         worker_status_path=worker_status_path,
         global_lock_path=global_lock_path,
@@ -188,53 +77,13 @@ def resolve_trade_feature_readiness(
         price_step=price_step,
         archive_publish_lag_hours=archive_publish_lag_hours,
     )
-    extra = dict(coverage.extra or {})
-    required = coverage.required_minutes
-    tradebar_ready = (
-        int(extra.get("tradebar_complete_minutes", 0)) == required
-        and int(extra.get("missing_tradebar", required)) == 0
-        and int(extra.get("degraded_tradebar", required)) == 0
-    )
-    orderflow_ready = tradebar_ready
-    fixed_time_footprint_ready = (
-        int(extra.get("footprint_complete_minutes", 0)) == required
-        and int(extra.get("missing_footprint", required)) == 0
-        and int(extra.get("degraded_footprint", required)) == 0
-    )
-    range_footprint_ready = bool(extra.get("range_footprint_ready", False))
-    coverage_ready = (
-        tradebar_ready
-        and fixed_time_footprint_ready
-        and range_footprint_ready
-    )
-
-    return TradeFeatureReadiness(
-        tradebar_ready=tradebar_ready,
-        fixed_time_footprint_ready=fixed_time_footprint_ready,
-        range_footprint_ready=range_footprint_ready,
-        price_ready=tradebar_ready,
-        orderflow_ready=orderflow_ready,
-        footprint_ready=fixed_time_footprint_ready,
-        coverage_ready=coverage_ready,
-        coverage=coverage,
-        worker_running=(
-            _check_worker_running(worker_status_path)
-            if worker_status_path
-            else False
-        ),
-        waiting_for_global_lock=(
-            _check_lock_exists(global_lock_path) if global_lock_path else False
-        ),
-        degraded_footprint=int(extra.get("degraded_footprint", 0)) > 0,
-        current_day_archive_not_ready=True,
-    )
 
 
 def compute_backfill_target(
     *,
     symbol: str,
     exchange: str,
-    store: SqliteTradeFeatureStore,
+    store: TradeFeatureCoverageRepository,
     required_minutes: int = 4320,
     max_minutes_per_cycle: int = 1440,
     direction: str = "recent-to-oldest",
@@ -339,7 +188,7 @@ def compute_backfill_target(
             reason="gap_after_latest",
         )
 
-    coverage = store.coverage_scan(
+    coverage = TradeFeatureCoverageService(store).scan_window(
         symbol=symbol,
         exchange=exchange,
         required_minutes=required,
@@ -443,7 +292,7 @@ def latest_range_footprint_context_audit(
     *,
     symbol: str,
     exchange: str,
-    store: SqliteTradeFeatureStore,
+    store: TradeFeatureCoverageRepository,
     cutoff_ms: int,
     range_pct: str = "0.002",
     price_step: str = "1",
@@ -458,28 +307,13 @@ def latest_range_footprint_context_audit(
     range_text = _decimal_text(range_pct)
     step_text = _decimal_text(price_step)
     try:
-        with store._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT available_time_ms, range_bar_id,
-                       fp_max_bucket_abs_delta_pressure
-                FROM range_footprint_features
-                WHERE exchange=? AND symbol=?
-                  AND range_pct=? AND price_step=?
-                  AND available_time_ms<=?
-                  AND quality='COMPLETE'
-                  AND context_available=1
-                ORDER BY available_time_ms DESC, range_bar_id DESC
-                LIMIT 1
-                """,
-                (
-                    exchange,
-                    symbol,
-                    range_text,
-                    step_text,
-                    int(cutoff_ms),
-                ),
-            ).fetchone()
+        row = store.load_latest_range_footprint_context(
+            symbol=symbol,
+            exchange=exchange,
+            cutoff_ms=int(cutoff_ms),
+            range_pct=range_text,
+            price_step=step_text,
+        )
     except Exception as exc:
         return {
             "range_footprint_context_ready": False,
@@ -500,10 +334,12 @@ def latest_range_footprint_context_audit(
     return {
         "range_footprint_context_ready": True,
         "range_footprint_context_cutoff_ms": int(cutoff_ms),
-        "latest_range_footprint_context_available_time_ms": int(row[0]),
-        "latest_range_footprint_context_range_bar_id": int(row[1]),
+        "latest_range_footprint_context_available_time_ms":
+            int(row.available_time_ms),
+        "latest_range_footprint_context_range_bar_id":
+            int(row.range_bar_id),
         "latest_range_footprint_context_pressure": (
-            None if row[2] is None else str(row[2])
+            str(row.fp_max_bucket_abs_delta_pressure)
         ),
     }
 
@@ -517,51 +353,5 @@ def _bounded_window(
     return max(first_ms, last_ms - span_ms + 1), last_ms
 
 
-def _check_worker_running(status_path: str | None) -> bool:
-    if not status_path:
-        return False
-    try:
-        import json
-
-        data = json.loads(Path(status_path).read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or not data.get("running"):
-            return False
-        heartbeat = data.get("worker_heartbeat_ms", 0)
-        return int(time.time() * 1000) - int(heartbeat) < 180_000
-    except (OSError, json.JSONDecodeError, ValueError, TypeError):
-        return False
-
-
-def _check_lock_exists(lock_path: str | None) -> bool:
-    return bool(lock_path and Path(lock_path).exists())
-
-
-def _format_okx_time(timestamp_ms: int) -> str:
-    return datetime.fromtimestamp(
-        int(timestamp_ms) / 1_000,
-        tz=UTC,
-    ).astimezone(_OKX_ARCHIVE_TIMEZONE).strftime(
-        "%Y-%m-%d %H:%M:%S+08"
-    )
-
-
 def _decimal_text(value: object) -> str:
     return format(Decimal(str(value)).normalize(), "f")
-
-
-def _coverage_audit(
-    coverage: TradeDerivedFeatureCoverage | None,
-) -> Mapping[str, Any] | None:
-    if coverage is None:
-        return None
-    return {
-        "required_minutes": coverage.required_minutes,
-        "complete_minutes": coverage.complete_minutes,
-        "missing_minutes": coverage.missing_minutes,
-        "degraded_minutes": coverage.degraded_minutes,
-        "latest_complete_close_time_ms": coverage.latest_complete_close_time_ms,
-        "first_missing_range": coverage.first_missing_range,
-        "available": coverage.available,
-        "reason": coverage.reason,
-        "extra": coverage.extra,
-    }

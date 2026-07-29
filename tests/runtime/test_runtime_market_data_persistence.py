@@ -436,7 +436,10 @@ def test_runner_default_gateway_is_created_and_cached_once() -> None:
     second = runner._get_market_data_persistence()
 
     assert first is second
-    assert runner.services["market_data_persistence"] is first
+    assert (
+        runner._runtime_service_bundle().persistence.market_data
+        is first
+    )
     assert vars(first)["_persistence_service"] is service
 
 
@@ -467,7 +470,7 @@ def test_runner_live_kline_store_uses_configured_path_and_caches(
     assert runner._get_live_kline_store() is store
     assert runner._get_live_kline_store() is store
     factory.assert_called_once_with(path)
-    assert runner.services["kline_store"] is store
+    assert runner._runtime_service_bundle().market.kline_store is store
 
 
 def test_runner_persistence_error_handlers_keep_messages_and_severity(

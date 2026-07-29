@@ -2,6 +2,8 @@ import asyncio
 import json
 from decimal import Decimal
 
+import pytest
+
 from src.platform.data import TradeSide, create_market_data_feed
 from src.platform.exchanges import ExchangeConfig, ExchangeName
 from tests.data_feed.test_rest_feed import FakeExchangeClient
@@ -94,7 +96,7 @@ def test_okx_websocket_trade_stream_maps_tick_messages():
     assert trade.trade_id == "1"
 
 
-def test_binance_websocket_trade_stream_maps_tick_messages():
+def test_binance_websocket_trade_stream_is_rejected():
     connector = FakeWebSocketConnector(
         [
             json.dumps(
@@ -111,24 +113,15 @@ def test_binance_websocket_trade_stream_maps_tick_messages():
             )
         ]
     )
-    feed = create_market_data_feed(
-        "binance",
-        symbol="ETH-USDT-PERP",
-        config=ExchangeConfig(sandbox=False),
-        exchange_client=FakeExchangeClient(),
-        websocket_connector=connector,
-    )
-
-    trade = asyncio.run(_first_trade(feed))
-
-    assert connector.urls == ["wss://fstream.binance.com/ws/ethusdt@aggTrade"]
-    assert trade.exchange is ExchangeName.BINANCE
-    assert trade.symbol == "ETH-USDT-PERP"
-    assert trade.raw_symbol == "ETHUSDT"
-    assert trade.price == Decimal("3000.2")
-    assert trade.quantity == Decimal("0.3")
-    assert trade.side is TradeSide.SELL
-    assert trade.trade_id == "100"
+    with pytest.raises(ValueError, match="OKX is the only"):
+        create_market_data_feed(
+            "binance",
+            symbol="ETH-USDT-PERP",
+            config=ExchangeConfig(sandbox=False),
+            exchange_client=FakeExchangeClient(),
+            websocket_connector=connector,
+        )
+    assert connector.urls == []
 
 
 def test_market_data_feed_can_disable_trade_stream_for_rest_only_mode():
@@ -151,7 +144,7 @@ def test_market_data_feed_can_disable_trade_stream_for_rest_only_mode():
         raise AssertionError("REST-only feed should not stream trades")
 
 
-def test_binance_trade_stream_reconnects_after_disconnect():
+def test_binance_trade_stream_does_not_attempt_reconnect():
     class SequencedConnector:
         def __init__(self):
             self.urls = []
@@ -162,17 +155,14 @@ def test_binance_trade_stream_reconnects_after_disconnect():
             return FakeWebSocketConnection(self.messages.pop(0))
 
     connector = SequencedConnector()
-    feed = create_market_data_feed(
-        "binance",
-        symbol="ETH-USDT-PERP",
-        config=ExchangeConfig(),
-        exchange_client=FakeExchangeClient(),
-        websocket_connector=connector,
-        reconnect_delay_seconds=0,
-        max_reconnects=1,
-    )
-
-    trade = asyncio.run(_first_trade(feed))
-
-    assert len(connector.urls) == 2
-    assert trade.price == Decimal("3001")
+    with pytest.raises(ValueError, match="OKX is the only"):
+        create_market_data_feed(
+            "binance",
+            symbol="ETH-USDT-PERP",
+            config=ExchangeConfig(),
+            exchange_client=FakeExchangeClient(),
+            websocket_connector=connector,
+            reconnect_delay_seconds=0,
+            max_reconnects=1,
+        )
+    assert connector.urls == []

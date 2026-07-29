@@ -372,7 +372,7 @@ class StartupComponent(RuntimeComponent):
             )
 
     async def _run_warmup(self) -> None:
-        services = self.service_dependencies()
+        services = self.service_bundle.market
         warmup_services = services.warmup_services or services.warmup_service
         if warmup_services is not None:
             if not isinstance(warmup_services, (list, tuple)):
@@ -398,7 +398,7 @@ class StartupComponent(RuntimeComponent):
         return sum(1 for row in rows if row.is_closed)
 
     async def _run_requirement_warmup(self) -> None:
-        services = self.service_dependencies()
+        services = self.service_bundle.market
         time_range = self._closed_kline_warmup_range()
         if time_range is None:
             return

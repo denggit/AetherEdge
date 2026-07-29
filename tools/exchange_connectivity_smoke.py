@@ -28,10 +28,10 @@ from src.platform.account.factory import create_account_client
 from src.platform.data.factory import create_market_data_feed
 from src.platform.execution.factory import create_execution_client
 from src.platform.config import load_project_env_config, set_project_env_config
+from src.platform.exchanges.config_loader import load_exchange_config
 from src.platform.exchanges.credentials import validate_private_credentials
 from src.platform.exchanges.models import (
     CancelStopOrderRequest,
-    ExchangeConfig,
     MarginMode,
     PositionMode,
     StopMarketOrderRequest,
@@ -130,7 +130,7 @@ async def main() -> int:
 
     exchange_configs = {}
     for exchange in app_config.exchanges:
-        exchange_config = ExchangeConfig.from_env(
+        exchange_config = load_exchange_config(
             exchange,
             env=project_env.values,
         )
@@ -149,7 +149,7 @@ async def main() -> int:
         app_config.data_exchange,
         symbol=app_config.symbol,
         config=exchange_configs.get(app_config.data_exchange)
-        or ExchangeConfig.from_env(
+        or load_exchange_config(
             app_config.data_exchange,
             env=project_env.values,
         ),

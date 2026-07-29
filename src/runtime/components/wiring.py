@@ -79,7 +79,11 @@ from src.runtime.startup_catchup import (
 from src.runtime.strategy_host import StrategyHost
 from src.runtime.sync_lifecycle import RuntimeSyncLifecycle, SyncTaskFactory
 from src.runtime.sync_services import RuntimeSyncServiceRegistry
-from src.runtime.services import RuntimeServices, RuntimeServicesInput
+from src.runtime.services import (
+    RuntimeServiceBundle,
+    RuntimeServices,
+    RuntimeServicesInput,
+)
 from src.runtime.orders import LiveOrderIntentFactory
 from src.runtime.tasks import ClosedBarScheduler, ProducerHealthMonitor, ProducerSupervisor
 
@@ -92,6 +96,7 @@ from src.runtime.components.base import RuntimeComponent
 from src.runtime.components.latest_state_mailbox import (
     LatestStateMarketEventMailbox,
 )
+from src.runtime.compat.services import LegacyRuntimeServiceView
 
 
 class WiringComponent(RuntimeComponent):
@@ -112,8 +117,19 @@ class WiringComponent(RuntimeComponent):
         self._market_data_capabilities: frozenset[CapabilityId] = frozenset()
         self._market_modules_managed = bool(managed_market_modules)
         self.context = app_context
-        self.runtime_services = RuntimeServices.coerce(services)
-        self.services = self.runtime_services
+        legacy_input = services
+        self.runtime_services = RuntimeServices.coerce(legacy_input)
+        self.service_bundle = RuntimeServiceBundle.from_legacy_boundary(
+            self.runtime_services
+        )
+        self.services = (
+            LegacyRuntimeServiceView(
+                self.service_bundle,
+                self.runtime_services,
+            )
+            if isinstance(legacy_input, dict)
+            else self.service_bundle
+        )
         self._initialize_strategy_runtime()
         self._initialize_execution_runtime()
         self._initialize_market_runtime()

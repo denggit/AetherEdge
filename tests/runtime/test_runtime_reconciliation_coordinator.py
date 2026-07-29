@@ -299,13 +299,14 @@ async def test_runner_builds_complete_plan_and_delegates_original_snapshots() ->
     assert len(captured) == 1
     assert captured[0][0] is snapshots
     plan = captured[0][1]
+    component = runner.account_runtime
     expected = {
-        "resolve_service": runner._get_reconciliation_service,
-        "validate_snapshots": runner._validate_startup_reconciliation_snapshots,
-        "begin_reconciliation": runner._log_startup_reconciliation_begin,
-        "apply_legacy_adoptions": runner._apply_startup_legacy_stop_adoptions,
-        "invoke_service": runner._invoke_startup_reconciliation_service,
-        "handle_report": runner._handle_startup_reconciliation_report,
+        "resolve_service": component._get_reconciliation_service,
+        "validate_snapshots": component._validate_startup_reconciliation_snapshots,
+        "begin_reconciliation": component._log_startup_reconciliation_begin,
+        "apply_legacy_adoptions": component._apply_startup_legacy_stop_adoptions,
+        "invoke_service": component._invoke_startup_reconciliation_service,
+        "handle_report": component._handle_startup_reconciliation_report,
     }
     assert all(getattr(plan, name) == callback for name, callback in expected.items())
 

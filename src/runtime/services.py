@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, fields
 
 
@@ -11,9 +11,8 @@ DEFAULT_RUNTIME_SERVICE = object()
 class RuntimeServices:
     """Explicit runtime dependency container.
 
-    Production code consumes named attributes.  ``from_legacy_mapping`` and the
-    item accessors exist only for the pre-refactor constructor/test boundary and
-    can be removed once external callers have migrated.
+    Production code consumes named attributes. ``from_legacy_mapping`` exists
+    only at the pre-refactor constructor boundary.
     """
 
     strategy_host: object | None = None
@@ -95,40 +94,130 @@ class RuntimeServices:
     ) -> RuntimeServices:
         return value if isinstance(value, cls) else cls.from_legacy_mapping(value)
 
-    # Thin mapping compatibility for existing external callers and tests.
-    def __getitem__(self, key: str) -> object:
-        if key not in self:
-            raise KeyError(key)
-        return getattr(self, key)
-
-    def __setitem__(self, key: str, value: object) -> None:
-        if key not in {item.name for item in fields(self)}:
-            raise KeyError(key)
-        setattr(self, key, value)
-
-    def __contains__(self, key: object) -> bool:
-        if not isinstance(key, str) or key not in {
-            item.name for item in fields(self)
-        }:
-            return False
-        value = getattr(self, key)
-        return value is not None and value is not DEFAULT_RUNTIME_SERVICE
-
-    def __iter__(self) -> Iterator[str]:
-        return (item.name for item in fields(self))
-
-    def get(self, key: str, default: object | None = None) -> object | None:
-        if key not in self:
-            return default
-        value = getattr(self, key)
-        return default if value is DEFAULT_RUNTIME_SERVICE else value
-
-
 RuntimeServicesInput = RuntimeServices | Mapping[str, object] | None
+
+
+@dataclass
+class MarketRuntimeServices:
+    _source: RuntimeServices
+
+    kline_store = property(
+        lambda self: self._source.kline_store,
+        lambda self, value: setattr(self._source, "kline_store", value),
+    )
+    warmup_services = property(
+        lambda self: self._source.warmup_services,
+        lambda self, value: setattr(self._source, "warmup_services", value),
+    )
+    warmup_service = property(
+        lambda self: self._source.warmup_service,
+        lambda self, value: setattr(self._source, "warmup_service", value),
+    )
+    market_event_processor = property(
+        lambda self: self._source.market_event_processor,
+        lambda self, value: setattr(
+            self._source, "market_event_processor", value
+        ),
+    )
+    trade_data_integrity_tracker = property(
+        lambda self: self._source.trade_data_integrity_tracker
+    )
+    order_book_data_integrity_tracker = property(
+        lambda self: self._source.order_book_data_integrity_tracker
+    )
+
+
+@dataclass
+class AccountRuntimeServices:
+    _source: RuntimeServices
+
+    clients = property(lambda self: self._source.account_clients)
+
+
+@dataclass
+class ExecutionRuntimeServices:
+    _source: RuntimeServices
+
+    clients = property(lambda self: self._source.execution_clients)
+
+
+@dataclass
+class PersistenceRuntimeServices:
+    _source: RuntimeServices
+
+    runtime = property(
+        lambda self: self._source.runtime_persistence_service,
+        lambda self, value: setattr(
+            self._source, "runtime_persistence_service", value
+        ),
+    )
+    market_data = property(
+        lambda self: self._source.market_data_persistence,
+        lambda self, value: setattr(
+            self._source, "market_data_persistence", value
+        ),
+    )
+    writer = property(
+        lambda self: self._source.live_persistence_writer,
+        lambda self, value: setattr(
+            self._source, "live_persistence_writer", value
+        ),
+    )
+
+
+@dataclass
+class RangeRuntimeServices:
+    _source: RuntimeServices
+
+    module = property(lambda self: self._source.range_bar_module)
+
+
+@dataclass
+class RecoveryRuntimeServices:
+    _source: RuntimeServices
+
+
+@dataclass
+class LifecycleRuntimeServices:
+    _source: RuntimeServices
+
+
+@dataclass
+class RuntimeServiceBundle:
+    market: MarketRuntimeServices
+    execution: ExecutionRuntimeServices
+    account: AccountRuntimeServices
+    persistence: PersistenceRuntimeServices
+    recovery: RecoveryRuntimeServices
+    lifecycle: LifecycleRuntimeServices
+    range: RangeRuntimeServices
+
+    @classmethod
+    def from_legacy_boundary(
+        cls,
+        services: RuntimeServices,
+    ) -> "RuntimeServiceBundle":
+        return cls(
+            market=MarketRuntimeServices(services),
+            execution=ExecutionRuntimeServices(services),
+            account=AccountRuntimeServices(services),
+            persistence=PersistenceRuntimeServices(services),
+            recovery=RecoveryRuntimeServices(services),
+            lifecycle=LifecycleRuntimeServices(services),
+            range=RangeRuntimeServices(services),
+        )
 
 
 __all__ = [
     "DEFAULT_RUNTIME_SERVICE",
+    "AccountRuntimeServices",
+    "ExecutionRuntimeServices",
+    "LifecycleRuntimeServices",
+    "MarketRuntimeServices",
+    "PersistenceRuntimeServices",
+    "RangeRuntimeServices",
+    "RecoveryRuntimeServices",
+    "RuntimeServiceBundle",
     "RuntimeServices",
     "RuntimeServicesInput",
 ]

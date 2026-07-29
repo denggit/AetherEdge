@@ -3,6 +3,7 @@ from __future__ import annotations
 from src.platform.execution.ports import ExecutionClient
 from src.platform.execution.risk import ExecutionRiskLimits
 from src.platform.execution.service import ExchangeExecutionService
+from src.platform.exchanges.config_loader import load_exchange_config
 from src.platform.exchanges.factory import create_exchange_client
 from src.platform.exchanges.models import ExchangeConfig, ExchangeName
 from src.platform.exchanges.ports import ExchangeExecutionClient, HttpClient
@@ -21,7 +22,7 @@ def create_execution_client(
     validate_orders: bool = True,
 ) -> ExecutionClient:
     profile = market_profile or get_market_profile(symbol)
-    cfg = config or ExchangeConfig.from_env(exchange)
+    cfg = config or load_exchange_config(exchange)
     client = exchange_client or create_exchange_client(exchange, cfg, http_client=http_client)
     return ExchangeExecutionService(
         client,

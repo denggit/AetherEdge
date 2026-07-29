@@ -11,9 +11,14 @@ from src.market_data.models import (
     FixedTimeTradeBar,
     RangeFootprintFeature,
     TimeRange,
-    TradeDerivedFeatureCoverage,
-    TradeFeatureQuality,
     TradeFootprintFeature,
+)
+from src.market_data.trade_features.coverage_repository import (
+    FixedTimeQualityRows,
+    RangeCoverageRows,
+)
+from src.market_data.trade_features.compat import (
+    CoverageRepositoryCompatibility,
 )
 
 logger = logging.getLogger(__name__)
@@ -28,7 +33,7 @@ class LargeTradeShareSample:
     quality: str
 
 
-class SqliteTradeFeatureStore:
+class SqliteTradeFeatureStore(CoverageRepositoryCompatibility):
     """SQLite repository for 1m trade-derived features.
 
     Two main tables:
@@ -601,7 +606,46 @@ class SqliteTradeFeatureStore:
             return None
         return int(row[0])
 
-    def range_footprint_coverage_summary(
+    def load_fixed_time_quality_rows(
+        self,
+        *,
+        symbol: str,
+        exchange: str,
+        start_ms: int,
+        end_ms: int,
+    ) -> FixedTimeQualityRows:
+        with self._connect() as conn:
+            tradebars = conn.execute(
+                """
+                SELECT open_time_ms, quality
+                FROM tradebar_1m_features
+                WHERE symbol = ? AND exchange = ?
+                  AND open_time_ms >= ? AND open_time_ms <= ?
+                ORDER BY open_time_ms ASC
+                """,
+                (symbol, exchange, int(start_ms), int(end_ms)),
+            ).fetchall()
+            footprints = conn.execute(
+                """
+                SELECT open_time_ms, quality, context_available
+                FROM trade_footprint_1m_features
+                WHERE symbol = ? AND exchange = ?
+                  AND open_time_ms >= ? AND open_time_ms <= ?
+                ORDER BY open_time_ms ASC
+                """,
+                (symbol, exchange, int(start_ms), int(end_ms)),
+            ).fetchall()
+        return FixedTimeQualityRows(
+            tradebars=tuple(
+                (int(row[0]), str(row[1])) for row in tradebars
+            ),
+            footprints=tuple(
+                (int(row[0]), str(row[1]), bool(row[2]))
+                for row in footprints
+            ),
+        )
+
+    def load_range_coverage_rows(
         self,
         *,
         symbol: str,
@@ -610,7 +654,7 @@ class SqliteTradeFeatureStore:
         end_ms: int,
         range_pct: Decimal | str | float = Decimal("0.002"),
         price_step: Decimal | str | float = Decimal("1"),
-    ) -> dict[str, object]:
+    ) -> RangeCoverageRows:
         range_text = _decimal_key(range_pct)
         step_text = _decimal_key(price_step)
         with self._connect() as conn:
@@ -688,11 +732,6 @@ class SqliteTradeFeatureStore:
                 ),
             ).fetchall()
 
-        complete_count = sum(
-            str(row[1]) == TradeFeatureQuality.COMPLETE.value and bool(row[2])
-            for row in feature_rows
-        )
-        degraded_count = len(feature_rows) - complete_count
         latest_complete = (
             None
             if latest_row is None or latest_row[0] is None
@@ -703,72 +742,19 @@ class SqliteTradeFeatureStore:
             if seed_row is None or seed_row[0] is None
             else int(seed_row[0])
         )
-        coverage_intervals = [
-            (int(row[0]), int(row[1])) for row in coverage_rows
-        ]
-        missing_minutes = _missing_minutes_from_coverage(
-            start_ms=int(start_ms),
-            end_ms=int(end_ms),
-            intervals=coverage_intervals,
+        return RangeCoverageRows(
+            features=tuple(
+                (int(row[0]), str(row[1]), bool(row[2]))
+                for row in feature_rows
+            ),
+            latest_complete_time_ms=latest_complete,
+            context_seed_time_ms=context_seed,
+            complete_intervals=tuple(
+                (int(row[0]), int(row[1])) for row in coverage_rows
+            ),
+            range_pct=range_text,
+            price_step=step_text,
         )
-        missing_gaps = _missing_gaps_from_coverage(
-            start_ms=int(start_ms),
-            end_ms=int(end_ms),
-            intervals=coverage_intervals,
-        )
-        first_missing_gap = missing_gaps[0] if missing_gaps else None
-        last_missing_gap = missing_gaps[-1] if missing_gaps else None
-
-        # Compute contiguous degraded-feature ranges within the window.
-        degraded_gaps: list[tuple[int, int]] = []
-        _current_degraded_start: int | None = None
-        for row in feature_rows:
-            available_time_ms = int(row[0])
-            quality_val = str(row[1]) if row[1] else ""
-            context_ok = bool(row[2])
-            is_degraded = (
-                quality_val != TradeFeatureQuality.COMPLETE.value
-                or not context_ok
-            )
-            if is_degraded:
-                if _current_degraded_start is None:
-                    _current_degraded_start = available_time_ms
-            else:
-                if _current_degraded_start is not None:
-                    degraded_gaps.append(
-                        (_current_degraded_start, available_time_ms - _ONE_MINUTE_MS)
-                    )
-                    _current_degraded_start = None
-        if _current_degraded_start is not None:
-            degraded_gaps.append(
-                (_current_degraded_start, int(end_ms))
-            )
-        first_degraded_gap = degraded_gaps[0] if degraded_gaps else None
-        last_degraded_gap = degraded_gaps[-1] if degraded_gaps else None
-
-        coverage_marker_present = bool(coverage_rows)
-        ready = (
-            context_seed is not None
-            and degraded_count == 0
-            and missing_minutes == 0
-        )
-        if context_seed is None and missing_minutes == 0:
-            missing_minutes = 1
-        return {
-            "range_footprint_ready": ready,
-            "range_footprint_complete_count": complete_count,
-            "missing_range_footprint_count": missing_minutes,
-            "degraded_range_footprint_count": degraded_count,
-            "latest_range_footprint_available_time_ms": latest_complete,
-            "range_footprint_context_seed_available_time_ms": context_seed,
-            "range_footprint_coverage_marker_present": coverage_marker_present,
-            "range_pct": range_text,
-            "price_step": step_text,
-            "first_missing_range_footprint_range": first_missing_gap,
-            "last_missing_range_footprint_range": last_missing_gap,
-            "first_degraded_range_footprint_range": first_degraded_gap,
-            "last_degraded_range_footprint_range": last_degraded_gap,
-        }
 
     def tradebar_without_footprint_bounds(
         self, *, symbol: str, exchange: str, end_ms: int
@@ -833,328 +819,6 @@ class SqliteTradeFeatureStore:
         if row is None or row[0] is None:
             return None
         return int(row[0])
-
-    def coverage_scan(
-        self,
-        *,
-        symbol: str,
-        exchange: str,
-        required_minutes: int = 4320,
-        current_day_archive_ready: bool = False,
-        reference_end_ms: int | None = None,
-        safe_archive_end_ms: int | None = None,
-        range_pct: Decimal | str | float = Decimal("0.002"),
-        price_step: Decimal | str | float = Decimal("1"),
-        extra: dict | None = None,
-    ) -> TradeDerivedFeatureCoverage:
-        """Scan fixed-time and range-footprint coverage independently.
-
-        A minute is COMPLETE only when:
-        - tradebar exists with quality=COMPLETE
-        - fixed-time footprint exists with quality=COMPLETE and context_available=1
-
-        Range readiness additionally requires a proven raw-trade coverage
-        marker and at least one causally available COMPLETE range context.
-        """
-        required_minutes = max(0, int(required_minutes))
-        latest = self.latest_complete_close_time_ms(
-            symbol=symbol, exchange=exchange
-        )
-        latest_tradebar = self.latest_any_tradebar_close_time_ms(
-            symbol=symbol, exchange=exchange
-        )
-        latest_footprint = self.latest_any_footprint_close_time_ms(
-            symbol=symbol, exchange=exchange
-        )
-        latest_range_footprint = (
-            self.latest_any_range_footprint_available_time_ms(
-                symbol=symbol,
-                exchange=exchange,
-                range_pct=range_pct,
-                price_step=price_step,
-            )
-        )
-        if safe_archive_end_ms is None:
-            from src.market_data.trade_features.coverage import (
-                safe_okx_archive_end_ms,
-            )
-
-            safe_archive_end_ms = safe_okx_archive_end_ms()
-        if reference_end_ms is None:
-            # Historical coverage is anchored to the last complete OKX
-            # archive day. Newer live rows must not move this window into
-            # the current, intentionally incomplete archive day.
-            reference_end_ms = safe_archive_end_ms
-
-        end_ms = int(reference_end_ms)
-        start_ms = end_ms - (required_minutes * _ONE_MINUTE_MS) + 1
-
-        with self._connect() as conn:
-            # Get tradebars
-            tb_rows = conn.execute(
-                """
-                SELECT open_time_ms, quality
-                FROM tradebar_1m_features
-                WHERE symbol = ? AND exchange = ?
-                  AND open_time_ms >= ? AND open_time_ms <= ?
-                ORDER BY open_time_ms ASC
-                """,
-                (symbol, exchange, start_ms, end_ms),
-            ).fetchall()
-            tb_map: dict[int, str] = {int(r[0]): str(r[1]) for r in tb_rows}
-
-            # Get footprints
-            fp_rows = conn.execute(
-                """
-                SELECT open_time_ms, quality, context_available
-                FROM trade_footprint_1m_features
-                WHERE symbol = ? AND exchange = ?
-                  AND open_time_ms >= ? AND open_time_ms <= ?
-                ORDER BY open_time_ms ASC
-                """,
-                (symbol, exchange, start_ms, end_ms),
-            ).fetchall()
-            fp_map: dict[int, tuple[str, bool]] = {
-                int(r[0]): (str(r[1]), bool(r[2])) for r in fp_rows
-            }
-
-        complete = 0
-        degraded = 0
-        missing = 0
-        first_missing: tuple[int, int] | None = None
-        first_incomplete: tuple[int, int] | None = None
-        first_degraded_footprint: tuple[int, int] | None = None
-        first_missing_tradebar: tuple[int, int] | None = None
-        first_missing_footprint: tuple[int, int] | None = None
-        last_missing: tuple[int, int] | None = None
-        last_incomplete: tuple[int, int] | None = None
-        last_degraded_footprint: tuple[int, int] | None = None
-        last_missing_tradebar: tuple[int, int] | None = None
-        last_missing_footprint: tuple[int, int] | None = None
-        contiguous: dict[str, dict[str, object]] = {}
-        missing_tb_count = 0
-        missing_fp_count = 0
-        degraded_tb_count = 0
-        degraded_fp_count = 0
-        tradebar_complete_count = 0
-        footprint_complete_count = 0
-        tradebar_without_footprint = 0
-        footprint_without_tradebar = 0
-
-        bucket = _bucket_start_ms(start_ms)
-        end_bucket = _bucket_start_ms(end_ms)
-        while bucket <= end_bucket:
-            tb_quality = tb_map.get(bucket)
-            fp_info = fp_map.get(bucket)
-
-            tb_complete = tb_quality == TradeFeatureQuality.COMPLETE.value
-            fp_complete = bool(
-                fp_info is not None
-                and fp_info[0] == TradeFeatureQuality.COMPLETE.value
-                and fp_info[1]
-            )
-            if tb_complete:
-                tradebar_complete_count += 1
-            if fp_complete:
-                footprint_complete_count += 1
-            if tb_quality is None:
-                missing_tb_count += 1
-            elif not tb_complete:
-                degraded_tb_count += 1
-            if fp_info is None:
-                missing_fp_count += 1
-            elif not fp_complete:
-                degraded_fp_count += 1
-            if tb_quality is not None and fp_info is None:
-                tradebar_without_footprint += 1
-            if fp_info is not None and tb_quality is None:
-                footprint_without_tradebar += 1
-
-            bucket_missing = tb_quality is None or fp_info is None
-            bucket_complete = tb_complete and fp_complete
-            bucket_incomplete = not bucket_complete
-            bucket_degraded = (
-                tb_quality is not None
-                and fp_info is not None
-                and not bucket_complete
-            )
-            footprint_degraded = fp_info is not None and not fp_complete
-            _observe_contiguous_bucket(
-                contiguous,
-                "missing",
-                active=bucket_missing,
-                bucket=bucket,
-            )
-            _observe_contiguous_bucket(
-                contiguous,
-                "incomplete",
-                active=bucket_incomplete,
-                bucket=bucket,
-            )
-            _observe_contiguous_bucket(
-                contiguous,
-                "degraded",
-                active=bucket_degraded,
-                bucket=bucket,
-            )
-            _observe_contiguous_bucket(
-                contiguous,
-                "degraded_footprint",
-                active=footprint_degraded,
-                bucket=bucket,
-            )
-            _observe_contiguous_bucket(
-                contiguous,
-                "missing_tradebar",
-                active=tb_quality is None,
-                bucket=bucket,
-            )
-            _observe_contiguous_bucket(
-                contiguous,
-                "missing_footprint",
-                active=fp_info is None,
-                bucket=bucket,
-            )
-
-            if bucket_missing:
-                missing += 1
-            elif bucket_complete:
-                complete += 1
-            else:
-                degraded += 1
-
-            bucket += _ONE_MINUTE_MS
-
-        first_missing, last_missing = _contiguous_bounds(
-            contiguous, "missing"
-        )
-        first_incomplete, last_incomplete = _contiguous_bounds(
-            contiguous, "incomplete"
-        )
-        _, _last_degraded = _contiguous_bounds(
-            contiguous, "degraded"
-        )
-        (
-            first_degraded_footprint,
-            last_degraded_footprint,
-        ) = _contiguous_bounds(contiguous, "degraded_footprint")
-        (
-            first_missing_tradebar,
-            last_missing_tradebar,
-        ) = _contiguous_bounds(contiguous, "missing_tradebar")
-        (
-            first_missing_footprint,
-            last_missing_footprint,
-        ) = _contiguous_bounds(contiguous, "missing_footprint")
-
-        fixed_time_available = missing == 0 and degraded == 0
-        range_summary = self.range_footprint_coverage_summary(
-            symbol=symbol,
-            exchange=exchange,
-            start_ms=start_ms,
-            end_ms=end_ms,
-            range_pct=range_pct,
-            price_step=price_step,
-        )
-        range_footprint_ready = bool(
-            range_summary["range_footprint_ready"]
-        )
-        available = fixed_time_available and range_footprint_ready
-
-        reason_parts = []
-        if latest_tradebar is None and latest_footprint is None:
-            reason_parts.append("no_features_stored")
-        if missing > 0:
-            reason_parts.append(f"missing={missing}")
-        if missing_tb_count > 0:
-            reason_parts.append(f"missing_tradebar={missing_tb_count}")
-        if missing_fp_count > 0:
-            reason_parts.append(f"missing_footprint={missing_fp_count}")
-        if degraded > 0:
-            reason_parts.append(f"degraded={degraded}")
-            if degraded_tb_count > 0:
-                reason_parts.append(f"degraded_tradebar={degraded_tb_count}")
-            if degraded_fp_count > 0:
-                reason_parts.append(f"degraded_footprint={degraded_fp_count}")
-        missing_range = int(
-            range_summary["missing_range_footprint_count"]
-        )
-        degraded_range = int(
-            range_summary["degraded_range_footprint_count"]
-        )
-        if missing_range > 0:
-            reason_parts.append(f"missing_range_footprint={missing_range}")
-        if degraded_range > 0:
-            reason_parts.append(f"degraded_range_footprint={degraded_range}")
-        if not current_day_archive_ready:
-            reason_parts.append("current_day_archive_not_ready")
-        reason = "; ".join(reason_parts) if reason_parts else ""
-
-        extra = dict(extra or {})
-        extra.setdefault("current_day_archive_ready", current_day_archive_ready)
-        extra.update(
-            {
-                "tradebar_complete_minutes": tradebar_complete_count,
-                "footprint_complete_minutes": footprint_complete_count,
-                "missing_tradebar": missing_tb_count,
-                "missing_footprint": missing_fp_count,
-                "degraded_tradebar": degraded_tb_count,
-                "degraded_footprint": degraded_fp_count,
-                "tradebar_without_footprint": tradebar_without_footprint,
-                "footprint_without_tradebar": footprint_without_tradebar,
-                "latest_any_tradebar_close_time_ms": latest_tradebar,
-                "latest_any_footprint_close_time_ms": latest_footprint,
-                "latest_any_range_footprint_available_time_ms":
-                    latest_range_footprint,
-                "safe_archive_end_ms": safe_archive_end_ms,
-                "reference_end_ms": end_ms,
-                "first_incomplete_range": first_incomplete,
-                "last_incomplete_range": last_incomplete,
-                "first_missing_range_contiguous": first_missing,
-                "last_missing_range_contiguous": last_missing,
-                "first_incomplete_range_contiguous": first_incomplete,
-                "last_incomplete_range_contiguous": last_incomplete,
-                "first_degraded_range_contiguous": (
-                    _contiguous_bounds(contiguous, "degraded")[0]
-                ),
-                "last_degraded_range_contiguous": _last_degraded,
-                "first_degraded_footprint_range_contiguous": (
-                    first_degraded_footprint
-                ),
-                "last_degraded_footprint_range_contiguous": (
-                    last_degraded_footprint
-                ),
-                "first_missing_tradebar_range_contiguous": (
-                    first_missing_tradebar
-                ),
-                "last_missing_tradebar_range_contiguous": (
-                    last_missing_tradebar
-                ),
-                "first_missing_footprint_range_contiguous": (
-                    first_missing_footprint
-                ),
-                "last_missing_footprint_range_contiguous": (
-                    last_missing_footprint
-                ),
-                "first_degraded_footprint_range": first_degraded_footprint,
-                "fixed_time_coverage_ready": fixed_time_available,
-                **range_summary,
-            }
-        )
-
-        return TradeDerivedFeatureCoverage(
-            symbol=symbol,
-            exchange=exchange,
-            required_minutes=required_minutes,
-            complete_minutes=complete,
-            missing_minutes=missing,
-            degraded_minutes=degraded,
-            latest_complete_close_time_ms=latest,
-            first_missing_range=first_missing,
-            available=available,
-            reason=reason,
-            extra=extra,
-        )
 
     def _time_scalar(
         self, query: str, *, symbol: str, exchange: str
@@ -1344,64 +1008,6 @@ class SqliteTradeFeatureStore:
 # Serialisation helpers
 # ==================================================================
 
-def _observe_contiguous_bucket(
-    states: dict[str, dict[str, object]],
-    name: str,
-    *,
-    active: bool,
-    bucket: int,
-) -> None:
-    state = states.setdefault(
-        name,
-        {
-            "current": None,
-            "first": None,
-            "last": None,
-        },
-    )
-    current = state["current"]
-    if active:
-        if current is None:
-            current = [bucket, bucket + _ONE_MINUTE_MS - 1]
-            state["current"] = current
-        else:
-            current[1] = bucket + _ONE_MINUTE_MS - 1
-        return
-    if current is None:
-        return
-    completed = (int(current[0]), int(current[1]))
-    if state["first"] is None:
-        state["first"] = completed
-    state["last"] = completed
-    state["current"] = None
-
-
-def _contiguous_bounds(
-    states: dict[str, dict[str, object]],
-    name: str,
-) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
-    state = states.get(name)
-    if state is None:
-        return None, None
-    current = state.get("current")
-    if current is not None:
-        completed = (int(current[0]), int(current[1]))
-        if state.get("first") is None:
-            state["first"] = completed
-        state["last"] = completed
-        state["current"] = None
-    first = state.get("first")
-    last = state.get("last")
-    return (
-        None
-        if first is None
-        else (int(first[0]), int(first[1])),
-        None
-        if last is None
-        else (int(last[0]), int(last[1])),
-    )
-
-
 def _tradebar_params(bar: FixedTimeTradeBar) -> tuple[object, ...]:
     return (
         bar.exchange, bar.symbol, bar.timeframe,
@@ -1517,70 +1123,6 @@ def _decimal_key(value: Decimal | str | float) -> str:
     return _dec(Decimal(str(value)))
 
 
-def _missing_minutes_from_coverage(
-    *,
-    start_ms: int,
-    end_ms: int,
-    intervals: Sequence[tuple[int, int]],
-) -> int:
-    if end_ms < start_ms:
-        return 0
-    merged: list[tuple[int, int]] = []
-    for raw_start, raw_end in sorted(intervals):
-        clipped_start = max(start_ms, int(raw_start))
-        clipped_end = min(end_ms, int(raw_end))
-        if clipped_end < clipped_start:
-            continue
-        if merged and clipped_start <= merged[-1][1] + 1:
-            merged[-1] = (
-                merged[-1][0],
-                max(merged[-1][1], clipped_end),
-            )
-        else:
-            merged.append((clipped_start, clipped_end))
-    covered_ms = sum(end - start + 1 for start, end in merged)
-    total_ms = end_ms - start_ms + 1
-    missing_ms = max(0, total_ms - covered_ms)
-    return (missing_ms + _ONE_MINUTE_MS - 1) // _ONE_MINUTE_MS
-
-
-def _missing_gaps_from_coverage(
-    *,
-    start_ms: int,
-    end_ms: int,
-    intervals: Sequence[tuple[int, int]],
-) -> list[tuple[int, int]]:
-    """Return ordered list of (start_ms, end_ms) ranges *not* covered by intervals."""
-    if end_ms < start_ms:
-        return []
-    merged: list[tuple[int, int]] = []
-    for raw_start, raw_end in sorted(intervals):
-        clipped_start = max(start_ms, int(raw_start))
-        clipped_end = min(end_ms, int(raw_end))
-        if clipped_end < clipped_start:
-            continue
-        if merged and clipped_start <= merged[-1][1] + 1:
-            merged[-1] = (
-                merged[-1][0],
-                max(merged[-1][1], clipped_end),
-            )
-        else:
-            merged.append((clipped_start, clipped_end))
-    gaps: list[tuple[int, int]] = []
-    cursor = start_ms
-    for m_start, m_end in merged:
-        if cursor < m_start:
-            gaps.append((cursor, m_start - 1))
-        cursor = max(cursor, m_end + 1)
-    if cursor <= end_ms:
-        gaps.append((cursor, end_ms))
-    return gaps
-
-
 def _now_ms() -> int:
     import time
     return int(time.time() * 1000)
-
-
-def _bucket_start_ms(time_ms: int) -> int:
-    return (time_ms // _ONE_MINUTE_MS) * _ONE_MINUTE_MS

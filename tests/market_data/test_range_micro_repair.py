@@ -1146,6 +1146,7 @@ async def test_rest_feed_passes_partial_on_pagination_to_exchange_client() -> No
         exchange_client=client,
         symbol="ETH-USDT-PERP",
         market_profile=_MINI_PROFILE,
+        supports_partial_trade_pagination=True,
     )
 
     await feed.fetch_trades_between_ids(
@@ -1166,6 +1167,7 @@ async def test_rest_feed_default_partial_on_pagination_is_false() -> None:
         exchange_client=client,
         symbol="ETH-USDT-PERP",
         market_profile=_MINI_PROFILE,
+        supports_partial_trade_pagination=True,
     )
 
     await feed.fetch_trades_between_ids(
@@ -1208,6 +1210,7 @@ async def test_micro_repair_staging_passes_partial_on_pagination_through_rest_fe
         exchange_client=client,
         symbol="ETH-USDT-PERP",
         market_profile=_MINI_PROFILE,
+        supports_partial_trade_pagination=True,
     )
     checkpoint_store = SqliteRangeCheckpointStore(
         tmp_path / "checkpoint.sqlite3"

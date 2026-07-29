@@ -17,7 +17,8 @@ from src.order_management.safety.recovery_exit_validator import (
 )
 from src.platform import create_account_client, create_execution_client
 from src.platform.account.ports import AccountClient
-from src.platform.exchanges.models import ExchangeConfig, ExchangeName, InstrumentRule, Order, OrderStatus, Position, PositionMode, PositionSide
+from src.platform.exchanges.config_loader import load_exchange_config
+from src.platform.exchanges.models import ExchangeName, InstrumentRule, Order, OrderStatus, Position, PositionMode, PositionSide
 from src.platform.execution.ports import ExecutionClient
 from src.platform.markets import get_market_profile
 from src.platform.markets.models import MarketProfile
@@ -604,12 +605,16 @@ class OrderResultsComponent(RuntimeComponent):
 
     def _get_execution_clients(self) -> tuple[ExecutionClient, ...]:
         if self._execution_clients is None:
-            injected = self.service_dependencies().execution_clients
+            injected = self._runtime_service_bundle().execution.clients
             if injected is not None:
                 self._execution_clients = tuple(injected)
             else:
                 self._execution_clients = tuple(
-                    create_execution_client(exchange, symbol=self.app_config.symbol, config=ExchangeConfig.from_env(exchange))
+                    create_execution_client(
+                        exchange,
+                        symbol=self.app_config.symbol,
+                        config=load_exchange_config(exchange),
+                    )
                     for exchange in self.app_config.exchanges
                 )
         return self._execution_clients

@@ -2,13 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
-from enum import Enum
 from typing import Any, Mapping
 
+from src.platform.exchanges.names import ExchangeName
 
-class ExchangeName(str, Enum):
-    OKX = "okx"
-    BINANCE = "binance"
+
+from enum import Enum
 
 
 class OrderSide(str, Enum):
@@ -61,15 +60,7 @@ class TriggerPriceType(str, Enum):
 
 @dataclass(frozen=True)
 class ExchangeConfig:
-    """Runtime config passed into exchange adapters.
-
-    ``from_env()`` loads ``.env`` first and overlays process environment.
-    Credential names are intentionally strict to avoid preserving old typo-based
-    fallbacks:
-
-    - OKX: ``OKX_API_KEY``, ``OKX_SECRET_KEY``, ``OKX_PASSPHRASE``
-    - Binance USD-M: ``BINANCE_API_KEY``, ``BINANCE_SECRET_KEY``
-    """
+    """Pure runtime values passed into exchange adapters."""
 
     api_key: str = field(default="", repr=False)
     api_secret: str = field(default="", repr=False)
@@ -87,95 +78,11 @@ class ExchangeConfig:
         exchange: ExchangeName | str,
         env: Mapping[str, str] | None = None,
     ) -> "ExchangeConfig":
-        from src.platform.config import get_project_env_config, has_project_env_config, load_env_config
+        """Deprecated strategy-tool compatibility; use load_exchange_config."""
 
-        if env is not None:
-            values = {str(key): str(value) for key, value in env.items()}
-        elif has_project_env_config():
-            values = dict(get_project_env_config().values)
-        else:
-            values = load_env_config()
-        exchange_name = exchange if isinstance(exchange, ExchangeName) else ExchangeName(str(exchange).strip().lower())
-        base = cls(
-            sandbox=_bool_env(values.get(f"{exchange_name.value.upper()}_SANDBOX", values.get("SANDBOX", "false"))),
-            timeout_seconds=float(values.get("API_TIMEOUT_SECONDS", "10.0") or 10.0),
-            recv_window_ms=int(values.get("BINANCE_RECV_WINDOW_MS", "5000") or 5000),
-            live_trading_enabled=_bool_env(values.get("AETHER_LIVE_TRADING", "false")),
-            default_margin_mode=MarginMode(str(values.get("MARGIN_MODE", "cross")).strip().lower()),
-        )
-        if exchange_name == ExchangeName.OKX:
-            from src.platform.exchanges.okx.credentials import resolve_okx_credentials
+        from src.platform.exchanges.config_loader import load_exchange_config
 
-            api_key, api_secret, passphrase = resolve_okx_credentials(base, values)
-            return cls(
-                api_key=api_key,
-                api_secret=api_secret,
-                passphrase=passphrase,
-                sandbox=base.sandbox,
-                timeout_seconds=base.timeout_seconds,
-                recv_window_ms=base.recv_window_ms,
-                live_trading_enabled=base.live_trading_enabled,
-                default_margin_mode=base.default_margin_mode,
-            )
-        if exchange_name == ExchangeName.BINANCE:
-            from src.platform.exchanges.binance.credentials import resolve_binance_credentials
-
-            api_key, api_secret = resolve_binance_credentials(base, values)
-            return cls(
-                api_key=api_key,
-                api_secret=api_secret,
-                passphrase="",
-                sandbox=base.sandbox,
-                timeout_seconds=base.timeout_seconds,
-                recv_window_ms=base.recv_window_ms,
-                live_trading_enabled=base.live_trading_enabled,
-                default_margin_mode=base.default_margin_mode,
-            )
-        return base
-
-
-@dataclass(frozen=True)
-class Kline:
-    exchange: ExchangeName
-    symbol: str
-    raw_symbol: str
-    interval: str
-    open_time_ms: int
-    close_time_ms: int
-    open: Decimal
-    high: Decimal
-    low: Decimal
-    close: Decimal
-    volume: Decimal
-    quote_volume: Decimal | None = None
-    is_closed: bool = True
-    raw: Mapping[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class Ticker:
-    exchange: ExchangeName
-    symbol: str
-    raw_symbol: str
-    price: Decimal
-    time_ms: int | None = None
-    raw: Mapping[str, Any] = field(default_factory=dict)
-
-
-
-@dataclass(frozen=True)
-class Trade:
-    exchange: ExchangeName
-    symbol: str
-    raw_symbol: str
-    price: Decimal
-    quantity: Decimal
-    side: OrderSide | None = None
-    trade_id: str | None = None
-    event_time_ms: int | None = None
-    trade_time_ms: int | None = None
-    raw: Mapping[str, Any] = field(default_factory=dict)
-
+        return load_exchange_config(exchange, env)
 
 @dataclass(frozen=True)
 class Balance:
@@ -351,7 +258,19 @@ class Order:
     quantity: Decimal | None = None
     filled_quantity: Decimal | None = None
     raw: Mapping[str, Any] = field(default_factory=dict)
+def __getattr__(name: str):
+    """Resolve import-only aliases without coupling model initialization."""
 
+    if name not in {"Kline", "Ticker", "Trade"}:
+        raise AttributeError(name)
+    from src.platform.data.models import (
+        MarketKline,
+        MarketTicker,
+        MarketTrade,
+    )
 
-def _bool_env(value: str) -> bool:
-    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+    return {
+        "Kline": MarketKline,
+        "Ticker": MarketTicker,
+        "Trade": MarketTrade,
+    }[name]

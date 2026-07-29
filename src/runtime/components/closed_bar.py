@@ -71,7 +71,7 @@ class ClosedBarComponent(RuntimeComponent):
         if due is None:
             return []
         open_time_ms, closed_kline = due
-        processor = self.service_dependencies().market_event_processor
+        processor = self.service_bundle.market.market_event_processor
         if isinstance(processor, MarketEventProcessor):
             event = ClosedBarControlEvent(
                 open_time_ms=open_time_ms,
@@ -153,7 +153,7 @@ class ClosedBarComponent(RuntimeComponent):
     ) -> None:
         if not self.requirements.range_bars.enabled:
             return
-        module = self.service_dependencies().range_bar_module
+        module = self.service_bundle.range.module
         mark = getattr(module, "mark_trade_incomplete", None)
         if callable(mark):
             mark(
@@ -163,7 +163,7 @@ class ClosedBarComponent(RuntimeComponent):
             )
 
     def sync_next_closed_bar_cutoff(self, now_ms: int) -> None:
-        processor = self.service_dependencies().market_event_processor
+        processor = self.service_bundle.market.market_event_processor
         if not isinstance(processor, MarketEventProcessor):
             return
         interval = self._closed_bar_interval_ms
@@ -199,7 +199,7 @@ class ClosedBarComponent(RuntimeComponent):
                 open_time_ms,
                 finalized_at_ms=finalized_at_ms,
             )
-        processor = self.service_dependencies().market_event_processor
+        processor = self.service_bundle.market.market_event_processor
         if isinstance(processor, MarketEventProcessor):
             processor.stats.module_timings["repair-maintenance"] = (
                 processor.stats.module_timings.get("repair-maintenance", 0.0)
@@ -254,7 +254,7 @@ class ClosedBarComponent(RuntimeComponent):
         open_time_ms = self._closed_bar_scheduler.due_closed_bar(now_ms)
         if open_time_ms is None:
             return None
-        processor = self.service_dependencies().market_event_processor
+        processor = self.service_bundle.market.market_event_processor
         rest_started = time.monotonic()
         try:
             rows = await self.context.data.fetch_klines(

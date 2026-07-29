@@ -36,9 +36,10 @@ from src.platform.config import load_project_env_config, set_project_env_config
 from src.platform.data.factory import create_market_data_feed
 from src.platform.data.models import MarketTrade, TradeSide
 from src.platform.execution.factory import create_execution_client
+from src.platform.exchanges.config_loader import load_exchange_config
 from src.platform.exchanges.credentials import validate_private_credentials
 from src.platform.exchanges.errors import ExchangeConfigError
-from src.platform.exchanges.models import ExchangeConfig, MarginMode, Position, PositionMode, PositionSide
+from src.platform.exchanges.models import MarginMode, Position, PositionMode, PositionSide
 from src.platform.markets import get_market_profile
 from src.runtime import RuntimeMode, live_runtime_config_from_app, runtime_mode_from_env
 from src.runtime.account_config import (
@@ -155,7 +156,7 @@ async def main() -> int:
             for exchange in app.exchanges:
                 validate_private_credentials(
                     exchange,
-                    ExchangeConfig.from_env(
+                    load_exchange_config(
                         exchange,
                         env=project_env.values,
                     ),
@@ -362,7 +363,7 @@ async def _check_exchange_read_apis(
     data_feed = create_market_data_feed(
         app.data_exchange,
         symbol=app.symbol,
-        config=ExchangeConfig.from_env(app.data_exchange),
+        config=load_exchange_config(app.data_exchange),
         enable_trade_stream=False,
         enable_order_book_stream=False,
     )
@@ -370,8 +371,8 @@ async def _check_exchange_read_apis(
 
     snapshots: dict[ExchangeName, dict[str, Any]] = {}
     for exchange in app.exchanges:
-        account = create_account_client(exchange, symbol=app.symbol, config=ExchangeConfig.from_env(exchange))
-        execution = create_execution_client(exchange, symbol=app.symbol, config=ExchangeConfig.from_env(exchange))
+        account = create_account_client(exchange, symbol=app.symbol, config=load_exchange_config(exchange))
+        execution = create_execution_client(exchange, symbol=app.symbol, config=load_exchange_config(exchange))
         balance = await _step(report, "fetch_balance", exchange, account.fetch_balance, "USDT")
         positions = await _step(report, "fetch_positions", exchange, account.fetch_positions)
         leverage = await _step(report, "fetch_leverage", exchange, account.fetch_leverage, margin_mode=MarginMode.ISOLATED)
@@ -587,7 +588,7 @@ async def _check_account_config(
         create_account_client(
             exchange,
             symbol=app.symbol,
-            config=ExchangeConfig.from_env(exchange, env),
+            config=load_exchange_config(exchange, env),
         )
         for exchange in app.exchanges
     ]
@@ -595,7 +596,7 @@ async def _check_account_config(
         create_execution_client(
             exchange,
             symbol=app.symbol,
-            config=ExchangeConfig.from_env(exchange, env),
+            config=load_exchange_config(exchange, env),
         )
         for exchange in app.exchanges
     ]
@@ -783,7 +784,7 @@ async def _check_latest_closed_kline(report: PreflightReport, *, app: AppConfig,
         data_feed = create_market_data_feed(
             app.data_exchange,
             symbol=app.symbol,
-            config=ExchangeConfig.from_env(app.data_exchange),
+            config=load_exchange_config(app.data_exchange),
             enable_trade_stream=False,
             enable_order_book_stream=False,
         )
@@ -812,14 +813,14 @@ async def _check_follower_min_notional_balance(report: PreflightReport, *, app: 
         data_feed = create_market_data_feed(
             app.data_exchange,
             symbol=app.symbol,
-            config=ExchangeConfig.from_env(app.data_exchange),
+            config=load_exchange_config(app.data_exchange),
             enable_trade_stream=False,
             enable_order_book_stream=False,
         )
         ticker = await data_feed.fetch_ticker()
         profile = data_feed.market_profile
         for follower in policy.follower_exchanges:
-            account = create_account_client(follower, symbol=app.symbol, config=ExchangeConfig.from_env(follower))
+            account = create_account_client(follower, symbol=app.symbol, config=load_exchange_config(follower))
             balance = await account.fetch_balance("USDT")
             min_qty = profile.min_quantity(follower) or Decimal("0")
             min_notional = min_qty * ticker.price
@@ -839,7 +840,7 @@ def _check_local_rangebar_builder(report: PreflightReport, *, app: AppConfig) ->
         data_feed = create_market_data_feed(
             app.data_exchange,
             symbol=app.symbol,
-            config=ExchangeConfig.from_env(app.data_exchange),
+            config=load_exchange_config(app.data_exchange),
             enable_trade_stream=False,
             enable_order_book_stream=False,
         )

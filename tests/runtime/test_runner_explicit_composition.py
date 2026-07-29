@@ -1,25 +1,13 @@
 from __future__ import annotations
 
-import pytest
-
 from src.runtime import runner as runner_module
 from src.runtime.components.market_events import MarketEventsComponent
 from src.runtime.runner import LiveRuntimeRunner
 
 
-def test_component_method_conflicts_are_rejected(monkeypatch) -> None:
-    class First:
-        def collide(self):
-            return None
-
-    class Second:
-        def collide(self):
-            return None
-
-    monkeypatch.setattr(runner_module, "COMPONENT_TYPES", (First, Second))
-
-    with pytest.raises(RuntimeError, match="component method conflict"):
-        runner_module._compatibility_component_methods()
+def test_runner_has_no_dynamic_component_method_scanner() -> None:
+    assert not hasattr(runner_module, "_compatibility_component_methods")
+    assert not hasattr(runner_module, "_COMPATIBILITY_COMPONENT_METHODS")
 
 
 def test_instance_compatibility_patch_does_not_mutate_component_class() -> None:
@@ -44,4 +32,4 @@ def test_instance_compatibility_patch_does_not_mutate_component_class() -> None:
 
     assert first.__dict__["_process_market_event"] is replacement
     assert MarketEventsComponent._process_market_event is original
-    assert second._process_market_event.__self__ is second_component
+    assert second._process_market_event.__self__ is second

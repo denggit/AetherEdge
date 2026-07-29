@@ -1,9 +1,7 @@
-from src.platform.data.factory import (
-    create_full_order_book_stream,
-    create_market_data_feed,
-    create_open_interest_stream,
-    create_order_book_l2_stream,
-)
+from __future__ import annotations
+
+from importlib import import_module
+
 from src.platform.data.models import (
     MarketDataSource,
     MarketEvent,
@@ -18,27 +16,45 @@ from src.platform.data.models import (
     OrderBookLevel,
     TradeSide,
 )
-from src.platform.data.ports import MarketDataFeed
-from src.platform.data.rest_feed import RestMarketDataFeed
-from src.platform.data.storage import MarketDataStore, SqliteMarketDataStore
-from src.platform.data.websocket import (
-    BinanceOrderBookWebSocketFeed,
-    BinanceTradeWebSocketFeed,
-    OkxOrderBookWebSocketFeed,
-    OkxOpenInterestWebSocketFeed,
-    OkxOrderBookL2WebSocketFeed,
-    OkxTradeWebSocketFeed,
-    OpenInterestStream,
-    OrderBookL2Stream,
-    OrderBookStream,
-    TradeStream,
-    WebSocketConnector,
-    WebsocketsConnector,
-)
+
+_LAZY_EXPORTS = {
+    "MarketDataFeed": ("src.platform.data.ports", "MarketDataFeed"),
+    "RestMarketDataFeed": ("src.platform.data.rest_feed", "RestMarketDataFeed"),
+    "MarketDataStore": ("src.platform.data.storage", "MarketDataStore"),
+    "SqliteMarketDataStore": (
+        "src.platform.data.storage",
+        "SqliteMarketDataStore",
+    ),
+    "create_full_order_book_stream": (
+        "src.platform.data.factory",
+        "create_full_order_book_stream",
+    ),
+    "create_market_data_feed": (
+        "src.platform.data.factory",
+        "create_market_data_feed",
+    ),
+    "create_open_interest_stream": (
+        "src.platform.data.factory",
+        "create_open_interest_stream",
+    ),
+    "create_order_book_l2_stream": (
+        "src.platform.data.factory",
+        "create_order_book_l2_stream",
+    ),
+}
+
+
+def __getattr__(name: str):
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(name)
+    module_name, attribute = target
+    value = getattr(import_module(module_name), attribute)
+    globals()[name] = value
+    return value
+
 
 __all__ = [
-    "BinanceOrderBookWebSocketFeed",
-    "BinanceTradeWebSocketFeed",
     "MarketDataFeed",
     "MarketDataSource",
     "MarketDataStore",
@@ -51,20 +67,10 @@ __all__ = [
     "MarketOrderBookL2",
     "MarketTicker",
     "MarketTrade",
-    "OkxOrderBookWebSocketFeed",
-    "OkxOpenInterestWebSocketFeed",
-    "OkxOrderBookL2WebSocketFeed",
-    "OkxTradeWebSocketFeed",
-    "OpenInterestStream",
-    "OrderBookL2Stream",
     "OrderBookLevel",
-    "OrderBookStream",
     "RestMarketDataFeed",
     "SqliteMarketDataStore",
     "TradeSide",
-    "TradeStream",
-    "WebSocketConnector",
-    "WebsocketsConnector",
     "create_full_order_book_stream",
     "create_market_data_feed",
     "create_open_interest_stream",

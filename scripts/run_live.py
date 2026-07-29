@@ -13,9 +13,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.platform.config import ProjectEnvConfig, load_project_env_config, set_project_env_config
+from src.platform.exchanges.config_loader import load_exchange_config
 from src.platform.exchanges.credentials import validate_private_credentials
 from src.platform.exchanges.errors import ExchangeConfigError
-from src.platform.exchanges.models import ExchangeConfig
 
 
 def bootstrap_live_process_config(project_root: Path = PROJECT_ROOT) -> ProjectEnvConfig:
@@ -179,7 +179,7 @@ def _validate_direct_live_private_credentials(config: AppConfig) -> None:
         try:
             validate_private_credentials(
                 exchange,
-                ExchangeConfig.from_env(exchange),
+                load_exchange_config(exchange),
             )
         except ExchangeConfigError as exc:
             raise LiveRuntimeError(str(exc)) from exc
