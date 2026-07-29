@@ -14,7 +14,6 @@ class LocalOrderBook:
         if type(max_depth) is not int or max_depth <= 0:
             raise ValueError("max_depth must be a positive integer")
         self._max_depth = max_depth
-        self._retained_depth = max_depth * 4
         self._bids: dict[Decimal, OrderBookLevel] = {}
         self._asks: dict[Decimal, OrderBookLevel] = {}
 
@@ -129,7 +128,7 @@ class LocalOrderBook:
         *,
         reverse: bool,
     ) -> dict[Decimal, OrderBookLevel]:
-        prices = sorted(side, reverse=reverse)[: self._retained_depth]
+        prices = sorted(side, reverse=reverse)[: self._max_depth]
         return {price: side[price] for price in prices}
 
 

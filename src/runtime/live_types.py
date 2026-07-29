@@ -42,6 +42,10 @@ class LiveRuntimeStats:
     producer_stale: int = 0
     errors: int = 0
     market_events_dropped: int = 0
+    latest_state_events_coalesced: int = 0
+    order_book_l2_coalesced: int = 0
+    full_order_book_coalesced: int = 0
+    open_interest_coalesced: int = 0
 
 @dataclass(frozen=True)
 class MarketQueueDrainResult:

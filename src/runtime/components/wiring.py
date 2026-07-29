@@ -89,6 +89,9 @@ from src.runtime.live_types import (
     StartupPreviewState, logger,
 )
 from src.runtime.components.base import RuntimeComponent
+from src.runtime.components.latest_state_mailbox import (
+    LatestStateMarketEventMailbox,
+)
 
 
 class WiringComponent(RuntimeComponent):
@@ -155,6 +158,12 @@ class WiringComponent(RuntimeComponent):
         self._market_queue: asyncio.Queue[MarketEvent] = asyncio.Queue(
             maxsize=self.app_config.market_queue_maxsize
         )
+        self._market_event_available = asyncio.Event()
+        self._latest_state_mailbox = LatestStateMarketEventMailbox(
+            max_pending_keys=max(1024, self.app_config.market_queue_maxsize),
+            notify=self._market_event_available.set,
+        )
+        self._prefer_latest_state_event = False
         self._stop_event = asyncio.Event()
         self._producer_tasks: list[asyncio.Task] = []
         self._sync_tasks: list[asyncio.Task] = []

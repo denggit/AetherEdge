@@ -53,7 +53,12 @@ class OkxOpenInterestWebSocketFeed:
     async def stream_open_interest(
         self,
     ) -> AsyncIterator[MarketOpenInterest]:
-        async for event in self._session.stream(mapper=self._map_message):
+        async for event in self._session.stream(
+            mapper=self._map_message,
+            recoverable_exceptions=(
+                OkxPublicWebSocketProtocolError,
+            ),
+        ):
             yield event
 
     async def close(self) -> None:
