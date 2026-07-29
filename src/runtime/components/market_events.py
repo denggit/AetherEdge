@@ -287,10 +287,46 @@ class MarketEventsComponent(RuntimeComponent):
                     ),
                 )
             self._market_event_available.clear()
-            events = self._drain_ready_market_events(
-                capacity=remaining_capacity
-            )
-            if not events:
+            normal_ready = not self._market_queue.empty()
+            latest_ready = not self._latest_state_mailbox.empty()
+            processed = 0
+
+            if self._prefer_latest_state_event:
+                if remaining_capacity > 0:
+                    processed += int(
+                        await self._process_one_latest_state_event()
+                    )
+                processed += await self._process_normal_market_event_batch(
+                    capacity=min(
+                        self._market_queue_drain_batch_size,
+                        remaining_capacity - processed,
+                    )
+                )
+            else:
+                normal_capacity = min(
+                    self._market_queue_drain_batch_size,
+                    remaining_capacity,
+                )
+                if (
+                    latest_ready
+                    and remaining_capacity > 1
+                    and normal_capacity == remaining_capacity
+                ):
+                    normal_capacity -= 1
+                processed += await self._process_normal_market_event_batch(
+                    capacity=normal_capacity
+                )
+                if processed < remaining_capacity:
+                    processed += int(
+                        await self._process_one_latest_state_event()
+                    )
+
+            if normal_ready and latest_ready:
+                self._prefer_latest_state_event = (
+                    not self._prefer_latest_state_event
+                )
+
+            if processed == 0:
                 if (
                     self._all_producers_done()
                     and self._market_queue.empty()
@@ -311,69 +347,34 @@ class MarketEventsComponent(RuntimeComponent):
                 except asyncio.TimeoutError:
                     pass
                 continue
-            for event, from_fifo_queue in events:
-                try:
-                    await self.process_market_event(event)
-                finally:
-                    if from_fifo_queue:
-                        self._market_queue.task_done()
             if max_market_events is not None and self.stats.market_events_seen >= max_market_events:
                 break
 
-    def _drain_ready_market_events(
+    async def _process_one_latest_state_event(self) -> bool:
+        try:
+            event = self._latest_state_mailbox.get_nowait()
+        except asyncio.QueueEmpty:
+            return False
+        await self.process_market_event(event)
+        return True
+
+    async def _process_normal_market_event_batch(
         self,
         *,
         capacity: int,
-    ) -> list[tuple[MarketEvent, bool]]:
-        if capacity <= 0:
-            return []
-
-        events: list[tuple[MarketEvent, bool]] = []
-        normal_ready = not self._market_queue.empty()
-        latest_ready = not self._latest_state_mailbox.empty()
-
-        def take_latest() -> None:
-            if len(events) >= capacity:
-                return
+    ) -> int:
+        processed = 0
+        for _ in range(max(0, capacity)):
             try:
-                event = self._latest_state_mailbox.get_nowait()
+                event = self._market_queue.get_nowait()
             except asyncio.QueueEmpty:
-                return
-            events.append((event, False))
-
-        def take_normal(*, reserve_latest: bool) -> None:
-            available_capacity = capacity - len(events)
-            normal_capacity = min(
-                self._market_queue_drain_batch_size,
-                available_capacity,
-            )
-            if (
-                reserve_latest
-                and normal_capacity == available_capacity
-                and normal_capacity > 0
-            ):
-                normal_capacity -= 1
-            for _ in range(max(0, normal_capacity)):
-                try:
-                    event = self._market_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                events.append((event, True))
-
-        if self._prefer_latest_state_event:
-            take_latest()
-            take_normal(reserve_latest=False)
-        else:
-            take_normal(
-                reserve_latest=latest_ready and capacity > 1,
-            )
-            take_latest()
-
-        if normal_ready and latest_ready:
-            self._prefer_latest_state_event = (
-                not self._prefer_latest_state_event
-            )
-        return events
+                break
+            try:
+                await self.process_market_event(event)
+            finally:
+                self._market_queue.task_done()
+            processed += 1
+        return processed
 
     def _raise_on_unhealthy_market_data(self) -> None:
         integrity_error = self.market_state.integrity_error

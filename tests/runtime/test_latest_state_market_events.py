@@ -237,6 +237,113 @@ async def test_runtime_coalesces_all_three_latest_state_types_before_strategy() 
     ] == [100]
 
 
+@pytest.mark.parametrize(
+    (
+        "initial_latest",
+        "replacement_factory",
+        "received_values",
+        "coalesced_field",
+    ),
+    (
+        (
+            _l2(1),
+            _l2,
+            lambda strategy: [
+                event.sequence_id for event in strategy.order_books_l2
+            ],
+            "order_book_l2_coalesced",
+        ),
+        (
+            _full(1),
+            _full,
+            lambda strategy: [
+                event.event_time_ms for event in strategy.full_order_books
+            ],
+            "full_order_book_coalesced",
+        ),
+        (
+            _oi(1),
+            _oi,
+            lambda strategy: [
+                event.event_time_ms for event in strategy.open_interest
+            ],
+            "open_interest_coalesced",
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_latest_state_is_replaced_while_normal_batch_is_processing(
+    initial_latest,
+    replacement_factory,
+    received_values,
+    coalesced_field,
+) -> None:
+    runner, strategy = _runner()
+    runner._market_queue_drain_batch_size = 3
+    runner._prefer_latest_state_event = False
+    original_process = runner.process_market_event
+    replacements_published = False
+
+    async def process(event) -> None:
+        nonlocal replacements_published
+        if isinstance(event, MarketKline) and not replacements_published:
+            replacements_published = True
+            for value in range(2, 101):
+                await runner.enqueue_market_event(
+                    replacement_factory(value)
+                )
+        await original_process(event)
+
+    runner.process_market_event = process
+    for value in (1, 2, 3):
+        await runner.enqueue_market_event(_kline(value))
+    await runner.enqueue_market_event(initial_latest)
+
+    await runner._consume_market_events(max_market_events=4)
+
+    assert [event.open_time_ms for event in strategy.klines] == [1, 2, 3]
+    assert received_values(strategy) == [100]
+    assert runner._latest_state_mailbox.empty()
+    assert runner.stats.latest_state_events_coalesced == 99
+    assert getattr(runner.stats, coalesced_field) == 99
+    assert runner.stats.market_events_dropped == 0
+
+
+@pytest.mark.asyncio
+async def test_latest_first_gets_and_immediately_processes_latest_state() -> None:
+    runner, _strategy = _runner()
+    runner._prefer_latest_state_event = True
+    trace: list[str] = []
+    original_get = runner._latest_state_mailbox.get_nowait
+    original_process = runner.process_market_event
+
+    def get_nowait():
+        trace.append("get_latest")
+        return original_get()
+
+    async def process(event) -> None:
+        trace.append(
+            "process_latest"
+            if isinstance(event, MarketOrderBookL2)
+            else "process_normal"
+        )
+        await original_process(event)
+
+    runner._latest_state_mailbox.get_nowait = get_nowait
+    runner.process_market_event = process
+    await runner.enqueue_market_event(_kline(1))
+    await runner.enqueue_market_event(_l2(1))
+
+    await runner._consume_market_events(max_market_events=2)
+
+    assert trace[:2] == ["get_latest", "process_latest"]
+    assert trace == [
+        "get_latest",
+        "process_latest",
+        "process_normal",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_normal_market_events_keep_fifo_and_legacy_books_queue_path() -> None:
     runner, strategy = _runner()
@@ -284,6 +391,63 @@ async def test_continuous_normal_and_latest_state_events_do_not_starve() -> None
     assert normal_count == 5
     assert latest_count == 5
     assert processed[:2] == ["normal", "latest"]
+
+
+@pytest.mark.parametrize(
+    ("limit", "expected_kline_count", "latest_processed"),
+    (
+        (1, 1, False),
+        (2, 1, True),
+        (4, 3, True),
+    ),
+)
+@pytest.mark.asyncio
+async def test_max_market_events_never_exceeds_remaining_capacity(
+    limit: int,
+    expected_kline_count: int,
+    latest_processed: bool,
+) -> None:
+    runner, strategy = _runner()
+    runner._market_queue_drain_batch_size = 3
+    runner._prefer_latest_state_event = False
+    for value in range(1, 6):
+        await runner.enqueue_market_event(_kline(value))
+    await runner.enqueue_market_event(_l2(1))
+
+    await runner._consume_market_events(max_market_events=limit)
+
+    assert runner.stats.market_events_seen == limit
+    assert len(strategy.klines) == expected_kline_count
+    assert bool(strategy.order_books_l2) is latest_processed
+    assert (
+        runner._latest_state_mailbox.empty()
+        is latest_processed
+    )
+
+
+@pytest.mark.asyncio
+async def test_normal_processing_error_keeps_queue_accounting_and_latest_pending() -> None:
+    runner, _strategy = _runner()
+    runner._market_queue_drain_batch_size = 3
+    runner._prefer_latest_state_event = False
+
+    async def fail(_event) -> None:
+        raise RuntimeError("normal processing failed")
+
+    runner.process_market_event = fail
+    for value in (1, 2, 3):
+        await runner.enqueue_market_event(_kline(value))
+    await runner.enqueue_market_event(_l2(1))
+
+    with pytest.raises(RuntimeError, match="normal processing failed"):
+        await runner._consume_market_events(max_market_events=4)
+
+    assert runner._market_queue.qsize() == 2
+    assert runner._latest_state_mailbox.qsize() == 1
+    for _ in range(2):
+        runner._market_queue.get_nowait()
+        runner._market_queue.task_done()
+    await asyncio.wait_for(runner._market_queue.join(), timeout=1)
 
 
 @pytest.mark.asyncio
