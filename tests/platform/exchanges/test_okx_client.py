@@ -3,6 +3,7 @@ from decimal import Decimal
 
 import pytest
 
+from src.platform.data.models import TradeSide
 from src.platform.exchanges.errors import (
     ExchangeApiError,
     PrivateCredentialValidationError,
@@ -174,7 +175,50 @@ def test_okx_fetch_historical_trades_filters_time_range():
     assert http.calls[0]["params"]["instId"] == "ETH-USDT-SWAP"
     assert [row.trade_id for row in rows] == ["2", "3"]
     assert rows[0].price == Decimal("100.2")
-    assert rows[0].side is OrderSide.SELL
+    assert rows[0].side is TradeSide.SELL
+    assert rows[1].side is TradeSide.BUY
+    assert all(isinstance(row.side, TradeSide) for row in rows)
+    assert all(not isinstance(row.side, OrderSide) for row in rows)
+
+
+@pytest.mark.parametrize(
+    ("raw_side", "expected"),
+    [
+        ("buy", TradeSide.BUY),
+        ("sell", TradeSide.SELL),
+        ("unexpected", TradeSide.UNKNOWN),
+    ],
+)
+def test_okx_rest_trade_side_is_always_trade_side(raw_side, expected):
+    http = FakeHttpClient(
+        [
+            {
+                "code": "0",
+                "data": [
+                    {
+                        "tradeId": "1",
+                        "px": "100",
+                        "sz": "1",
+                        "side": raw_side,
+                        "ts": "1000",
+                    }
+                ],
+            }
+        ]
+    )
+    client = create_exchange_client(
+        ExchangeName.OKX,
+        ExchangeConfig(),
+        http_client=http,
+    )
+
+    [trade] = asyncio.run(
+        client.fetch_trades("ETH-USDT-PERP", limit=1, max_pages=1)
+    )
+
+    assert trade.side is expected
+    assert isinstance(trade.side, TradeSide)
+    assert not isinstance(trade.side, OrderSide)
 
 
 def test_okx_place_and_cancel_order_use_same_business_request_model():

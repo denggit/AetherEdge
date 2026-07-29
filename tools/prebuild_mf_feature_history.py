@@ -15,8 +15,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src.market_data.storage.trade_feature_store import (  # noqa: E402
-    SqliteTradeFeatureStore,
+from src.market_data.storage.trade_feature_repository import (  # noqa: E402
+    SqliteTradeFeatureRepository as SqliteTradeFeatureStore,
 )
 from src.market_data.trade_features.coverage import (  # noqa: E402
     latest_range_footprint_context_audit,

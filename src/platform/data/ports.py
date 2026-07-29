@@ -27,6 +27,10 @@ class TickerFetcher(Protocol):
 
 
 class HistoricalTradeFetcher(Protocol):
+    @property
+    def last_historical_trade_pages(self) -> int:
+        ...
+
     async def fetch_trades(
         self,
         symbol: str,

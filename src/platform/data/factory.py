@@ -91,14 +91,16 @@ def create_market_data_feed(
         else None
     )
     return RestMarketDataFeed(
-        exchange_client=client,
+        exchange=exchange_name,
         symbol=symbol,
         market_profile=profile,
+        kline_fetcher=client,
+        ticker_fetcher=client,
+        historical_trade_fetcher=client,
+        anchored_trade_fetcher=client,
         trade_stream=trade_stream,
         order_book_stream=order_book_stream,
         store=data_store,
-        supports_trade_max_pages=True,
-        supports_partial_trade_pagination=True,
     )
 
 

@@ -71,7 +71,13 @@ class FakeExchangeClient:
 
 def test_rest_feed_fetches_klines_through_exchange_public_method():
     exchange_client = FakeExchangeClient()
-    feed = RestMarketDataFeed(exchange_client=exchange_client, symbol="ETH-USDT-PERP", market_profile=get_market_profile("ETH-USDT-PERP"))
+    feed = RestMarketDataFeed(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        market_profile=get_market_profile("ETH-USDT-PERP"),
+        kline_fetcher=exchange_client,
+        ticker_fetcher=exchange_client,
+    )
 
     rows = asyncio.run(feed.fetch_klines(interval="1m", limit=1, start_time_ms=1, end_time_ms=2))
 
@@ -93,7 +99,13 @@ def test_rest_feed_fetches_klines_through_exchange_public_method():
 
 def test_rest_feed_fetches_ticker_through_exchange_public_method():
     exchange_client = FakeExchangeClient()
-    feed = RestMarketDataFeed(exchange_client=exchange_client, symbol="ETH-USDT-PERP", market_profile=get_market_profile("ETH-USDT-PERP"))
+    feed = RestMarketDataFeed(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        market_profile=get_market_profile("ETH-USDT-PERP"),
+        kline_fetcher=exchange_client,
+        ticker_fetcher=exchange_client,
+    )
 
     ticker = asyncio.run(feed.fetch_ticker())
 

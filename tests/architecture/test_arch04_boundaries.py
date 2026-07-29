@@ -4,6 +4,9 @@ import ast
 from dataclasses import fields
 from pathlib import Path
 
+from src.market_data.storage.trade_feature_repository import (
+    SqliteTradeFeatureRepository,
+)
 from src.runtime.services import RuntimeServiceBundle, RuntimeServices
 
 
@@ -130,7 +133,9 @@ def test_market_data_ports_do_not_reflect_over_fetch_trade_signatures() -> None:
     assert "ExchangeConfig.from_env" not in formal_sources
 
 
-def test_trade_feature_coverage_dependency_direction_is_explicit() -> None:
+def test_trade_feature_coverage_dependency_direction_is_explicit(
+    tmp_path,
+) -> None:
     repository = TRADE_FEATURES / "coverage_repository.py"
     service = TRADE_FEATURES / "coverage_service.py"
     calendar = TRADE_FEATURES / "okx_archive_calendar.py"
@@ -145,28 +150,38 @@ def test_trade_feature_coverage_dependency_direction_is_explicit() -> None:
     for forbidden in ("sqlite", "Store", "src.runtime"):
         assert forbidden not in calendar_source
 
-    store_tree = _tree(TRADE_FEATURE_STORE)
-    store_class = next(
-        node
-        for node in store_tree.body
-        if isinstance(node, ast.ClassDef)
-        and node.name == "SqliteTradeFeatureStore"
+    sqlite_repository_path = (
+        ROOT
+        / "src"
+        / "market_data"
+        / "storage"
+        / "trade_feature_repository.py"
     )
-    store_methods = {
+    repository_tree = _tree(sqlite_repository_path)
+    repository_class = next(
+        node
+        for node in repository_tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "SqliteTradeFeatureRepository"
+    )
+    repository_methods = {
         node.name
-        for node in store_class.body
+        for node in repository_class.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    assert "coverage_scan" not in store_methods
-    assert "range_footprint_coverage_summary" not in store_methods
-    store_imports = _imports(TRADE_FEATURE_STORE)
-    assert (
-        "src.market_data.trade_features.coverage_service"
-        not in store_imports
+    assert "coverage_scan" not in repository_methods
+    assert "range_footprint_coverage_summary" not in repository_methods
+    repository_imports = _imports(sqlite_repository_path)
+    assert not any(
+        name.endswith(("coverage_service", "compat", "okx_archive_calendar"))
+        for name in repository_imports
     )
-    assert (
-        "src.market_data.trade_features.okx_archive_calendar"
-        not in store_imports
+    repository = SqliteTradeFeatureRepository(tmp_path / "coverage.sqlite3")
+    assert not hasattr(repository, "coverage_scan")
+    assert not hasattr(repository, "range_footprint_coverage_summary")
+    assert all(
+        base.__name__ != "CoverageRepositoryCompatibility"
+        for base in SqliteTradeFeatureRepository.__mro__
     )
 
 

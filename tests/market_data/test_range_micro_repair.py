@@ -1143,10 +1143,12 @@ async def test_rest_feed_passes_partial_on_pagination_to_exchange_client() -> No
     """RestMarketDataFeed passes partial_on_pagination=True through to the client."""
     client = _RecordingExchangeClient()
     feed = RestMarketDataFeed(
-        exchange_client=client,
+        exchange=ExchangeName.OKX,
         symbol="ETH-USDT-PERP",
         market_profile=_MINI_PROFILE,
-        supports_partial_trade_pagination=True,
+        kline_fetcher=client,
+        ticker_fetcher=client,
+        anchored_trade_fetcher=client,
     )
 
     await feed.fetch_trades_between_ids(
@@ -1164,10 +1166,12 @@ async def test_rest_feed_default_partial_on_pagination_is_false() -> None:
     """Default partial_on_pagination=False should not enable partial mode."""
     client = _RecordingExchangeClient()
     feed = RestMarketDataFeed(
-        exchange_client=client,
+        exchange=ExchangeName.OKX,
         symbol="ETH-USDT-PERP",
         market_profile=_MINI_PROFILE,
-        supports_partial_trade_pagination=True,
+        kline_fetcher=client,
+        ticker_fetcher=client,
+        anchored_trade_fetcher=client,
     )
 
     await feed.fetch_trades_between_ids(
@@ -1180,24 +1184,23 @@ async def test_rest_feed_default_partial_on_pagination_is_false() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rest_feed_compatible_without_partial_on_pagination() -> None:
-    """RestMarketDataFeed works when exchange client lacks partial_on_pagination."""
+async def test_rest_feed_rejects_missing_anchored_history_port() -> None:
     client = _NonPartialExchangeClient()
     feed = RestMarketDataFeed(
-        exchange_client=client,
+        exchange=ExchangeName.OKX,
         symbol="ETH-USDT-PERP",
         market_profile=_MINI_PROFILE,
+        kline_fetcher=client,
+        ticker_fetcher=client,
     )
 
-    # Must not raise
-    result = await feed.fetch_trades_between_ids(
-        newer_trade_id="100",
-        older_trade_id="1",
-        partial_on_pagination=True,
-    )
-
-    assert client.called is True
-    assert len(result) == 1
+    with pytest.raises(NotImplementedError, match="anchored history"):
+        await feed.fetch_trades_between_ids(
+            newer_trade_id="100",
+            older_trade_id="1",
+            partial_on_pagination=True,
+        )
+    assert client.called is False
 
 
 @pytest.mark.asyncio
@@ -1207,10 +1210,12 @@ async def test_micro_repair_staging_passes_partial_on_pagination_through_rest_fe
     """Full integration: staging service → RestMarketDataFeed → exchange client."""
     client = _RecordingExchangeClient()
     feed = RestMarketDataFeed(
-        exchange_client=client,
+        exchange=ExchangeName.OKX,
         symbol="ETH-USDT-PERP",
         market_profile=_MINI_PROFILE,
-        supports_partial_trade_pagination=True,
+        kline_fetcher=client,
+        ticker_fetcher=client,
+        anchored_trade_fetcher=client,
     )
     checkpoint_store = SqliteRangeCheckpointStore(
         tmp_path / "checkpoint.sqlite3"

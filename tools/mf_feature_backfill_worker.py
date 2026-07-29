@@ -53,7 +53,9 @@ from src.market_data.models import (  # noqa: E402
     RangeFootprintFeature,
     TradeFootprintFeature,
 )
-from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore  # noqa: E402
+from src.market_data.storage.trade_feature_repository import (  # noqa: E402
+    SqliteTradeFeatureRepository as SqliteTradeFeatureStore,
+)
 from src.market_data.trade_features.coverage import (  # noqa: E402
     resolve_trade_feature_readiness,
     safe_okx_archive_end_ms,

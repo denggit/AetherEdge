@@ -10,6 +10,12 @@ from src.market_data.models import (
     TradeFootprintFeature,
 )
 from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
+from src.market_data.storage.trade_feature_repository import (
+    SqliteTradeFeatureRepository,
+)
+from src.market_data.trade_features.coverage_service import (
+    TradeFeatureCoverageService,
+)
 from src.market_data.trade_features.coverage import (
     compute_backfill_target,
     resolve_trade_feature_readiness,
@@ -1075,3 +1081,24 @@ def test_range_footprint_coverage_summary_exposes_degraded_gaps(
     assert summary["first_degraded_range_footprint_range"][0] == _base(
         0
     ) + _MINUTE - 1
+def test_legacy_facade_matches_explicit_coverage_service(tmp_path) -> None:
+    path = tmp_path / "parity.sqlite3"
+    legacy = SqliteTradeFeatureStore(path)
+    repository = SqliteTradeFeatureRepository(path)
+    kwargs = {
+        "symbol": "ETH-USDT-PERP",
+        "exchange": "okx",
+        "required_minutes": 3,
+        "reference_end_ms": 180_000,
+        "safe_archive_end_ms": 180_000,
+        "range_pct": "0.002",
+        "price_step": "1",
+        "extra": {"parity": True},
+    }
+
+    legacy_result = legacy.coverage_scan(**kwargs)
+    explicit_result = TradeFeatureCoverageService(
+        repository
+    ).scan_window(**kwargs)
+
+    assert legacy_result == explicit_result

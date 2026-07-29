@@ -893,9 +893,9 @@ def _map_okx_trade(
 ) -> MarketTrade:
     side_value = str(row.get("side") or "").lower()
     side = (
-        OrderSide.BUY
+        TradeSide.BUY
         if side_value == "buy"
-        else OrderSide.SELL
+        else TradeSide.SELL
         if side_value == "sell"
         else TradeSide.UNKNOWN
     )
