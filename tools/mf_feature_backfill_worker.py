@@ -54,7 +54,10 @@ from src.market_data.models import (  # noqa: E402
     TradeFootprintFeature,
 )
 from src.market_data.storage.trade_feature_repository import (  # noqa: E402
-    SqliteTradeFeatureRepository as SqliteTradeFeatureStore,
+    SqliteTradeFeatureRepository,
+)
+from src.market_data.trade_features.compat import (  # noqa: E402
+    LegacyTradeFeatureCoverageAdapter,
 )
 from src.market_data.trade_features.coverage import (  # noqa: E402
     resolve_trade_feature_readiness,
@@ -168,7 +171,8 @@ def run_cycle(
         logger.warning("save_raw_trades=True is NOT recommended")
 
     cycle_start = time.time()
-    store = SqliteTradeFeatureStore(path=market_db)
+    repository = SqliteTradeFeatureRepository(path=market_db)
+    legacy_coverage = LegacyTradeFeatureCoverageAdapter(repository)
     raw_symbol = okx_raw_symbol_from_canonical(symbol)
 
     # -------- global raw-trade coordinator --------
@@ -220,7 +224,7 @@ def run_cycle(
         target = compute_mf_signal_backfill_target(
             symbol=symbol,
             exchange=exchange,
-            store=store,
+            store=legacy_coverage,
             max_minutes_per_cycle=min(
                 max(1, int(max_minutes_per_cycle)),
                 max(1, int(max_days_per_cycle)) * 1_440,
@@ -307,7 +311,7 @@ def run_cycle(
             price_step=range_footprint_price_step,
             contract_value=contract_value,
         )
-        store.delete_range_footprint_window(
+        repository.delete_range_footprint_window(
             symbol=symbol,
             exchange=exchange,
             range_pct=range_footprint_range_pct,
@@ -409,13 +413,13 @@ def run_cycle(
 
                 # Batch-write
                 if batch_bars:
-                    store.upsert_tradebars_many(batch_bars)
+                    repository.upsert_tradebars_many(batch_bars)
                     total_bars += len(batch_bars)
                 if batch_fps:
-                    store.upsert_footprints_many(batch_fps)
+                    repository.upsert_footprints_many(batch_fps)
                     total_footprints += len(batch_fps)
                 if batch_range_fps:
-                    store.upsert_range_footprints_many(batch_range_fps)
+                    repository.upsert_range_footprints_many(batch_range_fps)
                     total_range_footprints += len(batch_range_fps)
 
                 if chunk_sleep_seconds > 0:
@@ -453,7 +457,7 @@ def run_cycle(
                 for row in remaining_bars
                 if start_ms <= row.close_time_ms <= end_ms
             ]
-            store.upsert_tradebars_many(target_bars)
+            repository.upsert_tradebars_many(target_bars)
             total_bars += len(target_bars)
         if remaining_fps:
             target_fps = [
@@ -461,10 +465,10 @@ def run_cycle(
                 for row in remaining_fps
                 if start_ms <= row.close_time_ms <= end_ms
             ]
-            store.upsert_footprints_many(target_fps)
+            repository.upsert_footprints_many(target_fps)
             total_footprints += len(target_fps)
         if latest_range_seed is not None:
-            store.upsert_range_footprints_many([latest_range_seed])
+            repository.upsert_range_footprints_many([latest_range_seed])
             total_range_footprints += 1
 
         # Discard active to prevent accidental writes
@@ -480,7 +484,7 @@ def run_cycle(
             // _ONE_MINUTE_MS,
         )
         if can_finalize_safe_history:
-            store.mark_range_footprint_coverage(
+            repository.mark_range_footprint_coverage(
                 symbol=symbol,
                 exchange=exchange,
                 range_pct=range_footprint_range_pct,
@@ -493,7 +497,7 @@ def run_cycle(
         readiness_after = resolve_trade_feature_readiness(
             symbol=symbol,
             exchange=exchange,
-            store=store,
+            store=repository,
             required_minutes=target_minutes,
             reference_end_ms=end_ms,
             range_pct=str(range_footprint_range_pct),
@@ -523,7 +527,7 @@ def run_cycle(
         full_gap_check = compute_mf_signal_backfill_target(
             symbol=symbol,
             exchange=exchange,
-            store=store,
+            store=legacy_coverage,
             max_minutes_per_cycle=min(
                 max(1, int(max_minutes_per_cycle)),
                 max(1, int(max_days_per_cycle)) * 1_440,

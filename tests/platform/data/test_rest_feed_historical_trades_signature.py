@@ -6,6 +6,7 @@ import pytest
 
 from src.platform.data.rest_feed import RestMarketDataFeed
 from src.platform.data.models import MarketTrade, TradeSide
+from src.platform.data.ports import TradeIdAnchoredHistoryFetcher
 from src.platform.exchanges.models import ExchangeName
 from src.platform.markets import MarketProfile
 
@@ -34,6 +35,14 @@ class _ExchangeClient:
         ]
 
 
+class _AnchoredFetcher:
+    def __init__(self) -> None:
+        self.last_historical_trade_pages = 4
+
+    async def fetch_trades_between_ids(self, symbol: str, **kwargs):
+        return []
+
+
 @pytest.mark.asyncio
 async def test_rest_feed_fetch_trades_accepts_historical_trade_feed_symbol_keyword() -> None:
     client = _ExchangeClient()
@@ -50,6 +59,55 @@ async def test_rest_feed_fetch_trades_accepts_historical_trade_feed_symbol_keywo
 
     assert len(rows) == 1
     assert client.calls == [("ETH-USDT-PERP", 1, 2, 100, True, None)]
+    assert feed.last_historical_trade_pages == 1
+
+
+@pytest.mark.asyncio
+async def test_rest_feed_propagates_normal_fetcher_page_count() -> None:
+    client = _ExchangeClient()
+    client.last_historical_trade_pages = 7
+    feed = RestMarketDataFeed(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        market_profile=MarketProfile(
+            symbol="ETH-USDT-PERP",
+            base_asset="ETH",
+            quote_asset="USDT",
+        ),
+        kline_fetcher=client,
+        ticker_fetcher=client,
+        historical_trade_fetcher=client,
+    )
+
+    await feed.fetch_trades()
+
+    assert feed.last_historical_trade_pages == 7
+
+
+@pytest.mark.asyncio
+async def test_rest_feed_propagates_anchored_fetcher_page_count() -> None:
+    client = _ExchangeClient()
+    anchored: TradeIdAnchoredHistoryFetcher = _AnchoredFetcher()
+    feed = RestMarketDataFeed(
+        exchange=ExchangeName.OKX,
+        symbol="ETH-USDT-PERP",
+        market_profile=MarketProfile(
+            symbol="ETH-USDT-PERP",
+            base_asset="ETH",
+            quote_asset="USDT",
+        ),
+        kline_fetcher=client,
+        ticker_fetcher=client,
+        anchored_trade_fetcher=anchored,
+    )
+
+    await feed.fetch_trades_between_ids(
+        newer_trade_id="20",
+        older_trade_id="10",
+    )
+
+    assert anchored.last_historical_trade_pages == 4
+    assert feed.last_historical_trade_pages == 4
 
 
 @pytest.mark.asyncio

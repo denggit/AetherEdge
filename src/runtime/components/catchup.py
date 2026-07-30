@@ -36,13 +36,21 @@ class _CatchupWindow:
 
 
 class CatchupComponent(RuntimeComponent):
+    @property
+    def _last_snapshots(self):
+        return self._context.resources.lifecycle.last_snapshots
+
+    @_last_snapshots.setter
+    def _last_snapshots(self, value) -> None:
+        self._context.resources.lifecycle.last_snapshots = tuple(value)
+
     async def _call_on_start(self, snapshot: PlatformSnapshot) -> None:
         signals = await self._strategy_host.on_start(snapshot)
         if signals is None:
             return
         self.stats.on_start_called = True
         logger.info("Strategy on_start completed | signals=%s", len(signals or ()))
-        await self._execute_signals(signals or (), source="on_start", event_time_ms=None)
+        await self.ports.execute_signals(signals or (), source="on_start", event_time_ms=None)
 
     async def _fetch_current_market_price(self) -> Decimal | None:
         """Fetch current market price for price guard validation.
@@ -99,14 +107,14 @@ class CatchupComponent(RuntimeComponent):
                     return True
 
         # 2 & 3. Strategy-internal logical positions / pending entry
-        if self._strategy_position_index().active:
+        if self.ports.strategy_position_index().active:
             return True
-        provider = self._strategy_pending_work_provider()
+        provider = self.ports.strategy_pending_work_provider()
         if provider is not None and provider.has_pending_strategy_work():
             return True
 
         # 4. PositionPlanStore active plans
-        store = self._position_plan_store or self._get_position_plan_store()
+        store = self._position_plan_store or self.ports.get_position_plan_store()
         try:
             if store.list_active_positions():
                 return True
@@ -118,7 +126,7 @@ class CatchupComponent(RuntimeComponent):
             return True
 
         # 6. Unresolved follower close (master closed, follower still open)
-        if self._has_unresolved_follower_close():
+        if self.ports.has_unresolved_follower_close():
             return True
 
         return False
@@ -134,11 +142,11 @@ class CatchupComponent(RuntimeComponent):
         """
         signals: list[TradeSignal] = []
         for event in events:
-            signals.extend(await self._get_market_feature_pipeline().dispatch(event))
+            signals.extend(await self.ports.get_market_feature_pipeline().dispatch(event))
         return signals
 
     def _capture_startup_preview_state(self) -> StartupPreviewState:
-        provider = self._strategy_startup_preview_provider()
+        provider = self.ports.strategy_startup_preview_provider()
         return StartupPreviewState(
             provider=provider,
             state=(
@@ -155,12 +163,12 @@ class CatchupComponent(RuntimeComponent):
     async def _build_range_aggregate_events_for_bucket(
         self, bucket_start_ms: int
     ) -> list[MarketFeatureEvent]:
-        return self._require_range_module().build_aggregate_events(
+        return self.ports.require_range_module().build_aggregate_events(
             bucket_start_ms
         )
 
     def _get_min_range_bars(self) -> int:
-        return self._require_range_module().config.min_bars
+        return self.ports.require_range_module().config.min_bars
 
     async def _evaluate_startup_catchup_once(
         self,
@@ -274,7 +282,7 @@ class CatchupComponent(RuntimeComponent):
         window: _CatchupWindow,
     ) -> MarketKline | None:
         repository = (
-            self.service_bundle.market.kline_store or SqliteKlineStore()
+            self.market_services.kline_store or SqliteKlineStore()
         )
         rows = repository.load(
             symbol=self.app_config.symbol,
@@ -479,7 +487,7 @@ class CatchupComponent(RuntimeComponent):
         return selected, int(range_bar_count)
 
     def _startup_intent_exists(self, position_id: object) -> bool:
-        journal = self._order_journal or self._get_order_journal()
+        journal = self._order_journal or self.ports.get_order_journal()
         has_intent = getattr(
             journal, "has_intent_with_position_id", None
         )
@@ -508,7 +516,7 @@ class CatchupComponent(RuntimeComponent):
             "range_bar_count": range_bar_count,
             "candidate_open_ms": window.candidate_open_ms,
         }
-        await self._execute_signals(
+        await self.ports.execute_signals(
             signals,
             source="startup_catchup",
             event_time_ms=window.candidate_open_ms,

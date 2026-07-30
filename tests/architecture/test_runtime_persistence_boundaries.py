@@ -493,9 +493,9 @@ def test_runner_owns_rejection_warning_and_wrappers_pass_callback() -> None:
         assert len(rejection_keywords) == 1
         callback = rejection_keywords[0]
         assert isinstance(callback, ast.Attribute)
-        assert isinstance(callback.value, ast.Name)
-        assert callback.value.id == "self"
-        assert callback.attr == "_on_live_persistence_write_rejected"
+        assert ast.unparse(callback) == (
+            "self.ports.on_live_persistence_write_rejected"
+        )
 
 
 def test_gateway_has_no_logging_metrics_alerts_or_signal_execution() -> None:

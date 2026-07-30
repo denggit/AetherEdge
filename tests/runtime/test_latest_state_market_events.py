@@ -226,7 +226,7 @@ async def test_runtime_coalesces_all_three_latest_state_types_before_strategy() 
     assert runner.stats.open_interest_coalesced == 99
     assert runner.stats.market_events_dropped == 0
 
-    await runner._consume_market_events(max_market_events=3)
+    await runner.market_events._consume_market_events(max_market_events=3)
 
     assert [event.sequence_id for event in strategy.order_books_l2] == [100]
     assert [
@@ -299,7 +299,7 @@ async def test_latest_state_is_replaced_while_normal_batch_is_processing(
         await runner.enqueue_market_event(_kline(value))
     await runner.enqueue_market_event(initial_latest)
 
-    await runner._consume_market_events(max_market_events=4)
+    await runner.market_events._consume_market_events(max_market_events=4)
 
     assert [event.open_time_ms for event in strategy.klines] == [1, 2, 3]
     assert received_values(strategy) == [100]
@@ -334,7 +334,7 @@ async def test_latest_first_gets_and_immediately_processes_latest_state() -> Non
     await runner.enqueue_market_event(_kline(1))
     await runner.enqueue_market_event(_l2(1))
 
-    await runner._consume_market_events(max_market_events=2)
+    await runner.market_events._consume_market_events(max_market_events=2)
 
     assert trace[:2] == ["get_latest", "process_latest"]
     assert trace == [
@@ -354,7 +354,7 @@ async def test_normal_market_events_keep_fifo_and_legacy_books_queue_path() -> N
     assert runner._market_queue.qsize() == 4
     assert runner._latest_state_mailbox.empty()
 
-    await runner._consume_market_events(max_market_events=4)
+    await runner.market_events._consume_market_events(max_market_events=4)
 
     assert [event.open_time_ms for event in strategy.klines] == [1, 2, 3]
     assert [event.event_time_ms for event in strategy.order_books] == [4]
@@ -386,7 +386,7 @@ async def test_continuous_normal_and_latest_state_events_do_not_starve() -> None
     await runner.enqueue_market_event(_kline(1))
     await runner.enqueue_market_event(_l2(1))
 
-    await runner._consume_market_events(max_market_events=10)
+    await runner.market_events._consume_market_events(max_market_events=10)
 
     assert normal_count == 5
     assert latest_count == 5
@@ -414,7 +414,7 @@ async def test_max_market_events_never_exceeds_remaining_capacity(
         await runner.enqueue_market_event(_kline(value))
     await runner.enqueue_market_event(_l2(1))
 
-    await runner._consume_market_events(max_market_events=limit)
+    await runner.market_events._consume_market_events(max_market_events=limit)
 
     assert runner.stats.market_events_seen == limit
     assert len(strategy.klines) == expected_kline_count
@@ -440,7 +440,9 @@ async def test_normal_processing_error_keeps_queue_accounting_and_latest_pending
     await runner.enqueue_market_event(_l2(1))
 
     with pytest.raises(RuntimeError, match="normal processing failed"):
-        await runner._consume_market_events(max_market_events=4)
+        await runner.market_events._consume_market_events(
+            max_market_events=4
+        )
 
     assert runner._market_queue.qsize() == 2
     assert runner._latest_state_mailbox.qsize() == 1
@@ -454,7 +456,7 @@ async def test_normal_processing_error_keeps_queue_accounting_and_latest_pending
 async def test_waiting_consumer_stops_without_pending_wait_tasks() -> None:
     runner, _strategy = _runner()
     consumer = asyncio.create_task(
-        runner._consume_market_events(max_market_events=None)
+        runner.market_events._consume_market_events(max_market_events=None)
     )
     await asyncio.sleep(0)
 

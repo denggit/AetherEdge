@@ -329,9 +329,9 @@ def test_strategy_range_minimum_is_read_from_runtime_requirements():
         runtime_config=runtime_config,
     )
 
-    assert runner._get_min_range_bars() == 5, (
+    assert runner.catchup._get_min_range_bars() == 5, (
         f"Expected _get_min_range_bars() == 5 for the live Strategy, "
-        f"got {runner._get_min_range_bars()}"
+        f"got {runner.catchup._get_min_range_bars()}"
     )
 
 

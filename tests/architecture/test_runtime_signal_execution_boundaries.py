@@ -249,10 +249,10 @@ def test_runner_selects_and_writes_back_one_signal_execution_service() -> None:
     selected = _assignment(initializer, "self._signal_execution_service")
     writeback = _assignment(
         initializer,
-        "self.runtime_services.signal_execution_service",
+        "execution.signal_execution_service",
     )
     assert ast.unparse(injected.value) == (
-        "self.runtime_services.signal_execution_service"
+        "execution.signal_execution_service"
     )
     assert isinstance(selected.value, ast.IfExp)
     assert ast.unparse(selected.value.test) == (
@@ -335,8 +335,8 @@ def test_runner_retains_all_signal_execution_business_rules() -> None:
         "self.stats.signals_seen += 1",
         "self.app_config.dry_run",
         "self.stats.dry_run_actions += 1",
-        "self._has_account_config_entry_block()",
-        "self._has_unresolved_follower_close()",
+        "self.ports.has_account_config_entry_block()",
+        "self.ports.has_unresolved_follower_close()",
         "follower_recovery_topup",
         "SignalAction.OPEN_LONG",
         "SignalAction.OPEN_SHORT",
@@ -347,14 +347,14 @@ def test_runner_retains_all_signal_execution_business_rules() -> None:
     create = ast.unparse(methods["_create_signal_execution_intent"])
     assert "self._intent_factory.create" in create
     execute_intent = ast.unparse(methods["_execute_signal_execution_intent"])
-    assert "self._get_order_coordinator().execute(intent)" in execute_intent
+    assert "self.ports.get_order_coordinator().execute(intent)" in execute_intent
 
     handle = ast.unparse(methods["_handle_signal_execution_results"])
     positions = [
         handle.index(name)
         for name in (
             "_record_order_results",
-            "_save_order_results",
+            "ports.save_order_results",
             "_check_follower_close_failure",
         )
     ]
@@ -397,7 +397,7 @@ def test_existing_business_methods_and_recovery_entrypoints_remain_runner_owned(
         "_execute_recovery_stop_signals",
         "_execute_recovery_other_signals",
     ):
-        assert len(_calls(methods[name], "_execute_signals")) == 1
+        assert len(_calls(methods[name], "execute_signals")) == 1
 
 
 def test_other_runtime_modules_do_not_depend_on_signal_execution_service() -> None:

@@ -11,7 +11,8 @@ from src.order_management.models import OrderIntent
 from src.order_management.position_plan.models import PositionPlan
 from src.planner import ExecutionPlanner, PlannedExecutionAction
 from src.platform import ExchangeName, OrderSide
-from src.runtime.runner import LiveRuntimeRunner
+from src.runtime.components import SignalExecutionComponent
+from src.runtime.context import RuntimeContext
 from src.runtime.orders import LiveOrderIntentFactory
 from src.runtime.signal_execution_service import (
     RuntimeSignalExecutionPlan,
@@ -344,7 +345,7 @@ async def test_runtime_signal_execution_records_complete_flow_and_recursive_foll
 
 
 def test_runner_builds_feedback_request_with_current_propagation_contract() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    component = SignalExecutionComponent(RuntimeContext())
     signal = _signal(SignalAction.OPEN_LONG)
     follow_up = (_signal(SignalAction.CANCEL_ALL_STOP_ORDERS),)
     parent = RuntimeSignalExecutionRequest(
@@ -355,8 +356,8 @@ def test_runner_builds_feedback_request_with_current_propagation_contract() -> N
         feedback_depth=2,
     )
 
-    request = LiveRuntimeRunner._build_signal_feedback_request(
-        runner, signal, follow_up, parent
+    request = component._build_signal_feedback_request(
+        signal, follow_up, parent
     )
 
     assert request is not None

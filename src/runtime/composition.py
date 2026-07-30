@@ -103,7 +103,8 @@ def compose_live_runtime(
         services=runtime_services,
     )
 
-    feature_config = runtime_services.trade_feature_config
+    service_bundle = runner.service_bundle
+    feature_config = service_bundle.market.trade_feature_config
     if not isinstance(feature_config, TradeFeatureRuntimeConfig):
         raise TypeError("composition did not produce TradeFeatureRuntimeConfig")
 
@@ -113,8 +114,10 @@ def compose_live_runtime(
     )
     trade_integrity = TradeDataIntegrityTracker() if pipeline_plan.trades_enabled else None
     order_book_integrity = OrderBookDataIntegrityTracker() if pipeline_plan.order_book_enabled else None
-    runtime_services.trade_data_integrity_tracker = trade_integrity
-    runtime_services.order_book_data_integrity_tracker = order_book_integrity
+    service_bundle.market.trade_data_integrity_tracker = trade_integrity
+    service_bundle.market.order_book_data_integrity_tracker = (
+        order_book_integrity
+    )
     if trade_integrity is not None:
         _bind_trade_integrity_persistence(
             trade_integrity,
@@ -144,9 +147,9 @@ def compose_live_runtime(
         if pipeline_plan.trades_enabled
         else None
     )
-    runtime_services.market_event_processor = trade_processor
+    service_bundle.market.market_event_processor = trade_processor
 
-    range_module = runtime_services.range_bar_module
+    range_module = service_bundle.range.module
     configure_integrity = getattr(range_module, "configure_integrity", None)
     if trade_integrity is not None and callable(configure_integrity):
         configure_integrity(trade_integrity)
@@ -205,8 +208,8 @@ def compose_live_runtime(
         config=module_config,
         create_range_module=(
             None
-            if runtime_services.range_bar_module is None
-            else lambda: runtime_services.range_bar_module
+            if service_bundle.range.module is None
+            else lambda: service_bundle.range.module
         ),
         consume_dropped_trade=runner.handle_dropped_trade,
         consume_order_book=runner.enqueue_market_event,

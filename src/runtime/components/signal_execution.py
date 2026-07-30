@@ -74,7 +74,7 @@ class SignalExecutionComponent(RuntimeComponent):
             SignalAction.OPEN_SHORT,
         }
         if signal.action in exposure_increasing_actions:
-            if self._has_account_config_entry_block():
+            if self.ports.has_account_config_entry_block():
                 logger.warning(
                     "Blocking new entry — account config not verified due to existing exposure | action=%s source=%s",
                     signal.action.value,
@@ -105,7 +105,7 @@ class SignalExecutionComponent(RuntimeComponent):
             ).strip().lower()
             if (
                 purpose not in {"follower_recovery_topup"}
-                and self._has_unresolved_follower_close()
+                and self.ports.has_unresolved_follower_close()
             ):
                 logger.warning(
                     "Blocking new entry — unresolved follower close after master close detected | action=%s source=%s",
@@ -145,7 +145,7 @@ class SignalExecutionComponent(RuntimeComponent):
         )
 
     async def _execute_signal_execution_intent(self, intent):
-        return await self._get_order_coordinator().execute(intent)
+        return await self.ports.get_order_coordinator().execute(intent)
 
     async def _run_post_submit_order_sync(
         self,
@@ -158,7 +158,7 @@ class SignalExecutionComponent(RuntimeComponent):
                 signal.action.value,
                 request.source,
             )
-            await self._get_order_sync_service().sync_once(
+            await self.ports.get_order_sync_service().sync_once(
                 sync_type="post_submit",
                 priority=True,
             )
@@ -169,7 +169,7 @@ class SignalExecutionComponent(RuntimeComponent):
         results: Sequence[ExchangeOrderResult],
     ) -> None:
         self._record_order_results(results)
-        self._save_order_results(signal, results)
+        self.ports.save_order_results(signal, results)
         self._check_follower_close_failure(signal, results)
 
     async def _run_post_order_account_sync(
@@ -187,7 +187,7 @@ class SignalExecutionComponent(RuntimeComponent):
                 SignalAction.CLOSE_SHORT,
             }
         ):
-            await self._get_account_sync_service().sync_once(
+            await self.ports.get_account_sync_service().sync_once(
                 sync_type="post_order_account",
                 priority=True,
             )
@@ -198,7 +198,7 @@ class SignalExecutionComponent(RuntimeComponent):
         results: Sequence[ExchangeOrderResult],
         request: RuntimeSignalExecutionRequest,
     ):
-        return await self._process_order_result_feedback(
+        return await self.ports.process_order_result_feedback(
             signal=signal,
             results=results,
             source=request.source,
@@ -251,7 +251,7 @@ class SignalExecutionComponent(RuntimeComponent):
                 len(results),
                 [result.error for result in results if not result.ok],
             )
-            self._set_health(
+            self.ports.set_health(
                 RuntimePhase.RUNNING,
                 healthy=False,
                 error="partial exchange execution failure",
@@ -260,7 +260,11 @@ class SignalExecutionComponent(RuntimeComponent):
         else:
             self.stats.failed_intents += 1
             logger.error("Order intent failed | total=%s errors=%s", len(results), [result.error for result in results])
-            self._set_health(RuntimePhase.RUNNING, healthy=False, error="exchange execution failed")
+            self.ports.set_health(
+                RuntimePhase.RUNNING,
+                healthy=False,
+                error="exchange execution failed",
+            )
 
     def _check_follower_close_failure(self, signal: TradeSignal, results: Sequence[ExchangeOrderResult]) -> None:
         purpose = str(signal.metadata.get("execution_purpose", "") if signal.metadata else "").strip().lower()
@@ -329,4 +333,7 @@ class SignalExecutionComponent(RuntimeComponent):
     ) -> Sequence[ExchangeOrderResult]:
         if intent.signal.action not in {SignalAction.PLACE_STOP_LOSS_LONG, SignalAction.PLACE_STOP_LOSS_SHORT}:
             return results
-        return await self._verify_stop_order_results(signal=intent.signal, results=results)
+        return await self.ports.verify_stop_order_results(
+            signal=intent.signal,
+            results=results,
+        )

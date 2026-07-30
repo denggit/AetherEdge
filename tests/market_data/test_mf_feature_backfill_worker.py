@@ -19,13 +19,43 @@ from src.market_data.models import (
     TradeFeatureBackfillTarget,
 )
 from src.market_data.storage.trade_feature_store import SqliteTradeFeatureStore
+from src.market_data.storage.trade_feature_repository import (
+    SqliteTradeFeatureRepository,
+)
+from src.market_data.trade_features.compat import (
+    LegacyTradeFeatureCoverageAdapter,
+)
 from src.market_data.trade_features.coverage import safe_okx_archive_end_ms
 from src.platform.data.models import MarketTrade, TradeSide
 from src.platform.exchanges.models import ExchangeName
 from tools import mf_feature_backfill_worker as worker
+from strategies.eth_portfolio_v1.preflight.mf_signal_readiness import (
+    compute_mf_signal_backfill_target,
+)
 
 _MINUTE = 60_000
 _OKX_TIMEZONE = timezone(timedelta(hours=8))
+
+
+def test_empty_repository_legacy_adapter_computes_initial_target(
+    tmp_path: Path,
+) -> None:
+    repository = SqliteTradeFeatureRepository(tmp_path / "market.sqlite3")
+    adapter = LegacyTradeFeatureCoverageAdapter(repository)
+
+    target = compute_mf_signal_backfill_target(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        store=adapter,
+        required_minutes=3,
+        max_minutes_per_cycle=3,
+        safe_archive_end_ms=180_000,
+    )
+
+    assert target is not None
+    assert target.reason == "initial_empty_tradebar_store"
+    assert not hasattr(repository, "coverage_scan")
+    assert hasattr(adapter, "coverage_scan")
 
 
 def _trade(price: str, time_ms: int, side: TradeSide) -> MarketTrade:

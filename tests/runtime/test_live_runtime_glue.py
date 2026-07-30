@@ -660,8 +660,12 @@ async def test_closed_bar_poll_uses_buffer_and_only_emits_closed_kline():
     runner1 = _runner(strategy, data=data, services={"recovery_service": None, "snapshot": _snapshot()}, dry_run=True)
     runner2 = _runner(strategy, data=data, services={"recovery_service": None, "snapshot": _snapshot()}, dry_run=True)
 
-    early = await runner1.poll_closed_bar_once(now_ms=10 * 60 * 60_000 + 30 * 60_000)
-    closed = await runner2.poll_closed_bar_once(now_ms=12 * 60 * 60_000 + 60_000)
+    early = await runner1.closed_bar.poll_closed_bar_once(
+        now_ms=10 * 60 * 60_000 + 30 * 60_000
+    )
+    closed = await runner2.closed_bar.poll_closed_bar_once(
+        now_ms=12 * 60 * 60_000 + 60_000
+    )
 
     assert early[0].data["open_time_ms"] == H4
     assert closed[0].data["open_time_ms"] == 2 * H4
@@ -675,7 +679,9 @@ async def test_poll_closed_bar_logs_4h_decision_summary_no_signal(caplog):
     runner = _runner(strategy, services={"recovery_service": None, "snapshot": _snapshot()}, dry_run=True)
 
     caplog.set_level(logging.INFO)
-    await runner.poll_closed_bar_once(now_ms=12 * 60 * 60_000 + 60_000)
+    await runner.closed_bar.poll_closed_bar_once(
+        now_ms=12 * 60 * 60_000 + 60_000
+    )
 
     messages = "\n".join(record.getMessage() for record in caplog.records if record.levelno == logging.INFO)
     assert "4H decision completed" in messages
@@ -701,7 +707,9 @@ async def test_poll_closed_bar_logs_4h_decision_summary_with_signal_and_range_fi
     runner = _runner(strategy, services={"recovery_service": None, "snapshot": _snapshot()}, dry_run=True)
 
     caplog.set_level(logging.INFO)
-    await runner.poll_closed_bar_once(now_ms=12 * 60 * 60_000 + 60_000)
+    await runner.closed_bar.poll_closed_bar_once(
+        now_ms=12 * 60 * 60_000 + 60_000
+    )
 
     messages = "\n".join(record.getMessage() for record in caplog.records if record.levelno == logging.INFO)
     assert "4H decision completed" in messages
@@ -750,7 +758,9 @@ async def test_poll_closed_bar_logs_4h_decision_summary_when_range_unavailable(c
     runner._range_module._trust_start_bucket_ms = 3 * H4
 
     caplog.set_level(logging.INFO)
-    await runner.poll_closed_bar_once(now_ms=12 * 60 * 60_000 + 60_000)
+    await runner.closed_bar.poll_closed_bar_once(
+        now_ms=12 * 60 * 60_000 + 60_000
+    )
 
     messages = "\n".join(record.getMessage() for record in caplog.records if record.levelno == logging.INFO)
     assert "4H decision completed" in messages
@@ -803,7 +813,9 @@ async def test_closed_bar_poll_does_not_backfill_historical_trades_when_trade_wa
         dry_run=True,
     )
 
-    events = await runner.poll_closed_bar_once(now_ms=12 * 60 * 60_000 + 60_000)
+    events = await runner.closed_bar.poll_closed_bar_once(
+        now_ms=12 * 60 * 60_000 + 60_000
+    )
 
     assert [event.type_value for event in events] == ["closed_kline"]
     assert feed.calls == []
@@ -832,8 +844,8 @@ async def test_range_bar_pipeline_saves_bar_and_emits_aggregate_feature():
 
     await runner._range_module.process_trade(trade1)
     await runner._range_module.process_trade(trade2)
-    await runner.emit_range_aggregate_for_bucket(0)
-    await runner._stop_live_persistence_writer()
+    await runner.closed_bar.emit_range_aggregate_for_bucket(0)
+    await runner.persistence._stop_live_persistence_writer()
 
     assert len(store.rows) == 1
     assert "range_bar_closed" in strategy.events
@@ -907,7 +919,7 @@ async def _run_smoke(tmp_path, *, binance_fail: bool):
     async def process_trade(trade):
         await runner.process_market_event(trade)
         if runner.stats.market_events_seen == len(live_data.trades):
-            await runner.emit_range_aggregate_for_bucket(0)
+            await runner.closed_bar.emit_range_aggregate_for_bucket(0)
 
     processor = MarketEventProcessor(
         raw_trade_callback=process_trade,
@@ -987,7 +999,9 @@ async def test_live_runtime_smoke_partial_failure_is_not_silent(tmp_path):
 async def test_range_aggregate_for_same_bucket_is_not_executed_twice(tmp_path):
     runner, repo, intent_id, okx, binance, strategy = await _run_smoke(tmp_path, binance_fail=False)
 
-    duplicate_events = await runner.emit_range_aggregate_for_bucket(0)
+    duplicate_events = await runner.closed_bar.emit_range_aggregate_for_bucket(
+        0
+    )
 
     with sqlite3.connect(repo.path) as conn:
         intents = conn.execute("SELECT intent_id FROM order_intents").fetchall()
@@ -1032,7 +1046,9 @@ async def test_place_stop_success_but_open_stop_orders_missing_blocks_confirmed_
         status=OrderStatus.NEW,
     )
 
-    verified = await runner._validate_order_results_before_journal(intent=_v8_stop_intent(signal), results=[result])
+    verified = await runner.signal_execution._validate_order_results_before_journal(
+        intent=_v8_stop_intent(signal), results=[result]
+    )
     await strategy.on_order_results(signal=signal, results=verified, source="test", event_time_ms=6)
 
     assert verified[0].ok is False
@@ -1088,7 +1104,9 @@ async def test_place_stop_success_and_exchange_stop_verified_confirms_stop():
         status=OrderStatus.NEW,
     )
 
-    verified = await runner._validate_order_results_before_journal(intent=_v8_stop_intent(signal), results=[result])
+    verified = await runner.signal_execution._validate_order_results_before_journal(
+        intent=_v8_stop_intent(signal), results=[result]
+    )
     await strategy.on_order_results(signal=signal, results=verified, source="test", event_time_ms=6)
 
     assert verified[0].ok is True
@@ -1118,9 +1136,9 @@ async def test_legacy_private_account_stream_requirement_does_not_start_unmanage
         },
     )
 
-    tasks = runner._start_producers()
+    tasks = runner.lifecycle._start_producers()
     runner._producer_tasks = tasks
-    await runner._stop_producers()
+    await runner.lifecycle._stop_producers()
 
     assert tasks == []
     assert runner._producer_monitor.snapshot() == ()
@@ -1138,7 +1156,7 @@ def test_request_sync_contexts_fail_fast_on_account_execution_exchange_mismatch(
     )
 
     with pytest.raises(RuntimeError, match="exchange mismatch"):
-        runner._get_sync_contexts()
+        runner.account_runtime._get_sync_contexts()
 
 
 def test_request_sync_contexts_fail_fast_on_partial_injection():
@@ -1152,7 +1170,7 @@ def test_request_sync_contexts_fail_fast_on_partial_injection():
     )
 
     with pytest.raises(RuntimeError, match="injected together"):
-        runner._get_sync_contexts()
+        runner.account_runtime._get_sync_contexts()
 
 
 def test_request_sync_services_share_runtime_throttle():
@@ -1168,8 +1186,8 @@ def test_request_sync_services_share_runtime_throttle():
         },
     )
 
-    account_service = runner._get_account_sync_service()
-    order_service = runner._get_order_sync_service()
+    account_service = runner.account_runtime._get_account_sync_service()
+    order_service = runner.account_runtime._get_order_sync_service()
 
     assert account_service.throttle is throttle
     assert order_service.throttle is throttle
@@ -1200,7 +1218,9 @@ async def test_account_sync_refreshes_strategy_account_snapshot():
         },
     )
 
-    results = await runner._get_account_sync_service().sync_once(sync_type="account_periodic")
+    results = await runner.account_runtime._get_account_sync_service().sync_once(
+        sync_type="account_periodic"
+    )
 
     assert [result.success for result in results] == [True, True]
     assert [(snap.balance.exchange, snap.balance.total, snap.balance.available) for snap in strategy.account_snapshots] == [
@@ -1217,27 +1237,27 @@ async def test_account_snapshot_logging_tracks_balance_by_exchange_and_sync_type
     runner = _runner(strategy)
     caplog.set_level(logging.DEBUG)
 
-    await runner._on_account_snapshot_synced(
+    await runner.account_runtime._on_account_snapshot_synced(
         _snapshot(total="1000.00", available="900.00"),
         "account_periodic",
     )
-    await runner._on_account_snapshot_synced(
+    await runner.account_runtime._on_account_snapshot_synced(
         _snapshot(total="1000", available="900"),
         "account_periodic",
     )
-    await runner._on_account_snapshot_synced(
+    await runner.account_runtime._on_account_snapshot_synced(
         _snapshot(total="1000", available="901"),
         "account_periodic",
     )
-    await runner._on_account_snapshot_synced(
+    await runner.account_runtime._on_account_snapshot_synced(
         _snapshot(total="1001", available="901"),
         "account_periodic",
     )
-    await runner._on_account_snapshot_synced(
+    await runner.account_runtime._on_account_snapshot_synced(
         _snapshot(ExchangeName.BINANCE, total="1001", available="901"),
         "account_periodic",
     )
-    await runner._on_account_snapshot_synced(
+    await runner.account_runtime._on_account_snapshot_synced(
         _snapshot(total="1001", available="901"),
         "post_order_account",
     )
@@ -1287,10 +1307,14 @@ async def test_account_snapshot_logging_emits_unchanged_keepalive(caplog, monkey
     caplog.set_level(logging.INFO)
     snapshot = _snapshot(total="1000", available="900")
 
-    await runner._on_account_snapshot_synced(snapshot, "account_periodic")
+    await runner.account_runtime._on_account_snapshot_synced(
+        snapshot, "account_periodic"
+    )
     key = (ExchangeName.OKX.value, "account_periodic")
     runner._last_account_snapshot_log_ms[key] = int(time.monotonic() * 1000) - 1_001
-    await runner._on_account_snapshot_synced(snapshot, "account_periodic")
+    await runner.account_runtime._on_account_snapshot_synced(
+        snapshot, "account_periodic"
+    )
 
     info_messages = [
         record.getMessage()
@@ -1327,7 +1351,9 @@ async def test_closed_bar_poll_emits_unavailable_range_aggregate_for_live_only_p
     )
     runner._range_module._trust_start_bucket_ms = 3 * H4
 
-    events = await runner.poll_closed_bar_once(now_ms=12 * 60 * 60_000 + 60_000)
+    events = await runner.closed_bar.poll_closed_bar_once(
+        now_ms=12 * 60 * 60_000 + 60_000
+    )
 
     assert [event.type_value for event in events] == ["closed_kline", "range_aggregate"]
     assert events[-1].data["bar_count"] == 0
@@ -1412,7 +1438,7 @@ async def test_live_runtime_fails_when_closed_kline_warmup_loads_zero_records():
     with patch("src.runtime.components.startup.KlineWarmupService") as MockSvc:
         MockSvc.return_value.warmup = AsyncMock(return_value=zero)
         with pytest.raises(LiveRuntimeError, match="insufficient records"):
-            await runner._run_requirement_warmup()
+            await runner.startup._run_requirement_warmup()
 
 
 @pytest.mark.asyncio
@@ -1438,7 +1464,7 @@ async def test_dry_run_allows_zero_closed_kline_warmup_with_warning():
     with patch("src.runtime.components.startup.KlineWarmupService") as MockSvc:
         MockSvc.return_value.warmup = AsyncMock(return_value=zero)
         # Must NOT raise
-        await runner._run_requirement_warmup()
+        await runner.startup._run_requirement_warmup()
 
     # Verify warmup was recorded
     assert runner.stats.warmup_runs >= 1
@@ -1491,7 +1517,7 @@ async def test_live_runtime_allows_warmup_with_records():
     with patch("src.runtime.components.startup.KlineWarmupService") as MockSvc:
         MockSvc.return_value.warmup = AsyncMock(return_value=result)
         # Must NOT raise: available_records=5 >= min_records=1
-        await runner._run_requirement_warmup()
+        await runner.startup._run_requirement_warmup()
 
     assert runner.stats.warmup_runs >= 1
 
@@ -1556,7 +1582,7 @@ async def test_live_runtime_fails_when_closed_kline_warmup_below_min_records():
     with patch("src.runtime.components.startup.KlineWarmupService") as MockSvc:
         MockSvc.return_value.warmup = AsyncMock(return_value=few)
         with pytest.raises(LiveRuntimeError, match="insufficient records"):
-            await runner._run_requirement_warmup()
+            await runner.startup._run_requirement_warmup()
 
 
 @pytest.mark.asyncio
@@ -1582,7 +1608,7 @@ async def test_dry_run_allows_closed_kline_warmup_below_min_records_with_warning
     with patch("src.runtime.components.startup.KlineWarmupService") as MockSvc:
         MockSvc.return_value.warmup = AsyncMock(return_value=few)
         # Must NOT raise
-        await runner._run_requirement_warmup()
+        await runner.startup._run_requirement_warmup()
 
     # Verify warmup was recorded
     assert runner.stats.warmup_runs >= 1
@@ -1612,7 +1638,7 @@ async def test_closed_kline_min_records_is_enforced_by_runtime():
     with patch("src.runtime.components.startup.KlineWarmupService") as MockSvc:
         MockSvc.return_value.warmup = AsyncMock(return_value=few)
         with pytest.raises(LiveRuntimeError) as exc_info:
-            await runner._run_requirement_warmup()
+            await runner.startup._run_requirement_warmup()
     error_msg = str(exc_info.value)
     assert "insufficient records" in error_msg
     assert "1000" in error_msg or "min_records" in error_msg.lower()
@@ -1689,7 +1715,7 @@ async def test_live_runtime_uses_available_kline_records_not_newly_loaded_record
         with patch("src.runtime.components.startup.KlineWarmupService") as MockSvc:
             MockSvc.return_value.warmup = AsyncMock(return_value=result)
             # Must NOT raise — available_records=1000 >= min_records=1000
-            await runner._run_requirement_warmup()
+            await runner.startup._run_requirement_warmup()
 
     assert runner.stats.warmup_runs >= 1
 
@@ -1756,7 +1782,7 @@ async def test_live_runtime_backfills_when_available_records_below_min():
                 # Preload store after backfill to match what a real provider would do
                 store._rows = _make_klines(1000)
                 # Must NOT raise
-                await runner._run_requirement_warmup()
+                await runner.startup._run_requirement_warmup()
 
     assert runner.stats.warmup_runs >= 1
 
@@ -1822,7 +1848,7 @@ async def test_live_runtime_fails_when_available_records_below_min_after_backfil
                 MockProv.return_value.backfill_and_reload = AsyncMock(return_value=fake_diag)
                 store._rows = _make_klines(5)  # backfill only gave 5
                 with pytest.raises(LiveRuntimeError, match="insufficient records"):
-                    await runner._run_requirement_warmup()
+                    await runner.startup._run_requirement_warmup()
 
 
 @pytest.mark.asyncio
@@ -1862,7 +1888,7 @@ async def test_live_runtime_skips_backfill_when_available_records_already_suffic
         with patch("src.runtime.components.startup.KlineWarmupService") as MockSvc:
             MockSvc.return_value.warmup = AsyncMock(return_value=result)
             with patch("src.market_data.warmup.kline_provider.MarketDataKlineProvider") as MockProv:
-                await runner._run_requirement_warmup()
+                await runner.startup._run_requirement_warmup()
                 # Backfill provider must NOT have been instantiated
                 MockProv.assert_not_called()
 
@@ -1889,7 +1915,7 @@ async def test_runner_has_reconciliation_service_available():
         },
         dry_run=True,
     )
-    svc = runner._get_reconciliation_service()
+    svc = runner.account_runtime._get_reconciliation_service()
     assert svc is not None
     assert isinstance(svc, LiveStateReconciliationService)
 
@@ -1964,10 +1990,10 @@ async def test_reconciliation_receives_all_snapshots():
         services={"recovery_service": FakeRecoveryService()},
         dry_run=True,
     )
-    runner._strategy_capabilities()
+    runner.recovery._strategy_capabilities()
 
     # _run_recovery should return a tuple with both OKX and Binance snapshots
-    snapshots = await runner._run_recovery()
+    snapshots = await runner.recovery._run_recovery()
     assert len(snapshots) == 2, f"Expected 2 snapshots, got {len(snapshots)}"
     assert {s.leverage.exchange for s in snapshots} == {ExchangeName.OKX, ExchangeName.BINANCE}
 
@@ -1984,7 +2010,9 @@ async def test_reconciliation_missing_snapshot_raises():
 
     # Pass only 1 snapshot when 2 are expected
     with pytest.raises(LiveRuntimeError, match="missing exchange snapshots"):
-        await runner._run_reconciliation((_snapshot(ExchangeName.OKX),))
+        await runner.account_runtime._run_reconciliation(
+            (_snapshot(ExchangeName.OKX),)
+        )
 
 
 @pytest.mark.asyncio
@@ -1996,9 +2024,9 @@ async def test_runner_recovery_stores_last_snapshots():
         services={"recovery_service": FakeRecoveryService()},
         dry_run=True,
     )
-    runner._strategy_capabilities()
+    runner.recovery._strategy_capabilities()
 
-    snapshots = await runner._run_recovery()
+    snapshots = await runner.recovery._run_recovery()
     assert runner._last_snapshots == snapshots
     assert len(runner._last_snapshots) == 2
     # Backward compat: _last_snapshot still points to first
@@ -2212,11 +2240,11 @@ async def test_startup_catchup_does_not_raise_missing_method():
     )
     # Should not raise AttributeError
     try:
-        await runner._evaluate_startup_catchup_once(_snapshot())
+        await runner.catchup._evaluate_startup_catchup_once(_snapshot())
     except AttributeError as e:
         pytest.fail(f"_evaluate_startup_catchup_once raised AttributeError: {e}")
     # Even if skipped, the method must exist and be callable
-    assert runner._has_unresolved_follower_close() is False
+    assert runner.account_runtime._has_unresolved_follower_close() is False
 
 
 # ── P0-4: range aggregate unavailable → skip, no placeholder ──────────────────
@@ -2260,11 +2288,11 @@ async def test_startup_catchup_skips_when_aggregate_event_missing():
         },
         dry_run=True,
     )
-    runner._startup_catchup_evaluated = False
+    runner.catchup._startup_catchup_evaluated = False
 
     # Override time to simulate fresh window
     with patch("time.time", return_value=now_ms / 1000):
-        await runner._evaluate_startup_catchup_once(_snapshot())
+        await runner.catchup._evaluate_startup_catchup_once(_snapshot())
 
     # Strategy must NOT have received any events (no placeholder fed)
     assert len(strategy.events_received) == 0, (
@@ -2333,10 +2361,10 @@ async def test_startup_catchup_requires_aggregate_bar_count():
         },
         dry_run=True,
     )
-    runner._startup_catchup_evaluated = False
+    runner.catchup._startup_catchup_evaluated = False
 
     with patch("time.time", return_value=now_ms / 1000):
-        await runner._evaluate_startup_catchup_once(_snapshot())
+        await runner.catchup._evaluate_startup_catchup_once(_snapshot())
 
     # Strategy must NOT have received events
     assert len(strategy.events_received) == 0
@@ -2399,10 +2427,10 @@ async def test_startup_catchup_uses_current_market_price_for_price_guard():
         },
         dry_run=True,
     )
-    runner._startup_catchup_evaluated = False
+    runner.catchup._startup_catchup_evaluated = False
 
     with patch("time.time", return_value=now_ms / 1000):
-        await runner._evaluate_startup_catchup_once(_snapshot())
+        await runner.catchup._evaluate_startup_catchup_once(_snapshot())
 
     # Signal should be discarded by price guard (current=101, theoretical_open ~ 100,
     # LONG: upper bound = 100 * 1.0015 = 100.15, fail)
@@ -2471,7 +2499,7 @@ async def test_startup_catchup_price_guard_uses_signal_side_not_kline_direction(
         },
         dry_run=True,
     )
-    runner._startup_catchup_evaluated = False
+    runner.catchup._startup_catchup_evaluated = False
 
     # Also set current_4h_open kline for theoretical_open fetch
     current_kline = MarketKline(
@@ -2484,7 +2512,7 @@ async def test_startup_catchup_price_guard_uses_signal_side_not_kline_direction(
     data._klines = [current_kline]
 
     with patch("time.time", return_value=now_ms / 1000):
-        await runner._evaluate_startup_catchup_once(_snapshot())
+        await runner.catchup._evaluate_startup_catchup_once(_snapshot())
 
     # Strategy receives events (for preview); signal discarded by price guard
     assert len(strategy.events_received) > 0, "Strategy should receive preview events"
@@ -2523,13 +2551,13 @@ async def test_startup_catchup_skips_when_snapshot_has_active_position():
         },
         dry_run=True,
     )
-    runner._startup_catchup_evaluated = False
+    runner.catchup._startup_catchup_evaluated = False
 
     # Should skip immediately due to active position; no AttributeError
     h4_ms = 4 * 60 * 60_000
     now_ms = 12 * 60 * 60_000 + 120_000
     with patch("time.time", return_value=now_ms / 1000):
-        await runner._evaluate_startup_catchup_once(pos_snapshot)
+        await runner.catchup._evaluate_startup_catchup_once(pos_snapshot)
 
     assert len(strategy.events_received) == 0
 
@@ -2554,12 +2582,12 @@ async def test_startup_catchup_skips_when_strategy_position_active():
         },
         dry_run=True,
     )
-    runner._startup_catchup_evaluated = False
+    runner.catchup._startup_catchup_evaluated = False
 
     h4_ms = 4 * 60 * 60_000
     now_ms = 12 * 60 * 60_000 + 120_000
     with patch("time.time", return_value=now_ms / 1000):
-        await runner._evaluate_startup_catchup_once(_snapshot())
+        await runner.catchup._evaluate_startup_catchup_once(_snapshot())
 
     assert len(strategy.events_received) == 0
 
@@ -2598,12 +2626,12 @@ async def test_startup_catchup_skips_when_state_store_has_open_order():
         },
         dry_run=True,
     )
-    runner._startup_catchup_evaluated = False
+    runner.catchup._startup_catchup_evaluated = False
 
     # AppContext is frozen, so mock _has_open_orders to return True
-    with patch.object(runner, "_has_open_orders", return_value=True):
+    with patch.object(runner.catchup, "_has_open_orders", return_value=True):
         with patch("time.time", return_value=now_ms / 1000):
-            await runner._evaluate_startup_catchup_once(_snapshot())
+            await runner.catchup._evaluate_startup_catchup_once(_snapshot())
 
     assert len(strategy.events_received) == 0
 
@@ -2660,10 +2688,10 @@ async def test_startup_catchup_skips_when_position_plan_requires_follower_close(
         },
         dry_run=True,
     )
-    runner._startup_catchup_evaluated = False
+    runner.catchup._startup_catchup_evaluated = False
 
     with patch("time.time", return_value=now_ms / 1000):
-        await runner._evaluate_startup_catchup_once(_snapshot())
+        await runner.catchup._evaluate_startup_catchup_once(_snapshot())
 
     assert len(strategy.events_received) == 0
 
@@ -2732,9 +2760,9 @@ async def test_startup_catchup_executes_open_signal_when_all_guards_pass():
         },
         dry_run=True,
     )
-    runner._startup_catchup_evaluated = False
+    runner.catchup._startup_catchup_evaluated = False
 
-    original_execute = runner._execute_signals
+    original_execute = runner.signal_execution._execute_signals
 
     async def capture_execute(signals, *, source, event_time_ms, metadata=None,
                               feedback_depth=0):
@@ -2745,7 +2773,7 @@ async def test_startup_catchup_executes_open_signal_when_all_guards_pass():
             runner.stats.signals_seen += 1
             runner.stats.dry_run_actions += 1
 
-    runner._execute_signals = capture_execute
+    runner.signal_execution._execute_signals = capture_execute
 
     # Current 4H kline for theoretical_open fetch
     current_kline = MarketKline(
@@ -2758,7 +2786,7 @@ async def test_startup_catchup_executes_open_signal_when_all_guards_pass():
     data._klines = [current_kline]
 
     with patch("time.time", return_value=now_ms / 1000):
-        await runner._evaluate_startup_catchup_once(_snapshot())
+        await runner.catchup._evaluate_startup_catchup_once(_snapshot())
 
     # Strategy should have received preview events
     assert len(strategy.events_received) >= 2, (
@@ -2838,10 +2866,10 @@ async def test_startup_catchup_skips_when_current_price_unavailable():
         },
         dry_run=True,
     )
-    runner._startup_catchup_evaluated = False
+    runner.catchup._startup_catchup_evaluated = False
 
     with patch("time.time", return_value=now_ms / 1000):
-        await runner._evaluate_startup_catchup_once(_snapshot())
+        await runner.catchup._evaluate_startup_catchup_once(_snapshot())
 
     # Strategy must NOT have received events — skipped before preview
     assert len(strategy.events_received) == 0
@@ -2859,9 +2887,11 @@ def test_has_unresolved_follower_close_method_exists_and_works():
         dry_run=True,
     )
     # Method exists
-    assert callable(runner._has_unresolved_follower_close)
+    assert callable(
+        runner.account_runtime._has_unresolved_follower_close
+    )
     # With no position plan store → returns False
-    assert runner._has_unresolved_follower_close() is False
+    assert runner.account_runtime._has_unresolved_follower_close() is False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2930,11 +2960,11 @@ async def test_startup_catchup_price_guard_failure_restores_pending_entry():
         },
         dry_run=True,
     )
-    runner._startup_catchup_evaluated = False
-    runner._execute_signals = capture_execute
+    runner.catchup._startup_catchup_evaluated = False
+    runner.signal_execution._execute_signals = capture_execute
 
     with patch("time.time", return_value=now_ms / 1000):
-        await runner._evaluate_startup_catchup_once(_snapshot())
+        await runner.catchup._evaluate_startup_catchup_once(_snapshot())
 
     # Price guard failed → pending_entry must be restored to None.
     assert strategy.pending_entry is None, (
@@ -3026,8 +3056,8 @@ async def test_startup_catchup_order_journal_duplicate_restores_pending_entry(tm
         },
         dry_run=True,
     )
-    runner._startup_catchup_evaluated = False
-    runner._execute_signals = capture_execute
+    runner.catchup._startup_catchup_evaluated = False
+    runner.signal_execution._execute_signals = capture_execute
 
     # Current 4H kline for theoretical_open fetch
     current_kline = MarketKline(
@@ -3040,7 +3070,7 @@ async def test_startup_catchup_order_journal_duplicate_restores_pending_entry(tm
     data._klines = [current_kline]
 
     with patch("time.time", return_value=now_ms / 1000):
-        await runner._evaluate_startup_catchup_once(_snapshot())
+        await runner.catchup._evaluate_startup_catchup_once(_snapshot())
 
     # Duplicate journal hit → pending_entry must be restored.
     assert strategy.pending_entry is None, (
@@ -3071,7 +3101,7 @@ async def test_dispatcher_dropped_trade_degrades_range_and_invalidates_journal()
     )()
     trade = _trade(trade_time_ms=2 * H4 + 3)
 
-    await runner._handle_market_data_trade_drop(trade)
+    await runner.market_events._handle_market_data_trade_drop(trade)
 
     assert runner.stats.market_events_dropped == 1
     assert runner._range_module.degraded_reason(2 * H4) == "market_queue_dropped_trade"
@@ -3112,7 +3142,9 @@ async def test_mid_bucket_restart_uses_store_range_aggregate_when_enough_rows():
     )
     runner._range_module._trust_start_bucket_ms = open_time_ms + H4
 
-    events = await runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
+    events = await runner.closed_bar.poll_closed_bar_once(
+        now_ms=3 * H4 + 60_000
+    )
 
     assert [event.type_value for event in events] == ["closed_kline", "range_aggregate"]
     assert events[-1].data["bar_count"] == 5
@@ -3140,7 +3172,9 @@ async def test_mid_bucket_restart_without_store_rows_emits_unavailable():
     )
     runner._range_module._trust_start_bucket_ms = open_time_ms + H4
 
-    events = await runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
+    events = await runner.closed_bar.poll_closed_bar_once(
+        now_ms=3 * H4 + 60_000
+    )
 
     assert [event.type_value for event in events] == ["closed_kline", "range_aggregate"]
     assert events[-1].data["context_available"] is False
@@ -3183,7 +3217,9 @@ async def test_mid_bucket_restart_with_insufficient_store_rows_does_not_emit_par
 
     monkeypatch.setattr(runner, "process_market_feature", capture_process_market_feature)
 
-    events = await runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
+    events = await runner.closed_bar.poll_closed_bar_once(
+        now_ms=3 * H4 + 60_000
+    )
 
     assert [event.type_value for event in events] == ["closed_kline", "range_aggregate"]
     assert events[-1].data["context_available"] is False
@@ -3226,7 +3262,9 @@ async def test_non_mid_bucket_emits_range_aggregate_even_when_store_rows_exist()
     )
     runner._range_module._trust_start_bucket_ms = None
 
-    events = await runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
+    events = await runner.closed_bar.poll_closed_bar_once(
+        now_ms=3 * H4 + 60_000
+    )
 
     assert [event.type_value for event in events] == ["closed_kline", "range_aggregate"]
     assert events[-1].data["bar_count"] == 5
@@ -3258,7 +3296,7 @@ async def test_emit_range_aggregate_for_bucket_still_processes_feature():
         dry_run=True,
     )
 
-    events = await runner.emit_range_aggregate_for_bucket(0)
+    events = await runner.closed_bar.emit_range_aggregate_for_bucket(0)
 
     assert [event.type_value for event in events] == ["range_aggregate"]
     assert events[0].data["bar_count"] == 5
@@ -3277,10 +3315,16 @@ async def test_runtime_start_logs_market_queue_settings(caplog, monkeypatch):
     async def fake_consume_market_events(*, max_market_events):
         return None
 
-    monkeypatch.setattr(runner, "_startup", fake_startup)
-    monkeypatch.setattr(runner, "_start_producers", lambda: [])
-    monkeypatch.setattr(runner, "_start_sync_tasks", lambda: [])
-    monkeypatch.setattr(runner, "_consume_market_events", fake_consume_market_events)
+    monkeypatch.setattr(
+        runner.lifecycle, "_run_startup_sequence", fake_startup
+    )
+    monkeypatch.setattr(runner.lifecycle, "_start_producers", lambda: [])
+    monkeypatch.setattr(runner.lifecycle, "_start_sync_tasks", lambda: [])
+    monkeypatch.setattr(
+        runner.market_events,
+        "_consume_market_events",
+        fake_consume_market_events,
+    )
 
     caplog.set_level(logging.INFO)
     await runner.run(max_market_events=0)
@@ -3329,7 +3373,7 @@ async def test_trade_health_update_is_throttled(monkeypatch):
     def fake_set_health(*args, **kwargs):
         health_calls.append((args, kwargs))
 
-    monkeypatch.setattr(runner, "_set_health", fake_set_health)
+    monkeypatch.setattr(runner.lifecycle, "_set_health", fake_set_health)
 
     await runner.process_market_event(_trade(trade_time_ms=1))
     await runner.process_market_event(_trade(trade_time_ms=2))
@@ -3370,9 +3414,13 @@ async def test_market_consumer_drains_batch(monkeypatch):
         producer_health_checks += 1
 
     monkeypatch.setattr(runner, "process_market_event", fake_process_market_event)
-    monkeypatch.setattr(runner, "_raise_on_unhealthy_producer", fake_raise_on_unhealthy_producer)
+    monkeypatch.setattr(
+        runner.lifecycle,
+        "_raise_on_unhealthy_producer",
+        fake_raise_on_unhealthy_producer,
+    )
 
-    await runner._consume_market_events(max_market_events=3)
+    await runner.market_events._consume_market_events(max_market_events=3)
 
     assert len(processed) == 3
     assert producer_health_checks == 1
@@ -3391,11 +3439,17 @@ async def test_market_failure_gate_runs_before_closed_bar_poll(monkeypatch):
         polled = True
         return []
 
-    monkeypatch.setattr(runner, "_raise_on_unhealthy_market_data", fail_market_data)
-    monkeypatch.setattr(runner, "poll_closed_bar_once", poll)
+    monkeypatch.setattr(
+        runner.market_events,
+        "_raise_on_unhealthy_market_data",
+        fail_market_data,
+    )
+    monkeypatch.setattr(runner.closed_bar, "poll_closed_bar_once", poll)
 
     with pytest.raises(RuntimeError, match="market data already failed"):
-        await runner._consume_market_events(max_market_events=1)
+        await runner.market_events._consume_market_events(
+            max_market_events=1
+        )
     assert polled is False
 
 
@@ -3415,7 +3469,9 @@ async def test_direct_closed_bar_poll_rejects_failed_market_runtime(monkeypatch)
 
     monkeypatch.setattr(runner, "process_market_feature", capture)
     with pytest.raises(RuntimeError, match="feature pipeline unhealthy"):
-        await runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
+        await runner.closed_bar.poll_closed_bar_once(
+            now_ms=3 * H4 + 60_000
+        )
     assert feature_calls == []
 
 
@@ -3437,7 +3493,9 @@ async def test_incomplete_trade_window_suppresses_entire_closed_bar_decision():
         dry_run=True,
     )
 
-    events = await runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
+    events = await runner.closed_bar.poll_closed_bar_once(
+        now_ms=3 * H4 + 60_000
+    )
 
     assert events == []
     assert runner.stats.closed_klines_seen == 0
@@ -3445,7 +3503,7 @@ async def test_incomplete_trade_window_suppresses_entire_closed_bar_decision():
     assert runner._closed_bar_scheduler.is_skipped(2 * H4)
     assert runner._market_queue.empty()
 
-    recovered = await runner.poll_closed_bar_once(
+    recovered = await runner.closed_bar.poll_closed_bar_once(
         now_ms=4 * H4 + 60_000
     )
 
@@ -3574,7 +3632,7 @@ async def test_execute_stop_signal_post_check_failure_blocks_confirmed_stop():
                 status=OrderStatus.NEW,
             )
         ]
-        verified = await runner._validate_order_results_before_journal(
+        verified = await runner.signal_execution._validate_order_results_before_journal(
             intent=intent, results=raw
         )
         return list(verified)
@@ -3582,8 +3640,14 @@ async def test_execute_stop_signal_post_check_failure_blocks_confirmed_stop():
     coordinator = AsyncMock()
     coordinator.execute = mock_execute
 
-    with patch.object(runner, "_get_order_coordinator", return_value=coordinator):
-        await runner._execute_signals([signal], source="test", event_time_ms=6)
+    with patch.object(
+        runner.order_results,
+        "_get_order_coordinator",
+        return_value=coordinator,
+    ):
+        await runner.signal_execution._execute_signals(
+            [signal], source="test", event_time_ms=6
+        )
 
     # ── Post-check must have failed → strategy must NOT confirm stop ────
     assert strategy.position.confirmed_stop_price is None, (
@@ -3638,7 +3702,7 @@ async def test_execute_stop_signal_post_check_success_confirms_stop():
                 status=OrderStatus.NEW,
             )
         ]
-        verified = await runner._validate_order_results_before_journal(
+        verified = await runner.signal_execution._validate_order_results_before_journal(
             intent=intent, results=raw
         )
         return list(verified)
@@ -3646,8 +3710,14 @@ async def test_execute_stop_signal_post_check_success_confirms_stop():
     coordinator = AsyncMock()
     coordinator.execute = mock_execute
 
-    with patch.object(runner, "_get_order_coordinator", return_value=coordinator):
-        await runner._execute_signals([signal], source="test", event_time_ms=6)
+    with patch.object(
+        runner.order_results,
+        "_get_order_coordinator",
+        return_value=coordinator,
+    ):
+        await runner.signal_execution._execute_signals(
+            [signal], source="test", event_time_ms=6
+        )
 
     # ── Post-check must pass → strategy must confirm stop ─────────────────
     assert strategy.position.confirmed_stop_price == Decimal("1686.42"), (
@@ -3905,7 +3975,7 @@ async def test_portfolio_v1_startup_recovers_existing_positions_and_stops(
             RecoveryExchangeContext(
                 account=account,
                 execution=execution,
-                state_store=runner.context.state_store,
+                    state_store=runner.app_context.state_store,
                 reconciler=CleanReconciler(account.exchange),
                 leverage_margin_mode=MarginMode.ISOLATED,
             )
@@ -3914,27 +3984,47 @@ async def test_portfolio_v1_startup_recovers_existing_positions_and_stops(
         position_plan_store=plan_store,
     )
 
-    monkeypatch.setattr(runner, "_initialize_rangebar_trust_window", lambda: None)
-    monkeypatch.setattr(runner, "_run_warmup", AsyncMock())
     monkeypatch.setattr(
-        runner,
+        runner.startup,
+        "_initialize_rangebar_trust_window",
+        lambda: None,
+    )
+    monkeypatch.setattr(runner.startup, "_run_warmup", AsyncMock())
+    monkeypatch.setattr(
+        runner.startup,
         "_warmup_range_speed_history",
         AsyncMock(return_value=0),
     )
-    monkeypatch.setattr(runner, "_check_startup_feature_backfills", AsyncMock())
-    monkeypatch.setattr(runner, "_run_reconciliation", AsyncMock())
-    monkeypatch.setattr(runner, "_evaluate_startup_catchup_once", AsyncMock())
     monkeypatch.setattr(
-        runner,
+        runner.lifecycle,
+        "_check_startup_feature_backfills",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        runner.account_runtime,
+        "_run_reconciliation",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        runner.catchup,
+        "_evaluate_startup_catchup_once",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        runner.startup,
         "_finish_range_speed_warmup_after_catchup",
         AsyncMock(),
     )
     monkeypatch.setattr(
-        runner,
+        runner.market_data_lifecycle,
         "_start_range_speed_background_services",
         lambda: None,
     )
-    monkeypatch.setattr(runner._heartbeat_service, "start", lambda **kwargs: None)
+    monkeypatch.setattr(
+        runner.lifecycle._heartbeat_service,
+        "start",
+        lambda **kwargs: None,
+    )
 
     await runner._startup()
 
@@ -4001,8 +4091,14 @@ async def test_open_signal_does_not_run_stop_post_check_before_followup_stop():
         ]
     )
 
-    with patch.object(runner, "_get_order_coordinator", return_value=coordinator):
-        await runner._execute_signals([open_signal], source="test", event_time_ms=7)
+    with patch.object(
+        runner.order_results,
+        "_get_order_coordinator",
+        return_value=coordinator,
+    ):
+        await runner.signal_execution._execute_signals(
+            [open_signal], source="test", event_time_ms=7
+        )
 
     # ── Non-stop signal must pass through unchanged ───────────────────────
     assert runner.stats.submitted_intents == 1
@@ -4050,7 +4146,7 @@ async def test_stop_post_check_retries_until_open_stop_order_visible(monkeypatch
         status=OrderStatus.NEW,
     )
 
-    verified = await runner._verify_stop_order_results(
+    verified = await runner.order_results._verify_stop_order_results(
         signal=signal, results=[result]
     )
 
@@ -4140,7 +4236,7 @@ async def test_stop_post_check_accepts_exchange_tick_normalized_price(
         },
     )
 
-    verified = await runner._verify_stop_order_results(
+    verified = await runner.order_results._verify_stop_order_results(
         signal=signal,
         results=(
             ExchangeOrderResult(
@@ -4203,7 +4299,7 @@ async def test_stop_post_check_fails_after_retry_exhausted(monkeypatch):
         status=OrderStatus.NEW,
     )
 
-    verified = await runner._verify_stop_order_results(
+    verified = await runner.order_results._verify_stop_order_results(
         signal=signal, results=[result]
     )
 
@@ -4273,7 +4369,7 @@ async def test_stop_post_check_runs_once_via_coordinator(monkeypatch):
                 status=OrderStatus.NEW,
             )
         ]
-        verified = await runner._validate_order_results_before_journal(
+        verified = await runner.signal_execution._validate_order_results_before_journal(
             intent=intent, results=raw
         )
         return list(verified)
@@ -4281,8 +4377,14 @@ async def test_stop_post_check_runs_once_via_coordinator(monkeypatch):
     coordinator = AsyncMock()
     coordinator.execute = mock_execute
 
-    with patch.object(runner, "_get_order_coordinator", return_value=coordinator):
-        await runner._execute_signals([signal], source="test", event_time_ms=6)
+    with patch.object(
+        runner.order_results,
+        "_get_order_coordinator",
+        return_value=coordinator,
+    ):
+        await runner.signal_execution._execute_signals(
+            [signal], source="test", event_time_ms=6
+        )
 
     # ── fetch_open_stop_orders called exactly 3 times (retry), NOT 6 ──────
     assert exec_client.fetch_open_stop_orders_calls == 3, (
@@ -4333,7 +4435,7 @@ async def test_stop_post_check_attempts_env_invalid_falls_back_to_default(monkey
         status=OrderStatus.NEW,
     )
 
-    verified = await runner._verify_stop_order_results(
+    verified = await runner.order_results._verify_stop_order_results(
         signal=signal, results=[result]
     )
 
@@ -4381,7 +4483,7 @@ async def test_stop_post_check_attempts_env_clamped_to_one(monkeypatch):
         status=OrderStatus.NEW,
     )
 
-    verified = await runner._verify_stop_order_results(
+    verified = await runner.order_results._verify_stop_order_results(
         signal=signal, results=[result]
     )
 
@@ -4431,7 +4533,7 @@ async def test_stop_post_check_delay_env_invalid_does_not_crash(monkeypatch):
     )
 
     # ── Must not raise ──────────────────────────────────────────────────
-    verified = await runner._verify_stop_order_results(
+    verified = await runner.order_results._verify_stop_order_results(
         signal=signal, results=[result]
     )
 
@@ -4477,7 +4579,7 @@ async def test_stop_post_check_missing_exchange_position_does_not_confirm_stop(
         status=OrderStatus.NEW,
     )
 
-    verified = await runner._verify_stop_order_results(
+    verified = await runner.order_results._verify_stop_order_results(
         signal=signal, results=[result]
     )
 
@@ -4542,7 +4644,7 @@ async def test_stop_post_check_retries_until_exchange_position_visible(monkeypat
         status=OrderStatus.NEW,
     )
 
-    verified = await runner._verify_stop_order_results(
+    verified = await runner.order_results._verify_stop_order_results(
         signal=signal, results=[result]
     )
 

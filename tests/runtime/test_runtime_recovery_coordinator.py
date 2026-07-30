@@ -12,7 +12,10 @@ from src.app import AppConfig
 from src.platform import ExchangeName
 from src.platform.config import ProjectEnvConfig
 from src.runtime import LiveRuntimeConfig, RuntimeMode
+from src.runtime.components import RecoveryComponent
 from src.runtime.components import recovery as recovery_component
+from src.runtime.context import RuntimeContext
+from src.runtime.ports import RecoveryPorts
 from src.runtime.recovery_coordinator import (
     RuntimeRecoveryCoordinator,
     RuntimeRecoveryPlan,
@@ -304,9 +307,9 @@ def test_injected_coordinator_has_priority_without_default_construction(
 
     default_factory.assert_not_called()
     coordinator.execute.assert_not_called()
-    assert runner._recovery_coordinator is coordinator
+    assert runner.recovery._recovery_coordinator is coordinator
     assert runner.services["recovery_coordinator"] is coordinator
-    assert runner._recovery_service is DEFAULT_RUNTIME_SERVICE
+    assert runner.recovery._recovery_service is DEFAULT_RUNTIME_SERVICE
 
 
 def test_default_coordinator_is_created_once_and_not_executed(
@@ -323,9 +326,9 @@ def test_default_coordinator_is_created_once_and_not_executed(
 
     factory.assert_called_once_with()
     coordinator.execute.assert_not_called()
-    assert runner._recovery_coordinator is coordinator
+    assert runner.recovery._recovery_coordinator is coordinator
     assert runner.services["recovery_coordinator"] is coordinator
-    assert runner._recovery_service is DEFAULT_RUNTIME_SERVICE
+    assert runner.recovery._recovery_service is DEFAULT_RUNTIME_SERVICE
 
 
 @pytest.mark.asyncio
@@ -339,7 +342,7 @@ async def test_runner_builds_complete_plan_and_delegates_once() -> None:
             return snapshots
 
     runner = _runner(recovery_coordinator=Coordinator())
-    returned = await runner._run_recovery()
+    returned = await runner.recovery._run_recovery()
 
     assert returned is snapshots
     assert len(captured) == 1
@@ -365,7 +368,7 @@ async def test_runner_builds_complete_plan_and_delegates_once() -> None:
 
 
 def test_fallback_reads_only_last_snapshot_and_keeps_identity() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    runner = RecoveryComponent(RuntimeContext())
     snapshot = object()
     runner._last_snapshot = snapshot
     runner._last_snapshots = (object(),)
@@ -381,7 +384,7 @@ def test_fallback_reads_only_last_snapshot_and_keeps_identity() -> None:
 
 @pytest.mark.asyncio
 async def test_invoke_service_passes_same_strategy_once() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    runner = RecoveryComponent(RuntimeContext())
     strategy = object()
     report = object()
     runner.context = SimpleNamespace(strategy=strategy)
@@ -401,7 +404,7 @@ def test_record_and_report_validation_keep_order_and_messages() -> None:
                 alerts=("manual",),
             )
 
-    runner = object.__new__(LiveRuntimeRunner)
+    runner = RecoveryComponent(RuntimeContext())
     runner.stats = SimpleNamespace(recovery_runs=4)
     runner.context = SimpleNamespace(strategy=SimpleNamespace())
     runner.app_config = SimpleNamespace(
@@ -440,7 +443,7 @@ def test_record_and_report_validation_keep_order_and_messages() -> None:
 
 
 def test_signal_partition_preserves_list_type_order_and_duplicates() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    runner = RecoveryComponent(RuntimeContext())
     stop_one = SimpleNamespace(action=SignalAction.PLACE_STOP_LOSS_LONG)
     other = SimpleNamespace(action=SignalAction.OPEN_LONG)
     stop_two = SimpleNamespace(action=SignalAction.PLACE_STOP_LOSS_SHORT)
@@ -458,15 +461,24 @@ def test_signal_partition_preserves_list_type_order_and_duplicates() -> None:
 
 @pytest.mark.asyncio
 async def test_signal_wrappers_keep_exact_execution_arguments() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
-    runner._execute_signals = AsyncMock()
+    execute_signals = AsyncMock()
+    component = RecoveryComponent(RuntimeContext())
+    component.bind_ports(RecoveryPorts(
+        execute_signals=execute_signals,
+        get_account_clients=lambda: (),
+        get_execution_clients=lambda: (),
+        get_order_journal=lambda: None,
+        get_position_plan_store=lambda: None,
+        resolved_account_config_env=lambda: None,
+        strategy_position_index=lambda: SimpleNamespace(active=()),
+    ))
     stops = [object()]
     others = [object()]
 
-    await runner._execute_recovery_stop_signals(stops)
-    await runner._execute_recovery_other_signals(others)
+    await component._execute_recovery_stop_signals(stops)
+    await component._execute_recovery_other_signals(others)
 
-    assert runner._execute_signals.await_args_list == [
+    assert execute_signals.await_args_list == [
         call(
             stops,
             source="recovery",
@@ -483,7 +495,7 @@ async def test_signal_wrappers_keep_exact_execution_arguments() -> None:
 
 
 def test_failure_counts_and_validation_check_failed_before_partial() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    runner = RecoveryComponent(RuntimeContext())
     runner.stats = SimpleNamespace(failed_intents=2, partial_failures=3)
     counts = runner._capture_recovery_failure_counts()
     assert counts == (2, 3)
@@ -507,7 +519,7 @@ def test_failure_counts_and_validation_check_failed_before_partial() -> None:
 def test_finalize_logs_and_updates_snapshot_compatibility_fields(
     monkeypatch,
 ) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    runner = RecoveryComponent(RuntimeContext())
     old = (object(),)
     runner._last_snapshots = old
     runner._last_snapshot = old[0]
@@ -535,7 +547,7 @@ def test_finalize_logs_and_updates_snapshot_compatibility_fields(
 
 
 def test_finalize_empty_snapshots_preserves_old_tuple_or_raises() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    runner = RecoveryComponent(RuntimeContext())
     old = (object(),)
     runner._last_snapshots = old
     runner._last_snapshot = old[0]

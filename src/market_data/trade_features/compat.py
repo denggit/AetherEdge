@@ -7,13 +7,22 @@ from src.market_data.models import TradeDerivedFeatureCoverage
 from src.market_data.trade_features.coverage_service import (
     TradeFeatureCoverageService,
 )
+from src.market_data.trade_features.coverage_repository import (
+    TradeFeatureCoverageRepository,
+)
 from src.market_data.trade_features.okx_archive_calendar import (
     safe_okx_archive_end_ms,
 )
 
 
-class CoverageRepositoryCompatibility:
-    """Deprecated Store facade retained only for external legacy callers."""
+class LegacyTradeFeatureCoverageAdapter:
+    """Composition adapter for legacy callers expecting Store coverage methods."""
+
+    def __init__(
+        self,
+        repository: TradeFeatureCoverageRepository,
+    ) -> None:
+        self._repository = repository
 
     def coverage_scan(
         self,
@@ -33,7 +42,7 @@ class CoverageRepositoryCompatibility:
             if safe_archive_end_ms is None
             else int(safe_archive_end_ms)
         )
-        return TradeFeatureCoverageService(self).scan_window(
+        return TradeFeatureCoverageService(self._repository).scan_window(
             symbol=symbol,
             exchange=exchange,
             required_minutes=required_minutes,
@@ -55,7 +64,9 @@ class CoverageRepositoryCompatibility:
         range_pct: Decimal | str | float = Decimal("0.002"),
         price_step: Decimal | str | float = Decimal("1"),
     ) -> dict[str, object]:
-        return TradeFeatureCoverageService(self).summarize_range_window(
+        return TradeFeatureCoverageService(
+            self._repository
+        ).summarize_range_window(
             symbol=symbol,
             exchange=exchange,
             start_ms=start_ms,
@@ -64,5 +75,30 @@ class CoverageRepositoryCompatibility:
             price_step=price_step,
         )
 
+    def load_latest_range_footprint_context(self, **kwargs):
+        """Expose the one repository query used by the legacy preflight."""
 
-__all__ = ["CoverageRepositoryCompatibility"]
+        return self._repository.load_latest_range_footprint_context(**kwargs)
+
+    def _connect(self):
+        """Retain the legacy preflight's private SQL compatibility boundary."""
+
+        return self._repository._connect()
+
+
+class CoverageRepositoryCompatibility:
+    """Deprecated mixin retained only by the legacy Store facade."""
+
+    def coverage_scan(self, **kwargs):
+        return LegacyTradeFeatureCoverageAdapter(self).coverage_scan(**kwargs)
+
+    def range_footprint_coverage_summary(self, **kwargs):
+        return LegacyTradeFeatureCoverageAdapter(
+            self
+        ).range_footprint_coverage_summary(**kwargs)
+
+
+__all__ = [
+    "CoverageRepositoryCompatibility",
+    "LegacyTradeFeatureCoverageAdapter",
+]

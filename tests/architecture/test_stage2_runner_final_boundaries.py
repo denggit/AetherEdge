@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import fields
 from pathlib import Path
 
 from tests.runtime_surface_ast import runtime_surface_class
 
 import pytest
+
+from src.runtime.services import RuntimeServices
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -170,7 +173,7 @@ def test_final_runner_delegate_methods_remain_thin_and_single_call() -> None:
 
     startup = methods["_startup"]
     assert len(startup.body) == 4
-    assert ast.unparse(startup.body[0]) == "self._strategy_capabilities()"
+    assert ast.unparse(startup.body[0]) == "self.ports.strategy_capabilities()"
     assert len(
         [
             call
@@ -249,16 +252,16 @@ def test_shutdown_health_and_sync_delegation_stays_frozen() -> None:
     assert isinstance(final_steps, ast.Tuple)
     assert isinstance(explicit_steps, ast.Tuple)
     assert [ast.unparse(item) for item in final_steps.elts] == [
-        "self._compat_override('_stop_market_data_modules', market_data_lifecycle._stop_market_data_modules)",
-        "self._compat_override('_stop_sync_tasks', lifecycle._stop_sync_tasks)",
-        "self._compat_override('_stop_producers', lifecycle._stop_producers)",
-        "self._compat_override('_stop_live_persistence_writer', persistence._stop_live_persistence_writer)",
-        "self.context.alerts.stop",
+        "self.market_data_lifecycle._stop_market_data_modules",
+        "self.lifecycle._stop_sync_tasks",
+        "self.lifecycle._stop_producers",
+        "self.persistence._stop_live_persistence_writer",
+        "self.app_context.alerts.stop",
     ]
     assert [ast.unparse(item) for item in explicit_steps.elts] == [
-        "self._compat_override('_stop_market_data_modules', market_data_lifecycle._stop_market_data_modules)",
-        "self._compat_override('_stop_producers', lifecycle._stop_producers)",
-        "self._compat_override('_stop_live_persistence_writer', persistence._stop_live_persistence_writer)",
+        "self.market_data_lifecycle._stop_market_data_modules",
+        "self.lifecycle._stop_producers",
+        "self.persistence._stop_live_persistence_writer",
     ]
 
     set_health = methods["_set_health"]
@@ -289,12 +292,11 @@ def test_shutdown_health_and_sync_delegation_stays_frozen() -> None:
 
 def test_final_service_injection_keys_and_fields_are_frozen() -> None:
     initializer = _methods(_class(RUNNER, "LiveRuntimeRunner"))["__init__"]
-    dependency_fields = {
-        node.attr
-        for node in ast.walk(initializer)
-        if isinstance(node, ast.Attribute)
+    assert not any(
+        isinstance(node, ast.Attribute)
         and ast.unparse(node.value) == "self.runtime_services"
-    }
+        for node in ast.walk(initializer)
+    )
     assigned_fields = {
         ast.unparse(target)
         for node in ast.walk(initializer)
@@ -302,7 +304,9 @@ def test_final_service_injection_keys_and_fields_are_frozen() -> None:
         for target in node.targets
         if isinstance(target, ast.Attribute)
     }
-    assert set(SERVICE_FIELDS) <= dependency_fields
+    assert set(SERVICE_FIELDS) <= {
+        item.name for item in fields(RuntimeServices)
+    }
     assert {
         f"self.{field}" for field in SERVICE_FIELDS.values()
     } <= assigned_fields
@@ -451,7 +455,7 @@ def test_optional_strategy_callback_early_returns_precede_side_effects() -> None
         "self.stats.on_start_called"
     )
     assert _calls(on_start.body[3], "info")
-    assert _calls(on_start.body[4], "_execute_signals")
+    assert _calls(on_start.body[4], "execute_signals")
 
     account_event = methods["_process_account_event"]
     signals_index = next(
@@ -470,7 +474,7 @@ def test_optional_strategy_callback_early_returns_precede_side_effects() -> None
     assert _is_none_return(account_event.body[signals_index + 1], "signals")
     assert _calls(
         account_event.body[signals_index + 2],
-        "_execute_signals",
+        "execute_signals",
     )
 
     snapshot = methods["_on_account_snapshot_synced"]
@@ -530,7 +534,7 @@ def test_all_signal_sources_converge_on_one_runner_entrypoint() -> None:
     callers = {
         name
         for name, method in methods.items()
-        if _calls(method, "_execute_signals")
+        if _calls(method, "execute_signals")
     }
     assert callers == {
         "process_market_event",
@@ -559,7 +563,7 @@ def test_all_signal_sources_converge_on_one_runner_entrypoint() -> None:
         if isinstance(call, ast.Call)
         and isinstance(call.func, ast.Attribute)
         and call.func.attr == "execute"
-        and "_get_order_coordinator()" in ast.unparse(call.func.value)
+        and "get_order_coordinator()" in ast.unparse(call.func.value)
     }
     assert intent_creators == {"_create_signal_execution_intent"}
     assert order_executors == {"_execute_signal_execution_intent"}

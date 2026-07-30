@@ -362,6 +362,28 @@ def _minimal_runner(
     runner.runtime_config.producer_stale_timeout_ms = 60000
     runner.range_config = MagicMock()
     runner.range_config.range_pct = Decimal("0.002")
+    from src.runtime.components import RecoveryComponent
+    from src.runtime.context import RuntimeContext
+    from src.runtime.ports import RecoveryPorts
+    from src.runtime.strategy_positions import (
+        resolve_strategy_position_snapshot_index,
+    )
+
+    runner.recovery = RecoveryComponent(RuntimeContext())
+    runner.recovery.app_config = runner.app_config
+    runner.recovery.context = runner.context
+    runner.recovery.stats = runner.stats
+    runner.recovery.bind_ports(RecoveryPorts(
+        execute_signals=MagicMock(),
+        get_account_clients=lambda: runner._account_clients or (),
+        get_execution_clients=lambda: runner._execution_clients or (),
+        get_order_journal=lambda: None,
+        get_position_plan_store=lambda: None,
+        resolved_account_config_env=lambda: None,
+        strategy_position_index=lambda: (
+            resolve_strategy_position_snapshot_index(runner.context.strategy)
+        ),
+    ))
     return runner
 
 
@@ -446,7 +468,7 @@ class TestRecoveryProtectionPostcondition:
         runner = _minimal_runner(strategy=strategy)
 
         with pytest.raises(LiveRuntimeError, match="recovery protection postcondition failed"):
-            runner._validate_recovery_protection_postcondition(report)
+            runner.recovery._validate_recovery_protection_postcondition(report)
 
     def test_active_position_with_valid_bot_stop_passes_without_signal(self):
         """8.5: active position + valid bot stop → no signal needed, postcondition passes."""
@@ -482,7 +504,7 @@ class TestRecoveryProtectionPostcondition:
 
         runner = _minimal_runner(strategy=strategy)
         # Should not raise
-        runner._validate_recovery_protection_postcondition(report)
+        runner.recovery._validate_recovery_protection_postcondition(report)
 
     def test_manual_stop_does_not_satisfy_postcondition_without_signal(self):
         """8.6: manual stop only → not bot-owned → postcondition fails."""
@@ -519,7 +541,7 @@ class TestRecoveryProtectionPostcondition:
         runner = _minimal_runner(strategy=strategy)
 
         with pytest.raises(LiveRuntimeError, match="recovery protection postcondition failed"):
-            runner._validate_recovery_protection_postcondition(report)
+            runner.recovery._validate_recovery_protection_postcondition(report)
 
     def test_manual_stop_with_place_stop_signal_satisfies_postcondition(self):
         """Manual stop + recovery PLACE_STOP_LOSS signal → postcondition passes."""
@@ -562,7 +584,7 @@ class TestRecoveryProtectionPostcondition:
 
         runner = _minimal_runner(strategy=strategy)
         # Should not raise — place_stop signal satisfies postcondition
-        runner._validate_recovery_protection_postcondition(report)
+        runner.recovery._validate_recovery_protection_postcondition(report)
 
     def test_blocking_flag_skips_postcondition(self):
         """When recovery_blocking_manual_required is True, postcondition is skipped."""
@@ -578,7 +600,7 @@ class TestRecoveryProtectionPostcondition:
 
         runner = _minimal_runner(strategy=strategy)
         # Should not raise — blocking flag bypasses postcondition
-        runner._validate_recovery_protection_postcondition(report)
+        runner.recovery._validate_recovery_protection_postcondition(report)
 
     def test_flat_snapshot_passes_postcondition(self):
         """No active position → postcondition passes."""
@@ -594,7 +616,7 @@ class TestRecoveryProtectionPostcondition:
 
         runner = _minimal_runner(strategy=strategy)
         # Should not raise
-        runner._validate_recovery_protection_postcondition(report)
+        runner.recovery._validate_recovery_protection_postcondition(report)
 
     def test_postcondition_error_message_contains_diagnostics(self):
         """Error message includes exchange, symbol, position_side, qty, stop info."""
@@ -618,7 +640,7 @@ class TestRecoveryProtectionPostcondition:
         runner = _minimal_runner(strategy=strategy)
 
         with pytest.raises(LiveRuntimeError) as exc_info:
-            runner._validate_recovery_protection_postcondition(report)
+            runner.recovery._validate_recovery_protection_postcondition(report)
 
         msg = str(exc_info.value)
         assert "recovery protection postcondition failed" in msg
@@ -682,7 +704,7 @@ class TestPostExecutionStopProtection:
             open_stop_orders=[valid_stop],
         )
         # Should not raise
-        await runner._validate_post_execution_stop_protection()
+        await runner.recovery._validate_post_execution_stop_protection()
 
     @pytest.mark.asyncio
     async def test_stop_submit_fails_post_validation_raises(self, runner_with_mock_exchanges):
@@ -694,7 +716,7 @@ class TestPostExecutionStopProtection:
             open_stop_orders=[],  # stop was not placed
         )
         with pytest.raises(LiveRuntimeError, match="post-execution stop validation failed"):
-            await runner._validate_post_execution_stop_protection()
+            await runner.recovery._validate_post_execution_stop_protection()
 
     @pytest.mark.asyncio
     async def test_manual_stop_only_stop_submit_success_passes(self, runner_with_mock_exchanges):
@@ -722,7 +744,7 @@ class TestPostExecutionStopProtection:
             open_stop_orders=[manual_stop, bot_stop],
         )
         # Should not raise — bot stop now exists alongside manual stop
-        await runner._validate_post_execution_stop_protection()
+        await runner.recovery._validate_post_execution_stop_protection()
 
     @pytest.mark.asyncio
     async def test_manual_stop_only_stop_submit_fails_raises(self, runner_with_mock_exchanges):
@@ -742,7 +764,7 @@ class TestPostExecutionStopProtection:
             open_stop_orders=[manual_stop],  # only manual, no bot stop
         )
         with pytest.raises(LiveRuntimeError, match="post-execution stop validation failed"):
-            await runner._validate_post_execution_stop_protection()
+            await runner.recovery._validate_post_execution_stop_protection()
 
     @pytest.mark.asyncio
     async def test_no_canonical_stop_price_raises(self, runner_with_mock_exchanges):
@@ -750,7 +772,7 @@ class TestPostExecutionStopProtection:
         runner = runner_with_mock_exchanges
         runner.context.strategy.position.stop_price = None
         with pytest.raises(LiveRuntimeError, match="no canonical stop price"):
-            await runner._validate_post_execution_stop_protection()
+            await runner.recovery._validate_post_execution_stop_protection()
 
     @pytest.mark.asyncio
     async def test_position_gone_after_placement_passes(self, runner_with_mock_exchanges):
@@ -762,7 +784,7 @@ class TestPostExecutionStopProtection:
             open_stop_orders=[],
         )
         # Should not raise — no position to protect
-        await runner._validate_post_execution_stop_protection()
+        await runner.recovery._validate_post_execution_stop_protection()
 
     @pytest.mark.asyncio
     async def test_fetch_failure_raises(self, runner_with_mock_exchanges):
@@ -779,7 +801,7 @@ class TestPostExecutionStopProtection:
         runner._account_clients = (mock_acct,)
 
         with pytest.raises(LiveRuntimeError, match="cannot fetch exchange state"):
-            await runner._validate_post_execution_stop_protection()
+            await runner.recovery._validate_post_execution_stop_protection()
 
 
 def _async_return(value):

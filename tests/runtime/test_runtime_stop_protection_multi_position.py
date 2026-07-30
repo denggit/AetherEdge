@@ -20,6 +20,12 @@ from src.platform import (
 )
 from src.platform.snapshot import PlatformSnapshot
 from src.runtime.recovery.models import RecoveryReport
+from src.runtime.components import RecoveryComponent
+from src.runtime.context import RuntimeContext
+from src.runtime.ports import RecoveryPorts
+from src.runtime.strategy_positions import (
+    resolve_strategy_position_snapshot_index,
+)
 from src.runtime.runner import (
     LiveRuntimeError,
     LiveRuntimeRunner,
@@ -176,7 +182,7 @@ def _runner(
     *,
     exchange_positions: tuple[Position, ...] = (),
     stops: tuple[Order, ...] = (),
-) -> LiveRuntimeRunner:
+) -> RecoveryComponent:
     runner = LiveRuntimeRunner.__new__(LiveRuntimeRunner)
     runner.app_config = AppConfig(
         symbol=SYMBOL,
@@ -196,7 +202,21 @@ def _runner(
     )
     runner._account_clients = (FakeAccount(exchange_positions),)
     runner._execution_clients = (FakeExecution(stops),)
-    return runner
+    runner.recovery = RecoveryComponent(RuntimeContext())
+    runner.recovery.app_config = runner.app_config
+    runner.recovery.context = runner.context
+    runner.recovery.bind_ports(RecoveryPorts(
+        execute_signals=lambda *_args, **_kwargs: None,
+        get_account_clients=lambda: runner._account_clients,
+        get_execution_clients=lambda: runner._execution_clients,
+        get_order_journal=lambda: None,
+        get_position_plan_store=lambda: None,
+        resolved_account_config_env=lambda: None,
+        strategy_position_index=lambda: (
+            resolve_strategy_position_snapshot_index(runner.context.strategy)
+        ),
+    ))
+    return runner.recovery
 
 
 def test_recovery_postcondition_validates_multiple_scoped_signals() -> None:

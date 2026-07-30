@@ -211,17 +211,21 @@ def test_fake_repository_sentinel_and_real_runtime_manifest_remain_unchanged(
         },
         dry_run=True,
     )
-    runner._get_reconciliation_service()
-    assert runner._get_position_plan_store().list_active_positions() == ()
+    runner.account_runtime._get_reconciliation_service()
+    assert (
+        runner.persistence._get_position_plan_store()
+        .list_active_positions()
+        == ()
+    )
 
     pytest_root = Path(os.environ["AETHER_PYTEST_STATE_ROOT"]).resolve()
     paths = (
-        runner._get_position_plan_store().path,
-        runner._get_order_journal().path,
-        runner._range_module.checkpoint_store.path,
-        runner._range_repair_journal.store.path,
-        runner._range_module.bar_store.path,
-        runner._heartbeat_service.store.db_path,
+        runner.persistence._get_position_plan_store().path,
+        runner.order_results._get_order_journal().path,
+        runner.market_data_lifecycle._range_module.checkpoint_store.path,
+        runner.market_events._range_repair_journal.store.path,
+        runner.market_data_lifecycle._range_module.bar_store.path,
+        runner.lifecycle._heartbeat_service.store.db_path,
     )
     for path in paths:
         Path(path).resolve().relative_to(pytest_root)

@@ -35,7 +35,7 @@ class PersistenceComponent(RuntimeComponent):
                 writer_name="live-persistence-writer",
             )
             self._runtime_persistence_service = service
-            self._runtime_service_bundle().persistence.runtime = service
+            self.persistence_services.runtime = service
         return service
 
     def _get_market_data_persistence(self) -> RuntimeMarketDataPersistence:
@@ -45,17 +45,17 @@ class PersistenceComponent(RuntimeComponent):
             pass
         persistence = getattr(self, "_market_data_persistence", None)
         if persistence is None:
-            services = self._runtime_service_bundle().persistence
+            services = self.persistence_services
             persistence = services.market_data
             if persistence is None:
                 persistence = RuntimeMarketDataPersistence(
                     persistence_service=self._get_runtime_persistence_service(),
-                    kline_store_provider=self._get_live_kline_store,
+                    kline_store_provider=self.ports.get_live_kline_store,
                     range_bar_store_provider=(
-                        lambda: self._require_range_module().bar_store
+                        lambda: self.ports.require_range_module().bar_store
                     ),
                     completed_aggregate_store_provider=(
-                        lambda: self._require_range_module().checkpoint_store
+                        lambda: self.ports.require_range_module().checkpoint_store
                     ),
                     exchange=self.app_config.data_exchange.value,
                     clock_ms=lambda: int(time.time() * 1000),
@@ -67,7 +67,7 @@ class PersistenceComponent(RuntimeComponent):
     def _get_live_persistence_writer(self) -> _BackgroundWriteQueue:
         writer = self._get_runtime_persistence_service().get_writer()
         self._live_persistence_writer = writer
-        self._runtime_service_bundle().persistence.writer = writer
+        self.persistence_services.writer = writer
         return writer  # type: ignore[return-value]
 
     def _on_live_persistence_write_rejected(self, description: str) -> None:

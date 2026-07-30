@@ -68,7 +68,7 @@ class StartupComponent(RuntimeComponent):
         if not requirements:
             return
 
-        strategy_id = self._strategy_capabilities().identity
+        strategy_id = self.ports.strategy_capabilities().identity
         audit: dict[str, Any] = {
             "strategy": strategy_id,
             "symbol": self.app_config.symbol,
@@ -81,7 +81,7 @@ class StartupComponent(RuntimeComponent):
             statuses = await fetch_position_mode_statuses(
                 exchanges=requirement.exchanges,
                 symbol=self.app_config.symbol,
-                account_clients=self._get_account_clients(),
+                account_clients=self.ports.get_account_clients(),
                 source="startup_hard_gate",
             )
             requirement_ok = bool(statuses) and all(
@@ -136,7 +136,7 @@ class StartupComponent(RuntimeComponent):
                     f"{status.exchange.value}={status.mode}"
                 )
 
-        self._set_health(
+        self.ports.set_health(
             self._health.phase,
             metadata={
                 **dict(self._health.metadata),
@@ -181,8 +181,8 @@ class StartupComponent(RuntimeComponent):
         self._account_config_apply_writes = apply_writes
         results = await bootstrap_account_config(
             targets=env.targets,
-            account_clients=self._get_account_clients(),
-            execution_clients=self._get_execution_clients(),
+            account_clients=self.ports.get_account_clients(),
+            execution_clients=self.ports.get_execution_clients(),
             apply=apply_writes,
             dry_run=self.app_config.dry_run,
             fail_on_error=require_leverage,
@@ -247,8 +247,8 @@ class StartupComponent(RuntimeComponent):
             return
 
         # Check if any exchange still has positions
-        account_clients = self._get_account_clients()
-        execution_clients = self._get_execution_clients()
+        account_clients = self.ports.get_account_clients()
+        execution_clients = self.ports.get_execution_clients()
 
         still_has_exposure = False
         for target in env.targets:
@@ -316,7 +316,7 @@ class StartupComponent(RuntimeComponent):
     def _initialize_rangebar_trust_window(self) -> None:
         if not self.requirements.range_bars.enabled:
             return
-        module = self._require_range_module()
+        module = self.ports.require_range_module()
         now_ms = int(time.time() * 1000)
         recovery = (
             module.initial_recovery
@@ -354,7 +354,7 @@ class StartupComponent(RuntimeComponent):
         recovery: RangeCheckpointRecovery,
     ) -> None:
         del recovery
-        self._require_range_module().repair_now()
+        self.ports.require_range_module().repair_now()
 
     async def _warmup_range_speed_history(self) -> int:
         warmup = self._range_speed_warmup
@@ -372,7 +372,7 @@ class StartupComponent(RuntimeComponent):
             )
 
     async def _run_warmup(self) -> None:
-        services = self.service_bundle.market
+        services = self.market_services
         warmup_services = services.warmup_services or services.warmup_service
         if warmup_services is not None:
             if not isinstance(warmup_services, (list, tuple)):
@@ -398,7 +398,7 @@ class StartupComponent(RuntimeComponent):
         return sum(1 for row in rows if row.is_closed)
 
     async def _run_requirement_warmup(self) -> None:
-        services = self.service_bundle.market
+        services = self.market_services
         time_range = self._closed_kline_warmup_range()
         if time_range is None:
             return
@@ -686,10 +686,10 @@ class StartupComponent(RuntimeComponent):
         )
 
     async def _hydrate_strategy_closed_klines(self, repository, *, time_range: TimeRange) -> None:
-        if not self._get_market_feature_pipeline().resolve_observers():
+        if not self.ports.get_market_feature_pipeline().resolve_observers():
             return
         rows = repository.load(symbol=self.app_config.symbol, interval=self._closed_bar_interval, time_range=time_range)
         for row in rows:
             if not row.is_closed:
                 continue
-            await self.process_market_feature(closed_kline_feature(row))
+            await self.ports.process_market_feature(closed_kline_feature(row))

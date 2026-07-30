@@ -13,7 +13,9 @@ from src.runtime.market_features import (
     dispatch_market_feature_event,
     resolve_market_feature_observers,
 )
-from src.runtime import runner as runner_module
+from src.runtime.components import CatchupComponent, MarketEventsComponent
+from src.runtime.context import RuntimeContext
+from src.runtime.ports import CatchupPorts, MarketEventPorts
 from src.signals import SignalAction, TradeSignal
 
 
@@ -355,7 +357,7 @@ async def test_dispatcher_preserves_signal_and_metadata_identity() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runner_process_market_feature_uses_pipeline() -> None:
+async def test_market_event_component_processes_feature_with_its_ports() -> None:
     strategy = object()
     signal = _signal("runner")
     dispatched: list[MarketFeatureEvent] = []
@@ -369,19 +371,28 @@ async def test_runner_process_market_feature_uses_pipeline() -> None:
     async def fake_execute(signals, **kwargs):
         executed.append((tuple(signals), kwargs))
 
-    runner = object.__new__(runner_module.LiveRuntimeRunner)
-    runner.context = SimpleNamespace(strategy=strategy)
-    runner.stats = SimpleNamespace(feature_events_seen=0)
-    runner._heartbeat_service = None
-    runner._market_feature_pipeline = FakePipeline()
-    runner._execute_signals = fake_execute
-    runner._maybe_log_live_data_path_stats = lambda: None
+    component = MarketEventsComponent(RuntimeContext())
+    component.context = SimpleNamespace(strategy=strategy)
+    component.stats = SimpleNamespace(feature_events_seen=0)
+    component._heartbeat_service = None
+    component.bind_ports(MarketEventPorts(
+        all_producers_done=lambda: False,
+        execute_signals=fake_execute,
+        get_market_feature_pipeline=lambda: FakePipeline(),
+        maybe_log_live_data_path_stats=lambda: None,
+        mark_range_context_degraded_bucket=lambda **_kwargs: None,
+        poll_closed_bar_once=lambda **_kwargs: None,
+        process_market_event=lambda _event: None,
+        raise_on_unhealthy_market_data=lambda: None,
+        raise_on_unhealthy_producer=lambda: None,
+        set_health=lambda *_args, **_kwargs: None,
+    ))
     event = _event()
 
-    await runner.process_market_feature(event)
+    await component._process_market_feature_event(event)
 
     assert dispatched == [event]
-    assert runner.stats.feature_events_seen == 1
+    assert component.stats.feature_events_seen == 1
     assert executed == [
         (
             (signal,),
@@ -404,10 +415,20 @@ async def test_startup_preview_uses_same_pipeline() -> None:
             calls.append(event)
             return (_signal(str(event.event_time_ms)),)
 
-    runner = object.__new__(runner_module.LiveRuntimeRunner)
-    runner._market_feature_pipeline = FakePipeline()
+    component = CatchupComponent(RuntimeContext())
+    component.bind_ports(CatchupPorts(
+        execute_signals=lambda *_args, **_kwargs: None,
+        get_market_feature_pipeline=lambda: FakePipeline(),
+        get_order_journal=lambda: None,
+        get_position_plan_store=lambda: None,
+        has_unresolved_follower_close=lambda: False,
+        require_range_module=lambda: None,
+        strategy_pending_work_provider=lambda: None,
+        strategy_position_index=lambda: SimpleNamespace(active=()),
+        strategy_startup_preview_provider=lambda: None,
+    ))
 
-    signals = await runner._preview_strategy_market_features(events)
+    signals = await component._preview_strategy_market_features(events)
 
     assert calls == list(events)
     assert tuple(signal.reason for signal in signals) == ("100", "200")

@@ -216,10 +216,10 @@ def test_runner_selects_and_writes_back_one_recovery_coordinator() -> None:
     selected = _assignment(initializer, "self._recovery_coordinator")
     writeback = _assignment(
         initializer,
-        "self.runtime_services.recovery_coordinator",
+        "recovery.recovery_coordinator",
     )
     assert ast.unparse(injected.value) == (
-        "self.runtime_services.recovery_coordinator"
+        "recovery.recovery_coordinator"
     )
     assert isinstance(selected.value, ast.IfExp)
     assert ast.unparse(selected.value.test) == (
@@ -283,8 +283,8 @@ def test_runner_retains_service_construction_and_recovery_business_rules() -> No
     assert "RecoveryExchangeContext" in source
     assert "zip(accounts, clients, strict=False)" in source
     assert "state_store=self.context.state_store" in source
-    assert "self._get_order_journal()" in source
-    assert "self._get_position_plan_store()" in source
+    assert "self.ports.get_order_journal()" in source
+    assert "self.ports.get_position_plan_store()" in source
 
     required = {
         "_recovery_fallback_snapshots",
@@ -331,7 +331,7 @@ def test_recovery_service_definition_and_startup_boundary_remain_owned() -> None
         keyword.arg: ast.unparse(keyword.value)
         for keyword in plans[0].keywords
     }
-    assert callbacks["run_recovery"] == "self._run_recovery"
+    assert callbacks["run_recovery"] == "self.ports.run_recovery"
     assert "run_reconciliation" not in PLAN_FIELDS
 
 

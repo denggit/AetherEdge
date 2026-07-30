@@ -22,7 +22,8 @@ from src.order_management import (
 )
 from src.order_management.idempotency import DuplicateIntentError
 from src.runtime.orders import LiveOrderIntentFactory
-from src.runtime.runner import LiveRuntimeRunner
+from src.runtime.components import AccountComponent
+from src.runtime.context import RuntimeContext
 from src.signals import SignalAction
 from strategies.eth_lf_portfolio_v8.domain.models import Side
 from strategies.eth_lf_portfolio_v8.strategy import Strategy
@@ -180,10 +181,10 @@ async def test_production_follower_close_builders_share_generation_identity(
         plan_payload=payload,
     )[0]
 
-    runner = LiveRuntimeRunner.__new__(LiveRuntimeRunner)
-    runner._position_plan_store = plans
-    runner.app_config = SimpleNamespace(symbol="ETH-USDT-PERP")
-    periodic = runner._build_unresolved_follower_close_signals()[0]
+    account = AccountComponent(RuntimeContext())
+    account._position_plan_store = plans
+    account.app_config = SimpleNamespace(symbol="ETH-USDT-PERP")
+    periodic = account._build_unresolved_follower_close_signals()[0]
 
     factory = LiveOrderIntentFactory(
         strategy_id=initial_strategy.config.strategy_id,

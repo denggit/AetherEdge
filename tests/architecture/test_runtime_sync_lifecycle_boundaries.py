@@ -242,9 +242,9 @@ def test_runner_keeps_sync_task_selection_and_business_methods() -> None:
     assert {
         "poll_enabled",
         "poll_when_position_enabled",
-        "_get_account_sync_service",
-        "_get_order_sync_service",
-        "_periodic_follower_close_check",
+        "get_account_sync_service",
+        "get_order_sync_service",
+        "periodic_follower_close_check",
         "_heartbeat_service",
         "_get_startup_feature_backfill_providers",
         "_periodic_feature_readiness_refresh",
@@ -281,8 +281,8 @@ def test_post_submit_and_post_order_sync_remain_in_signal_execution() -> None:
     assert {
         "post_submit_sync_enabled",
         "post_order_sync_enabled",
-        "_get_order_sync_service",
-        "_get_account_sync_service",
+        "get_order_sync_service",
+        "get_account_sync_service",
         "sync_once",
     } <= attributes
     assert {"post_submit", "post_order_account"} <= strings

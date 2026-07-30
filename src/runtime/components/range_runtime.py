@@ -10,7 +10,7 @@ from src.runtime.components.base import RuntimeComponent
 
 class RangeRuntimeComponent(RuntimeComponent):
     def _get_live_kline_store(self):
-        services = self._runtime_service_bundle().market
+        services = self.market_services
         repository = services.kline_store
         if repository is None:
             repository = SqliteKlineStore(self.range_config.market_data_db_path)

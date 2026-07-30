@@ -51,6 +51,22 @@ from src.runtime.services import DEFAULT_RUNTIME_SERVICE
 
 
 class AccountComponent(RuntimeComponent):
+    @property
+    def _last_snapshot(self):
+        return self._context.resources.lifecycle.last_snapshot
+
+    @_last_snapshot.setter
+    def _last_snapshot(self, value) -> None:
+        self._context.resources.lifecycle.last_snapshot = value
+
+    @property
+    def _last_snapshots(self):
+        return self._context.resources.lifecycle.last_snapshots
+
+    @_last_snapshots.setter
+    def _last_snapshots(self, value) -> None:
+        self._context.resources.lifecycle.last_snapshots = tuple(value)
+
     async def _periodic_follower_close_check(self, stop_event: asyncio.Event) -> None:
         await asyncio.sleep(30)
         while not stop_event.is_set():
@@ -61,7 +77,7 @@ class AccountComponent(RuntimeComponent):
                         "Auto-triggering follower close retry for %s unresolved follower(s)",
                         len(signals),
                     )
-                    await self._execute_signals(
+                    await self.ports.execute_signals(
                         signals,
                         source="follower_close_periodic_check",
                         event_time_ms=None,
@@ -159,7 +175,7 @@ class AccountComponent(RuntimeComponent):
         signals = await self._strategy_host.on_account_event(event)
         if signals is None:
             return
-        await self._execute_signals(signals or (), source=f"account:{event.exchange.value}", event_time_ms=event.event_time_ms)
+        await self.ports.execute_signals(signals or (), source=f"account:{event.exchange.value}", event_time_ms=event.event_time_ms)
 
     async def _on_account_snapshot_synced(self, snapshot: PlatformSnapshot, sync_type: str) -> None:
         snapshots = [
@@ -231,7 +247,7 @@ class AccountComponent(RuntimeComponent):
 
     def _get_account_clients(self) -> tuple[AccountClient, ...]:
         if self._account_clients is None:
-            injected = self._runtime_service_bundle().account.clients
+            injected = self.account_services.clients
             if injected is not None:
                 self._account_clients = tuple(injected)
             else:
@@ -248,8 +264,8 @@ class AccountComponent(RuntimeComponent):
     def _get_reconciliation_service(self):
         if self._reconciliation_service is DEFAULT_RUNTIME_SERVICE:
             self._reconciliation_service = LiveStateReconciliationService(
-                position_plan_store=self._get_position_plan_store(),
-                order_journal=self._get_order_journal(),
+                position_plan_store=self.ports.get_position_plan_store(),
+                order_journal=self.ports.get_order_journal(),
                 state_store=self.context.state_store,
                 alert_sink=self.context.alerts,
             )
@@ -452,12 +468,11 @@ class AccountComponent(RuntimeComponent):
             )
 
     def _get_sync_contexts(self) -> tuple[SyncExchangeContext, ...]:
-        bundle = self._runtime_service_bundle()
-        injected_execution = bundle.execution.clients
-        injected_accounts = bundle.account.clients
+        injected_execution = self.execution_services.clients
+        injected_accounts = self.account_services.clients
         if (injected_execution is not None) != (injected_accounts is not None):
             raise LiveRuntimeError("request sync requires account_clients and execution_clients to be injected together")
-        clients = self._get_execution_clients()
+        clients = self.ports.get_execution_clients()
         accounts = self._get_account_clients()
         execution_by_exchange = {client.exchange: client for client in clients}
         account_by_exchange = {client.exchange: client for client in accounts}
@@ -528,7 +543,7 @@ class AccountComponent(RuntimeComponent):
             alert_sink=self.context.alerts,
             throttle=self._request_sync_throttle,
             active_check=self._order_sync_active,
-            position_plan_store=self._get_position_plan_store(),
+            position_plan_store=self.ports.get_position_plan_store(),
         )
 
     def _get_order_sync_service(self):
@@ -541,7 +556,7 @@ class AccountComponent(RuntimeComponent):
     def _order_sync_active(self) -> bool:
         if self._strategy_position_index().active:
             return True
-        provider = self._strategy_pending_work_provider()
+        provider = self.ports.strategy_pending_work_provider()
         if provider is not None and provider.has_pending_strategy_work():
             return True
         store = self._position_plan_store

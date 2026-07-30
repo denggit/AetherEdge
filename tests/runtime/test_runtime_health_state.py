@@ -11,6 +11,8 @@ from src.platform import ExchangeName
 from src.platform.config import ProjectEnvConfig
 from src.runtime import LiveRuntimeConfig, RuntimeMode
 from src.runtime import runner as runner_module
+from src.runtime.components import LifecycleComponent
+from src.runtime.context import RuntimeContext
 from src.runtime.health_state import RuntimeHealthState
 from src.runtime.models import RuntimeHealth, RuntimePhase
 from src.runtime.requirements import StrategyRuntimeRequirements
@@ -206,7 +208,7 @@ def test_injected_state_has_priority_and_is_not_updated_during_construction(
 
 
 def test_set_health_delegates_once_and_synchronizes_compatibility_field() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    component = LifecycleComponent(RuntimeContext())
     previous = RuntimeHealth(phase=RuntimePhase.CREATED)
     updated = RuntimeHealth(
         phase=RuntimePhase.RUNNING,
@@ -219,10 +221,10 @@ def test_set_health_delegates_once_and_synchronizes_compatibility_field() -> Non
     )
     state = SimpleNamespace(update=Mock(return_value=updated))
     metadata = {"source": "delegate"}
-    runner._runtime_health_state = state
-    runner._health = previous
+    component._runtime_health_state = state
+    component._health = previous
 
-    result = runner._set_health(
+    result = component._set_health(
         RuntimePhase.RUNNING,
         healthy=False,
         warmup_complete=True,
@@ -242,7 +244,7 @@ def test_set_health_delegates_once_and_synchronizes_compatibility_field() -> Non
         error="delegated",
         metadata=metadata,
     )
-    assert runner._health is updated
+    assert component._health is updated
 
 
 @pytest.mark.asyncio
@@ -256,26 +258,14 @@ async def test_health_returns_current_compatibility_field() -> None:
 
 @pytest.mark.asyncio
 async def test_start_and_stop_return_the_final_compatibility_snapshots() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
-    runner._health = RuntimeHealth(phase=RuntimePhase.CREATED)
-    runner._stop_event = SimpleNamespace(set=Mock())
-
-    def update(phase, **kwargs):
-        return RuntimeHealth(
-            phase=phase,
-            healthy=kwargs.get("healthy", True),
-            warmup_complete=kwargs.get("warmup_complete", False),
-            caught_up=kwargs.get("caught_up", False),
-        )
-
-    runner._runtime_health_state = SimpleNamespace(update=Mock(side_effect=update))
+    runner = _runner()
 
     async def no_op() -> None:
         return None
 
-    runner._stop_market_data_modules = no_op
-    runner._stop_producers = no_op
-    runner._stop_live_persistence_writer = no_op
+    runner.market_data_lifecycle._stop_market_data_modules = no_op
+    runner.lifecycle._stop_producers = no_op
+    runner.persistence._stop_live_persistence_writer = no_op
 
     running = await runner.start()
     stopped = await runner.stop()
@@ -287,4 +277,4 @@ async def test_start_and_stop_return_the_final_compatibility_snapshots() -> None
     assert stopped is runner._health
     assert stopped.phase is RuntimePhase.STOPPED
     assert stopped.healthy is True
-    runner._stop_event.set.assert_called_once_with()
+    assert runner._stop_event.is_set()

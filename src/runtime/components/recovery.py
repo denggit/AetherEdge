@@ -60,6 +60,22 @@ _PostExecutionExchangeState = tuple[
 
 
 class RecoveryComponent(RuntimeComponent):
+    @property
+    def _last_snapshot(self):
+        return self._context.resources.lifecycle.last_snapshot
+
+    @_last_snapshot.setter
+    def _last_snapshot(self, value) -> None:
+        self._context.resources.lifecycle.last_snapshot = value
+
+    @property
+    def _last_snapshots(self):
+        return self._context.resources.lifecycle.last_snapshots
+
+    @_last_snapshots.setter
+    def _last_snapshots(self, value) -> None:
+        self._context.resources.lifecycle.last_snapshots = tuple(value)
+
     async def _run_recovery(self) -> tuple[PlatformSnapshot, ...]:
         return await self._recovery_coordinator.execute(
             RuntimeRecoveryPlan(
@@ -257,7 +273,7 @@ class RecoveryComponent(RuntimeComponent):
         self,
         signals: list[TradeSignal],
     ) -> None:
-        await self._execute_signals(
+        await self.ports.execute_signals(
             signals,
             source="recovery",
             event_time_ms=None,
@@ -284,7 +300,7 @@ class RecoveryComponent(RuntimeComponent):
         self,
         signals: list[TradeSignal],
     ) -> None:
-        await self._execute_signals(
+        await self.ports.execute_signals(
             signals,
             source="recovery",
             event_time_ms=None,
@@ -317,7 +333,7 @@ class RecoveryComponent(RuntimeComponent):
 
         if self._strategy_recovery_status().blocking_manual_required:
             return
-        active_positions = self._strategy_position_index().active
+        active_positions = self.ports.strategy_position_index().active
         if not active_positions:
             return
         converter = NativeQuantityConverter()
@@ -537,18 +553,18 @@ class RecoveryComponent(RuntimeComponent):
     async def _validate_post_execution_stop_protection(self) -> None:
         """Verify freshly placed recovery stops on every active exchange leg."""
 
-        active_positions = self._strategy_position_index().active
+        active_positions = self.ports.strategy_position_index().active
         if not active_positions:
             return
         converter = NativeQuantityConverter()
         validator = RecoveryExitOrderValidator(quantity_converter=converter)
         exec_by_exchange = {
             client.exchange: client
-            for client in self._get_execution_clients()
+            for client in self.ports.get_execution_clients()
         }
         acct_by_exchange = {
             client.exchange: client
-            for client in self._get_account_clients()
+            for client in self.ports.get_account_clients()
         }
         exchange_state: dict[
             ExchangeName,
@@ -749,9 +765,9 @@ class RecoveryComponent(RuntimeComponent):
 
     def _get_recovery_service(self):
         if self._recovery_service is DEFAULT_RUNTIME_SERVICE:
-            clients = self._get_execution_clients()
-            accounts = self._get_account_clients()
-            config_env = self._resolved_account_config_env()
+            clients = self.ports.get_execution_clients()
+            accounts = self.ports.get_account_clients()
+            config_env = self.ports.resolved_account_config_env()
             contexts = []
             for account, execution in zip(accounts, clients, strict=False):
                 target = config_env.target_for(account.exchange)
@@ -767,5 +783,9 @@ class RecoveryComponent(RuntimeComponent):
                         ),
                     )
                 )
-            self._recovery_service = RuntimeRecoveryService(exchange_contexts=contexts, order_journal=self._get_order_journal(), position_plan_store=self._get_position_plan_store())
+            self._recovery_service = RuntimeRecoveryService(
+                exchange_contexts=contexts,
+                order_journal=self.ports.get_order_journal(),
+                position_plan_store=self.ports.get_position_plan_store(),
+            )
         return self._recovery_service

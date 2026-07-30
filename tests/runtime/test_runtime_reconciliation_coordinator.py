@@ -17,7 +17,9 @@ from src.order_management.reconciliation.models import (
 from src.platform import ExchangeName
 from src.platform.config import ProjectEnvConfig
 from src.runtime import LiveRuntimeConfig, RuntimeMode
+from src.runtime.components import AccountComponent
 from src.runtime.components import account as account_component
+from src.runtime.context import RuntimeContext
 from src.runtime.reconciliation_coordinator import (
     RuntimeReconciliationCoordinator,
     RuntimeReconciliationPlan,
@@ -254,11 +256,14 @@ def test_injected_coordinator_has_priority_without_default_construction(
 
     default_factory.assert_not_called()
     coordinator.execute.assert_not_called()
-    assert runner._reconciliation_coordinator is coordinator
+    assert runner.account_runtime._reconciliation_coordinator is coordinator
     assert runner.services["reconciliation_coordinator"] is coordinator
-    assert runner._reconciliation_service is DEFAULT_RUNTIME_SERVICE
-    assert runner._position_plan_store is None
-    assert runner._order_journal is None
+    assert (
+        runner.account_runtime._reconciliation_service
+        is DEFAULT_RUNTIME_SERVICE
+    )
+    assert runner.account_runtime._position_plan_store is None
+    assert runner.service_bundle.execution.order_journal is None
 
 
 def test_default_coordinator_is_created_once_written_back_and_not_executed(
@@ -275,11 +280,14 @@ def test_default_coordinator_is_created_once_written_back_and_not_executed(
 
     factory.assert_called_once_with()
     coordinator.execute.assert_not_called()
-    assert runner._reconciliation_coordinator is coordinator
+    assert runner.account_runtime._reconciliation_coordinator is coordinator
     assert runner.services["reconciliation_coordinator"] is coordinator
-    assert runner._reconciliation_service is DEFAULT_RUNTIME_SERVICE
-    assert runner._position_plan_store is None
-    assert runner._order_journal is None
+    assert (
+        runner.account_runtime._reconciliation_service
+        is DEFAULT_RUNTIME_SERVICE
+    )
+    assert runner.account_runtime._position_plan_store is None
+    assert runner.service_bundle.execution.order_journal is None
 
 
 @pytest.mark.asyncio
@@ -293,7 +301,7 @@ async def test_runner_builds_complete_plan_and_delegates_original_snapshots() ->
     runner = _runner(reconciliation_coordinator=Coordinator())
     snapshots = (object(),)
 
-    result = await runner._run_reconciliation(snapshots)
+    result = await runner.account_runtime._run_reconciliation(snapshots)
 
     assert result is None
     assert len(captured) == 1
@@ -312,8 +320,8 @@ async def test_runner_builds_complete_plan_and_delegates_original_snapshots() ->
 
 
 def test_snapshot_validation_keeps_count_sorted_names_and_exact_error() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
-    runner.app_config = SimpleNamespace(
+    component = AccountComponent(RuntimeContext())
+    component.app_config = SimpleNamespace(
         exchanges=(
             SimpleNamespace(value="okx"),
             SimpleNamespace(value="binance"),
@@ -336,14 +344,14 @@ def test_snapshot_validation_keeps_count_sorted_names_and_exact_error() -> None:
             r"exchanges \(okx, binance, third\), got 2 \(alpha, zeta\)"
         ),
     ):
-        runner._validate_startup_reconciliation_snapshots(snapshots)
+        component._validate_startup_reconciliation_snapshots(snapshots)
 
-    runner.app_config.exchanges = (object(), object())
-    runner._validate_startup_reconciliation_snapshots(snapshots)
+    component.app_config.exchanges = (object(), object())
+    component._validate_startup_reconciliation_snapshots(snapshots)
 
 
 def test_begin_log_keeps_snapshot_order_and_exact_arguments(monkeypatch) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    component = AccountComponent(RuntimeContext())
     snapshots = (
         SimpleNamespace(
             leverage=SimpleNamespace(exchange=SimpleNamespace(value="binance"))
@@ -355,7 +363,7 @@ def test_begin_log_keeps_snapshot_order_and_exact_arguments(monkeypatch) -> None
     logger = Mock()
     monkeypatch.setattr(account_component, "logger", logger)
 
-    runner._log_startup_reconciliation_begin(snapshots)
+    component._log_startup_reconciliation_begin(snapshots)
 
     logger.info.assert_called_once_with(
         "Startup reconciliation starting | exchanges=%s count=%s",
@@ -367,34 +375,34 @@ def test_begin_log_keeps_snapshot_order_and_exact_arguments(monkeypatch) -> None
 def test_empty_legacy_adoptions_do_not_read_clock_or_call_service(
     monkeypatch,
 ) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
-    runner.context = SimpleNamespace(strategy=_StopAdoptionProvider())
-    runner.app_config = SimpleNamespace(symbol="ETH-USDT-PERP")
+    component = AccountComponent(RuntimeContext())
+    component.context = SimpleNamespace(strategy=_StopAdoptionProvider())
+    component.app_config = SimpleNamespace(symbol="ETH-USDT-PERP")
     service = SimpleNamespace(_apply_actions=Mock())
     clock = Mock()
     monkeypatch.setattr(account_component.time, "time", clock)
 
-    runner._apply_startup_legacy_stop_adoptions(service)
+    component._apply_startup_legacy_stop_adoptions(service)
 
     clock.assert_not_called()
     service._apply_actions.assert_not_called()
-    assert runner.context.strategy.adoptions == []
+    assert component.context.strategy.adoptions == []
 
 
 def test_legacy_adoptions_keep_order_fields_clock_and_clear_after_success(
     monkeypatch,
 ) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    component = AccountComponent(RuntimeContext())
     adoptions = [_adoption("first", "okx"), _adoption("second", "binance")]
-    runner.context = SimpleNamespace(strategy=_StopAdoptionProvider(adoptions))
-    runner.app_config = SimpleNamespace(symbol="ETH-USDT-PERP")
+    component.context = SimpleNamespace(strategy=_StopAdoptionProvider(adoptions))
+    component.app_config = SimpleNamespace(symbol="ETH-USDT-PERP")
     service = SimpleNamespace(_apply_actions=Mock())
     clock = Mock(return_value=1.25)
     logger = Mock()
     monkeypatch.setattr(account_component.time, "time", clock)
     monkeypatch.setattr(account_component, "logger", logger)
 
-    runner._apply_startup_legacy_stop_adoptions(service)
+    component._apply_startup_legacy_stop_adoptions(service)
 
     clock.assert_called_once_with()
     assert len(service._apply_actions.call_args_list) == 2
@@ -420,7 +428,7 @@ def test_legacy_adoptions_keep_order_fields_clock_and_clear_after_success(
         args.args[1] == "ETH-USDT-PERP"
         for args in service._apply_actions.call_args_list
     )
-    assert runner.context.strategy.adoptions == []
+    assert component.context.strategy.adoptions == []
     assert logger.warning.call_args_list == [
         call(
             "Startup recovery: legacy stop adopted | position_id=%s exchange=%s stop_order_id=%s effective_stop_price=%s",
@@ -440,11 +448,11 @@ def test_legacy_adoptions_keep_order_fields_clock_and_clear_after_success(
 
 
 def test_legacy_adoption_failure_preserves_original_list(monkeypatch) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    component = AccountComponent(RuntimeContext())
     adoptions = [_adoption("first", "okx"), _adoption("second", "binance")]
     provider = _StopAdoptionProvider(adoptions)
-    runner.context = SimpleNamespace(strategy=provider)
-    runner.app_config = SimpleNamespace(symbol="ETH-USDT-PERP")
+    component.context = SimpleNamespace(strategy=provider)
+    component.app_config = SimpleNamespace(symbol="ETH-USDT-PERP")
     error = RuntimeError("store write failed")
     service = SimpleNamespace(
         _apply_actions=Mock(side_effect=[None, error])
@@ -452,7 +460,7 @@ def test_legacy_adoption_failure_preserves_original_list(monkeypatch) -> None:
     monkeypatch.setattr(account_component.time, "time", Mock(return_value=2.0))
 
     with pytest.raises(RuntimeError) as raised:
-        runner._apply_startup_legacy_stop_adoptions(service)
+        component._apply_startup_legacy_stop_adoptions(service)
 
     assert raised.value is error
     assert provider.adoptions == adoptions
@@ -461,12 +469,12 @@ def test_legacy_adoption_failure_preserves_original_list(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_invoke_service_receives_original_snapshots_once() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    component = AccountComponent(RuntimeContext())
     report = object()
     service = SimpleNamespace(reconcile_and_apply=AsyncMock(return_value=report))
     snapshots = (object(), object())
 
-    returned = await runner._invoke_startup_reconciliation_service(
+    returned = await component._invoke_startup_reconciliation_service(
         service,
         snapshots,
     )
@@ -479,9 +487,9 @@ async def test_invoke_service_receives_original_snapshots_once() -> None:
 def test_report_handler_preserves_warning_alert_and_failure_order(
     monkeypatch,
 ) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    component = AccountComponent(RuntimeContext())
     emit = Mock()
-    runner.context = SimpleNamespace(alerts=SimpleNamespace(emit=emit))
+    component.context = SimpleNamespace(alerts=SimpleNamespace(emit=emit))
     logger = Mock()
     monkeypatch.setattr(account_component, "logger", logger)
     ref = FakeOrderRef(
@@ -517,7 +525,7 @@ def test_report_handler_preserves_warning_alert_and_failure_order(
             r"issues=\['unsafe'\]"
         ),
     ):
-        runner._handle_startup_reconciliation_report(report)
+        component._handle_startup_reconciliation_report(report)
 
     assert logger.warning.call_args_list == [
         call(
@@ -583,8 +591,8 @@ def test_report_cleanup_log_all_three_conditions(
     stale: int,
     fake_refs: list[object],
 ) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
-    runner.context = SimpleNamespace(alerts=SimpleNamespace(emit=Mock()))
+    component = AccountComponent(RuntimeContext())
+    component.context = SimpleNamespace(alerts=SimpleNamespace(emit=Mock()))
     logger = Mock()
     monkeypatch.setattr(account_component, "logger", logger)
     report = _report(
@@ -593,7 +601,7 @@ def test_report_cleanup_log_all_three_conditions(
         fake_order_refs_found=fake_refs,
     )
 
-    runner._handle_startup_reconciliation_report(report)
+    component._handle_startup_reconciliation_report(report)
 
     normalized = verdict.value if hasattr(verdict, "value") else str(verdict)
     logger.info.assert_called_once_with(
@@ -607,12 +615,12 @@ def test_report_cleanup_log_all_three_conditions(
 def test_report_plain_pass_accepts_string_verdict_and_logs_exactly(
     monkeypatch,
 ) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
-    runner.context = SimpleNamespace(alerts=SimpleNamespace(emit=Mock()))
+    component = AccountComponent(RuntimeContext())
+    component.context = SimpleNamespace(alerts=SimpleNamespace(emit=Mock()))
     logger = Mock()
     monkeypatch.setattr(account_component, "logger", logger)
 
-    runner._handle_startup_reconciliation_report(_report(verdict="pass"))
+    component._handle_startup_reconciliation_report(_report(verdict="pass"))
 
     logger.info.assert_called_once_with(
         "Startup reconciliation passed | verdict=%s",

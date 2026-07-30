@@ -12,7 +12,9 @@ from src.app import AppConfig
 from src.platform import ExchangeName
 from src.platform.config import ProjectEnvConfig
 from src.runtime import LiveRuntimeConfig, RuntimeMode
+from src.runtime.components import LifecycleComponent
 from src.runtime.components import lifecycle as lifecycle_component
+from src.runtime.context import RuntimeContext
 from src.runtime.market_data import range_speed_runtime
 from src.runtime.market_data.range_speed_runtime import RangeSpeedWarmup
 from src.runtime.models import RuntimePhase
@@ -308,7 +310,7 @@ def test_injected_coordinator_has_priority_and_no_constructor_execution(
 
     default_factory.assert_not_called()
     coordinator.execute.assert_not_called()
-    assert runner._startup_phase_coordinator is coordinator
+    assert runner.lifecycle._startup_phase_coordinator is coordinator
     assert runner.services["startup_phase_coordinator"] is coordinator
 
 
@@ -326,7 +328,7 @@ def test_default_coordinator_is_created_once_written_back_and_not_executed(
 
     factory.assert_called_once_with()
     coordinator.execute.assert_not_called()
-    assert runner._startup_phase_coordinator is coordinator
+    assert runner.lifecycle._startup_phase_coordinator is coordinator
     assert runner.services["startup_phase_coordinator"] is coordinator
 
 
@@ -345,29 +347,43 @@ async def test_runner_startup_builds_complete_plan_and_logs_around_delegate(
     logger = Mock()
     monkeypatch.setattr(lifecycle_component, "logger", logger)
 
-    result = await runner._startup()
+    result = await runner.lifecycle._run_startup_sequence()
 
     assert result is None
     assert len(captured) == 1
     plan = captured[0]
     expected = {
-        "initialize_rangebar_trust_window": runner.startup._initialize_rangebar_trust_window,
+            "initialize_rangebar_trust_window": (
+                runner.lifecycle.ports.initialize_rangebar_trust_window
+            ),
         "enter_warming_up": runner.lifecycle._enter_startup_warming_up,
-        "bootstrap_account_config": runner.startup._bootstrap_account_config_if_enabled,
-        "check_position_mode": runner.startup._check_strategy_position_mode_requirements,
-        "run_warmup": runner.startup._run_warmup,
-        "warmup_range_speed_history": runner.startup._warmup_range_speed_history,
+            "bootstrap_account_config": (
+                runner.lifecycle.ports.bootstrap_account_config_if_enabled
+            ),
+            "check_position_mode": (
+                runner.lifecycle.ports.check_strategy_position_mode_requirements
+            ),
+            "run_warmup": runner.lifecycle.ports.run_warmup,
+            "warmup_range_speed_history": (
+                runner.lifecycle.ports.warmup_range_speed_history
+            ),
         "handle_range_speed_history_result": runner.lifecycle._handle_startup_range_speed_history_result,
         "check_feature_backfills": runner.lifecycle._check_startup_feature_backfills,
         "enter_catching_up": runner.lifecycle._enter_startup_catching_up,
-        "run_recovery": runner.recovery._run_recovery,
+            "run_recovery": runner.lifecycle.ports.run_recovery,
         "run_post_recovery_checks": runner.lifecycle._run_startup_post_recovery_checks,
-        "run_reconciliation": runner.account_runtime._run_reconciliation,
-        "call_strategy_on_start": runner.catchup._call_on_start,
-        "evaluate_startup_catchup": runner.catchup._evaluate_startup_catchup_once,
-        "finish_range_speed_warmup": runner.startup._finish_range_speed_warmup_after_catchup,
+            "run_reconciliation": runner.lifecycle.ports.run_reconciliation,
+            "call_strategy_on_start": runner.lifecycle.ports.call_on_start,
+            "evaluate_startup_catchup": (
+                runner.lifecycle.ports.evaluate_startup_catchup_once
+            ),
+            "finish_range_speed_warmup": (
+                runner.lifecycle.ports.finish_range_speed_warmup_after_catchup
+            ),
         "start_heartbeat": runner.lifecycle._start_runtime_heartbeat,
-        "start_range_speed_background_services": runner.market_data_lifecycle._start_range_speed_background_services,
+            "start_range_speed_background_services": (
+                runner.lifecycle.ports.start_range_speed_background_services
+            ),
         "enter_running": runner.lifecycle._enter_startup_running,
     }
     assert all(getattr(plan, name) == callback for name, callback in expected.items())
@@ -386,21 +402,21 @@ async def test_runner_startup_failure_omits_completed_log(monkeypatch) -> None:
     monkeypatch.setattr(lifecycle_component, "logger", logger)
 
     with pytest.raises(RuntimeError) as raised:
-        await runner._startup()
+        await runner.lifecycle._run_startup_sequence()
 
     assert raised.value is error
     logger.info.assert_called_once_with("Live runtime startup phase started")
 
 
 def test_health_wrappers_keep_exact_phase_values() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
-    runner._set_health = Mock()
+    component = LifecycleComponent(RuntimeContext())
+    component._set_health = Mock()
 
-    runner._enter_startup_warming_up()
-    runner._enter_startup_catching_up()
-    runner._enter_startup_running()
+    component._enter_startup_warming_up()
+    component._enter_startup_catching_up()
+    component._enter_startup_running()
 
-    assert runner._set_health.call_args_list == [
+    assert component._set_health.call_args_list == [
         call(RuntimePhase.WARMING_UP, healthy=True),
         call(
             RuntimePhase.CATCHING_UP,
@@ -456,28 +472,34 @@ def test_range_speed_runtime_warning_condition_is_not_expanded(
 async def test_post_recovery_wrapper_only_rechecks_when_blocked(
     blocked: bool,
 ) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
-    runner._account_config_new_entries_blocked = blocked
-    runner._recheck_account_config_after_recovery = AsyncMock()
+    runner = _runner()
+    runner.lifecycle._account_config_new_entries_blocked = blocked
+    runner.startup._recheck_account_config_after_recovery = AsyncMock()
 
-    await runner._run_startup_post_recovery_checks((object(),))
+    await runner.lifecycle._run_startup_post_recovery_checks((object(),))
 
     if blocked:
-        runner._recheck_account_config_after_recovery.assert_awaited_once_with()
+        (
+            runner.startup._recheck_account_config_after_recovery
+            .assert_awaited_once_with()
+        )
     else:
-        runner._recheck_account_config_after_recovery.assert_not_called()
+        (
+            runner.startup._recheck_account_config_after_recovery
+            .assert_not_called()
+        )
 
 
 def test_heartbeat_wrapper_keeps_exact_runtime_id() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
-    runner.app_config = SimpleNamespace(
+    component = LifecycleComponent(RuntimeContext())
+    component.app_config = SimpleNamespace(
         strategy="tests.fake:Strategy",
         symbol="ETH-USDT-PERP",
     )
-    runner._heartbeat_service = SimpleNamespace(start=Mock())
+    component._heartbeat_service = SimpleNamespace(start=Mock())
 
-    runner._start_runtime_heartbeat()
+    component._start_runtime_heartbeat()
 
-    runner._heartbeat_service.start.assert_called_once_with(
+    component._heartbeat_service.start.assert_called_once_with(
         runtime_id="tests.fake:Strategy::ETH-USDT-PERP"
     )

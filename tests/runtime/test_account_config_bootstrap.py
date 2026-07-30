@@ -429,12 +429,12 @@ async def test_live_runtime_startup_hook_applies_account_config_from_project_env
         ),
     )
 
-    await runner._bootstrap_account_config_if_enabled()
+    await runner.startup._bootstrap_account_config_if_enabled()
 
     assert account.set_margin_mode_calls == [MarginMode.ISOLATED]
     assert account.set_leverage_calls == [(Decimal("15"), MarginMode.ISOLATED)]
 
-    sync_context = runner._get_sync_contexts()[0]
+    sync_context = runner.account_runtime._get_sync_contexts()[0]
     assert sync_context.leverage_margin_mode is MarginMode.ISOLATED
     assert sync_context.expected_leverage == Decimal("15")
 
@@ -459,7 +459,7 @@ async def test_live_runtime_startup_hook_read_only_when_live_trading_false() -> 
         ),
     )
 
-    await runner._bootstrap_account_config_if_enabled()
+    await runner.startup._bootstrap_account_config_if_enabled()
 
     assert account.set_margin_mode_calls == []
     assert account.set_leverage_calls == []
@@ -485,7 +485,7 @@ async def test_live_runtime_startup_hook_dry_run_does_not_apply() -> None:
         ),
     )
 
-    await runner._bootstrap_account_config_if_enabled()
+    await runner.startup._bootstrap_account_config_if_enabled()
 
     assert account.set_margin_mode_calls == []
     assert account.set_leverage_calls == []
@@ -511,7 +511,7 @@ async def test_live_runtime_startup_hook_applies_when_all_exchanges_are_sandbox(
         ),
     )
 
-    await runner._bootstrap_account_config_if_enabled()
+    await runner.startup._bootstrap_account_config_if_enabled()
 
     assert account.set_margin_mode_calls == [MarginMode.ISOLATED]
     assert account.set_leverage_calls == [(Decimal("15"), MarginMode.ISOLATED)]
@@ -777,7 +777,7 @@ async def test_live_runtime_blocked_config_allows_startup_sets_entry_block(monke
     )
 
     # Should NOT raise even though config is blocked by existing position
-    await runner._bootstrap_account_config_if_enabled()
+    await runner.startup._bootstrap_account_config_if_enabled()
 
     # Entry block should be set
     assert runner._account_config_new_entries_blocked is True

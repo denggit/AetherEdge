@@ -241,10 +241,10 @@ def test_runner_selects_and_writes_back_one_startup_coordinator() -> None:
     selected = _assignment(initializer, "self._startup_phase_coordinator")
     writeback = _assignment(
         initializer,
-        "self.runtime_services.startup_phase_coordinator",
+        "lifecycle.startup_phase_coordinator",
     )
     assert ast.unparse(injected.value) == (
-        "self.runtime_services.startup_phase_coordinator"
+        "lifecycle.startup_phase_coordinator"
     )
     assert isinstance(selected.value, ast.IfExp)
     assert ast.unparse(selected.value.test) == (
@@ -270,7 +270,7 @@ def test_runner_selects_and_writes_back_one_startup_coordinator() -> None:
 def test_runner_startup_only_logs_builds_plan_and_delegates() -> None:
     startup = _methods(_class(RUNNER, "LiveRuntimeRunner"))["_startup"]
     assert len(startup.body) == 4
-    assert ast.unparse(startup.body[0]) == "self._strategy_capabilities()"
+    assert ast.unparse(startup.body[0]) == "self.ports.strategy_capabilities()"
     assert ast.unparse(startup.body[1]) == (
         "logger.info('Live runtime startup phase started')"
     )
@@ -291,7 +291,7 @@ def test_runner_startup_only_logs_builds_plan_and_delegates() -> None:
     assert not any(isinstance(node, ast.Lambda) for node in ast.walk(startup))
     allowed_call_functions = {
         "logger.info",
-        "self._strategy_capabilities",
+        "self.ports.strategy_capabilities",
         "self._startup_phase_coordinator.execute",
         "RuntimeStartupPhasePlan",
     }
@@ -358,7 +358,9 @@ def test_range_speed_component_and_runner_retain_business_conditions() -> None:
     assert ast.unparse(blocked[0].test) == (
         "self._account_config_new_entries_blocked"
     )
-    assert len(_calls(post_recovery, "_recheck_account_config_after_recovery")) == 1
+    assert len(
+        _calls(post_recovery, "recheck_account_config_after_recovery")
+    ) == 1
 
 
 def test_runner_retains_heartbeat_id_and_business_implementations() -> None:
@@ -391,10 +393,14 @@ def test_run_and_shutdown_order_remain_runner_owned() -> None:
     run = methods["run"]
     try_node = next(node for node in run.body if isinstance(node, ast.Try))
     run_source = ast.unparse(try_node)
-    assert run_source.index("'_startup'") < run_source.index(
-        "'_start_producers'"
-    ) < run_source.index("'_start_sync_tasks'") < run_source.index(
-        "'_consume_market_events'"
+    assert run_source.index(
+        "self.lifecycle._run_startup_sequence()"
+    ) < run_source.index(
+        "self.lifecycle._start_producers()"
+    ) < run_source.index(
+        "self.lifecycle._start_sync_tasks()"
+    ) < run_source.index(
+        "self.market_events._consume_market_events"
     )
     assert len(try_node.finalbody) == 1
     assert ast.unparse(try_node.finalbody[0]) == (

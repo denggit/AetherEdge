@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -183,7 +184,7 @@ async def test_missing_on_start_is_a_runner_noop(caplog) -> None:
     snapshot = object()
     caplog.set_level("INFO", logger=runner_module.logger.name)
 
-    await runner._call_on_start(snapshot)
+    await runner.catchup._call_on_start(snapshot)
 
     host.on_start.assert_awaited_once_with(snapshot)
     assert runner.stats.on_start_called is False
@@ -209,7 +210,7 @@ async def test_called_on_start_with_no_signals_keeps_stage1_side_effects(
     snapshot = object()
     caplog.set_level("INFO", logger=runner_module.logger.name)
 
-    await runner._call_on_start(snapshot)
+    await runner.catchup._call_on_start(snapshot)
 
     assert runner.stats.on_start_called is True
     signal_service.execute.assert_awaited_once()
@@ -236,7 +237,7 @@ async def test_on_start_exception_preserves_identity_and_stats(
     caplog.set_level("INFO", logger=runner_module.logger.name)
 
     with pytest.raises(RuntimeError) as raised:
-        await runner._call_on_start(object())
+        await runner.catchup._call_on_start(object())
 
     assert raised.value is expected
     assert runner.stats.on_start_called is False
@@ -249,7 +250,7 @@ async def test_on_start_exception_preserves_identity_and_stats(
 
 def _wire_startup_stages(monkeypatch, runner, calls, snapshots) -> None:
     monkeypatch.setattr(
-        runner,
+        runner.startup,
         "_initialize_rangebar_trust_window",
         lambda: calls.append("initialize_rangebar_trust_window"),
     )
@@ -257,50 +258,62 @@ def _wire_startup_stages(monkeypatch, runner, calls, snapshots) -> None:
     def set_health(phase, **kwargs):
         calls.append(f"health_{phase.value}")
 
-    monkeypatch.setattr(runner, "_set_health", set_health)
+    monkeypatch.setattr(runner.lifecycle, "_set_health", set_health)
     monkeypatch.setattr(
-        runner,
+        runner.startup,
         "_bootstrap_account_config_if_enabled",
         _async_stage(calls, "bootstrap_account_config"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.startup,
         "_check_strategy_position_mode_requirements",
         _async_stage(calls, "check_position_mode"),
     )
-    monkeypatch.setattr(runner, "_run_warmup", _async_stage(calls, "run_warmup"))
     monkeypatch.setattr(
-        runner,
+        runner.startup,
+        "_run_warmup",
+        _async_stage(calls, "run_warmup"),
+    )
+    monkeypatch.setattr(
+        runner.startup,
         "_warmup_range_speed_history",
         _async_stage(calls, "warmup_range_speed_history", 0),
     )
     monkeypatch.setattr(
-        runner,
+        runner.lifecycle,
         "_check_startup_feature_backfills",
         _async_stage(calls, "check_startup_feature_backfills"),
     )
     monkeypatch.setattr(
-        runner, "_run_recovery", _async_stage(calls, "run_recovery", snapshots)
+        runner.recovery,
+        "_run_recovery",
+        _async_stage(calls, "run_recovery", snapshots),
     )
     monkeypatch.setattr(
-        runner, "_run_reconciliation", _async_stage(calls, "run_reconciliation")
+        runner.account_runtime,
+        "_run_reconciliation",
+        _async_stage(calls, "run_reconciliation"),
     )
-    monkeypatch.setattr(runner, "_call_on_start", _async_stage(calls, "call_on_start"))
     monkeypatch.setattr(
-        runner,
+        runner.catchup,
+        "_call_on_start",
+        _async_stage(calls, "call_on_start"),
+    )
+    monkeypatch.setattr(
+        runner.catchup,
         "_evaluate_startup_catchup_once",
         _async_stage(calls, "startup_catchup"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.startup,
         "_finish_range_speed_warmup_after_catchup",
         _async_stage(calls, "finish_range_speed_warmup"),
     )
-    runner._heartbeat_service = SimpleNamespace(
+    runner.lifecycle._heartbeat_service = SimpleNamespace(
         start=lambda **kwargs: calls.append("heartbeat_start")
     )
     monkeypatch.setattr(
-        runner,
+        runner.market_data_lifecycle,
         "_start_range_speed_background_services",
         lambda: calls.append("start_range_speed_background_services"),
     )
@@ -328,17 +341,25 @@ async def test_startup_phase_order_is_characterized(monkeypatch) -> None:
         calls.append("startup_catchup")
         catchup_args.append(value)
 
-    monkeypatch.setattr(runner, "_run_reconciliation", reconciliation)
-    monkeypatch.setattr(runner, "_call_on_start", on_start)
-    monkeypatch.setattr(runner, "_evaluate_startup_catchup_once", catchup)
     monkeypatch.setattr(
-        runner, "_start_producers", lambda: calls.append("start_producers") or []
+        runner.account_runtime, "_run_reconciliation", reconciliation
+    )
+    monkeypatch.setattr(runner.catchup, "_call_on_start", on_start)
+    monkeypatch.setattr(
+        runner.catchup, "_evaluate_startup_catchup_once", catchup
     )
     monkeypatch.setattr(
-        runner, "_start_sync_tasks", lambda: calls.append("start_sync_tasks") or []
+        runner.lifecycle,
+        "_start_producers",
+        lambda: calls.append("start_producers") or [],
+    )
+    monkeypatch.setattr(
+        runner.lifecycle,
+        "_start_sync_tasks",
+        lambda: calls.append("start_sync_tasks") or [],
     )
 
-    await runner._startup()
+    await runner.lifecycle._run_startup_sequence()
 
     assert calls == [
         "initialize_rangebar_trust_window",
@@ -373,12 +394,12 @@ async def test_startup_rechecks_account_config_only_after_recovery(monkeypatch) 
     _wire_startup_stages(monkeypatch, runner, calls, snapshots)
     runner._account_config_new_entries_blocked = True
     monkeypatch.setattr(
-        runner,
+        runner.startup,
         "_recheck_account_config_after_recovery",
         _async_stage(calls, "account_config_recheck"),
     )
 
-    await runner._startup()
+    await runner.lifecycle._run_startup_sequence()
 
     assert calls.index("run_recovery") < calls.index("account_config_recheck")
     assert calls.index("account_config_recheck") < calls.index("run_reconciliation")
@@ -409,15 +430,18 @@ async def test_trade_processing_precedes_strategy_callback_and_execution(monkeyp
     )
     strategy.market_signals = (signal,)
     runner = _runner(strategy, calls=calls)
-    runner._heartbeat_service = None
+    runner.market_events._heartbeat_service = None
     executed = []
-    monkeypatch.setattr(runner, "_set_health", lambda *args, **kwargs: None)
-    monkeypatch.setattr(runner, "_maybe_log_live_data_path_stats", lambda: None)
+    runner.market_events.ports = replace(
+        runner.market_events.ports,
+        set_health=lambda *args, **kwargs: None,
+        maybe_log_live_data_path_stats=lambda: None,
+    )
     async def execute(signals, **kwargs):
         calls.append("_execute_signals")
         executed.append((signals, kwargs))
 
-    monkeypatch.setattr(runner, "_execute_signals", execute)
+    monkeypatch.setattr(runner.signal_execution, "_execute_signals", execute)
     trade = _trade()
 
     await runner.process_market_event(trade)
@@ -439,15 +463,18 @@ async def test_market_feature_dispatch_precedes_signal_execution(monkeypatch) ->
     )
     strategy.feature_signals = (signal,)
     runner = _runner(strategy, calls=calls)
-    runner._heartbeat_service = None
-    monkeypatch.setattr(runner, "_maybe_log_live_data_path_stats", lambda: None)
+    runner.market_events._heartbeat_service = None
+    runner.market_events.ports = replace(
+        runner.market_events.ports,
+        maybe_log_live_data_path_stats=lambda: None,
+    )
     executed = []
 
     async def execute(signals, **kwargs):
         calls.append("_execute_signals")
         executed.append((signals, kwargs))
 
-    monkeypatch.setattr(runner, "_execute_signals", execute)
+    monkeypatch.setattr(runner.signal_execution, "_execute_signals", execute)
     event = MarketFeatureEvent(
         event_type=MarketFeatureEventType.RANGE_AGGREGATE,
         symbol="ETH-USDT-PERP",
@@ -502,18 +529,19 @@ async def test_injected_market_feature_pipeline_preserves_runner_order(
             assert open_time_ms == 4321
             calls.append("heartbeat.note_closed_bar")
 
-    runner._heartbeat_service = Heartbeat()
+    runner.market_events._heartbeat_service = Heartbeat()
     executed = []
 
     async def execute(signals, **kwargs):
         calls.append("_execute_signals")
         executed.append((signals, kwargs))
 
-    monkeypatch.setattr(runner, "_execute_signals", execute)
-    monkeypatch.setattr(
-        runner,
-        "_maybe_log_live_data_path_stats",
-        lambda: calls.append("data_path_log"),
+    monkeypatch.setattr(runner.signal_execution, "_execute_signals", execute)
+    runner.market_events.ports = replace(
+        runner.market_events.ports,
+        maybe_log_live_data_path_stats=lambda: calls.append(
+            "data_path_log"
+        ),
     )
     event = MarketFeatureEvent(
         event_type=MarketFeatureEventType.CLOSED_KLINE,
@@ -562,7 +590,7 @@ async def test_account_event_is_persisted_before_strategy_and_execution(monkeypa
         calls.append("_execute_signals")
         executed.append((signals, kwargs))
 
-    monkeypatch.setattr(runner, "_execute_signals", execute)
+    monkeypatch.setattr(runner.signal_execution, "_execute_signals", execute)
     event = AccountEvent(
         exchange=ExchangeName.OKX,
         event_type=AccountEventType.ORDER,
@@ -610,7 +638,7 @@ async def test_missing_account_event_callback_still_persists_without_execution()
     await runner.process_account_event(event)
 
     assert runner.stats.account_events_seen == 1
-    assert runner.context.state_store.saved_account_events == [event]
+    assert runner.app_context.state_store.saved_account_events == [event]
     assert calls == [
         "state_store.save_account_event",
         "strategy_host.on_account_event",
@@ -689,7 +717,7 @@ async def test_account_event_exception_propagates_after_persistence() -> None:
         await runner.process_account_event(event)
 
     assert raised.value is expected
-    assert runner.context.state_store.saved_account_events == [event]
+    assert runner.app_context.state_store.saved_account_events == [event]
     assert calls == [
         "state_store.save_account_event",
         "strategy_host.on_account_event",
@@ -712,12 +740,14 @@ async def test_missing_account_snapshot_callback_updates_cache_without_logs(
     )
     caplog.set_level("DEBUG", logger=runner_module.logger.name)
 
-    await runner._on_account_snapshot_synced(snapshot, "account_periodic")
+    await runner.account_runtime._on_account_snapshot_synced(
+        snapshot, "account_periodic"
+    )
 
     assert runner._last_snapshots == (snapshot,)
     assert runner._last_snapshot is snapshot
-    assert runner._last_account_snapshot_log_state == {}
-    assert runner._last_account_snapshot_log_ms == {}
+    assert runner.account_runtime._last_account_snapshot_log_state == {}
+    assert runner.account_runtime._last_account_snapshot_log_ms == {}
     assert not any(
         "Strategy account snapshot refreshed" in message
         or "Account snapshot unchanged" in message
@@ -744,7 +774,7 @@ async def test_account_snapshot_exception_keeps_cache_and_skips_logs(
     caplog.set_level("DEBUG", logger=runner_module.logger.name)
 
     with pytest.raises(RuntimeError) as raised:
-        await runner._on_account_snapshot_synced(
+        await runner.account_runtime._on_account_snapshot_synced(
             snapshot,
             "account_periodic",
         )
@@ -752,8 +782,8 @@ async def test_account_snapshot_exception_keeps_cache_and_skips_logs(
     assert raised.value is expected
     assert runner._last_snapshots == (snapshot,)
     assert runner._last_snapshot is snapshot
-    assert runner._last_account_snapshot_log_state == {}
-    assert runner._last_account_snapshot_log_ms == {}
+    assert runner.account_runtime._last_account_snapshot_log_state == {}
+    assert runner.account_runtime._last_account_snapshot_log_ms == {}
     assert not any(
         "Strategy account snapshot refreshed" in message
         or "Account snapshot unchanged" in message
@@ -818,20 +848,24 @@ async def test_signal_execution_feedback_order_is_characterized(monkeypatch) -> 
             "account_sync_service": SyncService("post_order_account_sync"),
         },
     )
-    original_record = runner._record_order_results
+    original_record = runner.signal_execution._record_order_results
 
     def record_results(results):
         calls.append("runtime_result_accounting")
         original_record(results)
 
-    monkeypatch.setattr(runner, "_record_order_results", record_results)
     monkeypatch.setattr(
-        runner,
+        runner.signal_execution,
+        "_record_order_results",
+        record_results,
+    )
+    monkeypatch.setattr(
+        runner.signal_execution,
         "_check_follower_close_failure",
         lambda *args: calls.append("follower_close_failure_check"),
     )
 
-    await runner._execute_signals(
+    await runner.signal_execution._execute_signals(
         (signal,), source="root_source", event_time_ms=3456
     )
 
@@ -862,7 +896,7 @@ async def test_signal_execution_feedback_order_is_characterized(monkeypatch) -> 
         "order_result_feedback",
         "order_result_feedback",
     ]
-    assert len(runner.context.alerts.emitted) == 1
+    assert len(runner.app_context.alerts.emitted) == 1
 
 
 @pytest.mark.asyncio
@@ -903,7 +937,7 @@ async def test_injected_strategy_host_owns_order_result_feedback(caplog) -> None
     )
     caplog.set_level("INFO", logger=runner_module.logger.name)
 
-    returned = await runner._process_order_result_feedback(
+    returned = await runner.order_results._process_order_result_feedback(
         signal=signal,
         results=results,
         source="root_source",
@@ -944,7 +978,7 @@ async def test_order_result_feedback_distinguishes_missing_and_called_empty(
     )
     caplog.set_level("DEBUG", logger=runner_module.logger.name)
 
-    follow_up = await runner._process_order_result_feedback(
+    follow_up = await runner.order_results._process_order_result_feedback(
         signal=signal,
         results=results,
         source="root_source",
@@ -981,7 +1015,7 @@ async def test_order_result_feedback_exception_propagates_without_logs(
     caplog.set_level("DEBUG", logger=runner_module.logger.name)
 
     with pytest.raises(RuntimeError) as raised:
-        await runner._process_order_result_feedback(
+        await runner.order_results._process_order_result_feedback(
             signal=signal,
             results=(),
             source="root_source",
@@ -1002,12 +1036,20 @@ async def test_run_lifecycle_and_cleanup_order_is_characterized(
 ) -> None:
     calls: list[str] = []
     runner = _runner(calls=calls)
-    monkeypatch.setattr(runner, "_startup", _async_stage(calls, "startup"))
     monkeypatch.setattr(
-        runner, "_start_producers", lambda: calls.append("start_producers") or []
+        runner.lifecycle,
+        "_run_startup_sequence",
+        _async_stage(calls, "startup"),
     )
     monkeypatch.setattr(
-        runner, "_start_sync_tasks", lambda: calls.append("start_sync_tasks") or []
+        runner.lifecycle,
+        "_start_producers",
+        lambda: calls.append("start_producers") or [],
+    )
+    monkeypatch.setattr(
+        runner.lifecycle,
+        "_start_sync_tasks",
+        lambda: calls.append("start_sync_tasks") or [],
     )
 
     async def consume(*, max_market_events):
@@ -1015,14 +1057,21 @@ async def test_run_lifecycle_and_cleanup_order_is_characterized(
         if consumer_error:
             raise RuntimeError("consumer failed")
 
-    monkeypatch.setattr(runner, "_consume_market_events", consume)
-    for name in (
-        "_stop_market_data_modules",
-        "_stop_sync_tasks",
-        "_stop_producers",
-        "_stop_live_persistence_writer",
-    ):
-        monkeypatch.setattr(runner, name, _async_stage(calls, name.removeprefix("_")))
+    monkeypatch.setattr(
+        runner.market_events, "_consume_market_events", consume
+    )
+    owners = {
+        "_stop_market_data_modules": runner.market_data_lifecycle,
+        "_stop_sync_tasks": runner.lifecycle,
+        "_stop_producers": runner.lifecycle,
+        "_stop_live_persistence_writer": runner.persistence,
+    }
+    for name, owner in owners.items():
+        monkeypatch.setattr(
+            owner,
+            name,
+            _async_stage(calls, name.removeprefix("_")),
+        )
 
     if consumer_error:
         with pytest.raises(RuntimeError, match="consumer failed"):
@@ -1055,7 +1104,8 @@ async def test_run_lifecycle_and_cleanup_order_is_characterized(
 
 def test_sync_task_factory_order_is_characterized() -> None:
     runner = _runner()
-    stop_event = runner._stop_event
+    lifecycle = runner.lifecycle
+    stop_event = lifecycle._stop_event
     created: list[tuple[str, object]] = []
 
     def task(label: str):
@@ -1069,25 +1119,28 @@ def test_sync_task_factory_order_is_characterized() -> None:
         def start(self, factories):
             return [factory() for factory in factories]
 
-    runner.requirements = SimpleNamespace(
+    lifecycle.requirements = SimpleNamespace(
         account_state=SimpleNamespace(poll_enabled=True),
         order_state=SimpleNamespace(poll_when_position_enabled=True),
     )
-    runner._sync_lifecycle = CapturingLifecycle()
-    runner._get_account_sync_service = lambda: SimpleNamespace(
-        run_periodic=task("account")
+    lifecycle._sync_lifecycle = CapturingLifecycle()
+    lifecycle.ports = replace(
+        lifecycle.ports,
+        get_account_sync_service=lambda: SimpleNamespace(
+            run_periodic=task("account")
+        ),
+        get_order_sync_service=lambda: SimpleNamespace(
+            run_periodic=task("order")
+        ),
+        periodic_follower_close_check=task("follower_close"),
     )
-    runner._get_order_sync_service = lambda: SimpleNamespace(
-        run_periodic=task("order")
-    )
-    runner._periodic_follower_close_check = task("follower_close")
-    runner._heartbeat_service = SimpleNamespace(
+    lifecycle._heartbeat_service = SimpleNamespace(
         run_periodic=task("heartbeat")
     )
-    runner._get_startup_feature_backfill_providers = lambda: (object(),)
-    runner._periodic_feature_readiness_refresh = task("feature_readiness")
+    lifecycle._get_startup_feature_backfill_providers = lambda: (object(),)
+    lifecycle._periodic_feature_readiness_refresh = task("feature_readiness")
 
-    tasks = runner._start_sync_tasks()
+    tasks = lifecycle._start_sync_tasks()
 
     assert [label for label, _ in created] == [
         "account",
@@ -1097,4 +1150,4 @@ def test_sync_task_factory_order_is_characterized() -> None:
         "feature_readiness",
     ]
     assert all(event is stop_event for _, event in created)
-    assert runner._sync_tasks is tasks
+    assert lifecycle._sync_tasks is tasks

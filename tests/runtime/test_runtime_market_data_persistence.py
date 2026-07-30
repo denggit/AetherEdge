@@ -9,6 +9,17 @@ import pytest
 from src.runtime.market_data_persistence import RuntimeMarketDataPersistence
 from src.runtime.runner import LiveRuntimeRunner
 from src.runtime import runner as runner_module
+from src.runtime.components import (
+    ClosedBarComponent,
+    PersistenceComponent,
+    RangeRuntimeComponent,
+)
+from src.runtime.context import RuntimeContext
+from src.runtime.ports import ClosedBarPorts, PersistencePorts
+from src.runtime.services import (
+    MarketRuntimeServices,
+    PersistenceRuntimeServices,
+)
 
 
 class _CapturingPersistenceService:
@@ -313,31 +324,74 @@ class _InjectedGateway:
         return False
 
 
+def _persistence_components(
+    *,
+    gateway=None,
+    service=None,
+    emit_alert=None,
+    on_rejected=None,
+):
+    context = RuntimeContext()
+    persistence = PersistenceComponent(context)
+    persistence._runtime_persistence_service = service
+    persistence._market_data_persistence = gateway
+    persistence.persistence_services = PersistenceRuntimeServices(
+        runtime=service,
+        market_data=gateway,
+    )
+    persistence.app_config = SimpleNamespace(
+        data_exchange=SimpleNamespace(value="okx")
+    )
+    persistence.bind_ports(PersistencePorts(
+        get_live_kline_store=lambda: None,
+        require_range_module=lambda: SimpleNamespace(
+            bar_store=None,
+            checkpoint_store=None,
+        ),
+    ))
+    closed_bar = ClosedBarComponent(context)
+    closed_bar.bind_ports(ClosedBarPorts(
+        emit_alert_threadsafe=emit_alert or (lambda _alert: None),
+        get_market_data_persistence=persistence._get_market_data_persistence,
+        get_min_range_bars=lambda: 0,
+        on_live_persistence_write_rejected=(
+            on_rejected or persistence._on_live_persistence_write_rejected
+        ),
+        process_market_feature=lambda _event: None,
+        raise_on_unhealthy_market_data=lambda: None,
+        raise_on_unhealthy_producer=lambda: None,
+        require_range_module=lambda: None,
+        trade_integrity_tracker=lambda: None,
+    ))
+    return persistence, closed_bar
+
+
 def test_runner_wrappers_use_one_injected_gateway_and_keep_none_return() -> None:
     gateway = _InjectedGateway()
-    runner = object.__new__(LiveRuntimeRunner)
-    runner.services = {"market_data_persistence": gateway}
-    runner._market_data_persistence = None
+    rejected: list[str] = []
+    on_rejected = rejected.append
+    _, component = _persistence_components(
+        gateway=gateway,
+        on_rejected=on_rejected,
+    )
     handled: list[tuple[str, object, BaseException]] = []
-    runner._on_closed_kline_persist_error = (
+    component._on_closed_kline_persist_error = (
         lambda model, exc: handled.append(("closed", model, exc))
     )
-    runner._on_range_bar_persist_error = (
+    component._on_range_bar_persist_error = (
         lambda model, exc: handled.append(("range", model, exc))
     )
-    runner._on_completed_range_aggregate_persist_error = (
+    component._on_completed_range_aggregate_persist_error = (
         lambda model, exc: handled.append(("aggregate", model, exc))
     )
-    rejected: list[str] = []
-    runner._on_live_persistence_write_rejected = rejected.append
     kline = object()
     bar = object()
     aggregate = object()
 
-    assert runner._persist_closed_kline(kline) is None  # type: ignore[arg-type]
-    assert runner._persist_range_bar(bar) is None  # type: ignore[arg-type]
+    assert component._persist_closed_kline(kline) is None  # type: ignore[arg-type]
+    assert component._persist_range_bar(bar) is None  # type: ignore[arg-type]
     assert (
-        runner._persist_completed_range_aggregate(  # type: ignore[arg-type]
+        component._persist_completed_range_aggregate(  # type: ignore[arg-type]
             aggregate,
             coverage_status="complete",
             missing_gap_ms=789,
@@ -350,7 +404,7 @@ def test_runner_wrappers_use_one_injected_gateway_and_keep_none_return() -> None
     assert gateway.calls[2][2]["coverage_status"] == "complete"
     assert gateway.calls[2][2]["missing_gap_ms"] == 789
     assert all(
-        call[2]["on_rejected"] is runner._on_live_persistence_write_rejected
+        call[2]["on_rejected"] is on_rejected
         for call in gateway.calls
     )
     error = RuntimeError("write failed")
@@ -375,10 +429,10 @@ def test_runner_logs_one_exact_warning_for_each_gateway_rejection(
         aggregate_provider=aggregate_provider,
         clock_ms=clock_ms,
     )
-    runner = object.__new__(LiveRuntimeRunner)
-    runner.services = {"runtime_persistence_service": service}
-    runner._runtime_persistence_service = service
-    runner._market_data_persistence = gateway
+    _, component = _persistence_components(
+        gateway=gateway,
+        service=service,
+    )
     rendered_warnings: list[str] = []
 
     def capture_warning(message: str, *args) -> None:
@@ -386,10 +440,10 @@ def test_runner_logs_one_exact_warning_for_each_gateway_rejection(
 
     monkeypatch.setattr(runner_module.logger, "warning", capture_warning)
 
-    assert runner._persist_closed_kline(object()) is None  # type: ignore[arg-type]
-    assert runner._persist_range_bar(object()) is None  # type: ignore[arg-type]
+    assert component._persist_closed_kline(object()) is None  # type: ignore[arg-type]
+    assert component._persist_range_bar(object()) is None  # type: ignore[arg-type]
     assert (
-        runner._persist_completed_range_aggregate(  # type: ignore[arg-type]
+        component._persist_completed_range_aggregate(  # type: ignore[arg-type]
             object(),
             coverage_status="partial",
             missing_gap_ms=12,
@@ -412,51 +466,42 @@ def test_runner_logs_one_exact_warning_for_each_gateway_rejection(
 @pytest.mark.asyncio
 async def test_runner_gateway_delegate_keeps_alert_loop_for_worker_errors() -> None:
     gateway = _InjectedGateway()
-    runner = object.__new__(LiveRuntimeRunner)
-    runner.services = {"market_data_persistence": gateway}
-    runner._market_data_persistence = gateway
-    runner._on_closed_kline_persist_error = lambda model, exc: None
+    persistence, component = _persistence_components(gateway=gateway)
+    component._on_closed_kline_persist_error = lambda model, exc: None
 
-    runner._persist_closed_kline(object())  # type: ignore[arg-type]
+    component._persist_closed_kline(object())  # type: ignore[arg-type]
 
-    assert runner._persistence_alert_loop is asyncio.get_running_loop()
+    assert persistence._persistence_alert_loop is asyncio.get_running_loop()
 
 
 def test_runner_default_gateway_is_created_and_cached_once() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
     service = _CapturingPersistenceService()
-    runner.services = {}
-    runner._runtime_persistence_service = service
-    runner._market_data_persistence = None
-    runner.app_config = SimpleNamespace(
-        data_exchange=SimpleNamespace(value="okx")
-    )
+    component, _ = _persistence_components(service=service)
 
-    first = runner._get_market_data_persistence()
-    second = runner._get_market_data_persistence()
+    first = component._get_market_data_persistence()
+    second = component._get_market_data_persistence()
 
     assert first is second
     assert (
-        runner._runtime_service_bundle().persistence.market_data
-        is first
+        component.persistence_services.market_data is first
     )
     assert vars(first)["_persistence_service"] is service
 
 
 def test_runner_live_kline_store_prefers_injected_store() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
     store = object()
-    runner.services = {"kline_store": store}
+    component = RangeRuntimeComponent(RuntimeContext())
+    component.market_services = MarketRuntimeServices(kline_store=store)
 
-    assert runner._get_live_kline_store() is store
-    assert runner._get_live_kline_store() is store
+    assert component._get_live_kline_store() is store
+    assert component._get_live_kline_store() is store
 
 
 def test_runner_live_kline_store_uses_configured_path_and_caches(
     monkeypatch,
     tmp_path,
 ) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    component = RangeRuntimeComponent(RuntimeContext())
     path = tmp_path / "market.sqlite3"
     store = object()
     factory = Mock(return_value=store)
@@ -464,21 +509,20 @@ def test_runner_live_kline_store_uses_configured_path_and_caches(
         "src.runtime.components.range_runtime.SqliteKlineStore",
         factory,
     )
-    runner.services = {}
-    runner.range_config = SimpleNamespace(market_data_db_path=path)
+    component.market_services = MarketRuntimeServices()
+    component.range_config = SimpleNamespace(market_data_db_path=path)
 
-    assert runner._get_live_kline_store() is store
-    assert runner._get_live_kline_store() is store
+    assert component._get_live_kline_store() is store
+    assert component._get_live_kline_store() is store
     factory.assert_called_once_with(path)
-    assert runner._runtime_service_bundle().market.kline_store is store
+    assert component.market_services.kline_store is store
 
 
 def test_runner_persistence_error_handlers_keep_messages_and_severity(
     monkeypatch,
 ) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
     alerts = []
-    runner._emit_alert_threadsafe = alerts.append
+    _, component = _persistence_components(emit_alert=alerts.append)
     exception_log = Mock()
     warning_log = Mock()
     monkeypatch.setattr(runner_module.logger, "exception", exception_log)
@@ -503,9 +547,9 @@ def test_runner_persistence_error_handlers_keep_messages_and_severity(
         bucket_start_ms=100,
     )
 
-    runner._on_closed_kline_persist_error(kline, error)  # type: ignore[arg-type]
-    runner._on_range_bar_persist_error(bar, error)  # type: ignore[arg-type]
-    runner._on_completed_range_aggregate_persist_error(  # type: ignore[arg-type]
+    component._on_closed_kline_persist_error(kline, error)  # type: ignore[arg-type]
+    component._on_range_bar_persist_error(bar, error)  # type: ignore[arg-type]
+    component._on_completed_range_aggregate_persist_error(  # type: ignore[arg-type]
         aggregate,
         error,
     )

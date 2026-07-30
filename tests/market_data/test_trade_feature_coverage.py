@@ -1085,6 +1085,10 @@ def test_legacy_facade_matches_explicit_coverage_service(tmp_path) -> None:
     path = tmp_path / "parity.sqlite3"
     legacy = SqliteTradeFeatureStore(path)
     repository = SqliteTradeFeatureRepository(path)
+    from src.market_data.trade_features.compat import (
+        LegacyTradeFeatureCoverageAdapter,
+    )
+    adapter = LegacyTradeFeatureCoverageAdapter(repository)
     kwargs = {
         "symbol": "ETH-USDT-PERP",
         "exchange": "okx",
@@ -1100,5 +1104,7 @@ def test_legacy_facade_matches_explicit_coverage_service(tmp_path) -> None:
     explicit_result = TradeFeatureCoverageService(
         repository
     ).scan_window(**kwargs)
+    adapter_result = adapter.coverage_scan(**kwargs)
 
     assert legacy_result == explicit_result
+    assert adapter_result == legacy_result

@@ -206,11 +206,11 @@ def test_runner_selects_and_writes_back_one_shutdown_coordinator() -> None:
     selected = _assignment(initializer, "self._shutdown_coordinator")
     writeback = _assignment(
         initializer,
-        "self.runtime_services.shutdown_coordinator",
+        "lifecycle.shutdown_coordinator",
     )
 
     assert ast.unparse(injected.value) == (
-        "self.runtime_services.shutdown_coordinator"
+        "lifecycle.shutdown_coordinator"
     )
     assert isinstance(selected.value, ast.IfExp)
     assert ast.unparse(selected.value.test) == (
@@ -257,13 +257,13 @@ def test_final_shutdown_helper_has_one_range_owned_stop() -> None:
     method = _methods(_class(RUNNER, "LiveRuntimeRunner"))[
         "_run_finally_shutdown"
     ]
-    assert len(method.body) == 4
+    assert len(method.body) == 1
     assert _coordinator_steps(method) == [
-        "self._compat_override('_stop_market_data_modules', market_data_lifecycle._stop_market_data_modules)",
-        "self._compat_override('_stop_sync_tasks', lifecycle._stop_sync_tasks)",
-        "self._compat_override('_stop_producers', lifecycle._stop_producers)",
-        "self._compat_override('_stop_live_persistence_writer', persistence._stop_live_persistence_writer)",
-        "self.context.alerts.stop",
+        "self.market_data_lifecycle._stop_market_data_modules",
+        "self.lifecycle._stop_sync_tasks",
+        "self.lifecycle._stop_producers",
+        "self.persistence._stop_live_persistence_writer",
+        "self.app_context.alerts.stop",
     ]
     assert not any(
         isinstance(node, (ast.Lambda, ast.Try, ast.TryStar))
@@ -275,9 +275,9 @@ def test_explicit_stop_has_distinct_three_step_helper_and_outer_order() -> None:
     methods = _methods(_class(RUNNER, "LiveRuntimeRunner"))
     helper = methods["_explicit_stop_shutdown"]
     assert _coordinator_steps(helper, receiver="coordinator") == [
-        "self._compat_override('_stop_market_data_modules', market_data_lifecycle._stop_market_data_modules)",
-        "self._compat_override('_stop_producers', lifecycle._stop_producers)",
-        "self._compat_override('_stop_live_persistence_writer', persistence._stop_live_persistence_writer)",
+        "self.market_data_lifecycle._stop_market_data_modules",
+        "self.lifecycle._stop_producers",
+        "self.persistence._stop_live_persistence_writer",
     ]
 
     stop = methods["stop"]
@@ -310,7 +310,7 @@ def test_final_and_explicit_shutdown_sequences_are_not_merged() -> None:
         next(name for name in shutdown_names if name in step)
         for step in final_steps[:-1]
     ] == shutdown_names
-    assert final_steps[-1] == "self.context.alerts.stop"
+    assert final_steps[-1] == "self.app_context.alerts.stop"
 
 
 def test_runner_has_no_heartbeat_stop_and_sync_lifecycle_keeps_task_cleanup() -> None:

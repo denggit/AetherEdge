@@ -12,7 +12,10 @@ from src.app import AppConfig
 from src.platform import ExchangeName
 from src.platform.config import ProjectEnvConfig
 from src.runtime import LiveRuntimeConfig, RuntimeMode
+from src.runtime.components import SignalExecutionComponent
 from src.runtime.components import signal_execution as signal_execution_component
+from src.runtime.context import RuntimeContext
+from src.runtime.ports import SignalExecutionPorts
 from src.runtime.requirements import StrategyRuntimeRequirements
 from src.runtime.runner import LiveRuntimeRunner, LiveRuntimeStats
 from src.runtime.signal_execution_service import (
@@ -86,6 +89,24 @@ def _request(
         metadata=metadata,
         feedback_depth=feedback_depth,
     )
+
+
+def _component(**overrides) -> SignalExecutionComponent:
+    values = {
+        "get_account_sync_service": Mock(),
+        "get_order_coordinator": Mock(),
+        "get_order_sync_service": Mock(),
+        "has_account_config_entry_block": Mock(return_value=False),
+        "has_unresolved_follower_close": Mock(return_value=False),
+        "process_order_result_feedback": AsyncMock(return_value=()),
+        "save_order_results": Mock(),
+        "set_health": Mock(),
+        "verify_stop_order_results": AsyncMock(return_value=()),
+    }
+    values.update(overrides)
+    component = SignalExecutionComponent(RuntimeContext())
+    component.bind_ports(SignalExecutionPorts(**values))
+    return component
 
 
 def _plan(
@@ -353,13 +374,13 @@ def test_injected_service_has_priority_without_default_construction(
 
     default_factory.assert_not_called()
     service.execute.assert_not_called()
-    assert runner._signal_execution_service is service
+    assert runner.signal_execution._signal_execution_service is service
     assert runner.services["signal_execution_service"] is service
-    assert runner._order_coordinator is None
-    assert runner._account_sync_service is None
-    assert runner._order_sync_service is None
-    assert runner._order_journal is None
-    assert runner._position_plan_store is None
+    assert runner.service_bundle.execution.order_coordinator is None
+    assert runner.service_bundle.account.account_sync_service is None
+    assert runner.service_bundle.account.order_sync_service is None
+    assert runner.service_bundle.execution.order_journal is None
+    assert runner.service_bundle.execution.position_plan_store is None
 
 
 def test_default_service_created_once_written_back_and_not_executed(
@@ -376,13 +397,13 @@ def test_default_service_created_once_written_back_and_not_executed(
 
     factory.assert_called_once_with()
     service.execute.assert_not_called()
-    assert runner._signal_execution_service is service
+    assert runner.signal_execution._signal_execution_service is service
     assert runner.services["signal_execution_service"] is service
-    assert runner._order_coordinator is None
-    assert runner._account_sync_service is None
-    assert runner._order_sync_service is None
-    assert runner._order_journal is None
-    assert runner._position_plan_store is None
+    assert runner.service_bundle.execution.order_coordinator is None
+    assert runner.service_bundle.account.account_sync_service is None
+    assert runner.service_bundle.account.order_sync_service is None
+    assert runner.service_bundle.execution.order_journal is None
+    assert runner.service_bundle.execution.position_plan_store is None
 
 
 @pytest.mark.asyncio
@@ -397,7 +418,7 @@ async def test_runner_builds_exact_request_plan_and_delegates_once() -> None:
     signals = [object()]
     metadata = {"feature_type": "test"}
 
-    result = await runner._execute_signals(
+    result = await runner.signal_execution._execute_signals(
         signals,
         source="source",
         event_time_ms=88,
@@ -430,11 +451,14 @@ async def test_runner_builds_exact_request_plan_and_delegates_once() -> None:
 def test_prepare_dry_run_precedes_guards_and_keeps_exact_stats_log(
     monkeypatch,
 ) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    account_block = Mock(side_effect=AssertionError)
+    follower_block = Mock(side_effect=AssertionError)
+    runner = _component(
+        has_account_config_entry_block=account_block,
+        has_unresolved_follower_close=follower_block,
+    )
     runner.stats = LiveRuntimeStats()
     runner.app_config = SimpleNamespace(dry_run=True)
-    runner._has_account_config_entry_block = Mock(side_effect=AssertionError)
-    runner._has_unresolved_follower_close = Mock(side_effect=AssertionError)
     logger = Mock()
     monkeypatch.setattr(signal_execution_component, "logger", logger)
     signal = _signal(SignalAction.OPEN_LONG)
@@ -444,8 +468,8 @@ def test_prepare_dry_run_precedes_guards_and_keeps_exact_stats_log(
 
     assert runner.stats.signals_seen == 1
     assert runner.stats.dry_run_actions == 1
-    runner._has_account_config_entry_block.assert_not_called()
-    runner._has_unresolved_follower_close.assert_not_called()
+    account_block.assert_not_called()
+    follower_block.assert_not_called()
     logger.info.assert_called_once_with(
         "Dry-run signal skipped | action=%s source=%s event_time_ms=%s",
         "open_long",
@@ -455,11 +479,14 @@ def test_prepare_dry_run_precedes_guards_and_keeps_exact_stats_log(
 
 
 def test_prepare_account_config_block_keeps_warning_and_alert(monkeypatch) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    account_block = Mock(return_value=True)
+    follower_block = Mock()
+    runner = _component(
+        has_account_config_entry_block=account_block,
+        has_unresolved_follower_close=follower_block,
+    )
     runner.stats = LiveRuntimeStats()
     runner.app_config = SimpleNamespace(dry_run=False)
-    runner._has_account_config_entry_block = Mock(return_value=True)
-    runner._has_unresolved_follower_close = Mock()
     emit = Mock()
     runner.context = SimpleNamespace(alerts=SimpleNamespace(emit=emit))
     logger = Mock()
@@ -470,7 +497,7 @@ def test_prepare_account_config_block_keeps_warning_and_alert(monkeypatch) -> No
     assert runner._prepare_signal_execution(signal, request) is False
 
     assert runner.stats.signals_seen == 1
-    runner._has_unresolved_follower_close.assert_not_called()
+    follower_block.assert_not_called()
     logger.warning.assert_called_once_with(
         "Blocking new entry — account config not verified due to existing exposure | action=%s source=%s",
         "open_short",
@@ -483,11 +510,14 @@ def test_prepare_account_config_block_keeps_warning_and_alert(monkeypatch) -> No
 
 
 def test_prepare_unresolved_follower_block_and_topup_exception(monkeypatch) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    account_block = Mock(return_value=False)
+    follower_block = Mock(return_value=True)
+    runner = _component(
+        has_account_config_entry_block=account_block,
+        has_unresolved_follower_close=follower_block,
+    )
     runner.stats = LiveRuntimeStats()
     runner.app_config = SimpleNamespace(dry_run=False)
-    runner._has_account_config_entry_block = Mock(return_value=False)
-    runner._has_unresolved_follower_close = Mock(return_value=True)
     emit = Mock()
     runner.context = SimpleNamespace(alerts=SimpleNamespace(emit=emit))
     logger = Mock()
@@ -517,7 +547,7 @@ def test_prepare_unresolved_follower_block_and_topup_exception(monkeypatch) -> N
 
 
 def test_create_intent_keeps_signal_and_request_arguments() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    runner = _component()
     intent = object()
     runner._intent_factory = SimpleNamespace(create=Mock(return_value=intent))
     signal = object()
@@ -543,11 +573,11 @@ def test_create_intent_keeps_signal_and_request_arguments() -> None:
 
 @pytest.mark.asyncio
 async def test_execute_intent_passes_identity_to_lazy_coordinator() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
     intent = object()
     results = [object()]
     coordinator = SimpleNamespace(execute=AsyncMock(return_value=results))
-    runner._get_order_coordinator = Mock(return_value=coordinator)
+    coordinator_provider = Mock(return_value=coordinator)
+    runner = _component(get_order_coordinator=coordinator_provider)
 
     returned = await runner._execute_signal_execution_intent(intent)
 
@@ -561,12 +591,12 @@ async def test_post_submit_sync_condition_log_and_arguments(
     monkeypatch,
     enabled: bool,
 ) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    sync = SimpleNamespace(sync_once=AsyncMock())
+    sync_provider = Mock(return_value=sync)
+    runner = _component(get_order_sync_service=sync_provider)
     runner.requirements = SimpleNamespace(
         order_state=SimpleNamespace(post_submit_sync_enabled=enabled)
     )
-    sync = SimpleNamespace(sync_once=AsyncMock())
-    runner._get_order_sync_service = Mock(return_value=sync)
     logger = Mock()
     monkeypatch.setattr(signal_execution_component, "logger", logger)
     signal = _signal(SignalAction.CLOSE_LONG)
@@ -586,17 +616,17 @@ async def test_post_submit_sync_condition_log_and_arguments(
         )
     else:
         logger.info.assert_not_called()
-        runner._get_order_sync_service.assert_not_called()
+        sync_provider.assert_not_called()
 
 
 def test_result_handlers_keep_exact_three_step_order_and_identity() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    save_results = Mock()
+    runner = _component(save_order_results=save_results)
     parent = Mock()
     runner._record_order_results = Mock()
-    runner._save_order_results = Mock()
     runner._check_follower_close_failure = Mock()
     parent.attach_mock(runner._record_order_results, "record")
-    parent.attach_mock(runner._save_order_results, "save")
+    parent.attach_mock(save_results, "save")
     parent.attach_mock(runner._check_follower_close_failure, "follower")
     signal = object()
     results = [object()]
@@ -627,12 +657,12 @@ async def test_post_order_account_sync_exact_action_set(
     enabled: bool,
     expected: bool,
 ) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    sync = SimpleNamespace(sync_once=AsyncMock())
+    sync_provider = Mock(return_value=sync)
+    runner = _component(get_account_sync_service=sync_provider)
     runner.requirements = SimpleNamespace(
         account_state=SimpleNamespace(post_order_sync_enabled=enabled)
     )
-    sync = SimpleNamespace(sync_once=AsyncMock())
-    runner._get_account_sync_service = Mock(return_value=sync)
 
     await runner._run_post_order_account_sync(
         _signal(action),
@@ -645,14 +675,16 @@ async def test_post_order_account_sync_exact_action_set(
             priority=True,
         )
     else:
-        runner._get_account_sync_service.assert_not_called()
+        sync_provider.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_feedback_wrapper_keeps_all_arguments_and_result_identity() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
     follow_up = [object()]
-    runner._process_order_result_feedback = AsyncMock(return_value=follow_up)
+    process_feedback = AsyncMock(return_value=follow_up)
+    runner = _component(
+        process_order_result_feedback=process_feedback,
+    )
     signal = object()
     results = [object()]
     request = _request([], source="root", event_time_ms=44)
@@ -664,7 +696,7 @@ async def test_feedback_wrapper_keeps_all_arguments_and_result_identity() -> Non
     )
 
     assert returned is follow_up
-    runner._process_order_result_feedback.assert_awaited_once_with(
+    process_feedback.assert_awaited_once_with(
         signal=signal,
         results=results,
         source="root",
@@ -673,7 +705,7 @@ async def test_feedback_wrapper_keeps_all_arguments_and_result_identity() -> Non
 
 
 def test_feedback_depth_four_builds_depth_five_request_with_identity() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    runner = _component()
     follow_up = [object()]
     signal = _signal(SignalAction.CLOSE_LONG)
     request = _request(
@@ -694,7 +726,7 @@ def test_feedback_depth_four_builds_depth_five_request_with_identity() -> None:
 
 
 def test_feedback_depth_five_blocks_with_exact_log_and_alert(monkeypatch) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    runner = _component()
     emit = Mock()
     runner.context = SimpleNamespace(alerts=SimpleNamespace(emit=emit))
     logger = Mock()

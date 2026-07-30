@@ -181,7 +181,7 @@ def test_portfolio_v1_both_exchanges_hedge_passes() -> None:
         accounts=_accounts(),
     )
     asyncio.run(
-        runner._check_strategy_position_mode_requirements()
+        runner.startup._check_strategy_position_mode_requirements()
     )
     audit = runner._health.metadata[
         "position_mode_requirements"
@@ -213,7 +213,7 @@ def test_portfolio_v1_one_way_is_hard_failure(
         match="strategy position mode requirement failed",
     ):
         asyncio.run(
-            runner._check_strategy_position_mode_requirements()
+            runner.startup._check_strategy_position_mode_requirements()
         )
     audit = runner._health.metadata[
         "position_mode_requirements"
@@ -233,7 +233,7 @@ def test_portfolio_v1_unknown_mode_is_hard_failure() -> None:
     )
     with pytest.raises(LiveRuntimeError, match="binance=unknown"):
         asyncio.run(
-            runner._check_strategy_position_mode_requirements()
+            runner.startup._check_strategy_position_mode_requirements()
         )
 
 
@@ -255,7 +255,7 @@ def test_v10b_is_not_subject_to_portfolio_gate() -> None:
         accounts=accounts,
     )
     asyncio.run(
-        runner._check_strategy_position_mode_requirements()
+        runner.startup._check_strategy_position_mode_requirements()
     )
     assert (
         "position_mode_requirements"
@@ -266,18 +266,22 @@ def test_v10b_is_not_subject_to_portfolio_gate() -> None:
 def test_gate_is_ordered_before_recovery_on_start_and_producers() -> None:
     startup = inspect.getsource(LifecycleComponent._run_startup_sequence)
     run = inspect.getsource(LiveRuntimeRunner.run)
-    assert startup.index("_bootstrap_account_config_if_enabled") < (
-        startup.index("_check_strategy_position_mode_requirements")
+    assert startup.index("ports.bootstrap_account_config_if_enabled") < (
+        startup.index("ports.check_strategy_position_mode_requirements")
     )
-    assert startup.index("_check_strategy_position_mode_requirements") < (
-        startup.index("_run_recovery")
+    assert startup.index("ports.check_strategy_position_mode_requirements") < (
+        startup.index("ports.run_recovery")
     )
-    assert startup.index("_check_strategy_position_mode_requirements") < (
-        startup.index("_call_on_start")
+    assert startup.index("ports.check_strategy_position_mode_requirements") < (
+        startup.index("ports.call_on_start")
     )
-    assert run.index('"_startup"') < run.index('"_start_producers"')
-    assert run.index('"_start_producers"') < run.index(
-        '"_consume_market_events"'
+    assert run.index(
+        "self.lifecycle._run_startup_sequence()"
+    ) < run.index(
+        "self.lifecycle._start_producers()"
+    )
+    assert run.index("self.lifecycle._start_producers()") < run.index(
+        "self.market_events._consume_market_events"
     )
 
 
@@ -294,55 +298,59 @@ def test_startup_executes_gate_before_recovery_and_on_start(
         return result
 
     monkeypatch.setattr(
-        runner, "_initialize_rangebar_trust_window", lambda: None
+        runner.startup,
+        "_initialize_rangebar_trust_window",
+        lambda: None,
     )
     monkeypatch.setattr(
-        runner,
+        runner.startup,
         "_bootstrap_account_config_if_enabled",
         lambda: step("bootstrap"),
     )
     monkeypatch.setattr(
-        runner, "_run_warmup", lambda: step("warmup")
+        runner.startup, "_run_warmup", lambda: step("warmup")
     )
     monkeypatch.setattr(
-        runner,
+        runner.startup,
         "_warmup_range_speed_history",
         lambda: step("range_speed", 0),
     )
     monkeypatch.setattr(
-        runner,
+        runner.lifecycle,
         "_check_startup_feature_backfills",
         lambda: step("feature_readiness"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.recovery,
         "_run_recovery",
         lambda: step("recovery", (object(),)),
     )
     monkeypatch.setattr(
-        runner,
+        runner.account_runtime,
         "_run_reconciliation",
         lambda snapshots: step("reconciliation"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.catchup,
         "_call_on_start",
         lambda snapshot: step("on_start"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.catchup,
         "_evaluate_startup_catchup_once",
         lambda snapshot: step("catchup"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.startup,
         "_finish_range_speed_warmup_after_catchup",
         lambda: step("finish_warmup"),
     )
     monkeypatch.setattr(
-        runner, "_start_range_speed_background_services", lambda: None
+        runner.market_data_lifecycle,
+        "_start_range_speed_background_services",
+        lambda: None,
     )
-    runner._heartbeat_service = SimpleNamespace(
+    runner.lifecycle._heartbeat_service = SimpleNamespace(
         start=lambda **kwargs: None
     )
 
@@ -368,7 +376,7 @@ def test_failure_log_contains_required_audit_fields(caplog) -> None:
         LiveRuntimeError
     ):
         asyncio.run(
-            runner._check_strategy_position_mode_requirements()
+            runner.startup._check_strategy_position_mode_requirements()
         )
     message = "\n".join(record.message for record in caplog.records)
     assert "strategy=eth_portfolio_v1" in message

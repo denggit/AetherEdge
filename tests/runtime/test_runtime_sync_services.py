@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -11,6 +12,9 @@ from src.platform import ExchangeName
 from src.platform.config import ProjectEnvConfig
 from src.runtime import LiveRuntimeConfig, RuntimeMode
 from src.runtime import runner as runner_module
+from src.runtime.components import AccountComponent
+from src.runtime.context import RuntimeContext
+from src.runtime.ports import AccountPorts
 from src.runtime.requirements import StrategyRuntimeRequirements
 from src.runtime.runner import LiveRuntimeRunner
 from src.runtime.sync_services import RuntimeSyncServiceRegistry
@@ -49,6 +53,21 @@ def _runner(*, services: dict | None = None) -> LiveRuntimeRunner:
         ),
         services=injected,
     )
+
+
+def _account_component(
+    *,
+    get_position_plan_store=lambda: None,
+) -> AccountComponent:
+    component = AccountComponent(RuntimeContext())
+    component.bind_ports(AccountPorts(
+        execute_signals=Mock(),
+        get_execution_clients=lambda: (),
+        get_order_journal=lambda: None,
+        get_position_plan_store=get_position_plan_store,
+        strategy_pending_work_provider=lambda: None,
+    ))
+    return component
 
 
 def test_registry_initial_state_and_owned_fields() -> None:
@@ -153,18 +172,18 @@ def test_complete_registry_injection_overrides_legacy_services() -> None:
         }
     )
 
-    assert runner._sync_service_registry is registry
+    assert runner.account_runtime._sync_service_registry is registry
     assert runner.services["sync_service_registry"] is registry
-    assert runner._account_sync_service is registry_account
-    assert runner._order_sync_service is registry_order
-    assert runner._account_sync_service is not legacy_account
-    assert runner._order_sync_service is not legacy_order
+    assert vars(runner.account_runtime._sync_service_registry) == {
+        "_account_service": registry_account,
+        "_order_service": registry_order,
+    }
     assert runner.services["account_sync_service"] is legacy_account
     assert runner.services["order_sync_service"] is legacy_order
-    assert runner._get_account_sync_service() is registry_account
-    assert runner._get_order_sync_service() is registry_order
-    assert runner._account_sync_service is registry_account
-    assert runner._order_sync_service is registry_order
+    assert runner.account_runtime._get_account_sync_service() is registry_account
+    assert runner.account_runtime._get_order_sync_service() is registry_order
+    assert runner.account_runtime._get_account_sync_service() is registry_account
+    assert runner.account_runtime._get_order_sync_service() is registry_order
 
 
 def test_empty_registry_overrides_legacy_compatibility_fields() -> None:
@@ -180,8 +199,10 @@ def test_empty_registry_overrides_legacy_compatibility_fields() -> None:
         }
     )
 
-    assert runner._account_sync_service is None
-    assert runner._order_sync_service is None
+    assert vars(runner.account_runtime._sync_service_registry) == {
+        "_account_service": None,
+        "_order_service": None,
+    }
     assert runner.services["account_sync_service"] is legacy_account
     assert runner.services["order_sync_service"] is legacy_order
 
@@ -209,8 +230,10 @@ def test_partial_registry_immediately_controls_compatibility_fields(
         }
     )
 
-    assert runner._account_sync_service is registry_account
-    assert runner._order_sync_service is registry_order
+    assert vars(runner.account_runtime._sync_service_registry) == {
+        "_account_service": registry_account,
+        "_order_service": registry_order,
+    }
     assert runner.services["account_sync_service"] is legacy_account
     assert runner.services["order_sync_service"] is legacy_order
 
@@ -231,22 +254,25 @@ def test_empty_registry_construction_keeps_sync_dependencies_lazy(
         order_factory,
     )
     monkeypatch.setattr(
-        LiveRuntimeRunner,
+        AccountComponent,
         "_get_sync_contexts",
         get_contexts,
     )
     monkeypatch.setattr(
-        LiveRuntimeRunner,
+        AccountComponent,
         "_get_position_plan_store",
         get_position_plan_store,
+        raising=False,
     )
 
     runner = _runner(
         services={"sync_service_registry": RuntimeSyncServiceRegistry()}
     )
 
-    assert runner._account_sync_service is None
-    assert runner._order_sync_service is None
+    assert vars(runner.account_runtime._sync_service_registry) == {
+        "_account_service": None,
+        "_order_service": None,
+    }
     account_factory.assert_not_called()
     order_factory.assert_not_called()
     get_contexts.assert_not_called()
@@ -266,7 +292,7 @@ def test_complete_registry_injection_does_not_create_default(
     runner = _runner(services={"sync_service_registry": registry})
 
     default_factory.assert_not_called()
-    assert runner._sync_service_registry is registry
+    assert runner.account_runtime._sync_service_registry is registry
     assert runner.services["sync_service_registry"] is registry
 
 
@@ -284,7 +310,7 @@ def test_runner_creates_one_default_registry(monkeypatch) -> None:
         account_service=None,
         order_service=None,
     )
-    assert runner._sync_service_registry is registry
+    assert runner.account_runtime._sync_service_registry is registry
     assert runner.services["sync_service_registry"] is registry
 
 
@@ -306,22 +332,20 @@ def test_default_registry_preserves_all_legacy_injection_combinations(
 
     runner = _runner(services=services)
 
-    assert vars(runner._sync_service_registry) == {
+    assert vars(runner.account_runtime._sync_service_registry) == {
         "_account_service": account,
         "_order_service": order,
     }
-    assert runner._account_sync_service is account
-    assert runner._order_sync_service is order
     if account_injected:
-        assert runner._get_account_sync_service() is account
+        assert runner.account_runtime._get_account_sync_service() is account
     if order_injected:
-        assert runner._get_order_sync_service() is order
+        assert runner.account_runtime._get_order_sync_service() is order
 
 
 def test_account_builder_preserves_all_dependencies_and_identity(
     monkeypatch,
 ) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    runner = _account_component()
     contexts = (object(), object())
     config = object()
     alerts = object()
@@ -356,7 +380,6 @@ def test_account_builder_preserves_all_dependencies_and_identity(
 def test_order_builder_preserves_all_dependencies_and_lazy_position_store(
     monkeypatch,
 ) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
     contexts = (object(), object())
     config = object()
     alerts = object()
@@ -367,12 +390,14 @@ def test_order_builder_preserves_all_dependencies_and_lazy_position_store(
     factory = Mock(return_value=service)
     get_contexts = Mock(return_value=contexts)
     get_position_plan_store = Mock(return_value=position_plan_store)
+    runner = _account_component(
+        get_position_plan_store=get_position_plan_store,
+    )
     monkeypatch.setattr(
         "src.runtime.components.account.OrderStateSyncService",
         factory,
     )
     runner._get_sync_contexts = get_contexts
-    runner._get_position_plan_store = get_position_plan_store
     runner.requirements = SimpleNamespace(order_state=config)
     runner.context = SimpleNamespace(alerts=alerts)
     runner._request_sync_throttle = throttle
@@ -396,7 +421,7 @@ def test_order_builder_preserves_all_dependencies_and_lazy_position_store(
 
 
 def test_default_getters_build_lazily_once_and_keep_legacy_fields() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    runner = _account_component()
     registry = RuntimeSyncServiceRegistry()
     account = object()
     order = object()
@@ -427,16 +452,17 @@ def test_default_getters_build_lazily_once_and_keep_legacy_fields() -> None:
 def test_account_and_order_builders_resolve_contexts_independently(
     monkeypatch,
 ) -> None:
-    runner = object.__new__(LiveRuntimeRunner)
     account_service = object()
     order_service = object()
     get_contexts = Mock(side_effect=((object(),), (object(),)))
     get_position_plan_store = Mock(return_value=object())
+    runner = _account_component(
+        get_position_plan_store=get_position_plan_store,
+    )
     runner._sync_service_registry = RuntimeSyncServiceRegistry()
     runner._account_sync_service = None
     runner._order_sync_service = None
     runner._get_sync_contexts = get_contexts
-    runner._get_position_plan_store = get_position_plan_store
     runner.requirements = SimpleNamespace(
         account_state=object(),
         order_state=object(),
@@ -465,7 +491,6 @@ def test_account_and_order_builders_resolve_contexts_independently(
 
 
 def test_periodic_and_immediate_getters_share_service_instances() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
     stop_event = object()
     account_periodic: list[object] = []
     order_periodic: list[object] = []
@@ -484,32 +509,35 @@ def test_periodic_and_immediate_getters_share_service_instances() -> None:
         account_service=account,
         order_service=order,
     )
+    runner = _runner(
+        services={"sync_service_registry": registry}
+    )
 
     class Lifecycle:
         def start(self, factories):
             return [factory() for factory in factories]
 
-    runner._sync_service_registry = registry
-    runner._account_sync_service = None
-    runner._order_sync_service = None
-    runner._sync_lifecycle = Lifecycle()
-    runner._sync_tasks = []
-    runner._stop_event = stop_event
-    runner.requirements = SimpleNamespace(
+    runner.lifecycle._sync_lifecycle = Lifecycle()
+    runner.lifecycle._sync_tasks = []
+    runner.lifecycle._stop_event = stop_event
+    runner.lifecycle.requirements = SimpleNamespace(
         account_state=SimpleNamespace(poll_enabled=True),
         order_state=SimpleNamespace(poll_when_position_enabled=True),
     )
-    runner._periodic_follower_close_check = lambda event: object()
-    runner._heartbeat_service = SimpleNamespace(
+    runner.lifecycle.ports = replace(
+        runner.lifecycle.ports,
+        periodic_follower_close_check=lambda event: object(),
+    )
+    runner.lifecycle._heartbeat_service = SimpleNamespace(
         run_periodic=lambda event: object()
     )
-    runner._get_startup_feature_backfill_providers = lambda: ()
+    runner.lifecycle._get_startup_feature_backfill_providers = lambda: ()
 
-    runner._start_sync_tasks()
+    runner.lifecycle._start_sync_tasks()
 
     assert account_periodic == [stop_event]
     assert order_periodic == [stop_event]
-    assert runner._get_account_sync_service() is account
-    assert runner._get_order_sync_service() is order
-    assert runner._account_sync_service is account
-    assert runner._order_sync_service is order
+    assert runner.account_runtime._get_account_sync_service() is account
+    assert runner.account_runtime._get_order_sync_service() is order
+    assert runner.account_runtime._get_account_sync_service() is account
+    assert runner.account_runtime._get_order_sync_service() is order

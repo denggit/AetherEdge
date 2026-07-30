@@ -209,15 +209,16 @@ def _install_shutdown_steps(
     errors: dict[str, BaseException] | None = None,
 ) -> None:
     errors = errors or {}
-    for name in (
-        "_stop_market_data_modules",
-        "_stop_sync_tasks",
-        "_stop_producers",
-        "_stop_live_persistence_writer",
-    ):
+    owners = {
+        "_stop_market_data_modules": runner.market_data_lifecycle,
+        "_stop_sync_tasks": runner.lifecycle,
+        "_stop_producers": runner.lifecycle,
+        "_stop_live_persistence_writer": runner.persistence,
+    }
+    for name, owner in owners.items():
         label = name.removeprefix("_")
         monkeypatch.setattr(
-            runner,
+            owner,
             name,
             _async_step(calls, label, error=errors.get(label)),
         )
@@ -228,7 +229,7 @@ def _install_shutdown_steps(
         if error is not None:
             raise error
 
-    runner.context.alerts.stop = stop_alerts
+    runner.app_context.alerts.stop = stop_alerts
 
 
 @pytest.mark.asyncio
@@ -257,11 +258,17 @@ async def test_final_shutdown_passes_exact_five_bound_steps(monkeypatch) -> None
         "alerts.stop",
     ]
     assert len(captured[0]) == 5
-    assert captured[0][0] is runner._stop_market_data_modules
-    assert captured[0][1] is runner._stop_sync_tasks
-    assert captured[0][2] is runner._stop_producers
-    assert captured[0][3] is runner._stop_live_persistence_writer
-    assert captured[0][4] is runner.context.alerts.stop
+    assert (
+        captured[0][0]
+        is runner.market_data_lifecycle._stop_market_data_modules
+    )
+    assert captured[0][1] is runner.lifecycle._stop_sync_tasks
+    assert captured[0][2] is runner.lifecycle._stop_producers
+    assert (
+        captured[0][3]
+        is runner.persistence._stop_live_persistence_writer
+    )
+    assert captured[0][4] is runner.app_context.alerts.stop
 
 
 @pytest.mark.asyncio
@@ -273,15 +280,23 @@ async def test_run_executes_final_shutdown_once_on_both_paths(
     runner = _runner()
     final_shutdown = AsyncMock()
     monkeypatch.setattr(runner, "_run_finally_shutdown", final_shutdown)
-    monkeypatch.setattr(runner, "_startup", AsyncMock())
-    monkeypatch.setattr(runner, "_start_producers", Mock(return_value=[]))
-    monkeypatch.setattr(runner, "_start_sync_tasks", Mock(return_value=[]))
+    monkeypatch.setattr(
+        runner.lifecycle, "_run_startup_sequence", AsyncMock()
+    )
+    monkeypatch.setattr(
+        runner.lifecycle, "_start_producers", Mock(return_value=[])
+    )
+    monkeypatch.setattr(
+        runner.lifecycle, "_start_sync_tasks", Mock(return_value=[])
+    )
 
     async def consume(*, max_market_events) -> None:
         if consumer_error:
             raise RuntimeError("runtime failed")
 
-    monkeypatch.setattr(runner, "_consume_market_events", consume)
+    monkeypatch.setattr(
+        runner.market_events, "_consume_market_events", consume
+    )
 
     if consumer_error:
         with pytest.raises(RuntimeError, match="runtime failed"):
@@ -322,11 +337,17 @@ async def test_cleanup_error_can_override_runtime_error(monkeypatch) -> None:
     runtime_error = RuntimeError("runtime failed")
     cleanup_error = RuntimeError("cleanup failed")
     runner = _runner()
-    monkeypatch.setattr(runner, "_startup", AsyncMock())
-    monkeypatch.setattr(runner, "_start_producers", Mock(return_value=[]))
-    monkeypatch.setattr(runner, "_start_sync_tasks", Mock(return_value=[]))
     monkeypatch.setattr(
-        runner,
+        runner.lifecycle, "_run_startup_sequence", AsyncMock()
+    )
+    monkeypatch.setattr(
+        runner.lifecycle, "_start_producers", Mock(return_value=[])
+    )
+    monkeypatch.setattr(
+        runner.lifecycle, "_start_sync_tasks", Mock(return_value=[])
+    )
+    monkeypatch.setattr(
+        runner.market_events,
         "_consume_market_events",
         AsyncMock(side_effect=runtime_error),
     )
@@ -369,7 +390,7 @@ async def test_explicit_stop_sets_event_then_runs_exact_three_steps_and_health(
         calls.append("health")
         runner._health = stopped
 
-    monkeypatch.setattr(runner, "_set_health", set_health)
+    monkeypatch.setattr(runner.lifecycle, "_set_health", set_health)
 
     result = await runner.stop()
 
@@ -383,13 +404,13 @@ async def test_explicit_stop_sets_event_then_runs_exact_three_steps_and_health(
     ]
     assert len(captured) == 1
     assert captured[0] == (
-        runner._stop_market_data_modules,
-        runner._stop_producers,
-        runner._stop_live_persistence_writer,
+        runner.market_data_lifecycle._stop_market_data_modules,
+        runner.lifecycle._stop_producers,
+        runner.persistence._stop_live_persistence_writer,
     )
     excluded = {
-        runner._stop_sync_tasks,
-        runner.context.alerts.stop,
+        runner.lifecycle._stop_sync_tasks,
+        runner.app_context.alerts.stop,
     }
     assert excluded.isdisjoint(captured[0])
     assert all(
@@ -404,7 +425,7 @@ async def test_explicit_stop_error_prevents_health_update(monkeypatch) -> None:
     coordinator = SimpleNamespace(execute=AsyncMock(side_effect=error))
     runner = _runner(shutdown_coordinator=coordinator)
     set_health = Mock()
-    monkeypatch.setattr(runner, "_set_health", set_health)
+    monkeypatch.setattr(runner.lifecycle, "_set_health", set_health)
 
     with pytest.raises(RuntimeError) as raised:
         await runner.stop()
@@ -421,7 +442,7 @@ async def test_repeated_explicit_stop_keeps_current_non_idempotent_behavior(
     coordinator = SimpleNamespace(execute=AsyncMock())
     runner = _runner(shutdown_coordinator=coordinator)
     set_health = Mock()
-    monkeypatch.setattr(runner, "_set_health", set_health)
+    monkeypatch.setattr(runner.lifecycle, "_set_health", set_health)
 
     await runner.stop()
     await runner.stop()

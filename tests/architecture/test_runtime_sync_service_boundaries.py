@@ -226,7 +226,7 @@ def test_runner_init_syncs_compatibility_fields_from_selected_registry() -> None
         node
         for node in assignments
         if ast.unparse(node.targets[0])
-        == "self.runtime_services.sync_service_registry"
+        == "account.sync_service_registry"
     )
     for field, property_name in (
         ("_account_sync_service", "account_service"),
@@ -300,7 +300,9 @@ def test_runner_owns_exact_account_and_order_service_builders() -> None:
                 "alert_sink": "self.context.alerts",
                 "throttle": "self._request_sync_throttle",
                 "active_check": "self._order_sync_active",
-                "position_plan_store": "self._get_position_plan_store()",
+                    "position_plan_store": (
+                        "self.ports.get_position_plan_store()"
+                    ),
             },
         ),
     }
@@ -376,8 +378,8 @@ def test_runner_retains_sync_context_callbacks_and_service_call_paths() -> None:
         if isinstance(node, ast.Attribute)
     }
     assert {
-        "_get_account_sync_service",
-        "_get_order_sync_service",
+        "get_account_sync_service",
+        "get_order_sync_service",
     } <= start_attributes
 
     signal_sync_methods = (
@@ -399,8 +401,8 @@ def test_runner_retains_sync_context_callbacks_and_service_call_paths() -> None:
     assert {
         "post_submit_sync_enabled",
         "post_order_sync_enabled",
-        "_get_order_sync_service",
-        "_get_account_sync_service",
+        "get_order_sync_service",
+        "get_account_sync_service",
         "sync_once",
     } <= execute_attributes
     assert {"post_submit", "post_order_account"} <= execute_strings

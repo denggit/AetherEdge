@@ -60,7 +60,7 @@ def test_capability_validation_is_first_startup_operation() -> None:
     assert isinstance(first, ast.Expr)
     assert isinstance(first.value, ast.Call)
     assert isinstance(first.value.func, ast.Attribute)
-    assert first.value.func.attr == "_strategy_capabilities"
+    assert first.value.func.attr == "strategy_capabilities"
 
 
 def test_capability_validator_has_no_concrete_strategy_dependency() -> None:
@@ -101,7 +101,7 @@ def test_runtime_requirements_use_one_strict_validator_at_direct_boundaries() ->
     assert "def validate_strategy_runtime_requirements(" in requirements_source
     assert "validate_strategy_runtime_requirements(self)" in requirements_source
     assert "return validate_strategy_runtime_requirements(value)" in requirements_source
-    assert "self.runtime_services.runtime_requirements" in wiring_source
+    assert "self.service_bundle.execution.runtime_requirements" in wiring_source
     assert "validate_strategy_runtime_requirements(" in wiring_source
 
 

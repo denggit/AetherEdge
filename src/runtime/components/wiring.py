@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from decimal import Decimal
 from typing import Callable, Sequence
@@ -31,6 +32,8 @@ from src.runtime.market_data.range_config import (
 )
 from src.runtime.market_data.range_repair_journal import RangeRepairJournalSession
 from src.runtime.persistence_service import RuntimePersistenceService
+from src.runtime.market_data_persistence import RuntimeMarketDataPersistence
+from src.market_data.storage import SqliteKlineStore
 from src.runtime.market_features import MarketFeaturePipeline
 from src.runtime.models import RuntimeHealth, RuntimeMode, RuntimePhase
 from src.runtime.market_data.range_background import RangeBackgroundServices
@@ -93,6 +96,7 @@ from src.runtime.live_types import (
     StartupPreviewState, logger,
 )
 from src.runtime.components.base import RuntimeComponent
+from src.runtime.ports import WiringPorts
 from src.runtime.components.latest_state_mailbox import (
     LatestStateMarketEventMailbox,
 )
@@ -100,6 +104,50 @@ from src.runtime.compat.services import LegacyRuntimeServiceView
 
 
 class WiringComponent(RuntimeComponent):
+    def __init__(self, context, ports: WiringPorts) -> None:
+        super().__init__(context)
+        self.bind_ports(ports)
+
+    def _get_live_kline_store(self):
+        repository = self.service_bundle.market.kline_store
+        if repository is None:
+            repository = SqliteKlineStore(
+                self.range_config.market_data_db_path
+            )
+            self.service_bundle.market.kline_store = repository
+        return repository
+
+    def _require_range_module(self) -> RangeBarModule:
+        if self._range_module is None:
+            raise LiveRuntimeError("Range capability is not enabled")
+        return self._range_module
+
+    def _get_runtime_persistence_service(self) -> RuntimePersistenceService:
+        return self._runtime_persistence_service
+
+    def _get_market_data_persistence(self) -> RuntimeMarketDataPersistence:
+        try:
+            self._persistence_alert_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        persistence = self._market_data_persistence
+        if persistence is None:
+            persistence = RuntimeMarketDataPersistence(
+                persistence_service=self._get_runtime_persistence_service(),
+                kline_store_provider=self._get_live_kline_store,
+                range_bar_store_provider=(
+                    lambda: self._require_range_module().bar_store
+                ),
+                completed_aggregate_store_provider=(
+                    lambda: self._require_range_module().checkpoint_store
+                ),
+                exchange=self.app_config.data_exchange.value,
+                clock_ms=lambda: int(time.time() * 1000),
+            )
+            self.service_bundle.persistence.market_data = persistence
+            self._market_data_persistence = persistence
+        return persistence
+
     def initialize(
         self,
         *,
@@ -118,18 +166,11 @@ class WiringComponent(RuntimeComponent):
         self._market_modules_managed = bool(managed_market_modules)
         self.context = app_context
         legacy_input = services
-        self.runtime_services = RuntimeServices.coerce(legacy_input)
+        legacy_services = RuntimeServices.coerce(legacy_input)
         self.service_bundle = RuntimeServiceBundle.from_legacy_boundary(
-            self.runtime_services
+            legacy_services
         )
-        self.services = (
-            LegacyRuntimeServiceView(
-                self.service_bundle,
-                self.runtime_services,
-            )
-            if isinstance(legacy_input, dict)
-            else self.service_bundle
-        )
+        self.services = LegacyRuntimeServiceView(self.service_bundle)
         self._initialize_strategy_runtime()
         self._initialize_execution_runtime()
         self._initialize_market_runtime()
@@ -137,14 +178,14 @@ class WiringComponent(RuntimeComponent):
         self._initialize_range_runtime()
 
     def _initialize_strategy_runtime(self) -> None:
-        injected_strategy_host = self.runtime_services.strategy_host
+        injected_strategy_host = self.service_bundle.execution.strategy_host
         self._strategy_host = (
             injected_strategy_host
             if injected_strategy_host is not None
             else StrategyHost(self.context.strategy)
         )
         injected_market_feature_pipeline = (
-            self.runtime_services.market_feature_pipeline
+            self.service_bundle.market.market_feature_pipeline
         )
         self._market_feature_pipeline = (
             injected_market_feature_pipeline
@@ -152,15 +193,16 @@ class WiringComponent(RuntimeComponent):
             else MarketFeaturePipeline(self.context.strategy)
         )
         self._project_env: ProjectEnvConfig = (
-            self.runtime_services.project_env_config or get_project_env_config()
+            self.service_bundle.account.project_env_config
+            or get_project_env_config()
         )
         self._account_config_env: AccountConfigEnv | None = None
         self._account_config_new_entries_blocked: bool = False
         self._account_config_apply_writes: bool = False
         self._account_config_results: tuple[AccountConfigBootstrapResult, ...] = ()
-        if self.runtime_services.runtime_requirements is not None:
+        if self.service_bundle.execution.runtime_requirements is not None:
             self.requirements = validate_strategy_runtime_requirements(
-                self.runtime_services.runtime_requirements
+                self.service_bundle.execution.runtime_requirements
             )
         else:
             self.requirements = resolve_strategy_runtime_requirements(
@@ -183,23 +225,25 @@ class WiringComponent(RuntimeComponent):
         self._stop_event = asyncio.Event()
         self._producer_tasks: list[asyncio.Task] = []
         self._sync_tasks: list[asyncio.Task] = []
-        injected_sync_lifecycle = self.runtime_services.sync_lifecycle
+        injected_sync_lifecycle = self.service_bundle.lifecycle.sync_lifecycle
         self._sync_lifecycle = (
             injected_sync_lifecycle
             if injected_sync_lifecycle is not None
             else RuntimeSyncLifecycle()
         )
-        self.runtime_services.sync_lifecycle = self._sync_lifecycle
+        self.service_bundle.lifecycle.sync_lifecycle = self._sync_lifecycle
 
     def _initialize_execution_runtime(self) -> None:
         self._execution_clients: tuple[ExecutionClient, ...] | None = None
         self._account_clients: tuple[AccountClient, ...] | None = None
-        self._order_journal = self.runtime_services.order_journal
-        self._position_plan_store = self.runtime_services.position_plan_store
-        self._order_coordinator = self.runtime_services.order_coordinator
-        self._account_sync_service = self.runtime_services.account_sync_service
-        self._order_sync_service = self.runtime_services.order_sync_service
-        injected_sync_service_registry = self.runtime_services.sync_service_registry
+        execution = self.service_bundle.execution
+        account = self.service_bundle.account
+        self._order_journal = execution.order_journal
+        self._position_plan_store = execution.position_plan_store
+        self._order_coordinator = execution.order_coordinator
+        self._account_sync_service = account.account_sync_service
+        self._order_sync_service = account.order_sync_service
+        injected_sync_service_registry = account.sync_service_registry
         self._sync_service_registry = (
             injected_sync_service_registry
             if injected_sync_service_registry is not None
@@ -208,7 +252,7 @@ class WiringComponent(RuntimeComponent):
                 order_service=self._order_sync_service,
             )
         )
-        self.runtime_services.sync_service_registry = self._sync_service_registry
+        account.sync_service_registry = self._sync_service_registry
         self._account_sync_service = getattr(
             self._sync_service_registry,
             "account_service",
@@ -220,45 +264,44 @@ class WiringComponent(RuntimeComponent):
             None,
         )
         injected_signal_execution_service = (
-            self.runtime_services.signal_execution_service
+            execution.signal_execution_service
         )
         self._signal_execution_service = (
             injected_signal_execution_service
             if injected_signal_execution_service is not None
             else RuntimeSignalExecutionService()
         )
-        self.runtime_services.signal_execution_service = (
-            self._signal_execution_service
-        )
+        execution.signal_execution_service = self._signal_execution_service
         self._request_sync_throttle = (
-            self.runtime_services.request_sync_throttle
+            account.request_sync_throttle
             or RequestThrottle(min_interval_seconds=0.25)
         )
-        self._recovery_service = self.runtime_services.recovery_service
-        injected_recovery_coordinator = self.runtime_services.recovery_coordinator
+        recovery = self.service_bundle.recovery
+        self._recovery_service = recovery.recovery_service
+        injected_recovery_coordinator = recovery.recovery_coordinator
         self._recovery_coordinator = (
             injected_recovery_coordinator
             if injected_recovery_coordinator is not None
             else RuntimeRecoveryCoordinator()
         )
-        self.runtime_services.recovery_coordinator = self._recovery_coordinator
-        self._reconciliation_service = self.runtime_services.reconciliation_service
+        recovery.recovery_coordinator = self._recovery_coordinator
+        self._reconciliation_service = recovery.reconciliation_service
         injected_reconciliation_coordinator = (
-            self.runtime_services.reconciliation_coordinator
+            recovery.reconciliation_coordinator
         )
         self._reconciliation_coordinator = (
             injected_reconciliation_coordinator
             if injected_reconciliation_coordinator is not None
             else RuntimeReconciliationCoordinator()
         )
-        self.runtime_services.reconciliation_coordinator = (
-            self._reconciliation_coordinator
-        )
+        recovery.reconciliation_coordinator = self._reconciliation_coordinator
 
     def _initialize_market_runtime(self) -> None:
-        self._live_persistence_writer = self.runtime_services.live_persistence_writer
+        persistence = self.service_bundle.persistence
+        market = self.service_bundle.market
+        self._live_persistence_writer = persistence.writer
         injected_persistence_service = (
-            self.runtime_services.runtime_persistence_service
+            persistence.runtime
         )
         self._runtime_persistence_service = (
             injected_persistence_service
@@ -269,26 +312,22 @@ class WiringComponent(RuntimeComponent):
                 writer_name="live-persistence-writer",
             )
         )
-        self.runtime_services.runtime_persistence_service = (
-            self._runtime_persistence_service
-        )
+        persistence.runtime = self._runtime_persistence_service
         self._persistence_alert_loop: asyncio.AbstractEventLoop | None = None
         self._trade_feature_config = TradeFeatureRuntimeConfig.from_strategy(
             self.context.strategy
         )
-        self.runtime_services.trade_feature_config = self._trade_feature_config
-        self._market_data_persistence = (
-            self.runtime_services.market_data_persistence
-        )
+        market.trade_feature_config = self._trade_feature_config
+        self._market_data_persistence = persistence.market_data
         self._get_market_data_persistence()
         self._range_repair_bootstrap_service = (
-            self.runtime_services.range_repair_bootstrap_service
+            self.service_bundle.range.repair_bootstrap_service
         )
         self._producer_monitor: ProducerHealthMonitor = (
-            self.runtime_services.producer_monitor or ProducerHealthMonitor()
+            market.producer_monitor or ProducerHealthMonitor()
         )
         self._producer_supervisor: ProducerSupervisor = (
-            self.runtime_services.producer_supervisor
+            market.producer_supervisor
             or ProducerSupervisor(
             monitor=self._producer_monitor,
             stale_after_ms=self.runtime_config.producer_stale_timeout_ms,
@@ -306,7 +345,7 @@ class WiringComponent(RuntimeComponent):
 
     def _initialize_operational_state(self) -> None:
         self._closed_bar_scheduler: ClosedBarScheduler = (
-            self.runtime_services.closed_bar_scheduler
+            self.service_bundle.market.closed_bar_scheduler
             or ClosedBarScheduler(
             interval_ms=self._closed_bar_interval_ms,
             close_buffer_ms=self._closed_bar_buffer_ms,
@@ -315,14 +354,14 @@ class WiringComponent(RuntimeComponent):
             )
         )
         self._intent_factory = (
-            self.runtime_services.intent_factory
+            self.service_bundle.execution.intent_factory
             or LiveOrderIntentFactory(
             strategy_id=self.app_config.strategy,
             target_exchanges=self.app_config.exchanges,
             )
         )
         self._last_snapshot: PlatformSnapshot | None = (
-            self.runtime_services.snapshot
+            self.service_bundle.recovery.snapshot
         )
         self._last_snapshots: tuple[PlatformSnapshot, ...] = ()
         self._last_account_snapshot_log_state: dict[tuple[str, str], tuple[Decimal, Decimal]] = {}
@@ -343,53 +382,53 @@ class WiringComponent(RuntimeComponent):
             caught_up=not self.runtime_config.warmup_enabled,
             metadata={"runtime_mode": self.runtime_config.mode.value, "strategy": self.app_config.strategy},
         )
-        injected_health_state = self.runtime_services.runtime_health_state
+        lifecycle = self.service_bundle.lifecycle
+        injected_health_state = lifecycle.runtime_health_state
         self._runtime_health_state = (
             injected_health_state
             if injected_health_state is not None
             else RuntimeHealthState(initial_health)
         )
-        self.runtime_services.runtime_health_state = self._runtime_health_state
+        lifecycle.runtime_health_state = self._runtime_health_state
         self._health = self._runtime_health_state.current
-        injected_heartbeat_service = self.runtime_services.heartbeat_service
+        injected_heartbeat_service = lifecycle.heartbeat_service
         self._heartbeat_service = (
             injected_heartbeat_service
             if injected_heartbeat_service is not None
             else RuntimeHeartbeatService()
         )
-        self.runtime_services.heartbeat_service = self._heartbeat_service
+        lifecycle.heartbeat_service = self._heartbeat_service
         injected_shutdown_coordinator = (
-            self.runtime_services.shutdown_coordinator
+            lifecycle.shutdown_coordinator
         )
         self._shutdown_coordinator = (
             injected_shutdown_coordinator
             if injected_shutdown_coordinator is not None
             else RuntimeShutdownCoordinator()
         )
-        self.runtime_services.shutdown_coordinator = self._shutdown_coordinator
+        lifecycle.shutdown_coordinator = self._shutdown_coordinator
         injected_startup_phase_coordinator = (
-            self.runtime_services.startup_phase_coordinator
+            lifecycle.startup_phase_coordinator
         )
         self._startup_phase_coordinator = (
             injected_startup_phase_coordinator
             if injected_startup_phase_coordinator is not None
             else RuntimeStartupPhaseCoordinator()
         )
-        self.runtime_services.startup_phase_coordinator = (
-            self._startup_phase_coordinator
-        )
+        lifecycle.startup_phase_coordinator = self._startup_phase_coordinator
         self._startup_catchup_decision: StartupCatchupDecision | None = None
         self._startup_catchup_evaluated = False
         self._startup_catchup_range_observed = False
         self._range_speed_warmup: RangeSpeedWarmup | None = None
         self._startup_feature_backfill_providers = (
-            self.runtime_services.startup_feature_backfill_providers
+            lifecycle.startup_feature_backfill_providers
         )
         self._feature_backfill_providers_resolved = False
         self._range_background: RangeBackgroundServices | None = None
 
     def _initialize_range_runtime(self) -> None:
         if self.requirements.range_bars.enabled:
+            range_services = self.service_bundle.range
             market_profile = getattr(
                 self.context.data,
                 "market_profile",
@@ -410,11 +449,15 @@ class WiringComponent(RuntimeComponent):
                 min_bars=self.requirements.range_bars.min_bars,
                 runtime_config=self.range_config,
                 startup_catchup=self.runtime_config.startup_catchup,
-                publish=self.process_market_feature,
+                publish=self.ports.process_market_feature,
                 persistence=self._get_market_data_persistence(),
                 stop_event=self._stop_event,
-                speed_provider=self._strategy_range_speed_history_provider,
-                repair_bootstrap=self._get_range_repair_bootstrap_service,
+                speed_provider=(
+                    self.ports.strategy_range_speed_history_provider
+                ),
+                repair_bootstrap=(
+                    self.ports.get_range_repair_bootstrap_service
+                ),
                 emit_alert=getattr(
                     getattr(self.context, "alerts", None),
                     "emit",
@@ -424,40 +467,42 @@ class WiringComponent(RuntimeComponent):
                 on_error=lambda message, exc: logger.warning(
                     "%s | error=%s", message, exc
                 ),
-                on_bar_persist_error=self._on_range_bar_persist_error,
+                on_bar_persist_error=self.ports.on_range_bar_persist_error,
                 on_aggregate_persist_error=(
-                    self._on_completed_range_aggregate_persist_error
+                    self.ports.on_completed_range_aggregate_persist_error
                 ),
-                on_rejected=self._on_live_persistence_write_rejected,
+                on_rejected=(
+                    self.ports.on_live_persistence_write_rejected
+                ),
                 overrides=RangeModuleOverrides(
-                    module=self.runtime_services.range_bar_module,
-                    bar_builder=self.runtime_services.range_bar_builder,
-                    bar_store=self.runtime_services.range_bar_store,
-                    bar_aggregator=self.runtime_services.range_bar_aggregator,
+                    module=range_services.module,
+                    bar_builder=range_services.bar_builder,
+                    bar_store=range_services.bar_store,
+                    bar_aggregator=range_services.bar_aggregator,
                     checkpoint_store=(
-                        self.runtime_services.range_checkpoint_store
+                        range_services.checkpoint_store
                     ),
                     checkpoint_writer=(
-                        self.runtime_services.range_checkpoint_writer
+                        range_services.checkpoint_writer
                     ),
                     repair_journal_store=(
-                        self.runtime_services.range_repair_journal_store
+                        range_services.repair_journal_store
                     ),
                     repair_journal_writer=(
-                        self.runtime_services.range_repair_journal_writer
+                        range_services.repair_journal_writer
                     ),
                     backfill_supervisor=(
-                        self.runtime_services.range_backfill_supervisor
+                        range_services.backfill_supervisor
                     ),
                     micro_repair_supervisor=(
-                        self.runtime_services.range_micro_repair_supervisor
+                        range_services.micro_repair_supervisor
                     ),
                     speed_history_refresher=(
-                        self.runtime_services.range_speed_history_refresher
+                        range_services.speed_history_refresher
                     ),
                 ),
             ).build()
-            self.runtime_services.range_bar_module = self._range_module
+            range_services.module = self._range_module
             self._range_repair_journal = self._range_module.repair_journal
             self._range_speed_warmup = self._range_module.speed_warmup
             self._range_background = self._range_module.background

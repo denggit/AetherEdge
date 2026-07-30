@@ -16,7 +16,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.market_data.storage.trade_feature_repository import (  # noqa: E402
-    SqliteTradeFeatureRepository as SqliteTradeFeatureStore,
+    SqliteTradeFeatureRepository,
 )
 from src.market_data.trade_features.coverage import (  # noqa: E402
     latest_range_footprint_context_audit,
@@ -569,11 +569,11 @@ def _readiness_audit(
     *,
     required_minutes: int,
 ) -> dict[str, Any]:
-    store = SqliteTradeFeatureStore(path=args.market_db)
+    repository = SqliteTradeFeatureRepository(path=args.market_db)
     readiness = resolve_trade_feature_readiness(
         symbol=args.symbol,
         exchange=args.exchange,
-        store=store,
+        store=repository,
         required_minutes=required_minutes,
         range_pct=args.range_footprint_range_pct,
         price_step=args.range_footprint_price_step,
@@ -612,7 +612,7 @@ def _readiness_audit(
     context_audit = latest_range_footprint_context_audit(
         symbol=args.symbol,
         exchange=args.exchange,
-        store=store,
+        store=repository,
         cutoff_ms=(
             0
             if reference_end_ms is None

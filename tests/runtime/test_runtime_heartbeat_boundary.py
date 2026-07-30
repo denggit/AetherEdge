@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,7 +14,9 @@ from src.platform import ExchangeName
 from src.platform.config import ProjectEnvConfig
 from src.platform.data.models import MarketEventType, MarketTrade, TradeSide
 from src.runtime import LiveRuntimeConfig, RuntimeMode
+from src.runtime.components import LifecycleComponent
 from src.runtime.components import catchup as catchup_component
+from src.runtime.context import RuntimeContext
 from src.runtime.models import RuntimePhase
 from src.runtime.requirements import StrategyRuntimeRequirements
 from src.runtime.runner import LiveRuntimeRunner
@@ -154,72 +157,72 @@ async def test_startup_uses_injected_heartbeat_once_in_existing_order(
     snapshots = (object(),)
     runner._account_config_new_entries_blocked = False
     monkeypatch.setattr(
-        runner,
+        runner.startup,
         "_initialize_rangebar_trust_window",
         lambda: calls.append("initialize_trust_window"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.lifecycle,
         "_set_health",
         lambda phase, **kwargs: calls.append(f"health.{phase.value}"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.startup,
         "_bootstrap_account_config_if_enabled",
         _async_stage(calls, "account_config"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.startup,
         "_check_strategy_position_mode_requirements",
         _async_stage(calls, "position_mode"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.startup,
         "_run_warmup",
         _async_stage(calls, "warmup"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.startup,
         "_warmup_range_speed_history",
         _async_stage(calls, "range_speed_warmup", 0),
     )
     monkeypatch.setattr(
-        runner,
+        runner.lifecycle,
         "_check_startup_feature_backfills",
         _async_stage(calls, "feature_backfills"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.recovery,
         "_run_recovery",
         _async_stage(calls, "recovery", snapshots),
     )
     monkeypatch.setattr(
-        runner,
+        runner.account_runtime,
         "_run_reconciliation",
         _async_stage(calls, "reconciliation"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.catchup,
         "_call_on_start",
         _async_stage(calls, "strategy.on_start"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.catchup,
         "_evaluate_startup_catchup_once",
         _async_stage(calls, "startup_catchup"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.startup,
         "_finish_range_speed_warmup_after_catchup",
         _async_stage(calls, "finish_range_speed_warmup"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.market_data_lifecycle,
         "_start_range_speed_background_services",
         lambda: calls.append("start_range_speed_background_services"),
     )
 
-    await runner._startup()
+    await runner.lifecycle._run_startup_sequence()
 
     assert calls == [
         "initialize_trust_window",
@@ -258,27 +261,33 @@ def test_periodic_heartbeat_is_unconditional_ordered_and_uses_stop_event() -> No
         return create
 
     heartbeat.run_periodic.side_effect = task("heartbeat")
-    runner.requirements = SimpleNamespace(
+    runner.lifecycle.requirements = SimpleNamespace(
         account_state=SimpleNamespace(poll_enabled=True),
         order_state=SimpleNamespace(poll_when_position_enabled=True),
     )
-    runner._get_account_sync_service = lambda: SimpleNamespace(
+    runner.account_runtime._get_account_sync_service = lambda: SimpleNamespace(
         run_periodic=task("account")
     )
-    runner._get_order_sync_service = lambda: SimpleNamespace(
+    runner.account_runtime._get_order_sync_service = lambda: SimpleNamespace(
         run_periodic=task("order")
     )
-    runner._periodic_follower_close_check = task("follower_close")
-    runner._get_startup_feature_backfill_providers = lambda: (object(),)
-    runner._periodic_feature_readiness_refresh = task("feature_readiness")
+    runner.account_runtime._periodic_follower_close_check = task(
+        "follower_close"
+    )
+    runner.lifecycle._get_startup_feature_backfill_providers = (
+        lambda: (object(),)
+    )
+    runner.lifecycle._periodic_feature_readiness_refresh = task(
+        "feature_readiness"
+    )
 
     class Lifecycle:
         def start(self, factories):
             return [factory() for factory in factories]
 
-    runner._sync_lifecycle = Lifecycle()
+    runner.lifecycle._sync_lifecycle = Lifecycle()
 
-    runner._start_sync_tasks()
+    runner.lifecycle._start_sync_tasks()
 
     assert [name for name, _ in calls] == [
         "account",
@@ -294,17 +303,17 @@ def test_periodic_heartbeat_is_unconditional_ordered_and_uses_stop_event() -> No
 
 @pytest.mark.asyncio
 async def test_stop_sync_tasks_only_delegates_to_lifecycle() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    component = LifecycleComponent(RuntimeContext())
     heartbeat = _HeartbeatProbe()
     lifecycle = SimpleNamespace(stop=AsyncMock())
-    runner._heartbeat_service = heartbeat
-    runner._sync_lifecycle = lifecycle
-    runner._sync_tasks = [object()]
+    component._heartbeat_service = heartbeat
+    component._sync_lifecycle = lifecycle
+    component._sync_tasks = [object()]
 
-    await runner._stop_sync_tasks()
+    await component._stop_sync_tasks()
 
     lifecycle.stop.assert_awaited_once_with()
-    assert runner._sync_tasks == []
+    assert component._sync_tasks == []
     _assert_heartbeat_business_methods_not_called(heartbeat)
 
 
@@ -332,24 +341,17 @@ async def _process_market_event_with_order(
     )
     runner = _runner(heartbeat_service=heartbeat)
     monkeypatch.setattr(
-        runner,
-        "_set_health",
-        lambda *args, **kwargs: calls.append("health.update"),
-    )
-    monkeypatch.setattr(
-        runner,
+        runner.market_events,
         "_call_strategy_market_event",
         _async_stage(calls, "strategy", ()),
     )
-    monkeypatch.setattr(
-        runner,
-        "_execute_signals",
-        _async_stage(calls, "signals"),
-    )
-    monkeypatch.setattr(
-        runner,
-        "_maybe_log_live_data_path_stats",
-        lambda: calls.append("data_path"),
+    runner.market_events.ports = replace(
+        runner.market_events.ports,
+        set_health=lambda *args, **kwargs: calls.append("health.update"),
+        execute_signals=_async_stage(calls, "signals"),
+        maybe_log_live_data_path_stats=(
+            lambda: calls.append("data_path")
+        ),
     )
     await runner.process_market_event(event)
     return heartbeat, calls
@@ -412,13 +414,11 @@ async def test_closed_bar_notes_open_time_before_pipeline_dispatch(
             return ()
 
     runner = _runner(heartbeat_service=heartbeat)
-    runner._market_feature_pipeline = Pipeline()
-    monkeypatch.setattr(
-        runner,
-        "_execute_signals",
-        _async_stage(calls, "signals"),
+    runner.persistence._market_feature_pipeline = Pipeline()
+    runner.market_events.ports = replace(
+        runner.market_events.ports,
+        execute_signals=_async_stage(calls, "signals"),
     )
-    monkeypatch.setattr(runner, "_maybe_log_live_data_path_stats", lambda: None)
 
     await runner.process_market_feature(
         _feature_event(
@@ -448,11 +448,13 @@ async def test_non_closed_or_non_int_open_time_is_not_noted(
 ) -> None:
     heartbeat = _HeartbeatProbe()
     runner = _runner(heartbeat_service=heartbeat)
-    runner._market_feature_pipeline = SimpleNamespace(
+    runner.persistence._market_feature_pipeline = SimpleNamespace(
         dispatch=AsyncMock(return_value=())
     )
-    runner._execute_signals = AsyncMock()
-    runner._maybe_log_live_data_path_stats = Mock()
+    runner.market_events.ports = replace(
+        runner.market_events.ports,
+        execute_signals=AsyncMock(),
+    )
 
     await runner.process_market_feature(
         _feature_event(
@@ -468,22 +470,24 @@ async def test_non_closed_or_non_int_open_time_is_not_noted(
 async def test_startup_catchup_reads_previous_heartbeat_once(monkeypatch) -> None:
     heartbeat = _HeartbeatProbe()
     runner = _runner(heartbeat_service=heartbeat)
-    runner.requirements = SimpleNamespace(
+    runner.catchup.requirements = SimpleNamespace(
         closed_kline=SimpleNamespace(enabled=True)
     )
-    runner.runtime_config = SimpleNamespace(
+    runner.catchup.runtime_config = SimpleNamespace(
         startup_catchup=SimpleNamespace(
             enabled=True,
             fresh_open_window_seconds=300,
         )
     )
-    runner._startup_catchup_evaluated = False
-    runner._closed_bar_interval_ms = 4 * 60 * 60 * 1000
+    runner.catchup._startup_catchup_evaluated = False
+    runner.catchup._closed_bar_interval_ms = 4 * 60 * 60 * 1000
     runner._last_snapshots = ()
-    runner._has_any_active_position_for_catchup = lambda snapshots: True
-    runner._closed_bar_scheduler = SimpleNamespace(mark_emitted=Mock())
+    runner.catchup._has_any_active_position_for_catchup = (
+        lambda snapshots: True
+    )
+    runner.catchup._closed_bar_scheduler = SimpleNamespace(mark_emitted=Mock())
     monkeypatch.setattr(catchup_component.time, "time", lambda: 1_728_000)
 
-    await runner._evaluate_startup_catchup_once(object())
+    await runner.catchup._evaluate_startup_catchup_once(object())
 
     heartbeat.read_previous.assert_called_once_with()

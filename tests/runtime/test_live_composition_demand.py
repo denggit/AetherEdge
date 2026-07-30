@@ -1097,12 +1097,12 @@ async def test_formal_runtime_exits_when_trade_source_fails(
     async def no_op() -> None:
         return None
 
-    application.runner._startup = no_op
-    application.runner._start_producers = lambda: []
-    application.runner._start_sync_tasks = lambda: []
-    application.runner._stop_producers = no_op
-    application.runner._stop_sync_tasks = no_op
-    application.runner._stop_live_persistence_writer = no_op
+    application.runner.lifecycle._run_startup_sequence = no_op
+    application.runner.lifecycle._start_producers = lambda: []
+    application.runner.lifecycle._start_sync_tasks = lambda: []
+    application.runner.lifecycle._stop_producers = no_op
+    application.runner.lifecycle._stop_sync_tasks = no_op
+    application.runner.persistence._stop_live_persistence_writer = no_op
 
     with pytest.raises(
         MarketDataRuntimeError,
@@ -1185,12 +1185,12 @@ async def test_formal_runtime_exits_when_feature_handler_fails(
     async def no_op() -> None:
         return None
 
-    application.runner._startup = no_op
-    application.runner._start_producers = lambda: []
-    application.runner._start_sync_tasks = lambda: []
-    application.runner._stop_producers = no_op
-    application.runner._stop_sync_tasks = no_op
-    application.runner._stop_live_persistence_writer = no_op
+    application.runner.lifecycle._run_startup_sequence = no_op
+    application.runner.lifecycle._start_producers = lambda: []
+    application.runner.lifecycle._start_sync_tasks = lambda: []
+    application.runner.lifecycle._stop_producers = no_op
+    application.runner.lifecycle._stop_sync_tasks = no_op
+    application.runner.persistence._stop_live_persistence_writer = no_op
 
     with pytest.raises(MarketDataRuntimeError, match="injected feature failure"):
         await application.run()

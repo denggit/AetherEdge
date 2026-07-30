@@ -73,7 +73,7 @@ class MarketEventsComponent(RuntimeComponent):
                 self._last_trade_health_update_ms = now_ms
 
         if should_update_health:
-            self._set_health(
+            self.ports.set_health(
                 RuntimePhase.RUNNING,
                 healthy=self._health.healthy,
                 last_market_event_time_ms=event_ms,
@@ -84,12 +84,12 @@ class MarketEventsComponent(RuntimeComponent):
             )
 
         signals = await self._call_strategy_market_event(event)
-        await self._execute_signals(
+        await self.ports.execute_signals(
             signals,
             source=event.event_type.value,
             event_time_ms=event_ms,
         )
-        self._maybe_log_live_data_path_stats()
+        self.ports.maybe_log_live_data_path_stats()
 
     async def _process_market_feature_event(
         self,
@@ -111,14 +111,14 @@ class MarketEventsComponent(RuntimeComponent):
             )
             if isinstance(open_ms, int):
                 heartbeat.note_closed_bar(open_ms)
-        signals = await self._get_market_feature_pipeline().dispatch(event)
-        await self._execute_signals(
+        signals = await self.ports.get_market_feature_pipeline().dispatch(event)
+        await self.ports.execute_signals(
             signals,
             source=event.type_value,
             event_time_ms=event.event_time_ms,
             metadata={"feature_type": event.type_value},
         )
-        self._maybe_log_live_data_path_stats()
+        self.ports.maybe_log_live_data_path_stats()
 
     async def _enqueue_market_event(self, event: MarketEvent) -> None:
         if isinstance(event, MarketTrade) or event.event_type is MarketEventType.TRADE:
@@ -273,9 +273,9 @@ class MarketEventsComponent(RuntimeComponent):
             if max_market_events is not None and self.stats.market_events_seen >= max_market_events:
                 break
             self._raise_on_unhealthy_market_data()
-            self._raise_on_unhealthy_producer()
+            self.ports.raise_on_unhealthy_producer()
             if self.requirements.closed_kline.enabled:
-                await self.poll_closed_bar_once(_health_prechecked=True)
+                await self.ports.poll_closed_bar_once(_health_prechecked=True)
             self._raise_on_unhealthy_market_data()
             remaining_capacity = self._market_queue_drain_batch_size + 1
             if max_market_events is not None:
@@ -328,7 +328,7 @@ class MarketEventsComponent(RuntimeComponent):
 
             if processed == 0:
                 if (
-                    self._all_producers_done()
+                    self.ports.all_producers_done()
                     and self._market_queue.empty()
                     and self._latest_state_mailbox.empty()
                 ):
@@ -355,7 +355,7 @@ class MarketEventsComponent(RuntimeComponent):
             event = self._latest_state_mailbox.get_nowait()
         except asyncio.QueueEmpty:
             return False
-        await self.process_market_event(event)
+        await self.ports.process_market_event(event)
         return True
 
     async def _process_normal_market_event_batch(
@@ -370,7 +370,7 @@ class MarketEventsComponent(RuntimeComponent):
             except asyncio.QueueEmpty:
                 break
             try:
-                await self.process_market_event(event)
+                await self.ports.process_market_event(event)
             finally:
                 self._market_queue.task_done()
             processed += 1
@@ -389,13 +389,13 @@ class MarketEventsComponent(RuntimeComponent):
             runtime.raise_if_failed()
 
     def _trade_integrity_tracker(self) -> TradeDataIntegrityTracker | None:
-        value = self.service_bundle.market.trade_data_integrity_tracker
+        value = self.market_services.trade_data_integrity_tracker
         return value if isinstance(value, TradeDataIntegrityTracker) else None
 
     def _order_book_integrity_tracker(
         self,
     ) -> OrderBookDataIntegrityTracker | None:
-        value = self.service_bundle.market.order_book_data_integrity_tracker
+        value = self.market_services.order_book_data_integrity_tracker
         return (
             value
             if isinstance(value, OrderBookDataIntegrityTracker)

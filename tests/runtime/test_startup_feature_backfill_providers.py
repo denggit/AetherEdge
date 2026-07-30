@@ -21,6 +21,7 @@ from src.runtime.startup_feature_backfill import (
     resolve_startup_feature_backfill_providers,
 )
 import src.runtime.runner as runner_module
+import src.runtime.components.lifecycle as lifecycle_module
 
 
 class _Provider:
@@ -118,19 +119,19 @@ def _runner(strategy: object) -> LiveRuntimeRunner:
 def test_no_provider_passes_without_health_entry() -> None:
     runner = _runner(_Strategy())
 
-    asyncio.run(runner._check_startup_feature_backfills())
+    asyncio.run(runner.lifecycle._check_startup_feature_backfills())
 
     assert "feature_backfill_results" not in (
         runner._health.metadata
     )
 
 
-def test_runner_imports_feature_backfill_resolver() -> None:
+def test_lifecycle_component_imports_feature_backfill_resolver() -> None:
     assert (
-        runner_module.resolve_startup_feature_backfill_providers
+        lifecycle_module.resolve_startup_feature_backfill_providers
         is resolve_startup_feature_backfill_providers
     )
-    source = inspect.getsource(runner_module)
+    source = inspect.getsource(lifecycle_module)
     assert (
         "from src.runtime.startup_feature_backfill import"
         in source
@@ -143,7 +144,7 @@ def test_ready_result_updates_health_metadata() -> None:
     )
     runner = _runner(_Strategy((provider,)))
 
-    asyncio.run(runner._check_startup_feature_backfills())
+    asyncio.run(runner.lifecycle._check_startup_feature_backfills())
 
     result = runner._health.metadata[
         "feature_backfill_results"
@@ -157,7 +158,7 @@ def test_launched_not_ready_result_updates_health_metadata() -> None:
     )
     runner = _runner(_Strategy((provider,)))
 
-    asyncio.run(runner._check_startup_feature_backfills())
+    asyncio.run(runner.lifecycle._check_startup_feature_backfills())
 
     result = runner._health.metadata[
         "feature_backfill_results"
@@ -169,7 +170,7 @@ def test_provider_exception_is_audited_without_raising(caplog) -> None:
     provider = _Provider({}, error=RuntimeError("boom"))
     runner = _runner(_Strategy((provider,)))
 
-    asyncio.run(runner._check_startup_feature_backfills())
+    asyncio.run(runner.lifecycle._check_startup_feature_backfills())
 
     result = runner._health.metadata[
         "feature_backfill_results"
@@ -198,7 +199,7 @@ def test_provider_can_emit_generic_market_feature_event(
         capture,
     )
 
-    asyncio.run(runner._check_startup_feature_backfills())
+    asyncio.run(runner.lifecycle._check_startup_feature_backfills())
 
     assert emitted == [provider.event]
 

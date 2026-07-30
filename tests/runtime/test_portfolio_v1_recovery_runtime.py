@@ -24,6 +24,8 @@ from src.order_management.reconciliation.models import (
     ReconciliationVerdict,
 )
 from src.runtime.recovery.models import RecoveryReport
+from src.runtime.components import AccountComponent, RecoveryComponent
+from src.runtime.context import RuntimeContext
 from src.runtime.recovery_coordinator import RuntimeRecoveryCoordinator
 from src.runtime.models import RuntimeMode
 from src.runtime.strategy_capabilities import ValidatedStrategyCapabilities
@@ -35,6 +37,7 @@ from src.runtime.runner import (
     LiveRuntimeRunner,
     _is_fatal_startup_error,
 )
+from src.runtime.ports import AccountPorts, RecoveryPorts
 from src.strategy.positions import (
     StrategyPositionSide,
     StrategyPositionSnapshot,
@@ -184,6 +187,36 @@ def _runner(strategy: _Strategy) -> LiveRuntimeRunner:
         startup_preview=None,
         pending_work=None,
     )
+    runtime_context = RuntimeContext()
+    runner.recovery = RecoveryComponent(runtime_context)
+    runner.account_runtime = AccountComponent(runtime_context)
+    for component in (runner.recovery, runner.account_runtime):
+        component.app_config = runner.app_config
+        component.context = runner.context
+        component.runtime_config = runner.runtime_config
+    runner.recovery._recovery_coordinator = runner._recovery_coordinator
+    runner.recovery._validated_strategy_capabilities = (
+        runner._validated_strategy_capabilities
+    )
+    runner.recovery.bind_ports(RecoveryPorts(
+        execute_signals=lambda *_args, **_kwargs: None,
+        get_account_clients=lambda: (),
+        get_execution_clients=lambda: (),
+        get_order_journal=lambda: None,
+        get_position_plan_store=lambda: None,
+        resolved_account_config_env=lambda: None,
+        strategy_position_index=runner.account_runtime._strategy_position_index,
+    ))
+    runner.account_runtime._reconciliation_coordinator = (
+        runner._reconciliation_coordinator
+    )
+    runner.account_runtime.bind_ports(AccountPorts(
+        execute_signals=lambda *_args, **_kwargs: None,
+        get_execution_clients=lambda: (),
+        get_order_journal=lambda: None,
+        get_position_plan_store=lambda: None,
+        strategy_pending_work_provider=lambda: None,
+    ))
     return runner
 
 
@@ -191,7 +224,9 @@ def test_runtime_recovery_validates_all_v1_snapshots_with_aggregate_position() -
     strategy = _Strategy(_strategy_positions())
     report = RecoveryReport(ok=True, snapshots=(_snapshot(with_lf_stop=True),))
 
-    _runner(strategy)._validate_recovery_protection_postcondition(report)
+    _runner(strategy).recovery._validate_recovery_protection_postcondition(
+        report
+    )
 
 
 def test_mf_explicit_no_stop_does_not_require_lf_stop_scope() -> None:
@@ -199,7 +234,9 @@ def test_mf_explicit_no_stop_does_not_require_lf_stop_scope() -> None:
     strategy = _Strategy(mf_only)
     report = RecoveryReport(ok=True, snapshots=(_snapshot(with_lf_stop=False),))
 
-    _runner(strategy)._validate_recovery_protection_postcondition(report)
+    _runner(strategy).recovery._validate_recovery_protection_postcondition(
+        report
+    )
 
 
 def test_lf_missing_stop_is_not_satisfied_by_mf_no_stop_policy() -> None:
@@ -210,7 +247,9 @@ def test_lf_missing_stop_is_not_satisfied_by_mf_no_stop_policy() -> None:
         LiveRuntimeError,
         match="recovery protection postcondition failed",
     ):
-        _runner(strategy)._validate_recovery_protection_postcondition(report)
+        _runner(strategy).recovery._validate_recovery_protection_postcondition(
+            report
+        )
 
 
 @pytest.mark.asyncio
@@ -224,14 +263,14 @@ async def test_manual_required_blocks_startup_before_signal_execution() -> None:
             return RecoveryReport(ok=True, snapshots=(_snapshot(with_lf_stop=False),))
 
     runner = _runner(strategy)
-    runner.stats = SimpleNamespace(recovery_runs=0)
-    runner._get_recovery_service = lambda: _RecoveryService()
+    runner.recovery.stats = SimpleNamespace(recovery_runs=0)
+    runner.recovery._get_recovery_service = lambda: _RecoveryService()
 
     with pytest.raises(
         LiveRuntimeError,
         match="runtime recovery blocking manual required",
     ):
-        await runner._run_recovery()
+        await runner.recovery._run_recovery()
 
 
 def _reconciliation_report(
@@ -274,13 +313,15 @@ async def test_startup_reconciliation_not_ok_is_fatal_hard_fail(
             return report
 
     runner = _runner(_Strategy(()))
-    runner._get_reconciliation_service = lambda: _ReconciliationService()
+    runner.account_runtime._get_reconciliation_service = (
+        lambda: _ReconciliationService()
+    )
 
     with caplog.at_level("ERROR"), pytest.raises(
         LiveRuntimeError,
         match=f"startup reconciliation failed: verdict={verdict.value}",
     ) as exc_info:
-        await runner._run_reconciliation(
+        await runner.account_runtime._run_reconciliation(
             (_snapshot(with_lf_stop=False),)
         )
 
@@ -307,8 +348,10 @@ async def test_startup_reconciliation_ok_verdicts_continue(
             return report
 
     runner = _runner(_Strategy(()))
-    runner._get_reconciliation_service = lambda: _ReconciliationService()
+    runner.account_runtime._get_reconciliation_service = (
+        lambda: _ReconciliationService()
+    )
 
-    await runner._run_reconciliation(
+    await runner.account_runtime._run_reconciliation(
         (_snapshot(with_lf_stop=False),)
     )

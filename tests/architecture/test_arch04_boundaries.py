@@ -3,11 +3,22 @@ from __future__ import annotations
 import ast
 from dataclasses import fields
 from pathlib import Path
+from typing import Any, get_type_hints
 
 from src.market_data.storage.trade_feature_repository import (
     SqliteTradeFeatureRepository,
 )
-from src.runtime.services import RuntimeServiceBundle, RuntimeServices
+from src.runtime.services import (
+    AccountRuntimeServices,
+    ExecutionRuntimeServices,
+    LifecycleRuntimeServices,
+    MarketRuntimeServices,
+    PersistenceRuntimeServices,
+    RangeRuntimeServices,
+    RecoveryRuntimeServices,
+    RuntimeServiceBundle,
+    RuntimeServices,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -54,7 +65,7 @@ def test_runtime_has_no_magic_owner_or_dynamic_component_scanner() -> None:
         "_owner",
     ):
         assert token not in formal_runtime
-    assert "def _bind_component_ports(" in runner
+    assert "def _bind_component_ports(" not in runner
     assert "RuntimeContext()" in runner
 
 
@@ -70,9 +81,30 @@ def test_runtime_services_are_grouped_and_mapping_compat_is_external() -> None:
     }
     for method in ("get", "__getitem__", "__setitem__", "__contains__"):
         assert method not in RuntimeServices.__dict__
+    for group in (
+        RuntimeServiceBundle.from_legacy_boundary(RuntimeServices()).market,
+        RuntimeServiceBundle.from_legacy_boundary(RuntimeServices()).account,
+        RuntimeServiceBundle.from_legacy_boundary(RuntimeServices()).execution,
+    ):
+        assert "_source" not in {item.name for item in fields(type(group))}
     compat = _source(RUNTIME / "compat" / "services.py")
     assert "class LegacyRuntimeServiceView" in compat
     assert "def __getitem__" in compat
+
+
+def test_domain_service_groups_have_explicit_non_any_annotations() -> None:
+    for group_type in (
+        MarketRuntimeServices,
+        AccountRuntimeServices,
+        ExecutionRuntimeServices,
+        PersistenceRuntimeServices,
+        RecoveryRuntimeServices,
+        LifecycleRuntimeServices,
+        RangeRuntimeServices,
+    ):
+        annotations = get_type_hints(group_type)
+        assert annotations
+        assert all(annotation is not Any for annotation in annotations.values())
 
 
 def test_market_event_models_have_one_definition_and_no_conversion_layer() -> None:

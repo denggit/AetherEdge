@@ -94,12 +94,12 @@ def test_runner_constructor_selects_and_writes_back_one_heartbeat_service() -> N
     selected = _assignment(initializer, "self._heartbeat_service")
     writeback = _assignment(
         initializer,
-        "self.runtime_services.heartbeat_service",
+        "lifecycle.heartbeat_service",
     )
     health_compatibility = _assignment(initializer, "self._health")
 
     assert ast.unparse(injected.value) == (
-        "self.runtime_services.heartbeat_service"
+        "lifecycle.heartbeat_service"
     )
     assert isinstance(selected.value, ast.IfExp)
     assert ast.unparse(selected.value.test) == (
@@ -195,7 +195,7 @@ def test_startup_owns_single_heartbeat_start_with_exact_id_and_order() -> None:
         "self._start_runtime_heartbeat"
     )
     assert plan_callbacks["start_range_speed_background_services"] == (
-        "self._start_range_speed_background_services"
+        "self.ports.start_range_speed_background_services"
     )
     assert plan_callbacks["enter_running"] == (
         "self._enter_startup_running"
@@ -243,9 +243,9 @@ def test_sync_tasks_own_single_unconditional_heartbeat_periodic_factory() -> Non
         for node in ast.walk(method)
     )
 
-    account = _calls(method, "_get_account_sync_service")[0]
-    order = _calls(method, "_get_order_sync_service")[0]
-    follower = _calls(method, "_periodic_follower_close_check")[0]
+    account = _calls(method, "get_account_sync_service")[0]
+    order = _calls(method, "get_order_sync_service")[0]
+    follower = _calls(method, "periodic_follower_close_check")[0]
     readiness = _calls(method, "_periodic_feature_readiness_refresh")[0]
     assert (
         account.lineno
@@ -263,9 +263,9 @@ def test_market_event_notes_time_before_health_and_strategy_processing() -> None
     notes = _calls(method, "note_market_event")
     assert len(notes) == 1
     assert [ast.unparse(arg) for arg in notes[0].args] == ["event_ms"]
-    health = _calls(method, "_set_health")
+    health = _calls(method, "set_health")
     strategy = _calls(method, "_call_strategy_market_event")
-    execute = _calls(method, "_execute_signals")
+    execute = _calls(method, "execute_signals")
     assert len(health) == len(strategy) == len(execute) == 1
     assert notes[0].lineno < health[0].lineno
     assert notes[0].lineno < strategy[0].lineno < execute[0].lineno

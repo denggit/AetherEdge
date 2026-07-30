@@ -64,7 +64,7 @@ class OrderResultsComponent(RuntimeComponent):
         if not any(result.ok for result in results):
             return results
 
-        position_index = self._strategy_position_index()
+        position_index = self.ports.strategy_position_index()
         strategy_position = _strategy_position_for_stop_signal(
             position_index,
             signal,
@@ -143,7 +143,7 @@ class OrderResultsComponent(RuntimeComponent):
             },
             account_by_exchange={
                 client.exchange: client
-                for client in self._get_account_clients()
+                for client in self.ports.get_account_clients()
             },
             market_profile=get_market_profile(strategy_position.symbol),
             converter=converter,
@@ -605,7 +605,7 @@ class OrderResultsComponent(RuntimeComponent):
 
     def _get_execution_clients(self) -> tuple[ExecutionClient, ...]:
         if self._execution_clients is None:
-            injected = self._runtime_service_bundle().execution.clients
+            injected = self.execution_services.clients
             if injected is not None:
                 self._execution_clients = tuple(injected)
             else:
@@ -638,7 +638,9 @@ class OrderResultsComponent(RuntimeComponent):
                     if self.runtime_config.master_follower_policy is None
                     else MasterFollowerExecutionPolicy.from_config(self.runtime_config.master_follower_policy)
                 ),
-                position_plan_store=self._get_position_plan_store(),
-                post_result_validator=self._validate_order_results_before_journal,
+                position_plan_store=self.ports.get_position_plan_store(),
+                post_result_validator=(
+                    self.ports.validate_order_results_before_journal
+                ),
             )
         return self._order_coordinator

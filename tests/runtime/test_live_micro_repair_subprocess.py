@@ -159,7 +159,7 @@ async def test_live_main_launches_subprocess_without_touching_trade_flow(
         "src.runtime.components.catchup.time.time", lambda: NOW_MS / 1000
     )
 
-    runner._initialize_rangebar_trust_window()
+    runner.startup._initialize_rangebar_trust_window()
     await runner._range_module.process_trade(
         MarketTrade(
             exchange=ExchangeName.OKX,

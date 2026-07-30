@@ -97,31 +97,37 @@ async def test_closed_bar_retry_starts_at_05s_alerts_once_and_emits_once() -> No
     alerts = _Alerts()
     runner = _runner(strategy=strategy, data=data, alerts=alerts)
 
-    assert await runner.poll_closed_bar_once(now_ms=H4 + 4_000) == []
+    assert await runner.closed_bar.poll_closed_bar_once(now_ms=H4 + 4_000) == []
     assert data.calls == []
 
-    assert await runner.poll_closed_bar_once(now_ms=H4 + 5_000) == []
+    assert await runner.closed_bar.poll_closed_bar_once(now_ms=H4 + 5_000) == []
     assert len(data.calls) == 1
     assert data.calls[-1]["use_cache"] is False
     assert data.calls[-1]["start_time_ms"] == 0
 
-    assert await runner.poll_closed_bar_once(now_ms=H4 + 6_000) == []
+    assert await runner.closed_bar.poll_closed_bar_once(now_ms=H4 + 6_000) == []
     assert len(data.calls) == 1
 
-    assert await runner.poll_closed_bar_once(now_ms=H4 + 10_000) == []
+    assert await runner.closed_bar.poll_closed_bar_once(now_ms=H4 + 10_000) == []
     assert len(data.calls) == 2
 
-    assert await runner.poll_closed_bar_once(now_ms=H4 + 120_000) == []
+    assert await runner.closed_bar.poll_closed_bar_once(
+        now_ms=H4 + 120_000
+    ) == []
     assert len(data.calls) == 3
     assert len(alerts.items) == 1
     assert alerts.items[0].subject == "AetherEdge closed bar missing"
 
-    events = await runner.poll_closed_bar_once(now_ms=H4 + 125_000)
-    await runner._stop_live_persistence_writer()
+    events = await runner.closed_bar.poll_closed_bar_once(
+        now_ms=H4 + 125_000
+    )
+    await runner.persistence._stop_live_persistence_writer()
     assert [event.type_value for event in events] == ["closed_kline"]
     assert len(strategy.events) == 1
 
-    assert await runner.poll_closed_bar_once(now_ms=H4 + 130_000) == []
+    assert await runner.closed_bar.poll_closed_bar_once(
+        now_ms=H4 + 130_000
+    ) == []
     assert len(data.calls) == 4
     assert len(alerts.items) == 1
 
@@ -149,10 +155,10 @@ async def test_closed_bar_poll_upserts_same_open_time_without_duplicate(
         kline_store=store,
     )
 
-    assert await first.poll_closed_bar_once(now_ms=H4 + 5_000)
-    await first._stop_live_persistence_writer()
-    assert await second.poll_closed_bar_once(now_ms=H4 + 5_000)
-    await second._stop_live_persistence_writer()
+    assert await first.closed_bar.poll_closed_bar_once(now_ms=H4 + 5_000)
+    await first.persistence._stop_live_persistence_writer()
+    assert await second.closed_bar.poll_closed_bar_once(now_ms=H4 + 5_000)
+    await second.persistence._stop_live_persistence_writer()
     rows = store.load(
         symbol="ETH-USDT-PERP",
         interval="4h",
@@ -178,8 +184,10 @@ async def test_closed_bar_store_failure_alerts_and_still_processes_feature(
         kline_store=_FailingKlineStore(),
     )
 
-    events = await runner.poll_closed_bar_once(now_ms=H4 + 5_000)
-    await runner._stop_live_persistence_writer()
+    events = await runner.closed_bar.poll_closed_bar_once(
+        now_ms=H4 + 5_000
+    )
+    await runner.persistence._stop_live_persistence_writer()
     await asyncio.sleep(0)
 
     assert [event.type_value for event in events] == ["closed_kline"]

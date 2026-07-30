@@ -63,15 +63,15 @@ class ClosedBarComponent(RuntimeComponent):
         _health_prechecked: bool = False,
     ) -> list[MarketFeatureEvent]:
         if not _health_prechecked:
-            self._raise_on_unhealthy_market_data()
-            self._raise_on_unhealthy_producer()
+            self.ports.raise_on_unhealthy_market_data()
+            self.ports.raise_on_unhealthy_producer()
         now = int(time.time() * 1000) if now_ms is None else now_ms
         self.sync_next_closed_bar_cutoff(now)
         due = await self._fetch_due_closed_kline(now)
         if due is None:
             return []
         open_time_ms, closed_kline = due
-        processor = self.service_bundle.market.market_event_processor
+        processor = self.market_services.market_event_processor
         if isinstance(processor, MarketEventProcessor):
             event = ClosedBarControlEvent(
                 open_time_ms=open_time_ms,
@@ -91,7 +91,7 @@ class ClosedBarComponent(RuntimeComponent):
         now_ms: int | None = None,
     ) -> None:
         self._startup_trade_gap = None
-        tracker = self._trade_integrity_tracker()
+        tracker = self.ports.trade_integrity_tracker()
         if tracker is None:
             return
         now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
@@ -112,7 +112,7 @@ class ClosedBarComponent(RuntimeComponent):
 
     def close_startup_trade_gap(self, first_trade_time_ms: int) -> None:
         session = getattr(self, "_startup_trade_gap", None)
-        tracker = self._trade_integrity_tracker()
+        tracker = self.ports.trade_integrity_tracker()
         if (
             tracker is None
             or not isinstance(session, _StartupTradeGapSession)
@@ -153,7 +153,7 @@ class ClosedBarComponent(RuntimeComponent):
     ) -> None:
         if not self.requirements.range_bars.enabled:
             return
-        module = self.service_bundle.range.module
+        module = self.range_services.module
         mark = getattr(module, "mark_trade_incomplete", None)
         if callable(mark):
             mark(
@@ -163,7 +163,7 @@ class ClosedBarComponent(RuntimeComponent):
             )
 
     def sync_next_closed_bar_cutoff(self, now_ms: int) -> None:
-        processor = self.service_bundle.market.market_event_processor
+        processor = self.market_services.market_event_processor
         if not isinstance(processor, MarketEventProcessor):
             return
         interval = self._closed_bar_interval_ms
@@ -195,17 +195,17 @@ class ClosedBarComponent(RuntimeComponent):
     ) -> list[MarketFeatureEvent]:
         maintenance_started = time.monotonic()
         if self.requirements.range_bars.enabled:
-            await self._require_range_module().maintain_closed_bucket(
+            await self.ports.require_range_module().maintain_closed_bucket(
                 open_time_ms,
                 finalized_at_ms=finalized_at_ms,
             )
-        processor = self.service_bundle.market.market_event_processor
+        processor = self.market_services.market_event_processor
         if isinstance(processor, MarketEventProcessor):
             processor.stats.module_timings["repair-maintenance"] = (
                 processor.stats.module_timings.get("repair-maintenance", 0.0)
                 + (time.monotonic() - maintenance_started) * 1000
             )
-        tracker = self._trade_integrity_tracker()
+        tracker = self.ports.trade_integrity_tracker()
         invalid_reason = (
             None
             if tracker is None
@@ -254,7 +254,7 @@ class ClosedBarComponent(RuntimeComponent):
         open_time_ms = self._closed_bar_scheduler.due_closed_bar(now_ms)
         if open_time_ms is None:
             return None
-        processor = self.service_bundle.market.market_event_processor
+        processor = self.market_services.market_event_processor
         rest_started = time.monotonic()
         try:
             rows = await self.context.data.fetch_klines(
@@ -320,7 +320,7 @@ class ClosedBarComponent(RuntimeComponent):
     ) -> list[MarketFeatureEvent]:
         event = closed_kline_feature(closed_kline)
         self.stats.closed_klines_seen += 1
-        await self.process_market_feature(event)
+        await self.ports.process_market_feature(event)
         self._closed_bar_scheduler.mark_emitted(open_time_ms)
         return [event]
 
@@ -329,7 +329,7 @@ class ClosedBarComponent(RuntimeComponent):
         open_time_ms: int,
         closed_kline: MarketKline,
     ) -> list[MarketFeatureEvent]:
-        range_module = self._require_range_module()
+        range_module = self.ports.require_range_module()
         degraded = await self._degraded_range_context_feature(
             open_time_ms,
             closed_kline,
@@ -340,7 +340,7 @@ class ClosedBarComponent(RuntimeComponent):
             range_module.trust_start_bucket_ms is not None
             and open_time_ms < range_module.trust_start_bucket_ms
         )
-        min_range_bars = self._get_min_range_bars()
+        min_range_bars = self.ports.get_min_range_bars()
         range_aggregates = self._load_range_aggregates_for_bucket(open_time_ms)
         best_range_bar_count = max(
             (int(aggregate.bar_count) for aggregate in range_aggregates),
@@ -376,7 +376,7 @@ class ClosedBarComponent(RuntimeComponent):
         open_time_ms: int,
         closed_kline: MarketKline,
     ) -> MarketFeatureEvent | None:
-        reason = self._require_range_module().degraded_reason(open_time_ms)
+        reason = self.ports.require_range_module().degraded_reason(open_time_ms)
         if reason is None:
             return None
         logger.warning(
@@ -386,7 +386,7 @@ class ClosedBarComponent(RuntimeComponent):
             open_time_ms,
             open_time_ms + self._closed_bar_interval_ms - 1,
             reason,
-            self._require_range_module().trust_start_bucket_ms,
+            self.ports.require_range_module().trust_start_bucket_ms,
             self._market_queue.qsize(),
         )
         unavailable = range_aggregate_unavailable_feature(
@@ -400,7 +400,7 @@ class ClosedBarComponent(RuntimeComponent):
             reason=reason,
             coverage_status=RangeCoverageStatus.RECOVERED_INCOMPLETE.value,
         )
-        await self.process_market_feature(unavailable)
+        await self.ports.process_market_feature(unavailable)
         return unavailable
 
     def _log_loaded_mid_bucket_range_aggregate(
@@ -415,7 +415,7 @@ class ClosedBarComponent(RuntimeComponent):
             self._closed_bar_interval,
             open_time_ms,
             open_time_ms + self._closed_bar_interval_ms - 1,
-            self._require_range_module().trust_start_bucket_ms,
+            self.ports.require_range_module().trust_start_bucket_ms,
             best_range_bar_count,
             min_range_bars,
         )
@@ -437,7 +437,7 @@ class ClosedBarComponent(RuntimeComponent):
                 self._closed_bar_interval,
                 open_time_ms,
                 open_time_ms + self._closed_bar_interval_ms - 1,
-                self._require_range_module().trust_start_bucket_ms,
+                self.ports.require_range_module().trust_start_bucket_ms,
                 best_range_bar_count,
                 min_range_bars,
             )
@@ -449,17 +449,17 @@ class ClosedBarComponent(RuntimeComponent):
                 open_time_ms,
                 open_time_ms + self._closed_bar_interval_ms - 1,
                 reason,
-                self._require_range_module().trust_start_bucket_ms,
+                self.ports.require_range_module().trust_start_bucket_ms,
                 self._market_queue.qsize(),
             )
         elif (
-            self._require_range_module().initial_recovery is not None
+            self.ports.require_range_module().initial_recovery is not None
             and not has_range_aggregates
         ):
             reason = "no_completed_range_bars"
         else:
             return None
-        coverage = self._require_range_module().coverage(open_time_ms)
+        coverage = self.ports.require_range_module().coverage(open_time_ms)
         unavailable = range_aggregate_unavailable_feature(
             symbol=self.app_config.symbol,
             exchange=self.app_config.data_exchange,
@@ -474,7 +474,7 @@ class ClosedBarComponent(RuntimeComponent):
             range_recovered_from_checkpoint=coverage.recovered_from_checkpoint,
             range_checkpoint_age_ms=coverage.checkpoint_age_ms,
         )
-        await self.process_market_feature(unavailable)
+        await self.ports.process_market_feature(unavailable)
         return unavailable
 
     def _finish_closed_bar_decision(
@@ -493,12 +493,12 @@ class ClosedBarComponent(RuntimeComponent):
     def _persist_closed_kline(self, kline: MarketKline) -> None:
         """Queue one confirmed live closed kline after decisions complete."""
 
-        self._get_market_data_persistence().persist_closed_kline(
+        self.ports.get_market_data_persistence().persist_closed_kline(
             kline,
             on_error=lambda exc: self._on_closed_kline_persist_error(
                 kline, exc
             ),
-            on_rejected=self._on_live_persistence_write_rejected,
+            on_rejected=self.ports.on_live_persistence_write_rejected,
         )
 
     def _on_closed_kline_persist_error(
@@ -512,7 +512,7 @@ class ClosedBarComponent(RuntimeComponent):
                 kline.open_time_ms,
                 kline.close_time_ms,
             )
-            self._emit_alert_threadsafe(
+            self.ports.emit_alert_threadsafe(
                 AppAlert(
                     subject="AetherEdge closed kline persistence failed",
                     severity="error",
@@ -536,10 +536,10 @@ class ClosedBarComponent(RuntimeComponent):
     def _persist_range_bar(self, bar: RangeBar) -> None:
         """Queue one closed range bar after feature dispatch."""
 
-        self._get_market_data_persistence().persist_range_bar(
+        self.ports.get_market_data_persistence().persist_range_bar(
             bar,
             on_error=lambda exc: self._on_range_bar_persist_error(bar, exc),
-            on_rejected=self._on_live_persistence_write_rejected,
+            on_rejected=self.ports.on_live_persistence_write_rejected,
         )
 
     def _on_range_bar_persist_error(
@@ -553,7 +553,7 @@ class ClosedBarComponent(RuntimeComponent):
             bar.start_time_ms,
             bar.end_time_ms,
         )
-        self._emit_alert_threadsafe(
+        self.ports.emit_alert_threadsafe(
             AppAlert(
                 subject="AetherEdge range bar persistence failed",
                 severity="warning",
@@ -575,14 +575,14 @@ class ClosedBarComponent(RuntimeComponent):
         coverage_status: str,
         missing_gap_ms: int,
     ) -> None:
-        self._get_market_data_persistence().persist_completed_range_aggregate(
+        self.ports.get_market_data_persistence().persist_completed_range_aggregate(
             aggregate,
             coverage_status=coverage_status,
             missing_gap_ms=missing_gap_ms,
             on_error=lambda exc: self._on_completed_range_aggregate_persist_error(
                 aggregate, exc
             ),
-            on_rejected=self._on_live_persistence_write_rejected,
+            on_rejected=self.ports.on_live_persistence_write_rejected,
         )
 
     def _on_completed_range_aggregate_persist_error(
@@ -597,17 +597,17 @@ class ClosedBarComponent(RuntimeComponent):
         )
 
     def _load_range_aggregates_for_bucket(self, bucket_start_ms: int) -> list[RangeBarAggregate]:
-        return self._require_range_module().aggregates_for_bucket(
+        return self.ports.require_range_module().aggregates_for_bucket(
             bucket_start_ms
         )
 
     def _range_bar_rows_for_bucket(
         self, bucket_start_ms: int
     ) -> list[RangeBar]:
-        return self._require_range_module().rows_for_bucket(bucket_start_ms)
+        return self.ports.require_range_module().rows_for_bucket(bucket_start_ms)
 
     async def _emit_range_aggregates(self, aggregates: Sequence[RangeBarAggregate]) -> list[MarketFeatureEvent]:
-        module = self._require_range_module()
+        module = self.ports.require_range_module()
         before = module.aggregates_created
         events = await module.emit_aggregates(aggregates)
         self.stats.range_aggregates_created += (

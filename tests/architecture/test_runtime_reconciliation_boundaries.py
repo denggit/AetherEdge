@@ -215,10 +215,10 @@ def test_runner_selects_and_writes_back_one_reconciliation_coordinator() -> None
     selected = _assignment(initializer, "self._reconciliation_coordinator")
     writeback = _assignment(
         initializer,
-        "self.runtime_services.reconciliation_coordinator",
+        "recovery.reconciliation_coordinator",
     )
     assert ast.unparse(injected.value) == (
-        "self.runtime_services.reconciliation_coordinator"
+        "recovery.reconciliation_coordinator"
     )
     assert isinstance(selected.value, ast.IfExp)
     assert ast.unparse(selected.value.test) == (
@@ -284,8 +284,8 @@ def test_runner_retains_service_construction_and_business_rules() -> None:
     methods = _methods(_class(RUNNER, "LiveRuntimeRunner"))
     get_service = ast.unparse(methods["_get_reconciliation_service"])
     assert "LiveStateReconciliationService" in get_service
-    assert "position_plan_store=self._get_position_plan_store()" in get_service
-    assert "order_journal=self._get_order_journal()" in get_service
+    assert "position_plan_store=self.ports.get_position_plan_store()" in get_service
+    assert "order_journal=self.ports.get_order_journal()" in get_service
     assert "state_store=self.context.state_store" in get_service
     assert "alert_sink=self.context.alerts" in get_service
 
@@ -342,7 +342,7 @@ def test_service_definition_and_startup_entrypoint_remain_owned() -> None:
         keyword.arg: ast.unparse(keyword.value)
         for keyword in plans[0].keywords
     }
-    assert callbacks["run_reconciliation"] == "self._run_reconciliation"
+    assert callbacks["run_reconciliation"] == "self.ports.run_reconciliation"
 
 
 def test_other_runtime_boundaries_do_not_depend_on_coordinator() -> None:

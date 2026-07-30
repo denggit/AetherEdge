@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal
 
 import pytest
 
+from tools import mf_feature_backfill_worker as worker
 from tools import prebuild_mf_feature_history as tool
 
 
@@ -35,6 +37,77 @@ def _args(tmp_path, *extra: str):
             *extra,
         ]
     )
+
+
+def test_worker_crosses_legacy_gap_target_with_pure_repository(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    lock = {"acquired": False, "released": False}
+
+    class Coordinator:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+        def try_acquire(self, **kwargs) -> bool:
+            lock["acquired"] = True
+            return True
+
+        def heartbeat(self) -> None:
+            pass
+
+        def release(self) -> None:
+            lock["released"] = True
+
+    class MissingArchive:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+        def ensure_daily_file(self, **kwargs):
+            raise FileNotFoundError(kwargs["day"].isoformat())
+
+    monkeypatch.setattr(
+        worker,
+        "RawTradeBackfillCoordinator",
+        Coordinator,
+    )
+    monkeypatch.setattr(
+        worker,
+        "safe_okx_archive_end_ms",
+        lambda **kwargs: 180_000,
+    )
+    monkeypatch.setattr(
+        worker,
+        "iter_okx_archive_dates_for_utc_range",
+        lambda *args: iter((date(2026, 7, 1),)),
+    )
+    monkeypatch.setattr(worker, "OkxHistoricalTradeArchive", MissingArchive)
+
+    result = worker.run_cycle(
+        symbol="ETH-USDT-PERP",
+        exchange="okx",
+        market_db=str(tmp_path / "market.sqlite3"),
+        raw_root=str(tmp_path / "raw"),
+        status_path=str(tmp_path / "status.json"),
+        global_lock_path=str(tmp_path / "global.lock"),
+        global_status_path=str(tmp_path / "global-status.json"),
+        mode="live",
+        direction="recent-to-oldest",
+        max_minutes_per_cycle=2,
+        max_days_per_cycle=1,
+        max_trades_per_cycle=10,
+        max_seconds_per_cycle=10.0,
+        chunk_sleep_seconds=0.0,
+        no_download=True,
+        save_raw_trades=False,
+        contract_value=Decimal("0.01"),
+        large_trade_threshold=Decimal("10000"),
+        required_minutes=2,
+    )
+
+    assert lock == {"acquired": True, "released": True}
+    assert result["reason"] == "download_failures"
+    assert result["failed_downloads"] == ["2026-07-01"]
 
 
 def test_already_ready_exits_without_run_cycle(

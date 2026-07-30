@@ -200,7 +200,7 @@ def test_runner_uses_injected_lifecycle_and_writes_it_back_to_services() -> None
 
     runner = _runner(sync_lifecycle=injected)
 
-    assert runner._sync_lifecycle is injected
+    assert runner.lifecycle._sync_lifecycle is injected
     assert runner.services["sync_lifecycle"] is injected
     assert runner._sync_tasks == []
 
@@ -216,7 +216,7 @@ def test_runner_creates_one_default_lifecycle(monkeypatch) -> None:
     runner = _runner()
 
     factory.assert_called_once_with()
-    assert runner._sync_lifecycle is lifecycle
+    assert runner.lifecycle._sync_lifecycle is lifecycle
     assert runner.services["sync_lifecycle"] is lifecycle
 
 
@@ -241,7 +241,8 @@ def _runner_for_task_selection(
     order_enabled: bool,
     feature_readiness_enabled: bool,
 ):
-    runner = object.__new__(LiveRuntimeRunner)
+    runner = _runner()
+    component = runner.lifecycle
     lifecycle = _RecordingLifecycle()
     stop_event = object()
     calls: list[tuple[str, object]] = []
@@ -259,27 +260,29 @@ def _runner_for_task_selection(
         provider_resolution_calls += 1
         return (object(),) if feature_readiness_enabled else ()
 
-    runner._sync_lifecycle = lifecycle
-    runner._sync_tasks = []
-    runner._stop_event = stop_event
-    runner.requirements = SimpleNamespace(
+    component._sync_lifecycle = lifecycle
+    component._sync_tasks = []
+    component._stop_event = stop_event
+    component.requirements = SimpleNamespace(
         account_state=SimpleNamespace(poll_enabled=account_enabled),
         order_state=SimpleNamespace(
             poll_when_position_enabled=order_enabled
         ),
     )
-    runner._get_account_sync_service = lambda: SimpleNamespace(
+    runner.account_runtime._get_account_sync_service = lambda: SimpleNamespace(
         run_periodic=task("account")
     )
-    runner._get_order_sync_service = lambda: SimpleNamespace(
+    runner.account_runtime._get_order_sync_service = lambda: SimpleNamespace(
         run_periodic=task("order")
     )
-    runner._periodic_follower_close_check = task("follower_close")
-    runner._heartbeat_service = SimpleNamespace(
+    runner.account_runtime._periodic_follower_close_check = task(
+        "follower_close"
+    )
+    component._heartbeat_service = SimpleNamespace(
         run_periodic=task("heartbeat")
     )
-    runner._get_startup_feature_backfill_providers = providers
-    runner._periodic_feature_readiness_refresh = task("feature_readiness")
+    component._get_startup_feature_backfill_providers = providers
+    component._periodic_feature_readiness_refresh = task("feature_readiness")
     return runner, lifecycle, stop_event, calls, lambda: provider_resolution_calls
 
 
@@ -327,23 +330,23 @@ def test_runner_keeps_task_conditions_order_stop_event_and_list_identity(
         )
     )
 
-    tasks = runner._start_sync_tasks()
+    tasks = runner.lifecycle._start_sync_tasks()
 
     assert [label for label, _ in calls] == expected
     assert all(event is stop_event for _, event in calls)
     assert tasks is lifecycle.tasks
-    assert runner._sync_tasks is tasks
+    assert runner.lifecycle._sync_tasks is tasks
     assert provider_resolution_count() == 1
 
 
 @pytest.mark.asyncio
 async def test_runner_stop_delegates_once_and_clears_compatibility_list() -> None:
-    runner = object.__new__(LiveRuntimeRunner)
+    runner = _runner()
     lifecycle = _RecordingLifecycle()
-    runner._sync_lifecycle = lifecycle
-    runner._sync_tasks = [object()]
+    runner.lifecycle._sync_lifecycle = lifecycle
+    runner.lifecycle._sync_tasks = [object()]
 
-    await runner._stop_sync_tasks()
+    await runner.lifecycle._stop_sync_tasks()
 
     assert lifecycle.stop_calls == 1
-    assert runner._sync_tasks == []
+    assert runner.lifecycle._sync_tasks == []

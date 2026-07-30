@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -264,8 +265,10 @@ async def test_4h_range_aggregate_uses_memory_when_store_is_empty() -> None:
         for i in range(5)
     ]
 
-    events = await runner.poll_closed_bar_once(now_ms=H4 + 5_000)
-    await runner._stop_live_persistence_writer()
+    events = await runner.closed_bar.poll_closed_bar_once(
+        now_ms=H4 + 5_000
+    )
+    await runner.persistence._stop_live_persistence_writer()
 
     assert [event.type_value for event in events] == [
         "closed_kline",
@@ -299,7 +302,7 @@ async def test_range_bar_save_failure_does_not_block_closed_feature_dispatch() -
     ]
     assert runner._range_module._bars_by_bucket[0]
 
-    await runner._stop_live_persistence_writer()
+    await runner.persistence._stop_live_persistence_writer()
     await asyncio.sleep(0)
 
     assert store.save_calls == 1
@@ -321,15 +324,20 @@ async def test_closed_kline_persist_failure_does_not_block_signal_execution() ->
     async def capture(signals, **kwargs):
         executed.extend(signals)
 
-    runner._execute_signals = capture
+    runner.market_events.ports = replace(
+        runner.market_events.ports,
+        execute_signals=capture,
+    )
 
-    events = await runner.poll_closed_bar_once(now_ms=H4 + 5_000)
+    events = await runner.closed_bar.poll_closed_bar_once(
+        now_ms=H4 + 5_000
+    )
 
     assert [event.type_value for event in events] == ["closed_kline"]
     assert [event.type_value for event in strategy.events] == ["closed_kline"]
     assert [signal.action for signal in executed] == [SignalAction.OPEN_LONG]
 
-    await runner._stop_live_persistence_writer()
+    await runner.persistence._stop_live_persistence_writer()
     await asyncio.sleep(0)
 
     assert alerts.items[-1].subject == (
@@ -755,7 +763,7 @@ async def test_micro_repair_complete_forces_db_rows_for_4h_aggregate() -> None:
     # Assert: cache repopulated from DB
     assert len(runner._range_module._bars_by_bucket.get(0, [])) == 5
 
-    await runner._stop_live_persistence_writer()
+    await runner.persistence._stop_live_persistence_writer()
 
 
 # ── Test B: micro repair complete → checkpoint uses repaired DB rows ──
@@ -810,7 +818,7 @@ async def test_micro_repair_complete_checkpoint_uses_repaired_db_rows() -> None:
     # The checkpoint writer is _RangeCheckpointWriter in test — need to verify
     # what was submitted. Since the test runner uses a real RangeBarAggregator
     # but no RangeCheckpointWriter, we check via the store's aggregates.
-    await runner._stop_live_persistence_writer()
+    await runner.persistence._stop_live_persistence_writer()
 
     # The key assertion: partial rows (2) were replaced by repaired rows (5)
     rows = runner._range_module.rows_for_bucket(0)
@@ -840,13 +848,13 @@ async def test_normal_live_bucket_remains_memory_first() -> None:
         _range_bar(bar_id=i + 1, start_time_ms=i * 1_000, end_time_ms=i * 1_000)
         for i in range(5)
     ]
-    rows = runner._range_bar_rows_for_bucket(0)
+    rows = runner.closed_bar._range_bar_rows_for_bucket(0)
 
     assert len(rows) == 5
     assert store.load_was_called is False, (
         "DB load should NOT be called for normal live bucket with memory rows"
     )
-    await runner._stop_live_persistence_writer()
+    await runner.persistence._stop_live_persistence_writer()
 
 
 # ── Test D: repaired complete but DB empty → no fallback to partial memory ──
@@ -876,13 +884,13 @@ async def test_repaired_complete_db_empty_no_fallback_to_partial_memory() -> Non
     runner._range_module.begin_repair(0)
     assert runner._range_module.mark_repaired(0, through_revision=0)
 
-    rows = runner._range_bar_rows_for_bucket(0)
+    rows = runner.closed_bar._range_bar_rows_for_bucket(0)
 
     # Must return empty, NOT the 2 partial memory rows
     assert len(rows) == 0, (
         f"Expected empty for repaired bucket with no DB rows, got {len(rows)} rows"
     )
-    await runner._stop_live_persistence_writer()
+    await runner.persistence._stop_live_persistence_writer()
 
 
 # ── Test E: MF 1m feature dispatch does not trigger DB writes ──
@@ -908,12 +916,12 @@ async def test_live_data_path_stats_no_db_trigger() -> None:
     )
     load_before = store.load_calls
 
-    runner._maybe_log_live_data_path_stats()
+    runner.persistence._maybe_log_live_data_path_stats()
 
     assert store.load_calls == load_before, (
         "Live data path stats must not trigger DB reads"
     )
-    await runner._stop_live_persistence_writer()
+    await runner.persistence._stop_live_persistence_writer()
 
 
 # ── Test: BackgroundWriteQueue drop warning coverage ──
@@ -1004,11 +1012,11 @@ def test_live_data_path_stats_respects_env_interval() -> None:
     # With 300s interval, this should trigger a log
     # The method checks: now_ms - last_ms < interval_seconds * 1000
     # 301000 >= 300000 → will log
-    runner._maybe_log_live_data_path_stats()
+    runner.persistence._maybe_log_live_data_path_stats()
     # After logging, _last_live_data_path_log_ms is updated
     # Call again immediately — should NOT log
     last_after_first = runner._last_live_data_path_log_ms
-    runner._maybe_log_live_data_path_stats()
+    runner.persistence._maybe_log_live_data_path_stats()
     assert runner._last_live_data_path_log_ms == last_after_first, (
         "Second stats call within interval should be skipped"
     )
@@ -1096,7 +1104,7 @@ async def test_scheduler_registers_cutoff_before_blocked_rest_and_future_trade_r
     )
     processor = MarketEventProcessor(
         trade_modules=modules,
-        closed_bar_handler=runner,
+        closed_bar_handler=runner.closed_bar,
         raw_trade_callback=runner.process_market_event,
         maxsize=16,
     )
@@ -1108,14 +1116,18 @@ async def test_scheduler_registers_cutoff_before_blocked_rest_and_future_trade_r
     await source.prepare()
     await source.start()
     runner._closed_bar_scheduler.mark_emitted(H4)
-    assert await runner.poll_closed_bar_once(now_ms=cutoff - 1_000) == []
+    assert await runner.closed_bar.poll_closed_bar_once(
+        now_ms=cutoff - 1_000
+    ) == []
     assert processor._pending_cutoff[:2] == (2 * H4, cutoff)
     await stream.send(_trade(time_ms=cutoff, price="100"))
     await stream.send(_trade(time_ms=cutoff + 1, price="101"))
     assert len(processor._future_trades) == 1
     assert all(value <= cutoff for value in latest.values())
     poll = asyncio.create_task(
-        runner.poll_closed_bar_once(now_ms=3 * H4 + 60_000)
+        runner.closed_bar.poll_closed_bar_once(
+            now_ms=3 * H4 + 60_000
+        )
     )
     await data.fetch_started.wait()
     assert processor._pending_cutoff[:2] == (2 * H4, cutoff)
@@ -1129,4 +1141,4 @@ async def test_scheduler_registers_cutoff_before_blocked_rest_and_future_trade_r
     await source.stop()
     processor.stop_accepting()
     await processor.stop()
-    await runner._stop_live_persistence_writer()
+    await runner.persistence._stop_live_persistence_writer()

@@ -252,7 +252,7 @@ def test_runner_constructs_and_exposes_health_state_without_updating_it() -> Non
         node
         for node in assignments
         if ast.unparse(node.targets[0])
-        == "self.runtime_services.runtime_health_state"
+        == "lifecycle.runtime_health_state"
     )
     compatibility = next(
         node
@@ -318,13 +318,30 @@ def test_runner_retains_health_call_ownership_and_compatibility_reader() -> None
         if _attribute_calls(method, "_set_health")
     }
     assert call_counts == {
-        "process_market_event": 1,
         "_enter_startup_warming_up": 1,
         "_enter_startup_catching_up": 1,
         "_enter_startup_running": 1,
         "_check_startup_feature_backfills": 1,
-        "_check_strategy_position_mode_requirements": 1,
         "_record_feature_backfill_result": 1,
+        "run": 2,
+        "start": 1,
+        "stop": 1,
+    }
+    port_call_counts = {
+        name: sum(
+            isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "self.ports.set_health"
+            for node in ast.walk(method)
+        )
+        for name, method in methods.items()
+    }
+    assert {
+        name: count
+        for name, count in port_call_counts.items()
+        if count
+    } == {
+        "process_market_event": 1,
+        "_check_strategy_position_mode_requirements": 1,
         "_record_order_results": 2,
     }
 
@@ -344,7 +361,11 @@ def test_market_health_throttle_and_heartbeat_calls_remain_in_runner() -> None:
     assert "self._last_trade_health_update_ms" in market_source
     assert "should_update_health" in market_source
     assert len(_attribute_calls(market, "note_market_event")) == 1
-    assert len(_attribute_calls(market, "_set_health")) == 1
+    assert sum(
+        isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "self.ports.set_health"
+        for node in ast.walk(market)
+    ) == 1
 
     heartbeat_calls = {
         node.func.attr
@@ -374,7 +395,8 @@ def test_run_start_and_stop_keep_existing_health_and_shutdown_order() -> None:
 
     start = methods["start"]
     start_source = ast.unparse(start)
-    assert "self._named_component('lifecycle', LifecycleComponent)" in start_source
+    assert "self.lifecycle._set_health" in start_source
+    assert "_named_component" not in start_source
     assert "RuntimePhase.RUNNING" in start_source
     assert ast.unparse(start.body[-1]) == "return self._health"
 
@@ -409,7 +431,7 @@ def test_run_start_and_stop_keep_existing_health_and_shutdown_order() -> None:
         node
         for node in ast.walk(try_node)
         if isinstance(node, ast.Call)
-        and ast.unparse(node.func) == "self.context.alerts.emit"
+        and ast.unparse(node.func) == "self._emit_fatal_runtime_alert"
     )
     assert error_call.lineno < alert_emit.lineno
 

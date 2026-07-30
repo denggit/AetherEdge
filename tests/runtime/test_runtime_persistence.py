@@ -6,6 +6,10 @@ from types import SimpleNamespace
 import pytest
 
 from src.runtime.persistence import BackgroundWriteItem, BackgroundWriteQueue
+from src.runtime.components import PersistenceComponent
+from src.runtime.context import RuntimeContext
+from src.runtime.ports import PersistencePorts
+from src.runtime.services import PersistenceRuntimeServices
 from src.runtime.runner import LiveRuntimeRunner
 
 
@@ -235,12 +239,17 @@ def test_submit_is_rejected_while_writer_is_stopping() -> None:
     assert not rejected_write.is_set()
 
 
-def _bare_runner(writer=None) -> LiveRuntimeRunner:
-    runner = object.__new__(LiveRuntimeRunner)
-    runner._live_persistence_writer = writer
-    runner.services = {}
-    runner.runtime_config = SimpleNamespace(background_queue_maxsize=7)
-    return runner
+def _bare_runner(writer=None) -> PersistenceComponent:
+    component = PersistenceComponent(RuntimeContext())
+    component._live_persistence_writer = writer
+    component._runtime_persistence_service = None
+    component.persistence_services = PersistenceRuntimeServices(writer=writer)
+    component.runtime_config = SimpleNamespace(background_queue_maxsize=7)
+    component.bind_ports(PersistencePorts(
+        get_live_kline_store=lambda: None,
+        require_range_module=lambda: None,
+    ))
+    return component
 
 
 def test_runner_default_writer_uses_config_and_is_cached() -> None:
@@ -251,7 +260,7 @@ def test_runner_default_writer_uses_config_and_is_cached() -> None:
     assert isinstance(writer, BackgroundWriteQueue)
     assert writer.name == "live-persistence-writer"
     assert writer.max_pending == 7
-    assert runner._runtime_service_bundle().persistence.writer is writer
+    assert runner.persistence_services.writer is writer
     assert runner._get_live_persistence_writer() is writer
     writer.stop()
 
@@ -259,8 +268,6 @@ def test_runner_default_writer_uses_config_and_is_cached() -> None:
 def test_runner_uses_injected_writer_without_creating_default() -> None:
     injected = object()
     runner = _bare_runner(injected)
-    runner.services["live_persistence_writer"] = injected
-
     assert runner._get_live_persistence_writer() is injected
 
 

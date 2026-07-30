@@ -578,7 +578,7 @@ async def test_runtime_auto_alerts_when_follower_close_after_master_close_fails(
 
     # Real path: execute signal → coordinator retries 3× and fails →
     # _check_follower_close_failure() → context.alerts.emit()
-    await runner._execute_signals(
+    await runner.signal_execution._execute_signals(
         [close_signal], source="test", event_time_ms=1_000,
     )
 
@@ -668,7 +668,7 @@ async def test_periodic_follower_close_check_builds_retry_signal_for_unresolved_
         },
     )
 
-    signals = runner._build_unresolved_follower_close_signals()
+    signals = runner.account_runtime._build_unresolved_follower_close_signals()
 
     assert len(signals) == 1
     signal = signals[0]
@@ -749,7 +749,7 @@ async def test_periodic_follower_close_check_skips_already_closed_leg(tmp_path) 
         },
     )
 
-    signals = runner._build_unresolved_follower_close_signals()
+    signals = runner.account_runtime._build_unresolved_follower_close_signals()
     assert signals == []  # follower already CLOSED, nothing to retry
 
 
@@ -801,7 +801,7 @@ async def test_entry_blocked_when_unresolved_follower_close_exists(tmp_path) -> 
         },
     )
 
-    assert runner._has_unresolved_follower_close() is True
+    assert runner.account_runtime._has_unresolved_follower_close() is True
 
     # Without unresolved plans, the guard should be clear.
     plan_store.upsert_position(
@@ -817,7 +817,7 @@ async def test_entry_blocked_when_unresolved_follower_close_exists(tmp_path) -> 
             master_filled_qty_base=Decimal("0.1"),
         )
     )
-    assert runner._has_unresolved_follower_close() is False
+    assert runner.account_runtime._has_unresolved_follower_close() is False
 
 
 def test_runtime_does_not_call_strategy_private_follower_close_method() -> None:
@@ -908,5 +908,5 @@ async def test_master_close_not_filled_does_not_create_unresolved_follower_retry
         },
     )
 
-    signals = runner._build_unresolved_follower_close_signals()
+    signals = runner.account_runtime._build_unresolved_follower_close_signals()
     assert signals == []  # ACTIVE plans must not generate follower retry signals

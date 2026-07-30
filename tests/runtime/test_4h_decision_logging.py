@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import src.runtime.runner as runner_module
 import src.runtime.strategy_diagnostics as diagnostics_module
 from src.runtime.runner import LiveRuntimeRunner
+from src.runtime.components.closed_bar import ClosedBarComponent
+from src.runtime.context import RuntimeContext
 
 
 def _runner(audit):
@@ -16,12 +18,12 @@ def _runner(audit):
         def decision_audit(self):
             return audit
 
-    runner = object.__new__(LiveRuntimeRunner)
-    runner.context = SimpleNamespace(strategy=AuditStrategy())
-    runner.app_config = SimpleNamespace(symbol="ETH-USDT-PERP")
-    runner._closed_bar_interval = "4h"
-    runner._closed_bar_buffer_ms = 60_000
-    return runner
+    component = ClosedBarComponent(RuntimeContext())
+    component.context = SimpleNamespace(strategy=AuditStrategy())
+    component.app_config = SimpleNamespace(symbol="ETH-USDT-PERP")
+    component._closed_bar_interval = "4h"
+    component._closed_bar_buffer_ms = 60_000
+    return component
 
 
 def _kline():
@@ -123,5 +125,5 @@ def test_runtime_has_generic_hook_without_portfolio_v1_import() -> None:
     assert source.count("4H engine diagnostics") == 0
     assert diagnostics_source.count("4H engine diagnostics") == 1
     assert "log_closed_bar_decision" in inspect.getsource(
-        LiveRuntimeRunner._log_4h_decision_summary
+        ClosedBarComponent._log_4h_decision_summary
     )

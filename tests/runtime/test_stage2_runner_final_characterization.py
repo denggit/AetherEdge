@@ -170,19 +170,35 @@ def test_all_final_service_keys_preserve_injected_identity_and_are_lazy() -> Non
     runner = _runner(calls=calls, services=services)
 
     identities = {
-        "strategy_host": runner._strategy_host,
-        "market_feature_pipeline": runner._market_feature_pipeline,
-        "sync_lifecycle": runner._sync_lifecycle,
-        "sync_service_registry": runner._sync_service_registry,
-        "signal_execution_service": runner._signal_execution_service,
-        "recovery_coordinator": runner._recovery_coordinator,
-        "reconciliation_coordinator": runner._reconciliation_coordinator,
-        "runtime_persistence_service": runner._runtime_persistence_service,
-        "market_data_persistence": runner._market_data_persistence,
-        "runtime_health_state": runner._runtime_health_state,
-        "heartbeat_service": runner._heartbeat_service,
-        "shutdown_coordinator": runner._shutdown_coordinator,
-        "startup_phase_coordinator": runner._startup_phase_coordinator,
+        "strategy_host": runner.account_runtime._strategy_host,
+        "market_feature_pipeline": (
+            runner.persistence._market_feature_pipeline
+        ),
+        "sync_lifecycle": runner.lifecycle._sync_lifecycle,
+        "sync_service_registry": (
+            runner.account_runtime._sync_service_registry
+        ),
+        "signal_execution_service": (
+            runner.signal_execution._signal_execution_service
+        ),
+        "recovery_coordinator": runner.recovery._recovery_coordinator,
+        "reconciliation_coordinator": (
+            runner.account_runtime._reconciliation_coordinator
+        ),
+        "runtime_persistence_service": (
+            runner.persistence._runtime_persistence_service
+        ),
+        "market_data_persistence": (
+            runner.persistence._market_data_persistence
+        ),
+        "runtime_health_state": runner.lifecycle._runtime_health_state,
+        "heartbeat_service": runner.lifecycle._heartbeat_service,
+        "shutdown_coordinator": (
+            runner.service_bundle.lifecycle.shutdown_coordinator
+        ),
+        "startup_phase_coordinator": (
+            runner.lifecycle._startup_phase_coordinator
+        ),
     }
     for key, component in identities.items():
         assert component is services[key]
@@ -211,39 +227,50 @@ def test_all_final_service_keys_preserve_injected_identity_and_are_lazy() -> Non
 def test_default_construction_preserves_expensive_service_laziness() -> None:
     runner = _runner()
 
-    assert runner._recovery_service is DEFAULT_RUNTIME_SERVICE
-    assert runner._reconciliation_service is DEFAULT_RUNTIME_SERVICE
-    assert runner._order_coordinator is None
-    assert runner._order_journal is None
-    assert runner._position_plan_store is None
-    assert runner._account_sync_service is None
-    assert runner._order_sync_service is None
-    assert runner._execution_clients is None
-    assert runner._account_clients is None
+    assert runner.recovery._recovery_service is DEFAULT_RUNTIME_SERVICE
+    assert (
+        runner.account_runtime._reconciliation_service
+        is DEFAULT_RUNTIME_SERVICE
+    )
+    assert runner.order_results._order_coordinator is None
+    assert runner.order_results._order_journal is None
+    assert runner.persistence._position_plan_store is None
+    assert vars(runner.account_runtime._sync_service_registry) == {
+        "_account_service": None,
+        "_order_service": None,
+    }
+    assert "_account_sync_service" not in vars(runner.account_runtime)
+    assert "_order_sync_service" not in vars(runner.account_runtime)
+    assert runner.order_results._execution_clients is None
+    assert runner.account_runtime._account_clients is None
 
 
 @pytest.mark.asyncio
 async def test_normal_run_final_call_graph(monkeypatch) -> None:
     calls: list[str] = []
     runner = _runner(calls=calls)
-    monkeypatch.setattr(runner, "_startup", _async_step(calls, "startup"))
     monkeypatch.setattr(
-        runner,
+        runner.lifecycle,
+        "_run_startup_sequence",
+        _async_step(calls, "startup"),
+    )
+    monkeypatch.setattr(
+        runner.lifecycle,
         "_start_producers",
         lambda: calls.append("producers") or [],
     )
     monkeypatch.setattr(
-        runner,
+        runner.lifecycle,
         "_start_sync_tasks",
         lambda: calls.append("sync_tasks") or [],
     )
     monkeypatch.setattr(
-        runner,
+        runner.market_events,
         "_consume_market_events",
         _async_step(calls, "consume"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.lifecycle,
         "_set_health",
         lambda phase, **kwargs: calls.append(f"health.{phase.value}"),
     )
@@ -272,24 +299,28 @@ async def test_error_run_final_call_graph_and_original_exception(monkeypatch) ->
     calls: list[str] = []
     error = RuntimeError("business failed")
     runner = _runner(calls=calls)
-    monkeypatch.setattr(runner, "_startup", _async_step(calls, "startup"))
     monkeypatch.setattr(
-        runner,
+        runner.lifecycle,
+        "_run_startup_sequence",
+        _async_step(calls, "startup"),
+    )
+    monkeypatch.setattr(
+        runner.lifecycle,
         "_start_producers",
         lambda: calls.append("producers") or [],
     )
     monkeypatch.setattr(
-        runner,
+        runner.lifecycle,
         "_start_sync_tasks",
         lambda: calls.append("sync_tasks") or [],
     )
     monkeypatch.setattr(
-        runner,
+        runner.market_events,
         "_consume_market_events",
         _async_step(calls, "consume", error=error),
     )
     monkeypatch.setattr(
-        runner,
+        runner.lifecycle,
         "_set_health",
         lambda phase, **kwargs: calls.append(f"health.{phase.value}"),
     )
@@ -327,48 +358,50 @@ async def test_startup_final_call_graph_and_snapshot_identity(monkeypatch) -> No
     first = snapshots[0]
 
     monkeypatch.setattr(
-        runner,
+        runner.startup,
         "_initialize_rangebar_trust_window",
         lambda: calls.append("trust_window"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.lifecycle,
         "_enter_startup_warming_up",
         lambda: calls.append("WARMING_UP"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.startup,
         "_bootstrap_account_config_if_enabled",
         _async_step(calls, "account_config"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.startup,
         "_check_strategy_position_mode_requirements",
         _async_step(calls, "position_mode"),
     )
-    monkeypatch.setattr(runner, "_run_warmup", _async_step(calls, "warmup"))
     monkeypatch.setattr(
-        runner,
+        runner.startup, "_run_warmup", _async_step(calls, "warmup")
+    )
+    monkeypatch.setattr(
+        runner.startup,
         "_warmup_range_speed_history",
         _async_step(calls, "range_speed", result=9),
     )
     monkeypatch.setattr(
-        runner,
+        runner.lifecycle,
         "_handle_startup_range_speed_history_result",
         lambda loaded: calls.append(f"range_speed_result:{loaded}"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.lifecycle,
         "_check_startup_feature_backfills",
         _async_step(calls, "feature_backfill"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.lifecycle,
         "_enter_startup_catching_up",
         lambda: calls.append("CATCHING_UP"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.recovery,
         "_run_recovery",
         _async_step(calls, "recovery", result=snapshots),
     )
@@ -389,32 +422,40 @@ async def test_startup_final_call_graph_and_snapshot_identity(monkeypatch) -> No
         assert received is first
         calls.append("startup_catchup")
 
-    monkeypatch.setattr(runner, "_run_startup_post_recovery_checks", post_recovery)
-    monkeypatch.setattr(runner, "_run_reconciliation", reconciliation)
-    monkeypatch.setattr(runner, "_call_on_start", on_start)
-    monkeypatch.setattr(runner, "_evaluate_startup_catchup_once", catchup)
     monkeypatch.setattr(
-        runner,
+        runner.lifecycle,
+        "_run_startup_post_recovery_checks",
+        post_recovery,
+    )
+    monkeypatch.setattr(
+        runner.account_runtime, "_run_reconciliation", reconciliation
+    )
+    monkeypatch.setattr(runner.catchup, "_call_on_start", on_start)
+    monkeypatch.setattr(
+        runner.catchup, "_evaluate_startup_catchup_once", catchup
+    )
+    monkeypatch.setattr(
+        runner.startup,
         "_finish_range_speed_warmup_after_catchup",
         _async_step(calls, "finish_range_speed"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.lifecycle,
         "_start_runtime_heartbeat",
         lambda: calls.append("heartbeat"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.market_data_lifecycle,
         "_start_range_speed_background_services",
         lambda: calls.append("background_services"),
     )
     monkeypatch.setattr(
-        runner,
+        runner.lifecycle,
         "_enter_startup_running",
         lambda: calls.append("RUNNING"),
     )
 
-    await runner._startup()
+    await runner.lifecycle._run_startup_sequence()
 
     assert calls == [
         "trust_window",
@@ -544,14 +585,15 @@ async def test_final_and_explicit_shutdown_keep_distinct_sequences(
     calls: list[str] = []
     runner = _runner(calls=calls)
 
-    for name in (
-        "_stop_market_data_modules",
-        "_stop_sync_tasks",
-        "_stop_producers",
-        "_stop_live_persistence_writer",
-    ):
+    owners = {
+        "_stop_market_data_modules": runner.market_data_lifecycle,
+        "_stop_sync_tasks": runner.lifecycle,
+        "_stop_producers": runner.lifecycle,
+        "_stop_live_persistence_writer": runner.persistence,
+    }
+    for name, owner in owners.items():
         monkeypatch.setattr(
-            runner,
+            owner,
             name,
             _async_step(calls, name.removeprefix("_")),
         )
@@ -578,7 +620,7 @@ async def test_final_and_explicit_shutdown_keep_distinct_sequences(
         calls.append(f"health.{phase.value}")
         runner._health = stopped
 
-    monkeypatch.setattr(runner, "_set_health", set_health)
+    monkeypatch.setattr(runner.lifecycle, "_set_health", set_health)
 
     returned = await runner.stop()
 

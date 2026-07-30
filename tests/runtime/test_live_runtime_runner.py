@@ -153,8 +153,8 @@ def test_non_trade_market_queue_full_records_drop_and_emits_alert():
     )
 
     async def scenario():
-        await runner._enqueue_market_event(_ticker_event(1))
-        await runner._enqueue_market_event(_ticker_event(2))
+        await runner.enqueue_market_event(_ticker_event(1))
+        await runner.enqueue_market_event(_ticker_event(2))
 
     asyncio.run(scenario())
 

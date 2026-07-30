@@ -7,7 +7,7 @@ from src.runtime.position_mode_gate import (
     PositionModeRequirement,
     resolve_position_mode_requirements,
 )
-from src.runtime.runner import LiveRuntimeRunner
+from src.runtime.components import LifecycleComponent, StartupComponent
 from strategies.eth_portfolio_v1.strategy import Strategy
 
 
@@ -41,7 +41,7 @@ def test_strategy_exposes_generic_live_hooks() -> None:
 
 def test_runner_consumes_only_generic_position_mode_requirements() -> None:
     source = inspect.getsource(
-        LiveRuntimeRunner._check_strategy_position_mode_requirements
+        StartupComponent._check_strategy_position_mode_requirements
     ).lower()
     assert "resolve_position_mode_requirements" in source
     assert "eth_portfolio_v1" not in source
@@ -51,7 +51,7 @@ def test_runner_consumes_only_generic_position_mode_requirements() -> None:
 
 def test_runner_consumes_only_generic_feature_backfill_hook() -> None:
     source = inspect.getsource(
-        LiveRuntimeRunner._check_startup_feature_backfills
+        LifecycleComponent._check_startup_feature_backfills
     ).lower()
     assert "startup_feature_backfill" in source
     assert ("mf_" + "feature") not in source

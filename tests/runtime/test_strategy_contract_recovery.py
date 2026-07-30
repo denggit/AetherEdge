@@ -7,13 +7,14 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from src.runtime.models import RuntimeMode, RuntimePhase
+from src.runtime.components import RecoveryComponent
+from src.runtime.context import RuntimeContext
 from src.runtime.recovery import RuntimeRecoveryService
 from src.runtime.recovery.models import RecoveryReport
 from src.runtime.recovery_coordinator import (
     RuntimeRecoveryCoordinator,
     RuntimeRecoveryPlan,
 )
-from src.runtime.runner import LiveRuntimeRunner
 from src.signals import SignalAction, TradeSignal
 from src.strategy import (
     StrategyContractError,
@@ -80,8 +81,8 @@ class _RecoveringContractStrategy:
         )
 
 
-def _runner_for(strategy: object) -> LiveRuntimeRunner:
-    runner = object.__new__(LiveRuntimeRunner)
+def _runner_for(strategy: object) -> RecoveryComponent:
+    runner = RecoveryComponent(RuntimeContext())
     runner.context = SimpleNamespace(strategy=strategy)
     runner.app_config = SimpleNamespace(
         strategy="tests.contract:Strategy",

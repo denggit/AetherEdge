@@ -26,11 +26,13 @@ class TickerFetcher(Protocol):
         ...
 
 
-class HistoricalTradeFetcher(Protocol):
+class HistoricalTradePageState(Protocol):
     @property
     def last_historical_trade_pages(self) -> int:
         ...
 
+
+class HistoricalTradeFetcher(HistoricalTradePageState, Protocol):
     async def fetch_trades(
         self,
         symbol: str,
@@ -44,7 +46,7 @@ class HistoricalTradeFetcher(Protocol):
         ...
 
 
-class TradeIdAnchoredHistoryFetcher(Protocol):
+class TradeIdAnchoredHistoryFetcher(HistoricalTradePageState, Protocol):
     async def fetch_trades_between_ids(
         self,
         symbol: str,

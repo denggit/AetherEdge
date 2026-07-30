@@ -21,22 +21,22 @@ from src.runtime.components.base import RuntimeComponent
 
 class LifecycleComponent(RuntimeComponent):
     async def _run_startup_sequence(self) -> None:
-        self._strategy_capabilities()
+        self.ports.strategy_capabilities()
         logger.info("Live runtime startup phase started")
         await self._startup_phase_coordinator.execute(
             RuntimeStartupPhasePlan(
                 initialize_rangebar_trust_window=(
-                    self._initialize_rangebar_trust_window
+                    self.ports.initialize_rangebar_trust_window
                 ),
                 enter_warming_up=self._enter_startup_warming_up,
                 bootstrap_account_config=(
-                    self._bootstrap_account_config_if_enabled
+                    self.ports.bootstrap_account_config_if_enabled
                 ),
                 check_position_mode=(
-                    self._check_strategy_position_mode_requirements
+                    self.ports.check_strategy_position_mode_requirements
                 ),
-                run_warmup=self._run_warmup,
-                warmup_range_speed_history=self._warmup_range_speed_history,
+                run_warmup=self.ports.run_warmup,
+                warmup_range_speed_history=self.ports.warmup_range_speed_history,
                 handle_range_speed_history_result=(
                     self._handle_startup_range_speed_history_result
                 ),
@@ -44,19 +44,19 @@ class LifecycleComponent(RuntimeComponent):
                     self._check_startup_feature_backfills
                 ),
                 enter_catching_up=self._enter_startup_catching_up,
-                run_recovery=self._run_recovery,
+                run_recovery=self.ports.run_recovery,
                 run_post_recovery_checks=(
                     self._run_startup_post_recovery_checks
                 ),
-                run_reconciliation=self._run_reconciliation,
-                call_strategy_on_start=self._call_on_start,
-                evaluate_startup_catchup=self._evaluate_startup_catchup_once,
+                run_reconciliation=self.ports.run_reconciliation,
+                call_strategy_on_start=self.ports.call_on_start,
+                evaluate_startup_catchup=self.ports.evaluate_startup_catchup_once,
                 finish_range_speed_warmup=(
-                    self._finish_range_speed_warmup_after_catchup
+                    self.ports.finish_range_speed_warmup_after_catchup
                 ),
                 start_heartbeat=self._start_runtime_heartbeat,
                 start_range_speed_background_services=(
-                    self._start_range_speed_background_services
+                    self.ports.start_range_speed_background_services
                 ),
                 enter_running=self._enter_startup_running,
             )
@@ -94,7 +94,7 @@ class LifecycleComponent(RuntimeComponent):
         snapshots: tuple[object, ...],
     ) -> None:
         if self._account_config_new_entries_blocked:
-            await self._recheck_account_config_after_recovery()
+            await self.ports.recheck_account_config_after_recovery()
 
     def _start_runtime_heartbeat(self) -> None:
         self._heartbeat_service.start(
@@ -215,7 +215,7 @@ class LifecycleComponent(RuntimeComponent):
                     "feature backfill provider returned a non-market "
                     f"event: {type(event).__name__}"
                 )
-            await self.process_market_feature(event)
+            await self.ports.process_market_feature(event)
 
     def _start_producers(self) -> list[asyncio.Task]:
         tasks: list[asyncio.Task] = []
@@ -230,28 +230,29 @@ class LifecycleComponent(RuntimeComponent):
                     self._producer_supervisor.run_resilient_stream(
                         name="order_book",
                         stream_factory=self.context.data.stream_order_book,
-                        on_item=self._enqueue_market_event,
+                        on_item=self.ports.enqueue_market_event,
                     )
                 )
             )
+        self._producer_tasks = tasks
         return tasks
 
     def _start_sync_tasks(self) -> list[asyncio.Task]:
         task_factories: list[SyncTaskFactory] = []
         if self.requirements.account_state.poll_enabled:
             task_factories.append(
-                lambda: self._get_account_sync_service().run_periodic(
+                lambda: self.ports.get_account_sync_service().run_periodic(
                     self._stop_event
                 )
             )
         if self.requirements.order_state.poll_when_position_enabled:
             task_factories.append(
-                lambda: self._get_order_sync_service().run_periodic(
+                lambda: self.ports.get_order_sync_service().run_periodic(
                     self._stop_event
                 )
             )
             task_factories.append(
-                lambda: self._periodic_follower_close_check(self._stop_event)
+                lambda: self.ports.periodic_follower_close_check(self._stop_event)
             )
         # Heartbeat periodic task
         task_factories.append(
@@ -366,13 +367,13 @@ class LifecycleComponent(RuntimeComponent):
             event_ms // self._closed_bar_interval_ms
         ) * self._closed_bar_interval_ms
         if any(item.status.value == "failed" for item in unhealthy):
-            self._mark_range_context_degraded_bucket(
+            self.ports.mark_range_context_degraded_bucket(
                 bucket_start_ms=bucket_start_ms,
                 reason="producer_failed",
                 event_time_ms=event_ms,
             )
         elif any(item.status.value == "stale" for item in unhealthy):
-            self._mark_range_context_degraded_bucket(
+            self.ports.mark_range_context_degraded_bucket(
                 bucket_start_ms=bucket_start_ms,
                 reason="producer_stale",
                 event_time_ms=event_ms,

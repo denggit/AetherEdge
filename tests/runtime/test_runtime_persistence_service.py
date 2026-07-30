@@ -241,8 +241,8 @@ def test_runner_uses_injected_service_and_synchronizes_writer_references() -> No
 
     assert runner._runtime_persistence_service is service
     assert runner.services["runtime_persistence_service"] is service
-    assert runner._get_live_persistence_writer() is writer
-    assert runner._live_persistence_writer is writer
+    assert runner.persistence._get_live_persistence_writer() is writer
+    assert runner.persistence._live_persistence_writer is writer
     assert runner.services["live_persistence_writer"] is writer
 
 
@@ -250,9 +250,9 @@ def test_runner_preserves_legacy_injected_writer() -> None:
     writer = object()
     runner = _runner(services={"live_persistence_writer": writer})
 
-    assert runner._get_live_persistence_writer() is writer
+    assert runner.persistence._get_live_persistence_writer() is writer
     assert runner._runtime_persistence_service.get_writer() is writer
-    assert runner._live_persistence_writer is writer
+    assert runner.persistence._live_persistence_writer is writer
     assert runner.services["live_persistence_writer"] is writer
 
 
@@ -280,14 +280,14 @@ async def test_runner_submit_captures_loop_and_keeps_drop_warning(
     on_error = lambda exc: None
 
     with caplog.at_level(logging.WARNING):
-        accepted = runner._submit_live_persistence_write(
+        accepted = runner.persistence._submit_live_persistence_write(
             description="rejected",
             write=write,
             on_error=on_error,
         )
 
     assert accepted is False
-    assert runner._persistence_alert_loop is asyncio.get_running_loop()
+    assert runner.persistence._persistence_alert_loop is asyncio.get_running_loop()
     assert captured == [
         {
             "description": "rejected",
@@ -311,11 +311,11 @@ async def test_runner_stop_delegates_once_and_keeps_alert_emission() -> None:
 
     runner = _runner(services={"runtime_persistence_service": Service()})
 
-    await runner._stop_live_persistence_writer(flush=False)
+    await runner.persistence._stop_live_persistence_writer(flush=False)
 
     assert stop_calls == [False]
 
     alert = AppAlert(subject="subject", content="content", severity="warning")
-    runner._persistence_alert_loop = None
-    runner._emit_alert_threadsafe(alert)
-    assert runner.context.alerts.items == [alert]
+    runner.persistence._persistence_alert_loop = None
+    runner.persistence._emit_alert_threadsafe(alert)
+    assert runner.app_context.alerts.items == [alert]
