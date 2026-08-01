@@ -361,4 +361,4 @@ def test_run_finally_and_explicit_stop_order_remain_unchanged() -> None:
         "await self._explicit_stop_shutdown()"
     )
     assert "RuntimePhase.STOPPED" in stop_source
-    assert ast.unparse(stop.body[-1]) == "return self._health"
+    assert ast.unparse(stop.body[-1]) == "return self.context.resources.lifecycle.health_state.current"

@@ -95,7 +95,7 @@ class AccountComponent(RuntimeComponent):
         This is an order-lifecycle safety net — it does not depend on any
         strategy private method.
         """
-        store = self._position_plan_store
+        store = self.ports.get_position_plan_store()
         if store is None:
             return []
         signals: list[TradeSignal] = []
@@ -154,7 +154,7 @@ class AccountComponent(RuntimeComponent):
     def _has_unresolved_follower_close(self) -> bool:
         """Return True when at least one position plan has unresolved follower
         close after master close, blocking new entries."""
-        store = self._position_plan_store
+        store = self.ports.get_position_plan_store()
         if store is None:
             return False
         for plan in store.list_active_positions():
@@ -559,7 +559,7 @@ class AccountComponent(RuntimeComponent):
         provider = self.ports.strategy_pending_work_provider()
         if provider is not None and provider.has_pending_strategy_work():
             return True
-        store = self._position_plan_store
+        store = self.ports.get_position_plan_store()
         if store is not None and callable(getattr(store, "list_active_positions", None)) and store.list_active_positions():
             return True
         list_open = getattr(self.context.state_store, "list_open_orders", None)

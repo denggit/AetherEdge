@@ -618,7 +618,7 @@ async def test_final_and_explicit_shutdown_keep_distinct_sequences(
     def set_health(phase, **kwargs) -> None:
         assert stop_state["set"] is True
         calls.append(f"health.{phase.value}")
-        runner._health = stopped
+        runner.context.resources.lifecycle.health_state._current = stopped
 
     monkeypatch.setattr(runner.lifecycle, "_set_health", set_health)
 

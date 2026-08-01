@@ -251,11 +251,12 @@ class SignalExecutionComponent(RuntimeComponent):
                 len(results),
                 [result.error for result in results if not result.ok],
             )
+            current = self.current_health
             self.ports.set_health(
                 RuntimePhase.RUNNING,
                 healthy=False,
                 error="partial exchange execution failure",
-                metadata={**dict(self._health.metadata), "partial_failures": self.stats.partial_failures},
+                metadata={**dict(current.metadata), "partial_failures": self.stats.partial_failures},
             )
         else:
             self.stats.failed_intents += 1

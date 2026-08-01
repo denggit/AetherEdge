@@ -12,6 +12,7 @@ from src.runtime.context import (
     RuntimeContext,
     RuntimeState,
 )
+from src.runtime.models import RuntimeHealth
 
 
 RuntimeSharedState = RuntimeState
@@ -46,6 +47,13 @@ class RuntimeComponent:
     @property
     def market_state(self) -> MarketRuntimeState:
         return self._context.state.market
+
+    @property
+    def current_health(self) -> RuntimeHealth:
+        state = self._context.resources.lifecycle.health_state
+        if state is None:
+            raise RuntimeError("runtime health state is not initialized")
+        return state.current
 
     @property
     def _account_config_new_entries_blocked(self) -> bool:

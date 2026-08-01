@@ -182,7 +182,9 @@ async def test_production_follower_close_builders_share_generation_identity(
     )[0]
 
     account = AccountComponent(RuntimeContext())
-    account._position_plan_store = plans
+    account.ports = SimpleNamespace(
+        get_position_plan_store=lambda: plans,
+    )
     account.app_config = SimpleNamespace(symbol="ETH-USDT-PERP")
     periodic = account._build_unresolved_follower_close_signals()[0]
 

@@ -137,10 +137,11 @@ class LifecycleComponent(RuntimeComponent):
                 result,
             )
 
+        current = self.current_health
         self._set_health(
-            self._health.phase,
+            current.phase,
             metadata={
-                **dict(self._health.metadata),
+                **dict(current.metadata),
                 "feature_backfill_results": results,
             },
         )
@@ -220,7 +221,7 @@ class LifecycleComponent(RuntimeComponent):
     def _start_producers(self) -> list[asyncio.Task]:
         tasks: list[asyncio.Task] = []
         if (
-            not getattr(self, "_market_modules_managed", False)
+            not self.market_state.modules_managed
             and self.requirements.order_book.enabled
             and self.requirements.order_book.stream_enabled
         ):
@@ -334,14 +335,15 @@ class LifecycleComponent(RuntimeComponent):
         name: str,
         result: Mapping[str, Any],
     ) -> None:
-        metadata = dict(self._health.metadata)
+        current = self.current_health
+        metadata = dict(current.metadata)
         results = dict(
             metadata.get("feature_backfill_results", {})
         )
         results[name] = dict(result)
         metadata["feature_backfill_results"] = results
         self._set_health(
-            self._health.phase,
+            current.phase,
             metadata=metadata,
         )
 

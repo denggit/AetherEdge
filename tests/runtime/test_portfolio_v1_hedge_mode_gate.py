@@ -183,7 +183,7 @@ def test_portfolio_v1_both_exchanges_hedge_passes() -> None:
     asyncio.run(
         runner.startup._check_strategy_position_mode_requirements()
     )
-    audit = runner._health.metadata[
+    audit = runner.context.resources.lifecycle.health_state.current.metadata[
         "position_mode_requirements"
     ]
     assert audit["ok"] is True
@@ -215,7 +215,7 @@ def test_portfolio_v1_one_way_is_hard_failure(
         asyncio.run(
             runner.startup._check_strategy_position_mode_requirements()
         )
-    audit = runner._health.metadata[
+    audit = runner.context.resources.lifecycle.health_state.current.metadata[
         "position_mode_requirements"
     ]
     failed = next(
@@ -259,7 +259,7 @@ def test_v10b_is_not_subject_to_portfolio_gate() -> None:
     )
     assert (
         "position_mode_requirements"
-        not in runner._health.metadata
+        not in runner.context.resources.lifecycle.health_state.current.metadata
     )
 
 

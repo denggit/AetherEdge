@@ -163,11 +163,7 @@ class PersistenceComponent(RuntimeComponent):
             "Live data path stats | market_events_seen=%s feature_events_seen=%s latest_fixed_time_trade_bar_open_time_ms=%s mf_tradebar_count=%s mf_range_footprint_count=%s current_range_bucket_start_ms=%s range_bars_by_bucket_current_count=%s live_persistence_pending=%s live_persistence_dropped=%s live_persistence_failures=%s live_persistence_written=%s live_persistence_submitted=%s",
             getattr(getattr(self, "stats", None), "market_events_seen", None),
             getattr(getattr(self, "stats", None), "feature_events_seen", None),
-            getattr(
-                self,
-                "_latest_fixed_time_trade_bar_open_time_ms",
-                None,
-            ),
+            self.market_state.latest_fixed_time_trade_bar_open_time_ms,
             mf_audit.get("tradebar_count"),
             mf_audit.get("range_footprint_count"),
             current_bucket,

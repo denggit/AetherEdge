@@ -92,7 +92,9 @@ def _runner_for(strategy: object) -> RecoveryComponent:
     runner._validated_strategy_capabilities = SimpleNamespace(
         identity="recovery-contract"
     )
-    runner._health = SimpleNamespace(phase=RuntimePhase.CATCHING_UP)
+    runner._context.resources.lifecycle.health_state = SimpleNamespace(
+        current=SimpleNamespace(phase=RuntimePhase.CATCHING_UP)
+    )
     runner._producer_tasks = []
     runner._sync_tasks = []
     runner._validate_recovery_protection_postcondition = Mock()
@@ -179,7 +181,7 @@ def test_runner_revalidates_injected_recovery_report_before_any_signal_work() ->
     with pytest.raises(StrategyPositionContractError):
         runner._validate_runtime_recovery_report(report)
 
-    assert runner._health.phase is RuntimePhase.CATCHING_UP
+    assert runner.current_health.phase is RuntimePhase.CATCHING_UP
     assert runner._producer_tasks == []
     assert runner._sync_tasks == []
     runner._validate_recovery_protection_postcondition.assert_not_called()
@@ -252,6 +254,6 @@ async def test_forged_recovery_metadata_cannot_reach_partition_or_execution() ->
     runner._execute_recovery_stop_signals.assert_not_awaited()
     runner._execute_recovery_other_signals.assert_not_awaited()
     runner._finalize_recovery_report.assert_not_called()
-    assert runner._health.phase is RuntimePhase.CATCHING_UP
+    assert runner.current_health.phase is RuntimePhase.CATCHING_UP
     assert runner._producer_tasks == []
     assert runner._sync_tasks == []

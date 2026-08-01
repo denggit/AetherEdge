@@ -122,7 +122,7 @@ def test_no_provider_passes_without_health_entry() -> None:
     asyncio.run(runner.lifecycle._check_startup_feature_backfills())
 
     assert "feature_backfill_results" not in (
-        runner._health.metadata
+        runner.context.resources.lifecycle.health_state.current.metadata
     )
 
 
@@ -146,7 +146,7 @@ def test_ready_result_updates_health_metadata() -> None:
 
     asyncio.run(runner.lifecycle._check_startup_feature_backfills())
 
-    result = runner._health.metadata[
+    result = runner.context.resources.lifecycle.health_state.current.metadata[
         "feature_backfill_results"
     ][provider.name]
     assert result["reason"] == "coverage_complete"
@@ -160,7 +160,7 @@ def test_launched_not_ready_result_updates_health_metadata() -> None:
 
     asyncio.run(runner.lifecycle._check_startup_feature_backfills())
 
-    result = runner._health.metadata[
+    result = runner.context.resources.lifecycle.health_state.current.metadata[
         "feature_backfill_results"
     ][provider.name]
     assert result["action"] == "launched"
@@ -172,7 +172,7 @@ def test_provider_exception_is_audited_without_raising(caplog) -> None:
 
     asyncio.run(runner.lifecycle._check_startup_feature_backfills())
 
-    result = runner._health.metadata[
+    result = runner.context.resources.lifecycle.health_state.current.metadata[
         "feature_backfill_results"
     ][provider.name]
     assert result["reason"] == "provider_failed"

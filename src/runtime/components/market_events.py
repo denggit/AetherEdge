@@ -73,12 +73,13 @@ class MarketEventsComponent(RuntimeComponent):
                 self._last_trade_health_update_ms = now_ms
 
         if should_update_health:
+            current = self.current_health
             self.ports.set_health(
                 RuntimePhase.RUNNING,
-                healthy=self._health.healthy,
+                healthy=current.healthy,
                 last_market_event_time_ms=event_ms,
                 metadata={
-                    **dict(self._health.metadata),
+                    **dict(current.metadata),
                     "last_event_type": event.event_type.value,
                 },
             )
@@ -101,7 +102,7 @@ class MarketEventsComponent(RuntimeComponent):
         ):
             open_ms = event.data.get("open_time_ms")
             if isinstance(open_ms, int):
-                self._latest_fixed_time_trade_bar_open_time_ms = open_ms
+                self.market_state.latest_fixed_time_trade_bar_open_time_ms = open_ms
         heartbeat = getattr(self, "_heartbeat_service", None)
         if heartbeat is not None and event.type_value == "closed_kline":
             open_ms = (

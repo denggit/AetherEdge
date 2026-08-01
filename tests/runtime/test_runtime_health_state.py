@@ -178,7 +178,7 @@ def test_runner_creates_one_default_state_with_exact_initial_snapshot(
     )
     assert runner._runtime_health_state is state
     assert runner.services["runtime_health_state"] is state
-    assert runner._health is current
+    assert runner.context.resources.lifecycle.health_state.current is current
     state.update.assert_not_called()
     heartbeat.start.assert_not_called()
 
@@ -204,7 +204,7 @@ def test_injected_state_has_priority_and_is_not_updated_during_construction(
     state.update.assert_not_called()
     assert runner._runtime_health_state is state
     assert runner.services["runtime_health_state"] is state
-    assert runner._health is state.current
+    assert runner.context.resources.lifecycle.health_state.current is state.current
 
 
 def test_set_health_delegates_once_and_synchronizes_compatibility_field() -> None:
@@ -251,7 +251,14 @@ def test_set_health_delegates_once_and_synchronizes_compatibility_field() -> Non
 async def test_health_returns_current_compatibility_field() -> None:
     runner = object.__new__(LiveRuntimeRunner)
     snapshot = RuntimeHealth(phase=RuntimePhase.CATCHING_UP)
-    runner._health = snapshot
+    from types import SimpleNamespace
+    runner.context = SimpleNamespace(
+        resources=SimpleNamespace(
+            lifecycle=SimpleNamespace(
+                health_state=SimpleNamespace(current=snapshot)
+            )
+        )
+    )
 
     assert await runner.health() is snapshot
 
@@ -274,7 +281,7 @@ async def test_start_and_stop_return_the_final_compatibility_snapshots() -> None
     assert running.phase is RuntimePhase.RUNNING
     assert running.warmup_complete is True
     assert running.caught_up is True
-    assert stopped is runner._health
+    assert stopped is runner.context.resources.lifecycle.health_state.current
     assert stopped.phase is RuntimePhase.STOPPED
     assert stopped.healthy is True
     assert runner._stop_event.is_set()

@@ -388,7 +388,7 @@ async def test_explicit_stop_sets_event_then_runs_exact_three_steps_and_health(
 
     def set_health(phase, **kwargs) -> None:
         calls.append("health")
-        runner._health = stopped
+        runner.context.resources.lifecycle.health_state._current = stopped
 
     monkeypatch.setattr(runner.lifecycle, "_set_health", set_health)
 

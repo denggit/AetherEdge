@@ -221,3 +221,228 @@ def test_coverage_audit_uses_repository_port_not_sqlite_connection() -> None:
     coverage_source = _source(TRADE_FEATURES / "coverage.py")
     assert "._connect(" not in coverage_source
     assert "TradeFeatureCoverageService(" in coverage_source
+
+
+# ── Arch-04 State Ownership: Forbidden Mutable-State Copies ──────────
+
+
+def test_assembly_does_not_copy_health_to_non_lifecycle_components() -> None:
+    """Components must read health from the shared RuntimeHealthState,
+    not from a stale local snapshot injected by assembly."""
+    from src.app import AppContext, AsyncAlertDispatcher, NoopAlertSink
+    from src.planner import ExecutionPlanner
+    from src.runtime.components.base import RuntimeComponent
+    from src.runtime.runner import LiveRuntimeRunner
+    from src.runtime.config import LiveRuntimeConfig
+    from src.runtime.models import RuntimeMode
+    from tests.runtime.test_live_runtime_runner import (
+        FakeData, FakeExecution, FakeStateStore, FakeStrategy, _app_config,
+    )
+
+    config = _app_config()
+    runner = LiveRuntimeRunner(
+        app_config=config,
+        runtime_config=LiveRuntimeConfig(
+            app=config,
+            mode=RuntimeMode.LIVE_RUNTIME,
+        ),
+        app_context=AppContext(
+            data=FakeData(),
+            execution=FakeExecution(),
+            state_store=FakeStateStore(),
+            strategy=FakeStrategy(),
+            planner=ExecutionPlanner(),
+            alerts=AsyncAlertDispatcher(NoopAlertSink()),
+        ),
+    )
+
+    # MarketEvents, SignalExecution, Startup, Catchup, Account MUST NOT
+    # have a local _health snapshot injected.
+    for component_attr in (
+        "market_events",
+        "signal_execution",
+        "startup",
+        "catchup",
+        "account_runtime",
+        "persistence",
+    ):
+        component = getattr(runner, component_attr)
+        assert not hasattr(component, "_health"), (
+            f"{component_attr} must not have a local _health snapshot"
+        )
+
+    # Lifecycle may still track _health locally (it is the owner).
+    assert hasattr(runner.lifecycle, "_runtime_health_state")
+
+    # All components must read health through current_health → shared state.
+    for component_attr in (
+        "market_events",
+        "signal_execution",
+        "startup",
+        "catchup",
+        "account_runtime",
+        "lifecycle",
+    ):
+        component = getattr(runner, component_attr)
+        current = component.current_health
+        assert current is not None
+
+
+def test_assembly_does_not_copy_market_modules_managed_to_components() -> None:
+    """managed market-module state must live only in MarketRuntimeState."""
+    from src.app import AppContext, AsyncAlertDispatcher, NoopAlertSink
+    from src.planner import ExecutionPlanner
+    from src.runtime.runner import LiveRuntimeRunner
+    from src.runtime.config import LiveRuntimeConfig
+    from src.runtime.models import RuntimeMode
+    from tests.runtime.test_live_runtime_runner import (
+        FakeData, FakeExecution, FakeStateStore, FakeStrategy, _app_config,
+    )
+
+    config = _app_config()
+    runner = LiveRuntimeRunner(
+        app_config=config,
+        runtime_config=LiveRuntimeConfig(
+            app=config,
+            mode=RuntimeMode.LIVE_RUNTIME,
+        ),
+        app_context=AppContext(
+            data=FakeData(),
+            execution=FakeExecution(),
+            state_store=FakeStateStore(),
+            strategy=FakeStrategy(),
+            planner=ExecutionPlanner(),
+            alerts=AsyncAlertDispatcher(NoopAlertSink()),
+        ),
+    )
+
+    # No component should have a local _market_modules_managed
+    for component_attr in (
+        "lifecycle",
+        "startup",
+        "market_data_lifecycle",
+    ):
+        component = getattr(runner, component_attr)
+        assert not hasattr(component, "_market_modules_managed"), (
+            f"{component_attr} must not cache _market_modules_managed; "
+            f"read market_state.modules_managed instead"
+        )
+
+    # The context must own the canonical value
+    assert runner.runtime_state.market.modules_managed is False
+
+
+def test_assembly_does_not_copy_position_plan_store_to_account() -> None:
+    """Account must obtain PositionPlanStore through its port, not a local
+    cached copy that can go stale."""
+    from src.app import AppContext, AsyncAlertDispatcher, NoopAlertSink
+    from src.planner import ExecutionPlanner
+    from src.runtime.runner import LiveRuntimeRunner
+    from src.runtime.config import LiveRuntimeConfig
+    from src.runtime.models import RuntimeMode
+    from tests.runtime.test_live_runtime_runner import (
+        FakeData, FakeExecution, FakeStateStore, FakeStrategy, _app_config,
+    )
+
+    config = _app_config()
+    runner = LiveRuntimeRunner(
+        app_config=config,
+        runtime_config=LiveRuntimeConfig(
+            app=config,
+            mode=RuntimeMode.LIVE_RUNTIME,
+        ),
+        app_context=AppContext(
+            data=FakeData(),
+            execution=FakeExecution(),
+            state_store=FakeStateStore(),
+            strategy=FakeStrategy(),
+            planner=ExecutionPlanner(),
+            alerts=AsyncAlertDispatcher(NoopAlertSink()),
+        ),
+    )
+
+    assert not hasattr(runner.account_runtime, "_position_plan_store"), (
+        "account_runtime must not have a local _position_plan_store"
+    )
+
+    # Persistence IS the owner and still holds _position_plan_store
+    assert hasattr(runner.persistence, "_position_plan_store")
+
+    # Account must resolve the store through its port
+    store = runner.account_runtime.ports.get_position_plan_store()
+    # The port delegates to persistence; after first creation it is the
+    # same instance that persistence owns.
+    assert store is runner.persistence._position_plan_store
+
+
+def test_assembly_does_not_copy_startup_catchup_range_observed() -> None:
+    """startup_catchup_range_observed must be in RangeRuntimeState."""
+    from src.app import AppContext, AsyncAlertDispatcher, NoopAlertSink
+    from src.planner import ExecutionPlanner
+    from src.runtime.runner import LiveRuntimeRunner
+    from src.runtime.config import LiveRuntimeConfig
+    from src.runtime.models import RuntimeMode
+    from tests.runtime.test_live_runtime_runner import (
+        FakeData, FakeExecution, FakeStateStore, FakeStrategy, _app_config,
+    )
+
+    config = _app_config()
+    runner = LiveRuntimeRunner(
+        app_config=config,
+        runtime_config=LiveRuntimeConfig(
+            app=config,
+            mode=RuntimeMode.LIVE_RUNTIME,
+        ),
+        app_context=AppContext(
+            data=FakeData(),
+            execution=FakeExecution(),
+            state_store=FakeStateStore(),
+            strategy=FakeStrategy(),
+            planner=ExecutionPlanner(),
+            alerts=AsyncAlertDispatcher(NoopAlertSink()),
+        ),
+    )
+
+    assert not hasattr(runner.startup, "_startup_catchup_range_observed"), (
+        "startup must read startup_catchup_range_observed from "
+        "runtime_state.range, not a local copy"
+    )
+    assert runner.runtime_state.range.startup_catchup_range_observed is False
+
+
+def test_assembly_does_not_copy_latest_fixed_time_trade_bar_open_time_ms() -> None:
+    """latest_fixed_time_trade_bar_open_time_ms must be in MarketRuntimeState."""
+    from src.app import AppContext, AsyncAlertDispatcher, NoopAlertSink
+    from src.planner import ExecutionPlanner
+    from src.runtime.runner import LiveRuntimeRunner
+    from src.runtime.config import LiveRuntimeConfig
+    from src.runtime.models import RuntimeMode
+    from tests.runtime.test_live_runtime_runner import (
+        FakeData, FakeExecution, FakeStateStore, FakeStrategy, _app_config,
+    )
+
+    config = _app_config()
+    runner = LiveRuntimeRunner(
+        app_config=config,
+        runtime_config=LiveRuntimeConfig(
+            app=config,
+            mode=RuntimeMode.LIVE_RUNTIME,
+        ),
+        app_context=AppContext(
+            data=FakeData(),
+            execution=FakeExecution(),
+            state_store=FakeStateStore(),
+            strategy=FakeStrategy(),
+            planner=ExecutionPlanner(),
+            alerts=AsyncAlertDispatcher(NoopAlertSink()),
+        ),
+    )
+
+    assert not hasattr(runner.persistence, "_latest_fixed_time_trade_bar_open_time_ms"), (
+        "persistence must read latest_fixed_time_trade_bar_open_time_ms "
+        "from market_state, not a local copy"
+    )
+    assert (
+        runner.runtime_state.market.latest_fixed_time_trade_bar_open_time_ms
+        is None
+    )

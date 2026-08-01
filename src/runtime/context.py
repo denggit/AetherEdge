@@ -21,6 +21,7 @@ class MarketRuntimeState:
     capabilities: frozenset[CapabilityId] = frozenset()
     modules_managed: bool = False
     integrity_error: BaseException | None = None
+    latest_fixed_time_trade_bar_open_time_ms: int | None = None
 
 
 @dataclass(slots=True)
@@ -44,6 +45,7 @@ class ClosedBarRuntimeState:
 @dataclass(slots=True)
 class RangeRuntimeState:
     degraded_windows: dict[int, str] = field(default_factory=dict)
+    startup_catchup_range_observed: bool = False
 
 
 @dataclass(slots=True)

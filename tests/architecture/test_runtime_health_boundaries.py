@@ -349,7 +349,7 @@ def test_runner_retains_health_call_ownership_and_compatibility_reader() -> None
     assert isinstance(health, ast.AsyncFunctionDef)
     assert len(health.body) == 1
     assert isinstance(health.body[0], ast.Return)
-    assert ast.unparse(health.body[0].value) == "self._health"
+    assert ast.unparse(health.body[0].value) == "self.context.resources.lifecycle.health_state.current"
 
 
 def test_market_health_throttle_and_heartbeat_calls_remain_in_runner() -> None:
@@ -398,7 +398,7 @@ def test_run_start_and_stop_keep_existing_health_and_shutdown_order() -> None:
     assert "self.lifecycle._set_health" in start_source
     assert "_named_component" not in start_source
     assert "RuntimePhase.RUNNING" in start_source
-    assert ast.unparse(start.body[-1]) == "return self._health"
+    assert ast.unparse(start.body[-1]) == "return self.context.resources.lifecycle.health_state.current"
 
     stop = methods["stop"]
     stop_statements = [ast.unparse(statement) for statement in stop.body]
@@ -407,7 +407,7 @@ def test_run_start_and_stop_keep_existing_health_and_shutdown_order() -> None:
         "await self._explicit_stop_shutdown()",
     ]
     assert "RuntimePhase.STOPPED" in ast.unparse(stop)
-    assert stop_statements[-1] == "return self._health"
+    assert stop_statements[-1] == "return self.context.resources.lifecycle.health_state.current"
 
     run = methods["run"]
     try_node = next(node for node in run.body if isinstance(node, ast.Try))

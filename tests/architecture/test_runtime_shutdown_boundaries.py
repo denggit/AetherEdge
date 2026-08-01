@@ -286,7 +286,7 @@ def test_explicit_stop_has_distinct_three_step_helper_and_outer_order() -> None:
         "await self._explicit_stop_shutdown()"
     )
     assert "RuntimePhase.STOPPED" in stop_source
-    assert ast.unparse(stop.body[-1]) == "return self._health"
+    assert ast.unparse(stop.body[-1]) == "return self.context.resources.lifecycle.health_state.current"
     assert "_stop_sync_tasks" not in ast.unparse(helper)
     assert "alerts.stop" not in ast.unparse(helper)
     assert "_heartbeat_service" not in ast.unparse(helper)

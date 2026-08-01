@@ -37,6 +37,9 @@ def _initialize_context(context, wiring) -> None:
     context.runtime_config = wiring.runtime_config
     context.range_config = wiring.range_config
     context.requirements = wiring.requirements
+    context.state.market.modules_managed = bool(
+        wiring._market_modules_managed
+    )
     context.resources.queues.market = wiring._market_queue
     context.resources.queues.market_event_available = (
         wiring._market_event_available
@@ -62,7 +65,7 @@ def _inject_dependencies(runner, source) -> None:
             "_account_snapshot_log_keepalive_seconds",
             "_last_account_snapshot_log_ms",
             "_last_account_snapshot_log_state", "_last_snapshots",
-            "_position_plan_store", "_project_env",
+            "_project_env",
             "_reconciliation_coordinator", "_reconciliation_service",
             "_request_sync_throttle", "_strategy_host",
             "_sync_service_registry",
@@ -82,13 +85,13 @@ def _inject_dependencies(runner, source) -> None:
         ),
         runner.lifecycle: common + (
             "_account_config_new_entries_blocked", "_closed_bar_interval_ms",
-            "_feature_backfill_providers_resolved", "_health",
+            "_feature_backfill_providers_resolved",
             "_heartbeat_service", "_producer_supervisor", "_producer_tasks",
             "_runtime_health_state", "_startup_feature_backfill_providers",
             "_startup_phase_coordinator", "_stop_event", "_sync_lifecycle",
         ),
         runner.market_events: common + (
-            "_closed_bar_interval_ms", "_health",
+            "_closed_bar_interval_ms",
             "_heartbeat_service",
             "_last_market_queue_backlog_log_ms",
             "_last_market_queue_full_alert_ms",
@@ -110,13 +113,13 @@ def _inject_dependencies(runner, source) -> None:
             "_live_persistence_writer", "_market_data_persistence",
             "_market_feature_pipeline", "_persistence_alert_loop",
             "_last_live_data_path_log_ms", "_closed_bar_interval_ms",
-            "_latest_fixed_time_trade_bar_open_time_ms", "stats",
+            "stats",
         ),
         runner.market_data_lifecycle: (
             "app_config", "context", "range_config",
             "_closed_bar_interval_ms", "_range_background", "_range_module",
             "_range_pct", "_range_repair_bootstrap_service", "_stop_event",
-            "_market_data_runtime", "_market_modules_managed",
+            "_market_data_runtime",
         ),
         runner.recovery: common + (
             "runtime_config", "_last_snapshot", "_last_snapshots",
@@ -124,15 +127,14 @@ def _inject_dependencies(runner, source) -> None:
             "_validated_strategy_capabilities",
         ),
         runner.signal_execution: common + (
-            "_follower_close_alert_last_ms", "_health", "_intent_factory",
+            "_follower_close_alert_last_ms", "_intent_factory",
             "_signal_execution_service",
         ),
         runner.startup: common + (
             "runtime_config", "range_config", "_account_config_apply_writes",
             "_account_config_env", "_closed_bar_buffer_ms",
-            "_closed_bar_interval", "_closed_bar_interval_ms", "_health",
+            "_closed_bar_interval", "_closed_bar_interval_ms",
             "_project_env", "_range_speed_warmup",
-            "_startup_catchup_range_observed",
         ),
     }
     for component, names in selected.items():
@@ -341,7 +343,7 @@ def _inject_ports(runner) -> None:
 
 def _inject_runner_compatibility(runner, source) -> None:
     for name in (
-        "app_config", "stats", "_health", "_market_queue",
+        "app_config", "stats", "_market_queue",
         "_market_queue_backlog_warn_threshold",
         "_market_queue_drain_batch_size", "_shutdown_coordinator",
         "_stop_event", "_heartbeat_service", "requirements",

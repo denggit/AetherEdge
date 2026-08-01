@@ -262,7 +262,7 @@ def test_injected_coordinator_has_priority_without_default_construction(
         runner.account_runtime._reconciliation_service
         is DEFAULT_RUNTIME_SERVICE
     )
-    assert runner.account_runtime._position_plan_store is None
+    assert not hasattr(runner.account_runtime, "_position_plan_store")
     assert runner.service_bundle.execution.order_journal is None
 
 
@@ -286,7 +286,7 @@ def test_default_coordinator_is_created_once_written_back_and_not_executed(
         runner.account_runtime._reconciliation_service
         is DEFAULT_RUNTIME_SERVICE
     )
-    assert runner.account_runtime._position_plan_store is None
+    assert not hasattr(runner.account_runtime, "_position_plan_store")
     assert runner.service_bundle.execution.order_journal is None
 
 

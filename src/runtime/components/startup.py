@@ -136,10 +136,11 @@ class StartupComponent(RuntimeComponent):
                     f"{status.exchange.value}={status.mode}"
                 )
 
+        current = self.current_health
         self.ports.set_health(
-            self._health.phase,
+            current.phase,
             metadata={
-                **dict(self._health.metadata),
+                **dict(current.metadata),
                 "position_mode_requirements": audit,
             },
         )
@@ -320,7 +321,7 @@ class StartupComponent(RuntimeComponent):
         now_ms = int(time.time() * 1000)
         recovery = (
             module.initial_recovery
-            if getattr(self, "_market_modules_managed", False)
+            if self.market_state.modules_managed
             else module.initialize_recovery()
         )
         if recovery is None:
@@ -333,7 +334,7 @@ class StartupComponent(RuntimeComponent):
             configure_coverage(
                 degraded_fast_margin=self.range_config.degraded_fast_margin
             )
-        if not getattr(self, "_market_modules_managed", False):
+        if not self.market_state.modules_managed:
             module.checkpoint_writer.start()
             self._launch_range_micro_repair_subprocess(recovery)
         logger.info(
@@ -360,7 +361,7 @@ class StartupComponent(RuntimeComponent):
         warmup = self._range_speed_warmup
         if warmup is None:
             return 0
-        if getattr(self, "_market_modules_managed", False):
+        if self.market_state.modules_managed:
             return warmup.complete_history
         return await warmup.warmup()
 
@@ -368,7 +369,7 @@ class StartupComponent(RuntimeComponent):
         warmup = self._range_speed_warmup
         if warmup is not None:
             await warmup.finish_after_catchup(
-                range_observed=self._startup_catchup_range_observed
+                range_observed=self.runtime_state.range.startup_catchup_range_observed
             )
 
     async def _run_warmup(self) -> None:

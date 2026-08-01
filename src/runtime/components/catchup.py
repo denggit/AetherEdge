@@ -194,7 +194,7 @@ class CatchupComponent(RuntimeComponent):
         preview_events = [closed_kline_feature(kline), *range_events]
         preview_state = self._capture_startup_preview_state()
         signals = await self._preview_strategy_market_features(preview_events)
-        self._startup_catchup_range_observed = bool(range_events)
+        self.runtime_state.range.startup_catchup_range_observed = bool(range_events)
         logger.info(
             "Startup catchup strategy preview | total_signals=%s",
             len(signals),

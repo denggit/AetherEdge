@@ -43,7 +43,7 @@ class RangeRuntimeComponent(RuntimeComponent):
         return self._range_repair_bootstrap_service
 
     def _start_range_speed_background_services(self) -> None:
-        if not getattr(self, "_market_modules_managed", False):
+        if not self.market_state.modules_managed:
             if self._range_background is not None:
                 self._range_background.start(self._stop_event)
 

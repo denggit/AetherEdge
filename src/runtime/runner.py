@@ -163,7 +163,6 @@ class LiveRuntimeRunner(LegacyRunnerStateFacade):
         market_state.modules_managed = True
         self._market_data_runtime = runtime
         self._market_data_capabilities = capabilities
-        self._market_modules_managed = True
 
     async def enqueue_market_event(self, event: MarketEvent) -> None:
         await self.market_events._enqueue_market_event(event)
@@ -214,9 +213,10 @@ class LiveRuntimeRunner(LegacyRunnerStateFacade):
             await self.market_events._consume_market_events(
                 max_market_events=max_market_events
             )
+            current = self.lifecycle.current_health
             self.lifecycle._set_health(
                 RuntimePhase.STOPPED,
-                healthy=self.lifecycle._health.healthy,
+                healthy=current.healthy,
             )
             logger.info("Live runtime stopped | stats=%s", self.stats)
             return self.stats
@@ -265,13 +265,13 @@ class LiveRuntimeRunner(LegacyRunnerStateFacade):
             warmup_complete=True,
             caught_up=True,
         )
-        return self._health
+        return self.context.resources.lifecycle.health_state.current
 
     async def stop(self) -> RuntimeHealth:
         self._stop_event.set()
         await self._explicit_stop_shutdown()
         self.lifecycle._set_health(RuntimePhase.STOPPED, healthy=True)
-        return self._health
+        return self.context.resources.lifecycle.health_state.current
 
     async def _run_finally_shutdown(self) -> None:
         await self._shutdown_coordinator.execute(
@@ -299,7 +299,7 @@ class LiveRuntimeRunner(LegacyRunnerStateFacade):
         )
 
     async def health(self) -> RuntimeHealth:
-        return self._health
+        return self.context.resources.lifecycle.health_state.current
 
     async def process_market_event(self, event: MarketEvent) -> None:
         await self.market_events._process_market_event(event)

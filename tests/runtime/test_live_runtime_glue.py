@@ -4028,7 +4028,7 @@ async def test_portfolio_v1_startup_recovers_existing_positions_and_stops(
 
     await runner._startup()
 
-    assert runner._health.phase is RuntimePhase.RUNNING
+    assert runner.context.resources.lifecycle.health_state.current.phase is RuntimePhase.RUNNING
     assert strategy.recovery_blocking_manual_required is False
     assert strategy.position.in_pos is True
     assert strategy.position.position_id == lf_position_id

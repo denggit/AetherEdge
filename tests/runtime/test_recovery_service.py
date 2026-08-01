@@ -258,6 +258,7 @@ def _stop_order(*, order_id: str, quantity: Decimal, client_order_id: str = "pos
 # ══════════════════════════════════════════════════════════════════════════════
 
 import pytest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from src.app import AppContext
@@ -315,7 +316,9 @@ def _minimal_runner(
     runner._stop_event = MagicMock()
     runner._producer_tasks = []
     runner._sync_tasks = []
-    runner._health = MagicMock()
+    runner.context.resources.lifecycle.health_state = SimpleNamespace(
+        current=MagicMock()
+    )
     runner._heartbeat_service = MagicMock()
     runner._producer_monitor = MagicMock()
     runner._producer_supervisor = MagicMock()
