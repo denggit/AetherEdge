@@ -16,6 +16,10 @@ class RuntimeHealthState:
     def current(self) -> RuntimeHealth:
         return self._current
 
+    def replace(self, snapshot: RuntimeHealth) -> RuntimeHealth:
+        self._current = snapshot
+        return snapshot
+
     def update(
         self,
         phase: RuntimePhase,

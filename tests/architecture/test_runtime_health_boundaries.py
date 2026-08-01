@@ -10,6 +10,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = PROJECT_ROOT / "src"
 HEALTH_STATE = SOURCE_ROOT / "runtime" / "health_state.py"
 RUNNER = SOURCE_ROOT / "runtime" / "runner.py"
+LEGACY_STATE = SOURCE_ROOT / "runtime" / "compat" / "runner_state.py"
+LIFECYCLE = SOURCE_ROOT / "runtime" / "components" / "lifecycle.py"
 
 
 def _tree(path: Path) -> ast.Module:
@@ -203,6 +205,41 @@ def test_health_state_current_is_read_only_and_update_replaces_snapshot() -> Non
     assert isinstance(update.body[-1], ast.Return)
     assert ast.unparse(update.body[-1].value) == "updated"
 
+    replace = methods["replace"]
+    assert _self_assignments(replace) == {"_current"}
+    assert isinstance(replace.body[-1], ast.Return)
+    assert ast.unparse(replace.body[-1].value) == "snapshot"
+
+
+def test_legacy_health_facade_uses_only_canonical_state_when_available() -> None:
+    health_methods = [
+        node
+        for node in _class(
+            LEGACY_STATE, "LegacyRunnerStateFacade"
+        ).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_health"
+    ]
+    getter, setter = health_methods
+    getter_source = ast.unparse(getter)
+    assert "state.current" in getter_source
+    assert "component._health" not in getter_source
+
+    setter_source = ast.unparse(setter)
+    assert "state.replace(value)" in setter_source
+    assert "component._health" not in setter_source
+
+
+def test_lifecycle_set_health_updates_state_without_local_snapshot() -> None:
+    method = _methods(_class(LIFECYCLE, "LifecycleComponent"))["_set_health"]
+    assert "self._health" not in ast.unparse(method)
+    calls = [
+        node
+        for node in ast.walk(method)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "self._runtime_health_state.update"
+    ]
+    assert len(calls) == 1
+
 
 def test_runner_constructs_and_exposes_health_state_without_updating_it() -> None:
     initializer = _methods(_class(RUNNER, "LiveRuntimeRunner"))["__init__"]
@@ -272,13 +309,10 @@ def test_runner_constructs_and_exposes_health_state_without_updating_it() -> Non
 def test_runner_set_health_is_a_single_exact_delegate() -> None:
     method = _methods(_class(RUNNER, "LiveRuntimeRunner"))["_set_health"]
     assert len(method.body) == 1
-    assignment = method.body[0]
-    assert isinstance(assignment, ast.Assign)
-    assert [ast.unparse(target) for target in assignment.targets] == [
-        "self._health"
-    ]
-    assert isinstance(assignment.value, ast.Call)
-    call = assignment.value
+    statement = method.body[0]
+    assert isinstance(statement, ast.Expr)
+    assert isinstance(statement.value, ast.Call)
+    call = statement.value
     assert ast.unparse(call.func) == "self._runtime_health_state.update"
     assert [ast.unparse(argument) for argument in call.args] == ["phase"]
     assert {

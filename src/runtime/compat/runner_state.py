@@ -16,16 +16,24 @@ class LegacyRunnerStateFacade:
 
     @property
     def _health(self):
-        component, fallback = self._component_state("lifecycle", "_legacy_health")
-        return component._health if component is not None else fallback
+        context = self.__dict__.get("context")
+        resources = getattr(context, "resources", None)
+        lifecycle = getattr(resources, "lifecycle", None)
+        state = getattr(lifecycle, "health_state", None)
+        if state is not None:
+            return state.current
+        return self.__dict__.get("_legacy_health")
 
     @_health.setter
     def _health(self, value) -> None:
-        component, _ = self._component_state("lifecycle", "_legacy_health")
-        if component is None:
-            self.__dict__["_legacy_health"] = value
-        else:
-            component._health = value
+        context = self.__dict__.get("context")
+        resources = getattr(context, "resources", None)
+        lifecycle = getattr(resources, "lifecycle", None)
+        state = getattr(lifecycle, "health_state", None)
+        if state is not None:
+            state.replace(value)
+            return
+        self.__dict__["_legacy_health"] = value
 
     @property
     def _account_config_new_entries_blocked(self) -> bool:

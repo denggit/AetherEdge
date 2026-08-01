@@ -71,6 +71,17 @@ def test_initial_snapshot_identity_and_owned_field_are_preserved() -> None:
     assert vars(state) == {"_current": initial}
 
 
+def test_replace_preserves_replacement_snapshot_identity() -> None:
+    initial = RuntimeHealth(phase=RuntimePhase.CREATED)
+    replacement = RuntimeHealth(phase=RuntimePhase.ERROR, healthy=False)
+    state = RuntimeHealthState(initial)
+
+    result = state.replace(replacement)
+
+    assert result is replacement
+    assert state.current is replacement
+
+
 def test_update_with_none_preserves_values_and_copies_metadata() -> None:
     initial_metadata = {"source": "initial"}
     initial = RuntimeHealth(
@@ -151,7 +162,7 @@ def test_runner_creates_one_default_state_with_exact_initial_snapshot(
     warmup_enabled: bool,
 ) -> None:
     current = object()
-    state = SimpleNamespace(current=current, update=Mock())
+    state = SimpleNamespace(current=current, update=Mock(), replace=Mock())
     state_factory = Mock(return_value=state)
     heartbeat = Mock()
     monkeypatch.setattr(
@@ -180,6 +191,7 @@ def test_runner_creates_one_default_state_with_exact_initial_snapshot(
     assert runner.services["runtime_health_state"] is state
     assert runner.context.resources.lifecycle.health_state.current is current
     state.update.assert_not_called()
+    state.replace.assert_not_called()
     heartbeat.start.assert_not_called()
 
 
@@ -191,7 +203,7 @@ def test_injected_state_has_priority_and_is_not_updated_during_construction(
         healthy=False,
         error="injected",
     )
-    state = SimpleNamespace(current=current, update=Mock())
+    state = SimpleNamespace(current=current, update=Mock(), replace=Mock())
     default_factory = Mock()
     monkeypatch.setattr(
         "src.runtime.components.wiring.RuntimeHealthState",
@@ -205,11 +217,12 @@ def test_injected_state_has_priority_and_is_not_updated_during_construction(
     assert runner._runtime_health_state is state
     assert runner.services["runtime_health_state"] is state
     assert runner.context.resources.lifecycle.health_state.current is state.current
+    state.replace.assert_not_called()
 
 
-def test_set_health_delegates_once_and_synchronizes_compatibility_field() -> None:
-    component = LifecycleComponent(RuntimeContext())
-    previous = RuntimeHealth(phase=RuntimePhase.CREATED)
+def test_lifecycle_set_health_delegates_once_without_local_snapshot() -> None:
+    context = RuntimeContext()
+    component = LifecycleComponent(context)
     updated = RuntimeHealth(
         phase=RuntimePhase.RUNNING,
         healthy=False,
@@ -219,10 +232,10 @@ def test_set_health_delegates_once_and_synchronizes_compatibility_field() -> Non
         error="delegated",
         metadata={"source": "delegate"},
     )
-    state = SimpleNamespace(update=Mock(return_value=updated))
+    state = SimpleNamespace(current=updated, update=Mock(return_value=updated))
     metadata = {"source": "delegate"}
+    context.resources.lifecycle.health_state = state
     component._runtime_health_state = state
-    component._health = previous
 
     result = component._set_health(
         RuntimePhase.RUNNING,
@@ -244,7 +257,56 @@ def test_set_health_delegates_once_and_synchronizes_compatibility_field() -> Non
         error="delegated",
         metadata=metadata,
     )
-    assert component._health is updated
+    assert component.current_health is updated
+    assert "_health" not in component.__dict__
+
+
+def test_runner_health_is_available_immediately_without_local_copies() -> None:
+    runner = _runner()
+
+    assert runner._health is runner.context.resources.lifecycle.health_state.current
+    assert runner.lifecycle.current_health is runner._health
+    assert "_health" not in runner.__dict__
+    assert "_health" not in runner.lifecycle.__dict__
+
+
+@pytest.mark.asyncio
+async def test_legacy_health_setter_replaces_canonical_snapshot() -> None:
+    runner = _runner()
+    snapshot = RuntimeHealth(
+        phase=RuntimePhase.ERROR,
+        healthy=False,
+        error="legacy replacement",
+    )
+
+    runner._health = snapshot
+
+    assert runner._health is snapshot
+    assert runner.context.resources.lifecycle.health_state.current is snapshot
+    assert await runner.health() is snapshot
+    assert runner.lifecycle.current_health is snapshot
+    assert "_health" not in runner.__dict__
+    assert "_health" not in runner.lifecycle.__dict__
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_health_update_is_shared_by_all_interfaces() -> None:
+    runner = _runner()
+
+    runner.lifecycle._set_health(
+        RuntimePhase.RUNNING,
+        healthy=False,
+        warmup_complete=True,
+        caught_up=True,
+        error="latest",
+    )
+
+    snapshot = runner.context.resources.lifecycle.health_state.current
+    assert runner._health is snapshot
+    assert runner.lifecycle.current_health is snapshot
+    assert await runner.health() is snapshot
+    assert "_health" not in runner.__dict__
+    assert "_health" not in runner.lifecycle.__dict__
 
 
 @pytest.mark.asyncio

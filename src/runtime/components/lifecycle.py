@@ -398,7 +398,7 @@ class LifecycleComponent(RuntimeComponent):
         error: str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> None:
-        self._health = self._runtime_health_state.update(
+        self._runtime_health_state.update(
             phase,
             healthy=healthy,
             warmup_complete=warmup_complete,
